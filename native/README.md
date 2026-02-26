@@ -105,6 +105,10 @@ Note: this requires valid cross-compilers/toolchains to be installed on the buil
 Workflow: `fabric-mod/.github/workflows/native-matrix.yml`
 
 - builds 4 native binaries with matrix jobs
+- OpenCL mode in CI:
+  - Linux amd64/arm64: `ON`
+  - Windows x86_64: `ON` (OpenCL SDK provided via vcpkg in workflow)
+  - macOS arm64: `OFF` (GitHub macOS runner OpenCL SDK availability is inconsistent)
 - verifies all 4 files exist
 - packs them into mod jar via `./gradlew remapJar`
 - uploads `mod-jar` and `natives-bundle` artifacts
