@@ -35,6 +35,29 @@ constexpr std::array<float, kQ> kW = {
     1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f
 };
 
+constexpr int kChannelObstacle = 0;
+constexpr int kChannelFanMask = 1;
+constexpr int kChannelFanVx = 2;
+constexpr int kChannelFanVy = 3;
+constexpr int kChannelFanVz = 4;
+constexpr int kChannelStateVx = 5;
+constexpr int kChannelStateVy = 6;
+constexpr int kChannelStateVz = 7;
+constexpr int kChannelStateP = 8;
+
+constexpr float kLatticeSoundSpeed = 0.57735026919f;   // 1 / sqrt(3)
+constexpr float kTargetMach = 0.10f;                   // keep Mach number low for LBM stability
+constexpr float kMaxMach = 0.35f;                      // hard velocity clamp inside solver
+constexpr float kTargetLatticeSpeed = kLatticeSoundSpeed * kTargetMach;
+constexpr float kHardMaxLatticeSpeed = kLatticeSoundSpeed * kMaxMach;
+constexpr float kMinVelocityScale = 1e-4f;
+constexpr float kVelocityScaleReinitEps = 0.05f;
+
+constexpr float kRhoMin = 0.98f;
+constexpr float kRhoMax = 1.02f;
+constexpr float kPressureMin = -0.02f;
+constexpr float kPressureMax = 0.02f;
+
 constexpr float kTauPlus = 0.62f;
 constexpr float kTrtMagic = 0.25f;
 constexpr float kTauMinus = 0.5f + kTrtMagic / (kTauPlus - 0.5f);
@@ -42,7 +65,7 @@ constexpr float kOmegaPlus = 1.0f / kTauPlus;
 constexpr float kOmegaMinus = 1.0f / kTauMinus;
 constexpr float kFanRelax = 0.20f;
 constexpr float kStateNudge = 0.05f;
-constexpr float kMaxSpeed = 10.0f;
+constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
 struct Config {
     int grid_size = 0;
@@ -76,6 +99,7 @@ struct ContextState {
     std::vector<float> fan_uy;
     std::vector<float> fan_uz;
     std::vector<uint8_t> obstacle;
+    float velocity_scale = 1.0f;
 
 #if defined(AERO_LBM_OPENCL)
     bool gpu_buffers_ready = false;
@@ -160,6 +184,62 @@ inline float clampf(float v, float lo, float hi) {
     return std::min(hi, std::max(lo, v));
 }
 
+float compute_packet_velocity_scale(const float* payload, std::size_t cells, int in_channels) {
+    float peak_speed = 0.0f;
+    for (std::size_t cell = 0; cell < cells; ++cell) {
+        const std::size_t base = cell * static_cast<std::size_t>(in_channels);
+        if (payload[base + kChannelObstacle] > 0.5f) {
+            continue;
+        }
+
+        const float vx = payload[base + kChannelStateVx];
+        const float vy = payload[base + kChannelStateVy];
+        const float vz = payload[base + kChannelStateVz];
+        peak_speed = std::max(peak_speed, std::sqrt(vx * vx + vy * vy + vz * vz));
+
+        const float fan = clampf(payload[base + kChannelFanMask], 0.0f, 1.0f);
+        if (fan > 0.0f) {
+            const float fvx = payload[base + kChannelFanVx];
+            const float fvy = payload[base + kChannelFanVy];
+            const float fvz = payload[base + kChannelFanVz];
+            peak_speed = std::max(peak_speed, std::sqrt(fvx * fvx + fvy * fvy + fvz * fvz));
+        }
+    }
+
+    if (!(peak_speed > 0.0f) || peak_speed <= kTargetLatticeSpeed) {
+        return 1.0f;
+    }
+
+    return clampf(kTargetLatticeSpeed / peak_speed, kMinVelocityScale, 1.0f);
+}
+
+void scale_packet_velocities(float* payload, std::size_t cells, int in_channels, float scale) {
+    if (!(scale > 0.0f) || scale >= 1.0f) {
+        return;
+    }
+    for (std::size_t cell = 0; cell < cells; ++cell) {
+        const std::size_t base = cell * static_cast<std::size_t>(in_channels);
+        payload[base + kChannelFanVx] *= scale;
+        payload[base + kChannelFanVy] *= scale;
+        payload[base + kChannelFanVz] *= scale;
+        payload[base + kChannelStateVx] *= scale;
+        payload[base + kChannelStateVy] *= scale;
+        payload[base + kChannelStateVz] *= scale;
+    }
+}
+
+void scale_output_velocities(float* out, std::size_t cells, int out_channels, float scale) {
+    if (!(scale > 0.0f) || out_channels < 3 || scale == 1.0f) {
+        return;
+    }
+    for (std::size_t cell = 0; cell < cells; ++cell) {
+        const std::size_t base = cell * static_cast<std::size_t>(out_channels);
+        out[base + 0] *= scale;
+        out[base + 1] *= scale;
+        out[base + 2] *= scale;
+    }
+}
+
 inline float feq(int q, float rho, float ux, float uy, float uz) {
     const float cu = 3.0f * (kCx[q] * ux + kCy[q] * uy + kCz[q] * uz);
     const float uu = ux * ux + uy * uy + uz * uz;
@@ -193,15 +273,15 @@ void allocate_cpu_context(ContextState& ctx, int n) {
 void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         const std::size_t base = cell * static_cast<std::size_t>(in_channels);
-        ctx.obstacle[cell] = payload[base + 0] > 0.5f ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
-        ctx.fan_mask[cell] = clampf(payload[base + 1], 0.0f, 1.0f);
-        ctx.fan_ux[cell] = payload[base + 2];
-        ctx.fan_uy[cell] = payload[base + 3];
-        ctx.fan_uz[cell] = payload[base + 4];
-        ctx.ref_ux[cell] = payload[base + 5];
-        ctx.ref_uy[cell] = payload[base + 6];
-        ctx.ref_uz[cell] = payload[base + 7];
-        ctx.ref_pressure[cell] = payload[base + 8];
+        ctx.obstacle[cell] = payload[base + kChannelObstacle] > 0.5f ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+        ctx.fan_mask[cell] = clampf(payload[base + kChannelFanMask], 0.0f, 1.0f);
+        ctx.fan_ux[cell] = payload[base + kChannelFanVx];
+        ctx.fan_uy[cell] = payload[base + kChannelFanVy];
+        ctx.fan_uz[cell] = payload[base + kChannelFanVz];
+        ctx.ref_ux[cell] = payload[base + kChannelStateVx];
+        ctx.ref_uy[cell] = payload[base + kChannelStateVy];
+        ctx.ref_uz[cell] = payload[base + kChannelStateVz];
+        ctx.ref_pressure[cell] = clampf(payload[base + kChannelStateP], kPressureMin, kPressureMax);
     }
 }
 
@@ -213,7 +293,7 @@ void initialize_distributions(ContextState& ctx) {
             ctx.uy[cell] = 0.0f;
             ctx.uz[cell] = 0.0f;
         } else {
-            ctx.rho[cell] = clampf(1.0f + 0.05f * ctx.ref_pressure[cell], 0.5f, 2.0f);
+            ctx.rho[cell] = clampf(1.0f + ctx.ref_pressure[cell], kRhoMin, kRhoMax);
             ctx.ux[cell] = ctx.ref_ux[cell];
             ctx.uy[cell] = ctx.ref_uy[cell];
             ctx.uz[cell] = ctx.ref_uz[cell];
@@ -254,7 +334,7 @@ void collide(ContextState& ctx) {
             uy += fq * static_cast<float>(kCy[q]);
             uz += fq * static_cast<float>(kCz[q]);
         }
-        rho = std::max(1e-6f, rho);
+        rho = clampf(rho, kRhoMin, kRhoMax);
         ux /= rho;
         uy /= rho;
         uz /= rho;
@@ -360,7 +440,7 @@ void write_output(const ContextState& ctx, float* out, int out_channels) {
             uy += fq * static_cast<float>(kCy[q]);
             uz += fq * static_cast<float>(kCz[q]);
         }
-        rho = std::max(1e-6f, rho);
+        rho = clampf(rho, kRhoMin, kRhoMax);
         ux /= rho;
         uy /= rho;
         uz /= rho;
@@ -408,11 +488,15 @@ __constant float W[KQ] = {
     0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f
 };
 
-constant float OMEGA_PLUS = 1.6129032f;
-constant float OMEGA_MINUS = 0.38709676f;
-constant float FAN_RELAX = 0.20f;
-constant float STATE_NUDGE = 0.05f;
-constant float MAX_SPEED = 10.0f;
+__constant float OMEGA_PLUS = 1.6129032f;
+__constant float OMEGA_MINUS = 0.38709676f;
+__constant float FAN_RELAX = 0.20f;
+__constant float STATE_NUDGE = 0.05f;
+__constant float MAX_SPEED = 0.20207259f;
+__constant float RHO_MIN = 0.98f;
+__constant float RHO_MAX = 1.02f;
+__constant float P_MIN = -0.02f;
+__constant float P_MAX = 0.02f;
 
 inline float clampf(float v, float lo, float hi) {
     return fmin(hi, fmax(lo, v));
@@ -447,8 +531,8 @@ kernel void init_distributions(
     float uz = 0.0f;
 
     if (!solid) {
-        float p = payload[base + 8];
-        rho = clampf(1.0f + 0.05f * p, 0.5f, 2.0f);
+        float p = clampf(payload[base + 8], P_MIN, P_MAX);
+        rho = clampf(1.0f + p, RHO_MIN, RHO_MAX);
         ux = payload[base + 5];
         uy = payload[base + 6];
         uz = payload[base + 7];
@@ -494,7 +578,7 @@ kernel void collide_step(
         uz += fq * (float)CZ[q];
     }
 
-    rho = fmax(rho, 1e-6f);
+    rho = clampf(rho, RHO_MIN, RHO_MAX);
     ux /= rho;
     uy /= rho;
     uz /= rho;
@@ -624,7 +708,7 @@ kernel void output_macro(
         uz += fq * (float)CZ[q];
     }
 
-    rho = fmax(rho, 1e-6f);
+    rho = clampf(rho, RHO_MIN, RHO_MAX);
     ux /= rho;
     uy /= rho;
     uz /= rho;
@@ -1189,6 +1273,24 @@ Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStep(
     ContextState& ctx = g_contexts[context_key];
     ensure_context_shape(ctx, n, cells);
 
+    float velocity_scale = compute_packet_velocity_scale(packet.data(), cells, g_cfg.input_channels);
+    if (!(velocity_scale > 0.0f) || !std::isfinite(velocity_scale)) {
+        velocity_scale = 1.0f;
+    }
+    if (velocity_scale < 1.0f) {
+        scale_packet_velocities(packet.data(), cells, g_cfg.input_channels, velocity_scale);
+    }
+
+    const float scale_ref = std::max(ctx.velocity_scale, 1e-6f);
+    const bool scale_changed = std::fabs(velocity_scale - ctx.velocity_scale) > (kVelocityScaleReinitEps * scale_ref);
+    if (scale_changed) {
+        ctx.cpu_initialized = false;
+#if defined(AERO_LBM_OPENCL)
+        ctx.gpu_initialized = false;
+#endif
+    }
+    ctx.velocity_scale = velocity_scale;
+
     bool ok = false;
     if (g_cfg.opencl_enabled) {
         ok = opencl_step(ctx, packet.data(), out, timing);
@@ -1203,6 +1305,10 @@ Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStep(
         timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
         g_cfg.runtime_info = g_cfg.runtime_info.empty() ? "cpu|trt" : g_cfg.runtime_info;
         ok = true;
+    }
+
+    if (ok && velocity_scale < 1.0f) {
+        scale_output_velocities(out, cells, g_cfg.output_channels, 1.0f / velocity_scale);
     }
 
     env->ReleaseFloatArrayElements(output_flow, out, 0);
