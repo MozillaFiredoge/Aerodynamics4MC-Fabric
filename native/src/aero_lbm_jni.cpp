@@ -55,13 +55,13 @@ constexpr float kRhoMax = 1.03f;
 constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
-constexpr float kTauPlus = 0.5001f;
-constexpr float kTauPlusMin = 0.505f;
+constexpr float kTauPlus = 0.50003f;
+constexpr float kTauPlusMin = 0.50003f;
 constexpr float kTauPlusMax = 0.80f;
-constexpr float kSmagorinskyC = 0.16f;
+constexpr float kSmagorinskyC = 0.10f;
 constexpr float kSmagorinskyC2 = kSmagorinskyC * kSmagorinskyC;
 constexpr float kSmagorinskyFactor = 3.0f * kSmagorinskyC2;
-constexpr float kLesSpeedThreshold = 0.004f;
+constexpr float kLesSpeedThreshold = 0.0f;
 constexpr float kTrtMagic = 0.25f;
 constexpr float kTauMinus = 0.5f + kTrtMagic / (kTauPlus - 0.5f);
 constexpr float kOmegaPlus = 1.0f / kTauPlus;
@@ -313,9 +313,9 @@ void collide(ContextState& ctx) {
         }
 
         // Body-force injection (Guo-style momentum shift) is more stable than hard velocity pinning.
-        ux += fx / rho;
-        uy += fy / rho;
-        uz += fz / rho;
+        ux += fx / rho * 0.5;
+        uy += fy / rho * 0.5;
+        uz += fz / rho * 0.5;
 
         ux = (1.0f - kStateNudge) * ux + kStateNudge * ctx.ref_ux[cell];
         uy = (1.0f - kStateNudge) * uy + kStateNudge * ctx.ref_uy[cell];
@@ -369,7 +369,8 @@ void collide(ContextState& ctx) {
             const float s_mag = (3.0f / (2.0f * std::max(1e-6f, rho) * kTauPlus)) * q_mag;
             tau_plus_local = clampf(kTauPlus + kSmagorinskyFactor * s_mag, kTauPlusMin, kTauPlusMax);
         }
-        const float tau_minus_local = 0.5f + kTrtMagic / std::max(1e-6f, (tau_plus_local - 0.5f));
+        float tau_minus_local = 0.5f + kTrtMagic / std::max(1e-6f, (tau_plus_local - 0.5f));
+        tau_minus_local = fmin(tau_minus_local, 1.0f);
         const float omega_plus_local = 1.0f / tau_plus_local;
         const float omega_minus_local = 1.0f / tau_minus_local;
 
@@ -515,8 +516,13 @@ __constant float W[KQ] = {
     0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f
 };
 
-__constant float OMEGA_PLUS = 1.9996f;
-__constant float OMEGA_MINUS = 0.05825243f;
+__constant int LES_ENABLED = 1;
+__constant float TAU_PLUS_BASE = 0.50003f;
+__constant float TAU_PLUS_MIN = 0.50003f;
+__constant float TAU_PLUS_MAX = 0.8f;
+__constant float TRT_MAGIC = 0.25f;
+__constant float SMAG_FACTOR = 0.03f;
+__constant float LES_SPEED_THRESHOLD = 0.0f;
 __constant float FAN_ACCEL = 0.0120f;
 __constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
 __constant float FAN_FORCE_SCALE_MAX = 4.0f;
@@ -640,9 +646,9 @@ kernel void collide_step(
         }
     }
 
-    ux += fx / rho;
-    uy += fy / rho;
-    uz += fz / rho;
+    ux += fx / rho * 0.5;
+    uy += fy / rho * 0.5;
+    uz += fz / rho * 0.5;
 
     float ref_ux = payload[base + 5];
     float ref_uy = payload[base + 6];
@@ -660,12 +666,52 @@ kernel void collide_step(
         uz *= scale;
     }
 
+    float feq_cache[KQ];
+    float qxx = 0.0f;
+    float qyy = 0.0f;
+    float qzz = 0.0f;
+    float qxy = 0.0f;
+    float qxz = 0.0f;
+    float qyz = 0.0f;
+    int apply_les = LES_ENABLED && speed2 > (LES_SPEED_THRESHOLD * LES_SPEED_THRESHOLD);
+
+    for (int q = 0; q < KQ; ++q) {
+        float f_eq_q = feq(q, rho, ux, uy, uz);
+        feq_cache[q] = f_eq_q;
+
+        if (apply_les) {
+            float fneq = f[fq_base + q] - f_eq_q;
+            float cx = (float)CX[q];
+            float cy = (float)CY[q];
+            float cz = (float)CZ[q];
+            qxx += cx * cx * fneq;
+            qyy += cy * cy * fneq;
+            qzz += cz * cz * fneq;
+            qxy += cx * cy * fneq;
+            qxz += cx * cz * fneq;
+            qyz += cy * cz * fneq;
+        }
+    }
+
+    float tau_plus_local = TAU_PLUS_BASE;
+    if (apply_les) {
+        float q_norm2 = qxx * qxx + qyy * qyy + qzz * qzz
+            + 2.0f * (qxy * qxy + qxz * qxz + qyz * qyz);
+        float q_mag = sqrt(fmax(0.0f, q_norm2));
+        float s_mag = (3.0f / (2.0f * fmax(1e-6f, rho) * TAU_PLUS_BASE)) * q_mag;
+        tau_plus_local = clampf(TAU_PLUS_BASE + SMAG_FACTOR * s_mag, TAU_PLUS_MIN, TAU_PLUS_MAX);
+    }
+    float tau_minus_local = 0.5f + TRT_MAGIC / fmax(1e-6f, (tau_plus_local - 0.5f));
+    tau_minus_local = fmin(tau_minus_local, 1.0f);
+    float omega_plus_local = 1.0f / tau_plus_local;
+    float omega_minus_local = 1.0f / tau_minus_local;
+
     for (int q = 0; q < KQ; ++q) {
         int opp = OPP[q];
         float f_q = f[fq_base + q];
         float f_opp = f[fq_base + opp];
-        float f_eq_q = feq(q, rho, ux, uy, uz);
-        float f_eq_opp = feq(opp, rho, ux, uy, uz);
+        float f_eq_q = feq_cache[q];
+        float f_eq_opp = feq_cache[opp];
 
         float f_plus = 0.5f * (f_q + f_opp);
         float f_minus = 0.5f * (f_q - f_opp);
@@ -677,11 +723,11 @@ kernel void collide_step(
         float ciminu_dot_f = ((float)CX[q] - ux) * fx
             + ((float)CY[q] - uy) * fy
             + ((float)CZ[q] - uz) * fz;
-        float source = W[q] * (1.0f - 0.5f * OMEGA_PLUS) * 3.0f * (ciminu_dot_f + 3.0f * ci_dot_u * ci_dot_f);
+        float source = W[q] * (1.0f - 0.5f * omega_plus_local) * 3.0f * (ciminu_dot_f + 3.0f * ci_dot_u * ci_dot_f);
 
         f_post[fq_base + q] = f_q
-            - OMEGA_PLUS * (f_plus - feq_plus)
-            - OMEGA_MINUS * (f_minus - feq_minus)
+            - omega_plus_local * (f_plus - feq_plus)
+            - omega_minus_local * (f_minus - feq_minus)
             + source;
     }
 }
@@ -1290,17 +1336,15 @@ Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeInit(
         return JNI_TRUE;
     }
 
-    if (kEnableSmagorinskyLES) {
-        g_cfg.opencl_enabled = false;
-        g_cfg.runtime_info = "cpu|trt+les";
-        return JNI_TRUE;
-    }
-
     g_cfg.opencl_enabled = initialize_opencl_runtime();
     if (g_cfg.opencl_enabled) {
-        g_cfg.runtime_info = "opencl|trt:" + g_opencl.device_name;
+        g_cfg.runtime_info = kEnableSmagorinskyLES
+            ? ("opencl|trt+les:" + g_opencl.device_name)
+            : ("opencl|trt:" + g_opencl.device_name);
     } else {
-        g_cfg.runtime_info = "cpu|trt (" + g_opencl.error + ")";
+        g_cfg.runtime_info = kEnableSmagorinskyLES
+            ? ("cpu|trt+les (" + g_opencl.error + ")")
+            : ("cpu|trt (" + g_opencl.error + ")");
     }
     return JNI_TRUE;
 }

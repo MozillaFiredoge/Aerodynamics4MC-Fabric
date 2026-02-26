@@ -65,7 +65,7 @@ public class FlowRenderer {
 
     private void renderVelocityField(VertexConsumer buffer, MatrixStack matrices) {
         int stride = 1;
-        float velScale = 1f;
+        float velScale = 50.0f;
         var entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
 
@@ -74,11 +74,11 @@ public class FlowRenderer {
                 for (int z = 0; z < gridSize; z += stride) {
                     Vec3d vel = getVelocityAt(x, y, z);
                     float speed = (float) vel.length();
-                    if (speed < 0.05f) continue;
+                    if (speed < 8e-4f) continue;
 
                     Vec3d dir = vel.normalize();
                     
-                    int color = getViridisColor(speed * 0.5f);
+                    int color = getViridisColor(speed * 40.0f);
                     int r = (color >> 16) & 0xFF;
                     int g = (color >> 8) & 0xFF;
                     int b = color & 0xFF;
@@ -87,6 +87,7 @@ public class FlowRenderer {
                     float fx = x + 0.5f;
                     float fy = y + 0.5f;
                     float fz = z + 0.5f;
+                    float lineLength = MathHelper.clamp(speed * velScale, 0.05f, 0.9f);
                     
                     // Base of arrow
                     buffer.vertex(matrix, fx, fy, fz)
@@ -94,7 +95,12 @@ public class FlowRenderer {
                         .normal(entry, (float) dir.x, (float) dir.y, (float) dir.z)
                         .lineWidth(1.5f);
                     // Tip of arrow
-                    buffer.vertex(matrix, fx + (float)vel.x * velScale, fy + (float)vel.y * velScale, fz + (float)vel.z * velScale)
+                    buffer.vertex(
+                            matrix,
+                            fx + (float) dir.x * lineLength,
+                            fy + (float) dir.y * lineLength,
+                            fz + (float) dir.z * lineLength
+                        )
                         .color(r, g, b, a)
                         .normal(entry, (float) dir.x, (float) dir.y, (float) dir.z)
                         .lineWidth(2.0f);
@@ -105,9 +111,9 @@ public class FlowRenderer {
     
     private void renderStreamlines(VertexConsumer buffer, MatrixStack matrices) {
         // Simple streamlines from inflow plane
-        int seeds = 10;
-        float stepSize = 0.2f;
-        int maxSteps = 50;
+        int seeds = 48;
+        float stepSize = 0.35f;
+        int maxSteps = 80;
         var entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
         
@@ -122,29 +128,31 @@ public class FlowRenderer {
              // Trace
              for (int s = 0; s < maxSteps; s++) {
                  Vec3d vel = sampleVelocity(pos);
-                 if (vel.lengthSquared() < 0.001) break;
-                 
-                 Vec3d nextPos = pos.add(vel.multiply(stepSize));
-                 Vec3d dir = nextPos.subtract(pos).normalize();
+                 float speed = (float) vel.length();
+                 if (speed < 3e-4f) break;
+
+                 Vec3d dir = vel.normalize();
+                 float advectStep = stepSize * MathHelper.clamp(speed * 12.0f, 0.15f, 1.2f);
+                 Vec3d nextPos = pos.add(dir.multiply(advectStep));
+                 Vec3d segDir = nextPos.subtract(pos).normalize();
                  
                  // Check bounds
                  if (nextPos.x < 0 || nextPos.x >= gridSize || nextPos.y < 0 || nextPos.y >= gridSize || nextPos.z < 0 || nextPos.z >= gridSize) {
                      break;
                  }
                  
-                 float speed = (float) vel.length();
-                 int color = getViridisColor(speed * 0.5f);
+                 int color = getViridisColor(speed * 40.0f);
                  int r = (color >> 16) & 0xFF;
                  int g = (color >> 8) & 0xFF;
                  int b = color & 0xFF;
                  
                  buffer.vertex(matrix, (float)pos.x, (float)pos.y, (float)pos.z)
                      .color(r, g, b, 255)
-                     .normal(entry, (float) dir.x, (float) dir.y, (float) dir.z)
+                     .normal(entry, (float) segDir.x, (float) segDir.y, (float) segDir.z)
                      .lineWidth(1.0f);
                  buffer.vertex(matrix, (float)nextPos.x, (float)nextPos.y, (float)nextPos.z)
                      .color(r, g, b, 255)
-                     .normal(entry, (float) dir.x, (float) dir.y, (float) dir.z)
+                     .normal(entry, (float) segDir.x, (float) segDir.y, (float) segDir.z)
                      .lineWidth(1.0f);
                  
                  pos = nextPos;

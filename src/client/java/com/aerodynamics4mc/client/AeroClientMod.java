@@ -157,13 +157,13 @@ public class AeroClientMod implements ClientModInitializer {
         if (scannedFans == 0) {
             scannedFans = fallbackScanFanBlocks(client, fansByWindow);
         }
-        log("Scanned fans: " + scannedFans);
+        // log("Scanned fans: " + scannedFans);
 
         windows.entrySet().removeIf(entry -> {
             if (fansByWindow.containsKey(entry.getKey())) {
                 return false;
             }
-            log("Removing window (no fans) " + formatPos(entry.getKey()));
+            // log("Removing window (no fans) " + formatPos(entry.getKey()));
             nativeBackend.releaseContext(entry.getKey().asLong());
             closeSocket(entry.getValue());
             return true;
@@ -182,7 +182,7 @@ public class AeroClientMod implements ClientModInitializer {
     }
 
     private int fallbackScanFanBlocks(MinecraftClient client, Map<BlockPos, List<FanSource>> fansByWindow) {
-        log("Fallback scan: no FanBlockEntity found, scanning nearby blocks");
+        // log("Fallback scan: no FanBlockEntity found, scanning nearby blocks");
         if (client.world == null || client.player == null) {
             log("Fallback scan skipped: world/player missing");
             return 0;
