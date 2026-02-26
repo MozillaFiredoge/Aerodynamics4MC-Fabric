@@ -30,7 +30,7 @@ Reasoning:
 
 Current native code includes:
 
-- OpenCL path (if `OpenCL` found by CMake):
+- OpenCL path (required when `AERO_LBM_ENABLE_OPENCL=ON`, default):
   - kernels: `init_distributions`, `collide_step`, `stream_step`, `output_macro`
   - per-window GPU buffers keyed by `contextKey`
   - TRT collision (same physics core as CPU path)
@@ -55,6 +55,8 @@ The status command also prints tick timing breakdown: payload copy / solver / re
 
 ```bash
 cd fabric-mod/native
+# Ubuntu/Debian:
+# sudo apt-get install -y ocl-icd-opencl-dev opencl-c-headers opencl-clhpp-headers
 cmake -S . -B build
 cmake --build build -j
 ```
@@ -82,6 +84,12 @@ cmake -S . -B build-all -DAERO_LBM_SUPERBUILD=ON -DAERO_LBM_DIST_DIR=$PWD/dist/n
 cmake --build build-all -j
 ```
 
+If your cross toolchains do not provide target OpenCL SDK/libs, you can override:
+
+```bash
+cmake -S . -B build-all -DAERO_LBM_SUPERBUILD=ON -DAERO_LBM_SUPERBUILD_ENABLE_OPENCL=OFF
+```
+
 Compiler env overrides (if defaults are unavailable):
 
 - Linux amd64: `AERO_CC_LINUX_X86_64`, `AERO_CXX_LINUX_X86_64`
@@ -105,6 +113,12 @@ To force CPU fallback even when OpenCL exists:
 
 ```bash
 export AERO_LBM_CPU_ONLY=1
+```
+
+To build native without OpenCL support (not default):
+
+```bash
+cmake -S . -B build -DAERO_LBM_ENABLE_OPENCL=OFF
 ```
 
 ## Packaging in mod JAR

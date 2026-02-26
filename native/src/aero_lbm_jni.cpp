@@ -97,6 +97,7 @@ struct ContextState {
     std::vector<float> ref_uz;
     std::vector<float> ref_pressure;
 
+    std::vector<float> packet; // reused host-side payload buffer (floats)
     std::vector<float> fan_mask;
     std::vector<float> fan_ux;
     std::vector<float> fan_uy;
@@ -203,6 +204,7 @@ void allocate_cpu_context(ContextState& ctx, int n) {
     ctx.ref_uy.assign(ctx.cells, 0.0f);
     ctx.ref_uz.assign(ctx.cells, 0.0f);
     ctx.ref_pressure.assign(ctx.cells, 0.0f);
+    ctx.packet.assign(ctx.cells * g_cfg.input_channels, 0.0f);
 
     ctx.fan_mask.assign(ctx.cells, 0.0f);
     ctx.fan_ux.assign(ctx.cells, 0.0f);
@@ -269,7 +271,9 @@ void collide(ContextState& ctx) {
         rho = clampf(rho, kRhoMin, kRhoMax);
         ux /= rho; uy /= rho; uz /= rho;
 
-        float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
         if (ctx.fan_mask[cell] > 0.0f) {
             float fan_norm = std::sqrt(ctx.fan_ux[cell] * ctx.fan_ux[cell] + ctx.fan_uy[cell] * ctx.fan_uy[cell] + ctx.fan_uz[cell] * ctx.fan_uz[cell]);
             if (fan_norm > 1e-8f) {
@@ -302,8 +306,15 @@ void collide(ContextState& ctx) {
             f_eq_cache[q] = eq;
             float fneq = ctx.f[dist_index(cell, q, ctx.cells)] - eq;
             float cx = kCx[q], cy = kCy[q], cz = kCz[q];
-            qxx += cx * cx * fneq; qyy += cy * cy * fneq; qzz += cz * cz * fneq;
-            qxy += cx * cy * fneq; qxz += cx * cz * fneq; qyz += cy * cz * fneq;
+            // Use Q = cc - cs^2 I (cs^2 = 1/3) so that q_aa is trace-free component
+            float Qxx = cx * cx - 0.33333333f;
+            float Qyy = cy * cy - 0.33333333f;
+            float Qzz = cz * cz - 0.33333333f;
+            float Qxy = cx * cy;
+            float Qxz = cx * cz;
+            float Qyz = cy * cz;
+            qxx += Qxx * fneq; qyy += Qyy * fneq; qzz += Qzz * fneq;
+            qxy += Qxy * fneq; qxz += Qxz * fneq; qyz += Qyz * fneq;
         }
 
         float tau_local = kTauPlus;
@@ -583,8 +594,15 @@ kernel void stream_collide_step(
         f_eq_cache[q] = eq;
         float fneq = f_local[q] - eq;
         float cx = (float)CX[q], cy = (float)CY[q], cz = (float)CZ[q];
-        qxx += cx * cx * fneq; qyy += cy * cy * fneq; qzz += cz * cz * fneq;
-        qxy += cx * cy * fneq; qxz += cx * cz * fneq; qyz += cy * cz * fneq;
+        float Qxx = cx * cx - 0.33333333f;
+        float Qyy = cy * cy - 0.33333333f;
+        float Qzz = cz * cz - 0.33333333f;
+        float Qxy = cx * cy;
+        float Qxz = cx * cz;
+        float Qyz = cy * cz;
+        qxx += Qxx * fneq; qyy += Qyy * fneq; qzz += Qzz * fneq;
+        qxy += Qxy * fneq; qxz += Qxz * fneq; qyz += Qyz * fneq;
+
     }
 
     float tau_local = TAU_PLUS_BASE;
@@ -925,26 +943,39 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativ
     if (env->GetArrayLength(payload) != static_cast<jsize>(payload_bytes)) return JNI_FALSE;
 
     auto copy_begin = Clock::now();
-    jbyte* payload_bytes_ptr = env->GetByteArrayElements(payload, nullptr);
-    if (!payload_bytes_ptr) return JNI_FALSE;
-    std::vector<float> packet(cells * g_cfg.input_channels, 0.0f);
-    std::memcpy(packet.data(), payload_bytes_ptr, payload_bytes);
-    env->ReleaseByteArrayElements(payload, payload_bytes_ptr, JNI_ABORT);
-    timing.payload_copy_ms += elapsed_ms(copy_begin, Clock::now());
+    // jbyte* payload_bytes_ptr = env->GetByteArrayElements(payload, nullptr);
+    // if (!payload_bytes_ptr) return JNI_FALSE;
+    // std::vector<float> packet(cells * g_cfg.input_channels, 0.0f);
+    // std::memcpy(packet.data(), payload_bytes_ptr, payload_bytes);
+    // env->ReleaseByteArrayElements(payload, payload_bytes_ptr, JNI_ABORT);
+    // timing.payload_copy_ms += elapsed_ms(copy_begin, Clock::now());
 
     jfloat* out = env->GetFloatArrayElements(output_flow, nullptr);
     if (!out) return JNI_FALSE;
 
     ContextState& ctx = g_contexts[context_key];
     ensure_context_shape(ctx, grid_size, cells);
+    // Ensure CPU-side buffers exist and reuse packet buffer to avoid per-step allocations
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+    if (ctx.packet.size() != cells * (std::size_t)g_cfg.input_channels) {
+        ctx.packet.assign(cells * (std::size_t)g_cfg.input_channels, 0.0f);
+    }
+    jbyte* payload_bytes_ptr = env->GetByteArrayElements(payload, nullptr);
+    if (!payload_bytes_ptr) {
+        env->ReleaseFloatArrayElements(output_flow, out, 0);
+        return JNI_FALSE;
+    }
+    std::memcpy(ctx.packet.data(), payload_bytes_ptr, payload_bytes);
+    env->ReleaseByteArrayElements(payload, payload_bytes_ptr, JNI_ABORT);
+    timing.payload_copy_ms += elapsed_ms(copy_begin, Clock::now());
 
     bool ok = false;
     if (g_cfg.opencl_enabled) {
-        if (!(ok = opencl_step(ctx, packet.data(), out, timing))) disable_opencl_runtime("OpenCL fail");
+        if (!(ok = opencl_step(ctx, ctx.packet.data(), out, timing))) disable_opencl_runtime("OpenCL fail");
     }
     if (!ok) {
         auto solver_begin = Clock::now();
-        run_cpu_step(ctx, packet.data(), out);
+        run_cpu_step(ctx, ctx.packet.data(), out);
         timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
         ok = true;
     }

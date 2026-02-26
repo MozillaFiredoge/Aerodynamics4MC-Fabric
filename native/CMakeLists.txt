@@ -5,6 +5,7 @@ option(AERO_LBM_SUPERBUILD "Build all platform binaries in one invocation" OFF)
 set(AERO_LBM_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/natives" CACHE PATH "Directory used by multi-platform superbuild outputs")
 set(AERO_LBM_OUTPUT_DIR "" CACHE PATH "Optional output directory for single-target builds")
 set(AERO_LBM_BUILD_TYPE_RELEASE "Release" CACHE STRING "Build type used by AERO_LBM_SUPERBUILD")
+set(AERO_LBM_SUPERBUILD_ENABLE_OPENCL ON CACHE BOOL "Build superbuild targets with OpenCL enabled")
 set_property(CACHE AERO_LBM_BUILD_TYPE_RELEASE PROPERTY STRINGS Release RelWithDebInfo MinSizeRel Debug)
 
 if (AERO_LBM_SUPERBUILD)
@@ -24,7 +25,7 @@ if (AERO_LBM_SUPERBUILD)
             BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/build-${build_id}"
             CMAKE_ARGS
                 -DAERO_LBM_SUPERBUILD=OFF
-                -DAERO_LBM_ENABLE_OPENCL=OFF
+                -DAERO_LBM_ENABLE_OPENCL=${AERO_LBM_SUPERBUILD_ENABLE_OPENCL}
                 -DAERO_LBM_OUTPUT_DIR=${AERO_LBM_DIST_DIR}/${output_subdir}
                 -DCMAKE_BUILD_TYPE=${AERO_LBM_BUILD_TYPE_RELEASE}
                 -DCMAKE_LIBRARY_OUTPUT_DIRECTORY_${AERO_LBM_BUILD_TYPE_UPPER}=${AERO_LBM_DIST_DIR}/${output_subdir}
@@ -60,11 +61,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(JNI REQUIRED)
 
-set(_opencl_default ON)
-if (CMAKE_CROSSCOMPILING)
-    set(_opencl_default OFF)
-endif()
-option(AERO_LBM_ENABLE_OPENCL "Enable OpenCL backend in native solver" ${_opencl_default})
+option(AERO_LBM_ENABLE_OPENCL "Enable OpenCL backend in native solver" ON)
 
 add_library(aero_lbm SHARED
     src/aero_lbm_jni.cpp
@@ -73,11 +70,11 @@ add_library(aero_lbm SHARED
 target_include_directories(aero_lbm PRIVATE ${JNI_INCLUDE_DIRS})
 
 if (AERO_LBM_ENABLE_OPENCL)
-    find_package(OpenCL QUIET)
-    if (OpenCL_FOUND)
-        target_compile_definitions(aero_lbm PRIVATE AERO_LBM_OPENCL=1)
-        target_link_libraries(aero_lbm PRIVATE OpenCL::OpenCL)
-    endif()
+    find_package(OpenCL REQUIRED)
+    target_compile_definitions(aero_lbm PRIVATE AERO_LBM_OPENCL=1)
+    target_link_libraries(aero_lbm PRIVATE OpenCL::OpenCL)
+else()
+    message(STATUS "AERO_LBM_ENABLE_OPENCL=OFF (CPU-only native build)")
 endif()
 
 if (WIN32)

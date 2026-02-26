@@ -20,10 +20,10 @@ jobs:
             lib_name: libaero_lbm.so
             toolchain: ""
           - id: linux-arm64
-            runner: ubuntu-24.04
+            runner: ubuntu-24.04-arm
             target_dir: linux-arm64
             lib_name: libaero_lbm.so
-            toolchain: cmake/toolchains/linux-arm64.cmake
+            toolchain: ""
           - id: windows-x86_64
             runner: windows-2022
             target_dir: windows-x86_64
@@ -45,11 +45,11 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Install linux-arm64 cross compiler
-        if: matrix.id == 'linux-arm64'
+      - name: Install OpenCL dev dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y ocl-icd-opencl-dev opencl-c-headers opencl-clhpp-headers
 
       - name: Build native (Unix)
         if: runner.os != 'Windows'
@@ -69,9 +69,10 @@ jobs:
           fi
 
           cmake -S native -B "build/native-${{ matrix.id }}" \
-            -DAERO_LBM_ENABLE_OPENCL=OFF \
+            -DAERO_LBM_ENABLE_OPENCL=ON \
             -DCMAKE_BUILD_TYPE=Release \
             ${EXTRA_ARGS}
+          grep -E '^AERO_LBM_ENABLE_OPENCL:BOOL=ON$' "build/native-${{ matrix.id }}/CMakeCache.txt"
 
           cmake --build "build/native-${{ matrix.id }}" --config Release --parallel
 
@@ -93,7 +94,8 @@ jobs:
             $extra += "-DCMAKE_TOOLCHAIN_FILE=${{ matrix.toolchain }}"
           }
 
-          cmake -S native -B "build/native-${{ matrix.id }}" -DAERO_LBM_ENABLE_OPENCL=OFF @extra
+          cmake -S native -B "build/native-${{ matrix.id }}" -DAERO_LBM_ENABLE_OPENCL=ON @extra
+          Select-String -Path "build/native-${{ matrix.id }}/CMakeCache.txt" -Pattern '^AERO_LBM_ENABLE_OPENCL:BOOL=ON$' | Out-Null
           cmake --build "build/native-${{ matrix.id }}" --config Release --parallel
 
           $lib = Get-ChildItem -Path "build/native-${{ matrix.id }}" -Recurse -Filter "${{ matrix.lib_name }}" | Select-Object -First 1
