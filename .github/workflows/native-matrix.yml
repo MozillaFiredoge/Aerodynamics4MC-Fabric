@@ -62,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "native-out/natives/${{ matrix.target_dir }}"
-          EXTRA_ARGS=()
+          EXTRA_ARGS=""
           if [[ -n "${{ matrix.toolchain }}" ]]; then
             TOOLCHAIN_PATH="${GITHUB_WORKSPACE}/native/${{ matrix.toolchain }}"
             if [[ ! -f "${TOOLCHAIN_PATH}" ]]; then
@@ -70,13 +70,13 @@ jobs:
               find native -maxdepth 4 -type f | sort
               exit 1
             fi
-            EXTRA_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_PATH}")
+            EXTRA_ARGS="-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_PATH}"
           fi
 
           cmake -S native -B "build/native-${{ matrix.id }}" \
             -DAERO_LBM_ENABLE_OPENCL=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            "${EXTRA_ARGS[@]}"
+            ${EXTRA_ARGS}
 
           cmake --build "build/native-${{ matrix.id }}" --config Release --parallel
 
