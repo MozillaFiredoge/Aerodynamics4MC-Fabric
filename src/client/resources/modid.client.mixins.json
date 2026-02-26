@@ -1,0 +1,12 @@
+{
+	"required": true,
+	"package": "com.aerodynamics4mc.mixin.client",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"ParticleManagerAccessor",
+		"ParticleAccessor"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

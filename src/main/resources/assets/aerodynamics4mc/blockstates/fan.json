@@ -1,0 +1,10 @@
+{
+  "variants": {
+    "facing=north": { "model": "aerodynamics4mc:block/fan" },
+    "facing=east": { "model": "aerodynamics4mc:block/fan", "y": 90 },
+    "facing=south": { "model": "aerodynamics4mc:block/fan", "y": 180 },
+    "facing=west": { "model": "aerodynamics4mc:block/fan", "y": 270 },
+    "facing=up": { "model": "aerodynamics4mc:block/fan", "x": 270 },
+    "facing=down": { "model": "aerodynamics4mc:block/fan", "x": 90 }
+  }
+}

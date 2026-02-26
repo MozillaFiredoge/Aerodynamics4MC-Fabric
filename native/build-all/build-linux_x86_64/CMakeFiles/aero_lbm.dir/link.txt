@@ -1,0 +1,1 @@
+/usr/bin/g++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libaero_lbm.so -o /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/linux-x86_64/libaero_lbm.so CMakeFiles/aero_lbm.dir/src/aero_lbm_jni.cpp.o 

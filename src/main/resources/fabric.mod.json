@@ -1,0 +1,35 @@
+{
+	"schemaVersion": 1,
+	"id": "aerodynamics4mc",
+	"version": "${version}",
+	"name": "Aerodynamics4MC",
+	"description": "Real-time aerodynamics capture and visualization.",
+	"authors": [
+		"MozillaFiredoge"
+	],
+	"contact": {
+		"sources": "https://github.com/MozillaFiredoge/Aerodynamics4MC"
+	},
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.aerodynamics4mc.AeroMod"
+		],
+		"client": [
+			"com.aerodynamics4mc.client.AeroClientMod"
+		]
+	},
+	"mixins": [
+		"modid.client.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.18.2",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	},
+	"suggests": {
+		"another-mod": "*"
+	}
+}

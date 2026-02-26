@@ -1,0 +1,169 @@
+name: native-matrix
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  build-native:
+    name: native-${{ matrix.id }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x86_64
+            runner: ubuntu-24.04
+            target_dir: linux-x86_64
+            lib_name: libaero_lbm.so
+            toolchain: ""
+          - id: linux-arm64
+            runner: ubuntu-24.04
+            target_dir: linux-arm64
+            lib_name: libaero_lbm.so
+            toolchain: native/cmake/toolchains/linux-arm64.cmake
+          - id: windows-x86_64
+            runner: windows-2022
+            target_dir: windows-x86_64
+            lib_name: aero_lbm.dll
+            toolchain: ""
+          - id: macos-x86_64
+            runner: macos-13
+            target_dir: macos-x86_64
+            lib_name: libaero_lbm.dylib
+            toolchain: ""
+          - id: macos-arm64
+            runner: macos-14
+            target_dir: macos-arm64
+            lib_name: libaero_lbm.dylib
+            toolchain: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install linux-arm64 cross compiler
+        if: matrix.id == 'linux-arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Build native (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "native-out/natives/${{ matrix.target_dir }}"
+          EXTRA_ARGS=()
+          if [[ -n "${{ matrix.toolchain }}" ]]; then
+            EXTRA_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${{ matrix.toolchain }}")
+          fi
+
+          cmake -S native -B "build/native-${{ matrix.id }}" \
+            -DAERO_LBM_ENABLE_OPENCL=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            "${EXTRA_ARGS[@]}"
+
+          cmake --build "build/native-${{ matrix.id }}" --config Release --parallel
+
+          LIB_PATH="$(find "build/native-${{ matrix.id }}" -type f -name "${{ matrix.lib_name }}" | head -n 1)"
+          if [[ -z "${LIB_PATH}" ]]; then
+            echo "library not found: ${{ matrix.lib_name }}"
+            exit 1
+          fi
+          cp "${LIB_PATH}" "native-out/natives/${{ matrix.target_dir }}/${{ matrix.lib_name }}"
+
+      - name: Build native (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "native-out/natives/${{ matrix.target_dir }}" | Out-Null
+
+          $extra = @()
+          if ("${{ matrix.toolchain }}" -ne "") {
+            $extra += "-DCMAKE_TOOLCHAIN_FILE=${{ matrix.toolchain }}"
+          }
+
+          cmake -S native -B "build/native-${{ matrix.id }}" -DAERO_LBM_ENABLE_OPENCL=OFF @extra
+          cmake --build "build/native-${{ matrix.id }}" --config Release --parallel
+
+          $lib = Get-ChildItem -Path "build/native-${{ matrix.id }}" -Recurse -Filter "${{ matrix.lib_name }}" | Select-Object -First 1
+          if (-not $lib) {
+            throw "library not found: ${{ matrix.lib_name }}"
+          }
+
+          Copy-Item $lib.FullName "native-out/natives/${{ matrix.target_dir }}/${{ matrix.lib_name }}" -Force
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: natives-${{ matrix.id }}
+          path: native-out/natives
+          if-no-files-found: error
+
+  package-mod:
+    name: package-mod
+    runs-on: ubuntu-24.04
+    needs: build-native
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: natives-*
+          merge-multiple: true
+          path: native/dist
+
+      - name: Verify five native binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          find native/dist -maxdepth 4 -type f | sort
+
+          test -f native/dist/natives/linux-x86_64/libaero_lbm.so
+          test -f native/dist/natives/linux-arm64/libaero_lbm.so
+          test -f native/dist/natives/windows-x86_64/aero_lbm.dll
+          test -f native/dist/natives/macos-x86_64/libaero_lbm.dylib
+          test -f native/dist/natives/macos-arm64/libaero_lbm.dylib
+
+          ACTUAL_COUNT="$(find native/dist/natives -type f | wc -l | tr -d ' ')"
+          if [[ "${ACTUAL_COUNT}" != "5" ]]; then
+            echo "expected 5 native files, got ${ACTUAL_COUNT}"
+            exit 1
+          fi
+
+      - name: Build remapped mod jar
+        run: |
+          chmod +x ./gradlew
+          ./gradlew remapJar
+
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: mod-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+      - name: Upload packed natives
+        uses: actions/upload-artifact@v4
+        with:
+          name: natives-bundle
+          path: native/dist/natives/**
+          if-no-files-found: error

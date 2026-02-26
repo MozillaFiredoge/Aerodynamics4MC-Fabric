@@ -1,0 +1,3 @@
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/aero_lbm.dir
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/edit_cache.dir
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/rebuild_cache.dir

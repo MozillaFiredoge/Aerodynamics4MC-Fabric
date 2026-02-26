@@ -1,0 +1,157 @@
+plugins {
+	id 'fabric-loom' version "${loom_version}"
+	id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+repositories {
+	maven { url = 'https://maven.fabricmc.net' }
+	mavenCentral()
+}
+
+def generatedNativeResourcesDir = layout.buildDirectory.dir("generated/native-resources")
+
+tasks.register("prepareNativeResources") {
+	outputs.dir(generatedNativeResourcesDir)
+
+	doLast {
+		File outDir = generatedNativeResourcesDir.get().asFile
+		delete(outDir)
+		outDir.mkdirs()
+		int packedCount = 0
+
+		File distNativesDir = file("native/dist/natives")
+		if (distNativesDir.exists()) {
+			copy {
+				from(distNativesDir)
+				into(new File(outDir, "natives"))
+			}
+			packedCount += fileTree(distNativesDir).files.size()
+		}
+
+		File prebuiltDir = file("native/prebuilt")
+		if (prebuiltDir.exists()) {
+			copy {
+				from(prebuiltDir)
+				into(outDir)
+				exclude("**/.gitkeep")
+			}
+			packedCount += fileTree(prebuiltDir) {
+				exclude("**/.gitkeep")
+			}.files.size()
+		}
+
+		def copyNativeBinary = { File src, String relativeTarget ->
+			if (!src.exists()) {
+				return
+			}
+			File dst = new File(outDir, relativeTarget)
+			dst.parentFile.mkdirs()
+			copy {
+				from(src)
+				into(dst.parentFile)
+				rename { dst.name }
+			}
+			packedCount += 1
+		}
+
+		copyNativeBinary(file("native/build/libaero_lbm.so"), "natives/linux-x86_64/libaero_lbm.so")
+		copyNativeBinary(file("native/build/libaero_lbm.dylib"), "natives/macos-x86_64/libaero_lbm.dylib")
+		copyNativeBinary(file("native/build/aero_lbm.dll"), "natives/windows-x86_64/aero_lbm.dll")
+		copyNativeBinary(file("native/build/Release/aero_lbm.dll"), "natives/windows-x86_64/aero_lbm.dll")
+		copyNativeBinary(file("native/build-linux-arm64/libaero_lbm.so"), "natives/linux-arm64/libaero_lbm.so")
+		copyNativeBinary(file("native/build-macos-x86_64/libaero_lbm.dylib"), "natives/macos-x86_64/libaero_lbm.dylib")
+		copyNativeBinary(file("native/build-macos-arm64/libaero_lbm.dylib"), "natives/macos-arm64/libaero_lbm.dylib")
+		copyNativeBinary(file("native/build-windows-x86_64/aero_lbm.dll"), "natives/windows-x86_64/aero_lbm.dll")
+
+		if (packedCount == 0) {
+			logger.lifecycle("prepareNativeResources: no native binaries found")
+		} else {
+			logger.lifecycle("prepareNativeResources: packaged ${packedCount} native file(s)")
+		}
+	}
+}
+
+loom {
+	splitEnvironmentSourceSets()
+	mods {
+		"aerodynamics4mc" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+sourceSets {
+	main {
+		java {
+			exclude 'com/example/**'
+		}
+	}
+	client {
+		java {
+			exclude 'com/example/**'
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+	dependsOn tasks.named("prepareNativeResources")
+	inputs.property "version", project.version
+	from(generatedNativeResourcesDir)
+
+	filesMatching("fabric.mod.json") {
+		expand "version": inputs.properties.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 21
+	it.options.encoding = 'UTF-8'
+}
+
+java {
+	withSourcesJar()
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(21)
+	}
+}
+
+jar {
+	inputs.property "archivesName", project.base.archivesName
+
+	from("LICENSE") {
+		rename { "${it}_${inputs.properties.archivesName}"}
+	}
+}
+
+// configure the maven publication
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			artifactId = project.archives_base_name
+			from components.java
+		}
+	}
+
+	// See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
+	repositories {
+		// Add repositories to publish to here.
+		// Notice: This block does NOT have the same function as the block in the top level.
+		// The repositories here will be used for publishing your artifact, not for
+		// retrieving dependencies.
+	}
+}

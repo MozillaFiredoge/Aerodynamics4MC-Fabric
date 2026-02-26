@@ -1,0 +1,13 @@
+# Target labels
+ aero_lbm_macos_x86_64
+# Source files and their labels
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles/aero_lbm_macos_x86_64
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles/aero_lbm_macos_x86_64.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles/aero_lbm_macos_x86_64-complete.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/aero_lbm_macos_x86_64-prefix/src/aero_lbm_macos_x86_64-stamp/aero_lbm_macos_x86_64-build.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/aero_lbm_macos_x86_64-prefix/src/aero_lbm_macos_x86_64-stamp/aero_lbm_macos_x86_64-configure.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/aero_lbm_macos_x86_64-prefix/src/aero_lbm_macos_x86_64-stamp/aero_lbm_macos_x86_64-download.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/aero_lbm_macos_x86_64-prefix/src/aero_lbm_macos_x86_64-stamp/aero_lbm_macos_x86_64-install.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/aero_lbm_macos_x86_64-prefix/src/aero_lbm_macos_x86_64-stamp/aero_lbm_macos_x86_64-mkdir.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/aero_lbm_macos_x86_64-prefix/src/aero_lbm_macos_x86_64-stamp/aero_lbm_macos_x86_64-patch.rule
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/aero_lbm_macos_x86_64-prefix/src/aero_lbm_macos_x86_64-stamp/aero_lbm_macos_x86_64-update.rule

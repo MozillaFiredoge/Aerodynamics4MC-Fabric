@@ -1,0 +1,13 @@
+{
+  "parent": "minecraft:block/cube",
+  "textures": {
+    "down": "aerodynamics4mc:block/fan_bottom",
+    "up": "aerodynamics4mc:block/fan_top",
+    "north": "aerodynamics4mc:block/fan_front",
+    "east": "aerodynamics4mc:block/fan_left",
+    "south": "aerodynamics4mc:block/fan_front",
+    "west": "aerodynamics4mc:block/fan_right",
+    "particle": "aerodynamics4mc:block/fan_bottom"
+  },
+  "render_type": "solid"
+}
