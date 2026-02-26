@@ -23,7 +23,7 @@ jobs:
             runner: ubuntu-24.04
             target_dir: linux-arm64
             lib_name: libaero_lbm.so
-            toolchain: native/cmake/toolchains/linux-arm64.cmake
+            toolchain: cmake/toolchains/linux-arm64.cmake
           - id: windows-x86_64
             runner: windows-2022
             target_dir: windows-x86_64
@@ -64,7 +64,13 @@ jobs:
           mkdir -p "native-out/natives/${{ matrix.target_dir }}"
           EXTRA_ARGS=()
           if [[ -n "${{ matrix.toolchain }}" ]]; then
-            EXTRA_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${{ matrix.toolchain }}")
+            TOOLCHAIN_PATH="${GITHUB_WORKSPACE}/native/${{ matrix.toolchain }}"
+            if [[ ! -f "${TOOLCHAIN_PATH}" ]]; then
+              echo "toolchain not found: ${TOOLCHAIN_PATH}"
+              find native -maxdepth 4 -type f | sort
+              exit 1
+            fi
+            EXTRA_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_PATH}")
           fi
 
           cmake -S native -B "build/native-${{ matrix.id }}" \
