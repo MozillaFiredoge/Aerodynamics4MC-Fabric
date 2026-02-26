@@ -69,10 +69,11 @@ constexpr float kOmegaMinus = 1.0f / kTauMinus;
 constexpr float kFanAccel = 0.0120f;
 constexpr float kFanForceScalePerSpeed = 0.5f;
 constexpr float kFanForceScaleMax = 4.0f;
-constexpr float kFanPulseAmp = 0.20f;
+constexpr float kFanPulseAmp = 0.05f;
 constexpr float kFanPulseFreq = 0.12f;
 constexpr float kStateNudge = 0.0f;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
+constexpr float kFneqRelax = 0.92f;
 
 struct Config {
     int grid_size = 0;
@@ -395,10 +396,12 @@ void collide(ContextState& ctx) {
                 + (static_cast<float>(kCz[q]) - uz) * fz;
             const float source = kW[q] * (1.0f - 0.5f * omega_plus_local) * 3.0f * (ciminu_dot_f + 3.0f * ci_dot_u * ci_dot_f);
 
-            ctx.f_post[di] = f_q
+            const float f_collided = f_q
                 - omega_plus_local * (f_plus - feq_plus)
                 - omega_minus_local * (f_minus - feq_minus)
                 + source;
+            // Damp high-frequency checkerboard modes (odd-even decoupling) while keeping macroscopic moments.
+            ctx.f_post[di] = f_eq_q + kFneqRelax * (f_collided - f_eq_q);
         }
     }
 }
@@ -526,7 +529,7 @@ __constant float LES_SPEED_THRESHOLD = 0.0f;
 __constant float FAN_ACCEL = 0.0120f;
 __constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
 __constant float FAN_FORCE_SCALE_MAX = 4.0f;
-__constant float FAN_PULSE_AMP = 0.20f;
+__constant float FAN_PULSE_AMP = 0.05f;
 __constant float FAN_PULSE_FREQ = 0.12f;
 __constant float STATE_NUDGE = 0.0f;
 __constant float MAX_SPEED = 0.20207259f;
@@ -534,6 +537,7 @@ __constant float RHO_MIN = 0.97f;
 __constant float RHO_MAX = 1.03f;
 __constant float P_MIN = -0.03f;
 __constant float P_MAX = 0.03f;
+__constant float FNEQ_RELAX = 0.92f;
 
 inline float clampf(float v, float lo, float hi) {
     return fmin(hi, fmax(lo, v));
@@ -725,10 +729,11 @@ kernel void collide_step(
             + ((float)CZ[q] - uz) * fz;
         float source = W[q] * (1.0f - 0.5f * omega_plus_local) * 3.0f * (ciminu_dot_f + 3.0f * ci_dot_u * ci_dot_f);
 
-        f_post[fq_base + q] = f_q
+        float f_collided = f_q
             - omega_plus_local * (f_plus - feq_plus)
             - omega_minus_local * (f_minus - feq_minus)
             + source;
+        f_post[fq_base + q] = f_eq_q + FNEQ_RELAX * (f_collided - f_eq_q);
     }
 }
 

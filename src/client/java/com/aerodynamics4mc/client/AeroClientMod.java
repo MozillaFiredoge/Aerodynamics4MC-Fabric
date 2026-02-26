@@ -57,6 +57,7 @@ public class AeroClientMod implements ClientModInitializer {
     private static final int RESPONSE_CHANNELS = 4;
     private static final int FLOW_COUNT = GRID_SIZE * GRID_SIZE * GRID_SIZE * RESPONSE_CHANNELS;
     private static final int WINDOW_REFRESH_TICKS = 20;
+    private static final int OBSTACLE_REFRESH_TICKS = 200;
     private static final int PARTICLE_DEBUG_INTERVAL_TICKS = 4;
 
     private enum BackendMode {
@@ -114,7 +115,7 @@ public class AeroClientMod implements ClientModInitializer {
             window.busy.set(true);
             executor.execute(() -> {
                 try {
-                    byte[] payload = captureWindow(client, window);
+                    byte[] payload = captureWindow(window);
                     float[] response = runSolverStep(window, payload);
                     updateBaseFieldFromResponse(window, response, maxWindSpeed);
                     window.renderer.updateFlowField(window.origin, response);
@@ -177,6 +178,7 @@ public class AeroClientMod implements ClientModInitializer {
                 log("Created window " + formatPos(entry.getKey()));
             }
             window.fans = List.copyOf(entry.getValue());
+            refreshObstacleField(client.world, window, tickCounter);
         }
         log("Active windows: " + windows.size());
     }
@@ -294,28 +296,21 @@ public class AeroClientMod implements ClientModInitializer {
         }
     }
 
-    private byte[] captureWindow(MinecraftClient client, WindowState window) {
-        if (client.world == null) {
-            return new byte[0];
-        }
-        World world = client.world;
+    private byte[] captureWindow(WindowState window) {
+        int voxelCount = GRID_SIZE * GRID_SIZE * GRID_SIZE * CHANNELS;
+        window.ensureBaseFieldInitialized();
+        float[] obstacleField = window.obstacleField;
         BlockPos origin = window.origin;
         int minX = origin.getX();
         int minY = origin.getY();
         int minZ = origin.getZ();
-
-        int voxelCount = GRID_SIZE * GRID_SIZE * GRID_SIZE * CHANNELS;
-        window.ensureBaseFieldInitialized();
         ByteBuffer buffer = ByteBuffer.allocate(voxelCount * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
 
         for (int x = 0; x < GRID_SIZE; x++) {
             for (int y = 0; y < GRID_SIZE; y++) {
                 for (int z = 0; z < GRID_SIZE; z++) {
-                    int worldX = minX + x;
-                    int worldY = minY + y;
-                    int worldZ = minZ + z;
-                    BlockPos pos = new BlockPos(worldX, worldY, worldZ);
-                    boolean solid = !world.getBlockState(pos).isAir();
+                    int cell = (x * GRID_SIZE + y) * GRID_SIZE + z;
+                    boolean solid = obstacleField != null && cell < obstacleField.length && obstacleField[cell] > 0.5f;
                     int idx = voxelIndex(x, y, z);
                     window.baseField[idx + CH_OBSTACLE] = solid ? 1.0f : 0.0f;
                     // fan conditioning is rebuilt every tick from world fan blocks
@@ -343,6 +338,46 @@ public class AeroClientMod implements ClientModInitializer {
         }
 
         return buffer.array();
+    }
+
+    private boolean isSolidObstacle(World world, BlockPos pos) {
+        BlockState state = world.getBlockState(pos);
+        if (state.isAir()) {
+            return false;
+        }
+        return !state.getCollisionShape(world, pos).isEmpty();
+    }
+
+    private void refreshObstacleField(World world, WindowState window, int tickNow) {
+        if (world == null) {
+            return;
+        }
+        if (window.obstacleField != null
+            && window.lastObstacleRefreshTick >= 0
+            && (tickNow - window.lastObstacleRefreshTick) < OBSTACLE_REFRESH_TICKS) {
+            return;
+        }
+
+        int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        float[] obstacle = new float[cellCount];
+        BlockPos origin = window.origin;
+        int minX = origin.getX();
+        int minY = origin.getY();
+        int minZ = origin.getZ();
+        BlockPos.Mutable cursor = new BlockPos.Mutable();
+
+        for (int x = 0; x < GRID_SIZE; x++) {
+            for (int y = 0; y < GRID_SIZE; y++) {
+                for (int z = 0; z < GRID_SIZE; z++) {
+                    int cell = (x * GRID_SIZE + y) * GRID_SIZE + z;
+                    cursor.set(minX + x, minY + y, minZ + z);
+                    obstacle[cell] = isSolidObstacle(world, cursor) ? 1.0f : 0.0f;
+                }
+            }
+        }
+
+        window.obstacleField = obstacle;
+        window.lastObstacleRefreshTick = tickNow;
     }
 
     private void updateBaseFieldFromResponse(WindowState window, float[] response, float speedCap) {
@@ -570,6 +605,8 @@ public class AeroClientMod implements ClientModInitializer {
         private DataInputStream inputStream;
         private DataOutputStream outputStream;
         private float[] baseField;
+        private volatile float[] obstacleField;
+        private int lastObstacleRefreshTick = -1;
         private List<FanSource> fans = List.of();
 
         private WindowState(BlockPos origin) {
