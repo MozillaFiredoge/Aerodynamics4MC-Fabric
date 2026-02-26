@@ -44,7 +44,7 @@ cd fabric-mod
 详见：`native/README.md`
 
 关键点：
-- CMake 支持一次性 superbuild 目标（5 个动态库）
+- CMake 支持一次性 superbuild 目标（4 个动态库）
 - Gradle `prepareNativeResources` 会将 `native/dist/natives/**` 打包进 mod jar
 - GitHub Actions workflow：`.github/workflows/native-matrix.yml`
 
@@ -112,7 +112,7 @@ cd fabric-mod
 See: `native/README.md`
 
 Highlights:
-- CMake superbuild supports one-shot generation of 5 native binaries
+- CMake superbuild supports one-shot generation of 4 native binaries
 - Gradle `prepareNativeResources` packs `native/dist/natives/**` into the mod jar
 - GitHub Actions workflow: `.github/workflows/native-matrix.yml`
 
@@ -132,4 +132,4 @@ Highlights:
 - `src/main/java/com/aerodynamics4mc/`: block, block entity, main entry
 - `src/client/java/com/aerodynamics4mc/client/`: client airflow logic, physics, rendering, JNI bridge
 - `native/`: JNI + native solver + CMake + multi-platform build config
-- `.github/workflows/native-matrix.yml`: CI for 5-platform native build + packaging
+- `.github/workflows/native-matrix.yml`: CI for 4-platform native build + packaging

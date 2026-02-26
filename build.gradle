@@ -62,11 +62,9 @@ tasks.register("prepareNativeResources") {
 		}
 
 		copyNativeBinary(file("native/build/libaero_lbm.so"), "natives/linux-x86_64/libaero_lbm.so")
-		copyNativeBinary(file("native/build/libaero_lbm.dylib"), "natives/macos-x86_64/libaero_lbm.dylib")
 		copyNativeBinary(file("native/build/aero_lbm.dll"), "natives/windows-x86_64/aero_lbm.dll")
 		copyNativeBinary(file("native/build/Release/aero_lbm.dll"), "natives/windows-x86_64/aero_lbm.dll")
 		copyNativeBinary(file("native/build-linux-arm64/libaero_lbm.so"), "natives/linux-arm64/libaero_lbm.so")
-		copyNativeBinary(file("native/build-macos-x86_64/libaero_lbm.dylib"), "natives/macos-x86_64/libaero_lbm.dylib")
 		copyNativeBinary(file("native/build-macos-arm64/libaero_lbm.dylib"), "natives/macos-arm64/libaero_lbm.dylib")
 		copyNativeBinary(file("native/build-windows-x86_64/aero_lbm.dll"), "natives/windows-x86_64/aero_lbm.dll")
 

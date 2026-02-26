@@ -62,17 +62,17 @@ cmake --build build -j
 For standalone JNI tests, you can place the built shared library (`libaero_lbm.so` / `aero_lbm.dll`) on `java.library.path`.
 For the Fabric mod runtime, prefer the jar packaging flow below.
 
-## One-shot all-platform build (5 binaries)
+## One-shot multi-platform build (4 binaries)
 
 This repo now supports a CMake superbuild that tries to produce all of the following in one run:
 
 - `natives/linux-x86_64/libaero_lbm.so`
 - `natives/linux-arm64/libaero_lbm.so`
 - `natives/windows-x86_64/aero_lbm.dll`
-- `natives/macos-x86_64/libaero_lbm.dylib`
 - `natives/macos-arm64/libaero_lbm.dylib`
 
 Windows target is intentionally limited to `x86_64`.
+macOS target is intentionally `arm64` only.
 
 Command:
 
@@ -87,7 +87,6 @@ Compiler env overrides (if defaults are unavailable):
 - Linux amd64: `AERO_CC_LINUX_X86_64`, `AERO_CXX_LINUX_X86_64`
 - Linux arm64: `AERO_CC_LINUX_ARM64`, `AERO_CXX_LINUX_ARM64`
 - Windows amd64: `AERO_CC_WINDOWS_X86_64`, `AERO_CXX_WINDOWS_X86_64`, optional `AERO_RC_WINDOWS_X86_64`
-- macOS x86_64: `AERO_CC_MACOS_X86_64`, `AERO_CXX_MACOS_X86_64`
 - macOS arm64: `AERO_CC_MACOS_ARM64`, `AERO_CXX_MACOS_ARM64`
 - macOS SDK (optional): `AERO_MACOS_SYSROOT`
 
@@ -97,8 +96,8 @@ Note: this requires valid cross-compilers/toolchains to be installed on the buil
 
 Workflow: `fabric-mod/.github/workflows/native-matrix.yml`
 
-- builds 5 native binaries with matrix jobs
-- verifies all 5 files exist
+- builds 4 native binaries with matrix jobs
+- verifies all 4 files exist
 - packs them into mod jar via `./gradlew remapJar`
 - uploads `mod-jar` and `natives-bundle` artifacts
 
@@ -123,7 +122,6 @@ If you provide prebuilt files manually, use these paths:
 - `fabric-mod/native/prebuilt/natives/linux-x86_64/libaero_lbm.so`
 - `fabric-mod/native/prebuilt/natives/linux-arm64/libaero_lbm.so`
 - `fabric-mod/native/prebuilt/natives/windows-x86_64/aero_lbm.dll`
-- `fabric-mod/native/prebuilt/natives/macos-x86_64/libaero_lbm.dylib`
 - `fabric-mod/native/prebuilt/natives/macos-arm64/libaero_lbm.dylib`
 
 At runtime, `NativeLibraryLoader` extracts the matching native file from `jar:/natives/<os>-<arch>/` into temp dir and loads it via `System.load(...)`.

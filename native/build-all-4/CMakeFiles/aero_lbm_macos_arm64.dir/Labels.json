@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/CMakeFiles/aero_lbm_macos_arm64"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/CMakeFiles/aero_lbm_macos_arm64.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/CMakeFiles/aero_lbm_macos_arm64-complete.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/aero_lbm_macos_arm64-prefix/src/aero_lbm_macos_arm64-stamp/aero_lbm_macos_arm64-build.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/aero_lbm_macos_arm64-prefix/src/aero_lbm_macos_arm64-stamp/aero_lbm_macos_arm64-configure.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/aero_lbm_macos_arm64-prefix/src/aero_lbm_macos_arm64-stamp/aero_lbm_macos_arm64-download.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/aero_lbm_macos_arm64-prefix/src/aero_lbm_macos_arm64-stamp/aero_lbm_macos_arm64-install.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/aero_lbm_macos_arm64-prefix/src/aero_lbm_macos_arm64-stamp/aero_lbm_macos_arm64-mkdir.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/aero_lbm_macos_arm64-prefix/src/aero_lbm_macos_arm64-stamp/aero_lbm_macos_arm64-patch.rule"
+		},
+		{
+			"file" : "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all-4/aero_lbm_macos_arm64-prefix/src/aero_lbm_macos_arm64-stamp/aero_lbm_macos_arm64-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"aero_lbm_macos_arm64"
+		],
+		"name" : "aero_lbm_macos_arm64"
+	}
+}

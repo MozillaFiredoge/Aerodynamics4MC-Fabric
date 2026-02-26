@@ -29,11 +29,6 @@ jobs:
             target_dir: windows-x86_64
             lib_name: aero_lbm.dll
             toolchain: ""
-          - id: macos-x86_64
-            runner: macos-13
-            target_dir: macos-x86_64
-            lib_name: libaero_lbm.dylib
-            toolchain: ""
           - id: macos-arm64
             runner: macos-14
             target_dir: macos-arm64
@@ -137,7 +132,7 @@ jobs:
           merge-multiple: true
           path: native/dist
 
-      - name: Verify five native binaries
+      - name: Verify native binaries
         shell: bash
         run: |
           set -euo pipefail
@@ -146,12 +141,11 @@ jobs:
           test -f native/dist/natives/linux-x86_64/libaero_lbm.so
           test -f native/dist/natives/linux-arm64/libaero_lbm.so
           test -f native/dist/natives/windows-x86_64/aero_lbm.dll
-          test -f native/dist/natives/macos-x86_64/libaero_lbm.dylib
           test -f native/dist/natives/macos-arm64/libaero_lbm.dylib
 
           ACTUAL_COUNT="$(find native/dist/natives -type f | wc -l | tr -d ' ')"
-          if [[ "${ACTUAL_COUNT}" != "5" ]]; then
-            echo "expected 5 native files, got ${ACTUAL_COUNT}"
+          if [[ "${ACTUAL_COUNT}" != "4" ]]; then
+            echo "expected 4 native files, got ${ACTUAL_COUNT}"
             exit 1
           fi
 

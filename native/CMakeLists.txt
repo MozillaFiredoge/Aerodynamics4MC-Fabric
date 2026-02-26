@@ -40,7 +40,6 @@ if (AERO_LBM_SUPERBUILD)
     aero_add_platform("linux_x86_64" "linux-x86_64" "cmake/toolchains/linux-x86_64.cmake" "libaero_lbm.so")
     aero_add_platform("linux_arm64" "linux-arm64" "cmake/toolchains/linux-arm64.cmake" "libaero_lbm.so")
     aero_add_platform("windows_x86_64" "windows-x86_64" "cmake/toolchains/windows-x86_64.cmake" "aero_lbm.dll")
-    aero_add_platform("macos_x86_64" "macos-x86_64" "cmake/toolchains/macos-x86_64.cmake" "libaero_lbm.dylib")
     aero_add_platform("macos_arm64" "macos-arm64" "cmake/toolchains/macos-arm64.cmake" "libaero_lbm.dylib")
 
     add_custom_target(aero_lbm_all ALL
@@ -48,7 +47,6 @@ if (AERO_LBM_SUPERBUILD)
             aero_lbm_linux_x86_64
             aero_lbm_linux_arm64
             aero_lbm_windows_x86_64
-            aero_lbm_macos_x86_64
             aero_lbm_macos_arm64
     )
 
