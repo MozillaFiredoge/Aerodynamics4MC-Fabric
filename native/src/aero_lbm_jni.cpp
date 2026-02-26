@@ -45,26 +45,33 @@ constexpr int kChannelStateVy = 6;
 constexpr int kChannelStateVz = 7;
 constexpr int kChannelStateP = 8;
 
+constexpr bool kEnableSmagorinskyLES = true;
 constexpr float kLatticeSoundSpeed = 0.57735026919f;   // 1 / sqrt(3)
-constexpr float kTargetMach = 0.10f;                   // keep Mach number low for LBM stability
 constexpr float kMaxMach = 0.35f;                      // hard velocity clamp inside solver
-constexpr float kTargetLatticeSpeed = kLatticeSoundSpeed * kTargetMach;
 constexpr float kHardMaxLatticeSpeed = kLatticeSoundSpeed * kMaxMach;
-constexpr float kMinVelocityScale = 1e-4f;
-constexpr float kVelocityScaleReinitEps = 0.05f;
 
-constexpr float kRhoMin = 0.98f;
-constexpr float kRhoMax = 1.02f;
-constexpr float kPressureMin = -0.02f;
-constexpr float kPressureMax = 0.02f;
+constexpr float kRhoMin = 0.97f;
+constexpr float kRhoMax = 1.03f;
+constexpr float kPressureMin = -0.03f;
+constexpr float kPressureMax = 0.03f;
 
-constexpr float kTauPlus = 0.62f;
+constexpr float kTauPlus = 0.5001f;
+constexpr float kTauPlusMin = 0.505f;
+constexpr float kTauPlusMax = 0.80f;
+constexpr float kSmagorinskyC = 0.16f;
+constexpr float kSmagorinskyC2 = kSmagorinskyC * kSmagorinskyC;
+constexpr float kSmagorinskyFactor = 3.0f * kSmagorinskyC2;
+constexpr float kLesSpeedThreshold = 0.004f;
 constexpr float kTrtMagic = 0.25f;
 constexpr float kTauMinus = 0.5f + kTrtMagic / (kTauPlus - 0.5f);
 constexpr float kOmegaPlus = 1.0f / kTauPlus;
 constexpr float kOmegaMinus = 1.0f / kTauMinus;
-constexpr float kFanRelax = 0.20f;
-constexpr float kStateNudge = 0.05f;
+constexpr float kFanAccel = 0.0120f;
+constexpr float kFanForceScalePerSpeed = 0.5f;
+constexpr float kFanForceScaleMax = 4.0f;
+constexpr float kFanPulseAmp = 0.20f;
+constexpr float kFanPulseFreq = 0.12f;
+constexpr float kStateNudge = 0.0f;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
 struct Config {
@@ -99,7 +106,7 @@ struct ContextState {
     std::vector<float> fan_uy;
     std::vector<float> fan_uz;
     std::vector<uint8_t> obstacle;
-    float velocity_scale = 1.0f;
+    std::uint64_t step_counter = 0;
 
 #if defined(AERO_LBM_OPENCL)
     bool gpu_buffers_ready = false;
@@ -182,62 +189,6 @@ inline std::size_t dist_index(std::size_t cell, int q) {
 
 inline float clampf(float v, float lo, float hi) {
     return std::min(hi, std::max(lo, v));
-}
-
-float compute_packet_velocity_scale(const float* payload, std::size_t cells, int in_channels) {
-    float peak_speed = 0.0f;
-    for (std::size_t cell = 0; cell < cells; ++cell) {
-        const std::size_t base = cell * static_cast<std::size_t>(in_channels);
-        if (payload[base + kChannelObstacle] > 0.5f) {
-            continue;
-        }
-
-        const float vx = payload[base + kChannelStateVx];
-        const float vy = payload[base + kChannelStateVy];
-        const float vz = payload[base + kChannelStateVz];
-        peak_speed = std::max(peak_speed, std::sqrt(vx * vx + vy * vy + vz * vz));
-
-        const float fan = clampf(payload[base + kChannelFanMask], 0.0f, 1.0f);
-        if (fan > 0.0f) {
-            const float fvx = payload[base + kChannelFanVx];
-            const float fvy = payload[base + kChannelFanVy];
-            const float fvz = payload[base + kChannelFanVz];
-            peak_speed = std::max(peak_speed, std::sqrt(fvx * fvx + fvy * fvy + fvz * fvz));
-        }
-    }
-
-    if (!(peak_speed > 0.0f) || peak_speed <= kTargetLatticeSpeed) {
-        return 1.0f;
-    }
-
-    return clampf(kTargetLatticeSpeed / peak_speed, kMinVelocityScale, 1.0f);
-}
-
-void scale_packet_velocities(float* payload, std::size_t cells, int in_channels, float scale) {
-    if (!(scale > 0.0f) || scale >= 1.0f) {
-        return;
-    }
-    for (std::size_t cell = 0; cell < cells; ++cell) {
-        const std::size_t base = cell * static_cast<std::size_t>(in_channels);
-        payload[base + kChannelFanVx] *= scale;
-        payload[base + kChannelFanVy] *= scale;
-        payload[base + kChannelFanVz] *= scale;
-        payload[base + kChannelStateVx] *= scale;
-        payload[base + kChannelStateVy] *= scale;
-        payload[base + kChannelStateVz] *= scale;
-    }
-}
-
-void scale_output_velocities(float* out, std::size_t cells, int out_channels, float scale) {
-    if (!(scale > 0.0f) || out_channels < 3 || scale == 1.0f) {
-        return;
-    }
-    for (std::size_t cell = 0; cell < cells; ++cell) {
-        const std::size_t base = cell * static_cast<std::size_t>(out_channels);
-        out[base + 0] *= scale;
-        out[base + 1] *= scale;
-        out[base + 2] *= scale;
-    }
 }
 
 inline float feq(int q, float rho, float ux, float uy, float uz) {
@@ -339,12 +290,32 @@ void collide(ContextState& ctx) {
         uy /= rho;
         uz /= rho;
 
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
         const float fan = ctx.fan_mask[cell];
         if (fan > 0.0f) {
-            ux += kFanRelax * fan * (ctx.fan_ux[cell] - ux);
-            uy += kFanRelax * fan * (ctx.fan_uy[cell] - uy);
-            uz += kFanRelax * fan * (ctx.fan_uz[cell] - uz);
+            const float fan_ux = ctx.fan_ux[cell];
+            const float fan_uy = ctx.fan_uy[cell];
+            const float fan_uz = ctx.fan_uz[cell];
+            const float fan_norm = std::sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
+            if (fan_norm > 1e-8f) {
+                const float inv_norm = 1.0f / fan_norm;
+                const float base_force_scale = std::min(kFanForceScaleMax, fan_norm * kFanForceScalePerSpeed);
+                const float phase = kFanPulseFreq * static_cast<float>(ctx.step_counter)
+                    + 0.037f * static_cast<float>(cell);
+                const float pulse = 1.0f + kFanPulseAmp * std::sin(phase);
+                const float force_scale = std::max(0.0f, base_force_scale * pulse);
+                fx = fan * kFanAccel * force_scale * fan_ux * inv_norm;
+                fy = fan * kFanAccel * force_scale * fan_uy * inv_norm;
+                fz = fan * kFanAccel * force_scale * fan_uz * inv_norm;
+            }
         }
+
+        // Body-force injection (Guo-style momentum shift) is more stable than hard velocity pinning.
+        ux += fx / rho;
+        uy += fy / rho;
+        uz += fz / rho;
 
         ux = (1.0f - kStateNudge) * ux + kStateNudge * ctx.ref_ux[cell];
         uy = (1.0f - kStateNudge) * uy + kStateNudge * ctx.ref_uy[cell];
@@ -363,23 +334,70 @@ void collide(ContextState& ctx) {
         ctx.uy[cell] = uy;
         ctx.uz[cell] = uz;
 
+        std::array<float, kQ> feq_cache;
+        float qxx = 0.0f;
+        float qyy = 0.0f;
+        float qzz = 0.0f;
+        float qxy = 0.0f;
+        float qxz = 0.0f;
+        float qyz = 0.0f;
+        const bool apply_les = kEnableSmagorinskyLES && speed2 > (kLesSpeedThreshold * kLesSpeedThreshold);
+
+        for (int q = 0; q < kQ; ++q) {
+            const float feq_q = feq(q, rho, ux, uy, uz);
+            feq_cache[static_cast<std::size_t>(q)] = feq_q;
+
+            if (apply_les) {
+                const float fneq = ctx.f[dist_index(cell, q)] - feq_q;
+                const float cx = static_cast<float>(kCx[q]);
+                const float cy = static_cast<float>(kCy[q]);
+                const float cz = static_cast<float>(kCz[q]);
+                qxx += cx * cx * fneq;
+                qyy += cy * cy * fneq;
+                qzz += cz * cz * fneq;
+                qxy += cx * cy * fneq;
+                qxz += cx * cz * fneq;
+                qyz += cy * cz * fneq;
+            }
+        }
+
+        float tau_plus_local = kTauPlus;
+        if (apply_les) {
+            const float q_norm2 = qxx * qxx + qyy * qyy + qzz * qzz
+                + 2.0f * (qxy * qxy + qxz * qxz + qyz * qyz);
+            const float q_mag = std::sqrt(std::max(0.0f, q_norm2));
+            const float s_mag = (3.0f / (2.0f * std::max(1e-6f, rho) * kTauPlus)) * q_mag;
+            tau_plus_local = clampf(kTauPlus + kSmagorinskyFactor * s_mag, kTauPlusMin, kTauPlusMax);
+        }
+        const float tau_minus_local = 0.5f + kTrtMagic / std::max(1e-6f, (tau_plus_local - 0.5f));
+        const float omega_plus_local = 1.0f / tau_plus_local;
+        const float omega_minus_local = 1.0f / tau_minus_local;
+
         for (int q = 0; q < kQ; ++q) {
             const std::size_t di = dist_index(cell, q);
             const int opp = kOpp[q];
             const std::size_t di_opp = dist_index(cell, opp);
             const float f_q = ctx.f[di];
             const float f_opp = ctx.f[di_opp];
-            const float f_eq_q = feq(q, rho, ux, uy, uz);
-            const float f_eq_opp = feq(opp, rho, ux, uy, uz);
+            const float f_eq_q = feq_cache[static_cast<std::size_t>(q)];
+            const float f_eq_opp = feq_cache[static_cast<std::size_t>(opp)];
 
             const float f_plus = 0.5f * (f_q + f_opp);
             const float f_minus = 0.5f * (f_q - f_opp);
             const float feq_plus = 0.5f * (f_eq_q + f_eq_opp);
             const float feq_minus = 0.5f * (f_eq_q - f_eq_opp);
 
+            const float ci_dot_u = static_cast<float>(kCx[q]) * ux + static_cast<float>(kCy[q]) * uy + static_cast<float>(kCz[q]) * uz;
+            const float ci_dot_f = static_cast<float>(kCx[q]) * fx + static_cast<float>(kCy[q]) * fy + static_cast<float>(kCz[q]) * fz;
+            const float ciminu_dot_f = (static_cast<float>(kCx[q]) - ux) * fx
+                + (static_cast<float>(kCy[q]) - uy) * fy
+                + (static_cast<float>(kCz[q]) - uz) * fz;
+            const float source = kW[q] * (1.0f - 0.5f * omega_plus_local) * 3.0f * (ciminu_dot_f + 3.0f * ci_dot_u * ci_dot_f);
+
             ctx.f_post[di] = f_q
-                - kOmegaPlus * (f_plus - feq_plus)
-                - kOmegaMinus * (f_minus - feq_minus);
+                - omega_plus_local * (f_plus - feq_plus)
+                - omega_minus_local * (f_minus - feq_minus)
+                + source;
         }
     }
 }
@@ -403,7 +421,16 @@ void stream_and_bounce(ContextState& ctx) {
                     const int sz = z - kCz[q];
 
                     if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-                        ctx.f[dist_index(cell, q)] = ctx.f_post[dist_index(cell, kOpp[q])];
+                        // Zero-gradient domain boundary using mirrored interior ghost sampling.
+                        const int cx = std::min(n - 1, std::max(0, (sx < 0 || sx >= n) ? (x + kCx[q]) : sx));
+                        const int cy = std::min(n - 1, std::max(0, (sy < 0 || sy >= n) ? (y + kCy[q]) : sy));
+                        const int cz = std::min(n - 1, std::max(0, (sz < 0 || sz >= n) ? (z + kCz[q]) : sz));
+                        const std::size_t src = cell_index(cx, cy, cz, n);
+                        if (ctx.obstacle[src]) {
+                            ctx.f[dist_index(cell, q)] = ctx.f_post[dist_index(cell, q)];
+                        } else {
+                            ctx.f[dist_index(cell, q)] = ctx.f_post[dist_index(src, q)];
+                        }
                         continue;
                     }
 
@@ -488,18 +515,26 @@ __constant float W[KQ] = {
     0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f
 };
 
-__constant float OMEGA_PLUS = 1.6129032f;
-__constant float OMEGA_MINUS = 0.38709676f;
-__constant float FAN_RELAX = 0.20f;
-__constant float STATE_NUDGE = 0.05f;
+__constant float OMEGA_PLUS = 1.9996f;
+__constant float OMEGA_MINUS = 0.05825243f;
+__constant float FAN_ACCEL = 0.0120f;
+__constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
+__constant float FAN_FORCE_SCALE_MAX = 4.0f;
+__constant float FAN_PULSE_AMP = 0.20f;
+__constant float FAN_PULSE_FREQ = 0.12f;
+__constant float STATE_NUDGE = 0.0f;
 __constant float MAX_SPEED = 0.20207259f;
-__constant float RHO_MIN = 0.98f;
-__constant float RHO_MAX = 1.02f;
-__constant float P_MIN = -0.02f;
-__constant float P_MAX = 0.02f;
+__constant float RHO_MIN = 0.97f;
+__constant float RHO_MAX = 1.03f;
+__constant float P_MIN = -0.03f;
+__constant float P_MAX = 0.03f;
 
 inline float clampf(float v, float lo, float hi) {
     return fmin(hi, fmax(lo, v));
+}
+
+inline int clampi(int v, int lo, int hi) {
+    return min(hi, max(lo, v));
 }
 
 inline int is_obstacle(__global const float* payload, int cell, int in_ch) {
@@ -549,6 +584,7 @@ kernel void collide_step(
     __global const float* payload,
     int in_ch,
     int cells,
+    int tick,
     __global float* f_post
 ) {
     int cell = (int)get_global_id(0);
@@ -583,15 +619,30 @@ kernel void collide_step(
     uy /= rho;
     uz /= rho;
 
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
     float fan = clampf(payload[base + 1], 0.0f, 1.0f);
     if (fan > 0.0f) {
         float fan_ux = payload[base + 2];
         float fan_uy = payload[base + 3];
         float fan_uz = payload[base + 4];
-        ux += FAN_RELAX * fan * (fan_ux - ux);
-        uy += FAN_RELAX * fan * (fan_uy - uy);
-        uz += FAN_RELAX * fan * (fan_uz - uz);
+        float fan_norm = sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
+        if (fan_norm > 1e-8f) {
+            float inv_norm = 1.0f / fan_norm;
+            float base_force_scale = fmin(FAN_FORCE_SCALE_MAX, fan_norm * FAN_FORCE_SCALE_PER_SPEED);
+            float phase = FAN_PULSE_FREQ * (float)tick + 0.037f * (float)cell;
+            float pulse = 1.0f + FAN_PULSE_AMP * sin(phase);
+            float force_scale = fmax(0.0f, base_force_scale * pulse);
+            fx = fan * FAN_ACCEL * force_scale * fan_ux * inv_norm;
+            fy = fan * FAN_ACCEL * force_scale * fan_uy * inv_norm;
+            fz = fan * FAN_ACCEL * force_scale * fan_uz * inv_norm;
+        }
     }
+
+    ux += fx / rho;
+    uy += fy / rho;
+    uz += fz / rho;
 
     float ref_ux = payload[base + 5];
     float ref_uy = payload[base + 6];
@@ -621,9 +672,17 @@ kernel void collide_step(
         float feq_plus = 0.5f * (f_eq_q + f_eq_opp);
         float feq_minus = 0.5f * (f_eq_q - f_eq_opp);
 
+        float ci_dot_u = (float)CX[q] * ux + (float)CY[q] * uy + (float)CZ[q] * uz;
+        float ci_dot_f = (float)CX[q] * fx + (float)CY[q] * fy + (float)CZ[q] * fz;
+        float ciminu_dot_f = ((float)CX[q] - ux) * fx
+            + ((float)CY[q] - uy) * fy
+            + ((float)CZ[q] - uz) * fz;
+        float source = W[q] * (1.0f - 0.5f * OMEGA_PLUS) * 3.0f * (ciminu_dot_f + 3.0f * ci_dot_u * ci_dot_f);
+
         f_post[fq_base + q] = f_q
             - OMEGA_PLUS * (f_plus - feq_plus)
-            - OMEGA_MINUS * (f_minus - feq_minus);
+            - OMEGA_MINUS * (f_minus - feq_minus)
+            + source;
     }
 }
 
@@ -660,7 +719,20 @@ kernel void stream_step(
         int sz = z - CZ[q];
 
         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-            f[fq_base + q] = f_post[fq_base + OPP[q]];
+            // Zero-gradient domain boundary using mirrored interior ghost sampling.
+            int cx = (sx < 0 || sx >= n) ? (x + CX[q]) : sx;
+            int cy = (sy < 0 || sy >= n) ? (y + CY[q]) : sy;
+            int cz = (sz < 0 || sz >= n) ? (z + CZ[q]) : sz;
+            cx = clampi(cx, 0, n - 1);
+            cy = clampi(cy, 0, n - 1);
+            cz = clampi(cz, 0, n - 1);
+            int src = (cx * n + cy) * n + cz;
+            if (is_obstacle(payload, src, in_ch)) {
+                f[fq_base + q] = f_post[fq_base + q];
+            } else {
+                int src_base = src * KQ;
+                f[fq_base + q] = f_post[src_base + q];
+            }
             continue;
         }
 
@@ -1049,11 +1121,14 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         ctx.gpu_initialized = true;
     }
 
+    const int tick_i32 = static_cast<int>(ctx.step_counter & 0x7FFFFFFF);
+
     err = clSetKernelArg(g_opencl.k_collide, 0, sizeof(cl_mem), &ctx.d_f);
     err |= clSetKernelArg(g_opencl.k_collide, 1, sizeof(cl_mem), &ctx.d_payload);
     err |= clSetKernelArg(g_opencl.k_collide, 2, sizeof(int), &g_cfg.input_channels);
     err |= clSetKernelArg(g_opencl.k_collide, 3, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(g_opencl.k_collide, 4, sizeof(cl_mem), &ctx.d_f_post);
+    err |= clSetKernelArg(g_opencl.k_collide, 4, sizeof(int), &tick_i32);
+    err |= clSetKernelArg(g_opencl.k_collide, 5, sizeof(cl_mem), &ctx.d_f_post);
     if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_collide, cells_i32)) {
         return false;
     }
@@ -1089,6 +1164,7 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         return false;
     }
     timing.readback_ms += elapsed_ms(readback_begin, Clock::now());
+    ctx.step_counter += 1;
     return true;
 }
 
@@ -1144,7 +1220,9 @@ void disable_opencl_runtime(const std::string& reason) {
     }
     release_opencl_runtime();
     g_cfg.opencl_enabled = false;
-    g_cfg.runtime_info = "cpu|trt_fallback (" + reason + ")";
+    g_cfg.runtime_info = kEnableSmagorinskyLES
+        ? ("cpu|trt+les_fallback (" + reason + ")")
+        : ("cpu|trt_fallback (" + reason + ")");
 }
 
 bool should_force_cpu_backend() {
@@ -1176,6 +1254,7 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
     collide(ctx);
     stream_and_bounce(ctx);
     write_output(ctx, out, g_cfg.output_channels);
+    ctx.step_counter += 1;
 }
 
 }  // namespace
@@ -1205,7 +1284,15 @@ Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeInit(
 
     if (should_force_cpu_backend()) {
         g_cfg.opencl_enabled = false;
-        g_cfg.runtime_info = "cpu|trt (forced by AERO_LBM_CPU_ONLY)";
+        g_cfg.runtime_info = kEnableSmagorinskyLES
+            ? "cpu|trt+les (forced by AERO_LBM_CPU_ONLY)"
+            : "cpu|trt (forced by AERO_LBM_CPU_ONLY)";
+        return JNI_TRUE;
+    }
+
+    if (kEnableSmagorinskyLES) {
+        g_cfg.opencl_enabled = false;
+        g_cfg.runtime_info = "cpu|trt+les";
         return JNI_TRUE;
     }
 
@@ -1273,24 +1360,6 @@ Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStep(
     ContextState& ctx = g_contexts[context_key];
     ensure_context_shape(ctx, n, cells);
 
-    float velocity_scale = compute_packet_velocity_scale(packet.data(), cells, g_cfg.input_channels);
-    if (!(velocity_scale > 0.0f) || !std::isfinite(velocity_scale)) {
-        velocity_scale = 1.0f;
-    }
-    if (velocity_scale < 1.0f) {
-        scale_packet_velocities(packet.data(), cells, g_cfg.input_channels, velocity_scale);
-    }
-
-    const float scale_ref = std::max(ctx.velocity_scale, 1e-6f);
-    const bool scale_changed = std::fabs(velocity_scale - ctx.velocity_scale) > (kVelocityScaleReinitEps * scale_ref);
-    if (scale_changed) {
-        ctx.cpu_initialized = false;
-#if defined(AERO_LBM_OPENCL)
-        ctx.gpu_initialized = false;
-#endif
-    }
-    ctx.velocity_scale = velocity_scale;
-
     bool ok = false;
     if (g_cfg.opencl_enabled) {
         ok = opencl_step(ctx, packet.data(), out, timing);
@@ -1303,12 +1372,10 @@ Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStep(
         const auto solver_begin = Clock::now();
         run_cpu_step(ctx, packet.data(), out);
         timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
-        g_cfg.runtime_info = g_cfg.runtime_info.empty() ? "cpu|trt" : g_cfg.runtime_info;
+        g_cfg.runtime_info = g_cfg.runtime_info.empty()
+            ? (kEnableSmagorinskyLES ? "cpu|trt+les" : "cpu|trt")
+            : g_cfg.runtime_info;
         ok = true;
-    }
-
-    if (ok && velocity_scale < 1.0f) {
-        scale_output_velocities(out, cells, g_cfg.output_channels, 1.0f / velocity_scale);
     }
 
     env->ReleaseFloatArrayElements(output_flow, out, 0);
