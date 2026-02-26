@@ -32,6 +32,12 @@ bin/
 
 run/
 
+# native
+native/build/
+native/build-*/
+native/build-all*/
+native/dist/
+
 # java
 
 hs_err_*.log

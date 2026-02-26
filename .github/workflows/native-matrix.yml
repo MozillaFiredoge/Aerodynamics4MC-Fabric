@@ -107,7 +107,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: natives-${{ matrix.id }}
-          path: native-out/natives
+          path: native-out
           if-no-files-found: error
 
   package-mod:
@@ -125,12 +125,32 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Clean native dist
+        run: rm -rf native/dist
+
       - name: Download all native artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: natives-*
           merge-multiple: true
           path: native/dist
+
+      - name: Normalize native artifact layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p native/dist/natives
+
+          if [[ -d native/dist/native-out/natives ]]; then
+            cp -a native/dist/native-out/natives/. native/dist/natives/
+          fi
+
+          for target in linux-x86_64 linux-arm64 windows-x86_64 macos-arm64; do
+            if [[ -d "native/dist/${target}" ]]; then
+              mkdir -p "native/dist/natives/${target}"
+              cp -a "native/dist/${target}/." "native/dist/natives/${target}/"
+            fi
+          done
 
       - name: Verify native binaries
         shell: bash
