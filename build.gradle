@@ -19,6 +19,7 @@ def generatedNativeResourcesDir = layout.buildDirectory.dir("generated/native-re
 
 tasks.register("prepareNativeResources") {
 	outputs.dir(generatedNativeResourcesDir)
+	outputs.upToDateWhen { false }
 
 	doLast {
 		File outDir = generatedNativeResourcesDir.get().asFile

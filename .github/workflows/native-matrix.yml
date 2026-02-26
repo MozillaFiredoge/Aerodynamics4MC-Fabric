@@ -174,11 +174,29 @@ jobs:
           chmod +x ./gradlew
           ./gradlew remapJar
 
+      - name: Verify natives are inside release jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          MOD_JAR="$(ls build/libs/*.jar | grep -E -v '(-sources|-dev)\\.jar$' | head -n 1 || true)"
+          if [[ -z "${MOD_JAR}" ]]; then
+            echo "release mod jar not found in build/libs"
+            ls -la build/libs || true
+            exit 1
+          fi
+          echo "MOD_JAR=${MOD_JAR}" >> "$GITHUB_ENV"
+          echo "selected jar: ${MOD_JAR}"
+
+          jar tf "${MOD_JAR}" | grep -q '^natives/linux-x86_64/libaero_lbm.so$'
+          jar tf "${MOD_JAR}" | grep -q '^natives/linux-arm64/libaero_lbm.so$'
+          jar tf "${MOD_JAR}" | grep -q '^natives/windows-x86_64/aero_lbm.dll$'
+          jar tf "${MOD_JAR}" | grep -q '^natives/macos-arm64/libaero_lbm.dylib$'
+
       - name: Upload mod jar
         uses: actions/upload-artifact@v4
         with:
           name: mod-jar
-          path: build/libs/*.jar
+          path: ${{ env.MOD_JAR }}
           if-no-files-found: error
 
       - name: Upload packed natives
