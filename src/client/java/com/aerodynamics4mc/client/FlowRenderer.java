@@ -17,12 +17,14 @@ import net.minecraft.util.math.Vec3d;
 public class FlowRenderer {
     private final int gridSize;
     private final int channels;
+    private final float maxInflowSpeed;
     private final float[] flowField; // flattened [x,y,z,4]
     private BlockPos origin;
 
-    public FlowRenderer(int gridSize) {
+    public FlowRenderer(int gridSize, float maxInflowSpeed) {
         this.gridSize = gridSize;
         this.channels = 4;
+        this.maxInflowSpeed = Math.max(1e-6f, maxInflowSpeed);
         this.flowField = new float[gridSize * gridSize * gridSize * channels];
         this.origin = BlockPos.ORIGIN;
     }
@@ -129,10 +131,11 @@ public class FlowRenderer {
              for (int s = 0; s < maxSteps; s++) {
                  Vec3d vel = sampleVelocity(pos);
                  float speed = (float) vel.length();
-                 if (speed < 3e-4f) break;
+                 float speedNorm = MathHelper.clamp(speed / maxInflowSpeed, 0.0f, 1.0f);
+                 if (speedNorm < 3e-4f) break;
 
                  Vec3d dir = vel.normalize();
-                 float advectStep = stepSize * MathHelper.clamp(speed * 12.0f, 0.15f, 1.2f);
+                 float advectStep = stepSize * MathHelper.clamp(speedNorm * 12.0f, 0.15f, 1.2f);
                  Vec3d nextPos = pos.add(dir.multiply(advectStep));
                  Vec3d segDir = nextPos.subtract(pos).normalize();
                  
@@ -141,7 +144,7 @@ public class FlowRenderer {
                      break;
                  }
                  
-                 int color = getViridisColor(speed * 40.0f);
+                 int color = getViridisColor(speedNorm);
                  int r = (color >> 16) & 0xFF;
                  int g = (color >> 8) & 0xFF;
                  int b = color & 0xFF;

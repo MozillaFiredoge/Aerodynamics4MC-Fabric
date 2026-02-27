@@ -639,7 +639,7 @@ public class AeroClientMod implements ClientModInitializer {
 
         private WindowState(BlockPos origin) {
             this.origin = origin;
-            this.renderer = new FlowRenderer(GRID_SIZE);
+            this.renderer = new FlowRenderer(GRID_SIZE, INFLOW_SPEED);
             this.physicsHandler = new PhysicsHandler(renderer, GRID_SIZE);
         }
 

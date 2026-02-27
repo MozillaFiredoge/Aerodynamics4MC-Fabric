@@ -63,7 +63,7 @@ constexpr float kSmagorinskyC = 0.10f;
 constexpr float kSmagorinskyC2 = kSmagorinskyC * kSmagorinskyC;
 constexpr float kSmagorinskyFactor = 3.0f * kSmagorinskyC2;
 // constexpr float kLesSpeedThreshold = 0.0f;
-constexpr float kFanAccel = 0.00120f;
+constexpr float kFanAccel = 0.0120f;
 constexpr float kFanForceScalePerSpeed = 0.5f;
 constexpr float kFanForceScaleMax = 4.0f;
 constexpr float kFanPulseAmp = 0.05f;
@@ -480,7 +480,7 @@ __constant float TAU_PLUS_BASE = 0.515f;
 __constant float TAU_PLUS_MIN = 0.515f;
 __constant float TAU_PLUS_MAX = 0.8f;
 __constant float SMAG_FACTOR = 0.03f;
-__constant float FAN_ACCEL = 0.00120f;
+__constant float FAN_ACCEL = 0.0120f;
 __constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
 __constant float FAN_FORCE_SCALE_MAX = 4.0f;
 __constant float FAN_PULSE_AMP = 0.05f;
@@ -636,11 +636,11 @@ kernel void stream_collide_step(
     uy = mix(uy, payload[base + 6], STATE_NUDGE);
     uz = mix(uz, payload[base + 7], STATE_NUDGE);
 
-    // float speed2 = ux * ux + uy * uy + uz * uz;
-    // if (speed2 > MAX_SPEED * MAX_SPEED) {
-    //     float scale = MAX_SPEED * rsqrt(speed2);
-    //     ux *= scale; uy *= scale; uz *= scale;
-    // }
+    float speed2 = ux * ux + uy * uy + uz * uz;
+    if (speed2 > MAX_SPEED * MAX_SPEED) {
+        float scale = MAX_SPEED * rsqrt(speed2);
+        ux *= scale; uy *= scale; uz *= scale;
+    }
 
     // 4. COLLISION (RLBM + Smagorinsky)
     float qxx = 0.0f, qyy = 0.0f, qzz = 0.0f, qxy = 0.0f, qxz = 0.0f, qyz = 0.0f;
