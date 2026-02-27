@@ -923,9 +923,7 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
 
 extern "C" {
 
-JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeInit(
-    JNIEnv*, jclass, jint grid_size, jint input_channels, jint output_channels
-) {
+static jboolean native_init_impl(jint grid_size, jint input_channels, jint output_channels) {
     if (grid_size <= 0 || input_channels < 9 || output_channels < 4) { reset_runtime_state(); return JNI_FALSE; }
     clear_all_contexts(); reset_timing_stats();
     g_cfg.grid_size = grid_size; g_cfg.input_channels = input_channels; g_cfg.output_channels = output_channels; g_cfg.initialized = true;
@@ -944,7 +942,7 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativ
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStep(
+static jboolean native_step_impl(
     JNIEnv* env, jclass, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
 ) {
     auto tick_begin = Clock::now();
@@ -999,13 +997,67 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativ
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeReleaseContext(JNIEnv*, jclass, jlong context_key) {
+static void native_release_context_impl(jlong context_key) {
     auto it = g_contexts.find(context_key);
     if (it != g_contexts.end()) { clear_context(it->second); g_contexts.erase(it); }
 }
 
-JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeShutdown(JNIEnv*, jclass) { reset_runtime_state(); }
-JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeRuntimeInfo(JNIEnv* env, jclass) { return env->NewStringUTF((g_cfg.runtime_info.empty() ? "uninitialized" : g_cfg.runtime_info).c_str()); }
-JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeTimingInfo(JNIEnv* env, jclass) { return env->NewStringUTF(timing_info_string().c_str()); }
+static void native_shutdown_impl() { reset_runtime_state(); }
+static jstring native_runtime_info_impl(JNIEnv* env) {
+    return env->NewStringUTF((g_cfg.runtime_info.empty() ? "uninitialized" : g_cfg.runtime_info).c_str());
+}
+static jstring native_timing_info_impl(JNIEnv* env) {
+    return env->NewStringUTF(timing_info_string().c_str());
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeInit(
+    JNIEnv*, jclass, jint grid_size, jint input_channels, jint output_channels
+) {
+    return native_init_impl(grid_size, input_channels, output_channels);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeInit(
+    JNIEnv*, jclass, jint grid_size, jint input_channels, jint output_channels
+) {
+    return native_init_impl(grid_size, input_channels, output_channels);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStep(
+    JNIEnv* env, jclass clazz, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
+) {
+    return native_step_impl(env, clazz, payload, grid_size, context_key, output_flow);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeStep(
+    JNIEnv* env, jclass clazz, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
+) {
+    return native_step_impl(env, clazz, payload, grid_size, context_key, output_flow);
+}
+
+JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeReleaseContext(JNIEnv*, jclass, jlong context_key) {
+    native_release_context_impl(context_key);
+}
+JNIEXPORT void JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeReleaseContext(JNIEnv*, jclass, jlong context_key) {
+    native_release_context_impl(context_key);
+}
+
+JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeShutdown(JNIEnv*, jclass) {
+    native_shutdown_impl();
+}
+JNIEXPORT void JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeShutdown(JNIEnv*, jclass) {
+    native_shutdown_impl();
+}
+
+JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeRuntimeInfo(JNIEnv* env, jclass) {
+    return native_runtime_info_impl(env);
+}
+JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeRuntimeInfo(JNIEnv* env, jclass) {
+    return native_runtime_info_impl(env);
+}
+
+JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeTimingInfo(JNIEnv* env, jclass) {
+    return native_timing_info_impl(env);
+}
+JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeTimingInfo(JNIEnv* env, jclass) {
+    return native_timing_info_impl(env);
+}
 
 }  // extern "C"
