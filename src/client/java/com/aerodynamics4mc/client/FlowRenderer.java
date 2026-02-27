@@ -15,9 +15,11 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 public class FlowRenderer {
+    private static final float RENDER_THRESHOLD_RATIO = 0.1f;
     private final int gridSize;
     private final int channels;
     private final float maxInflowSpeed;
+    private final float renderThresholdNorm;
     private final float[] flowField; // flattened [x,y,z,4]
     private BlockPos origin;
 
@@ -25,6 +27,7 @@ public class FlowRenderer {
         this.gridSize = gridSize;
         this.channels = 4;
         this.maxInflowSpeed = Math.max(1e-6f, maxInflowSpeed);
+        this.renderThresholdNorm = RENDER_THRESHOLD_RATIO;
         this.flowField = new float[gridSize * gridSize * gridSize * channels];
         this.origin = BlockPos.ORIGIN;
     }
@@ -76,7 +79,6 @@ public class FlowRenderer {
                 for (int z = 0; z < gridSize; z += stride) {
                     Vec3d vel = getVelocityAt(x, y, z);
                     float speed = (float) vel.length();
-                    if (speed < 8e-4f) continue;
 
                     Vec3d dir = vel.normalize();
                     
@@ -132,7 +134,7 @@ public class FlowRenderer {
                  Vec3d vel = sampleVelocity(pos);
                  float speed = (float) vel.length();
                  float speedNorm = MathHelper.clamp(speed / maxInflowSpeed, 0.0f, 1.0f);
-                 if (speedNorm < 3e-4f) break;
+                 if (speedNorm < renderThresholdNorm) break;
 
                  Vec3d dir = vel.normalize();
                  float advectStep = stepSize * MathHelper.clamp(speedNorm * 12.0f, 0.15f, 1.2f);

@@ -60,7 +60,7 @@ public class AeroClientMod implements ClientModInitializer {
     private static final int OBSTACLE_REFRESH_TICKS = 200;
     private static final int PARTICLE_DEBUG_INTERVAL_TICKS = 4;
     // Keep client-side state/visualization on SOCKET-scale velocities and convert at native boundary.
-    private static final float NATIVE_VELOCITY_SCALE = 10.0f;
+    private static final float NATIVE_VELOCITY_SCALE = 30.0f;
 
     private enum BackendMode {
         SOCKET,

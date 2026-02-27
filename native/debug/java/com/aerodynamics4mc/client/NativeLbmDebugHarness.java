@@ -2,6 +2,12 @@ package com.aerodynamics4mc.client;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -19,6 +25,8 @@ public final class NativeLbmDebugHarness {
     private static final int CH_VY = 6;
     private static final int CH_VZ = 7;
     private static final int CH_P = 8;
+    private static final float INFLOW_SPEED = 8.0f;
+    private static final float NATIVE_SCALE = 30.0f;
 
     private record Metrics(double mass, double momentumX, double momentumY, double momentumZ,
                            double kineticEnergy, double pressureMean, double maxSpeed,
@@ -34,6 +42,9 @@ public final class NativeLbmDebugHarness {
     public static void main(String[] args) {
         int grid = parseIntArg(args, "--grid", 16);
         int steps = parseIntArg(args, "--steps", 48);
+        boolean socketSmoke = hasFlag(args, "--socket-smoke");
+        String socketHost = parseStringArg(args, "--socket-host", "127.0.0.1");
+        int socketPort = parseIntArg(args, "--socket-port", 5001);
 
         NativeLbmBridge bridge = new NativeLbmBridge();
         if (!bridge.isLoaded()) {
@@ -53,6 +64,9 @@ public final class NativeLbmDebugHarness {
         results.add(runMassConservation(bridge, grid, steps));
         results.add(runObstacleNoSlip(bridge, grid, Math.min(steps, 20)));
         results.add(runFanInjection(bridge, grid, Math.min(steps, 24)));
+        if (socketSmoke) {
+            results.add(runBackendUnitConsistency(bridge, grid, Math.min(steps, 24), socketHost, socketPort));
+        }
 
         boolean allPass = true;
         System.out.println("\n==== Native LBM Debug Summary ====");
@@ -224,6 +238,124 @@ public final class NativeLbmDebugHarness {
         return new TestResult("fan_injection", pass, detail);
     }
 
+    private static TestResult runBackendUnitConsistency(NativeLbmBridge bridge, int n, int steps, String host, int port) {
+        float[] stateNative = new float[n * n * n * INPUT_CHANNELS];
+        float[] stateSocket = new float[n * n * n * INPUT_CHANNELS];
+        seedFanInflow(stateNative, n);
+        seedFanInflow(stateSocket, n);
+
+        long nativeContext = 201L;
+        double nativeNear = 0.0;
+        double socketNear = 0.0;
+        double nativeMax = 0.0;
+        double socketMax = 0.0;
+
+        try (Socket socket = new Socket(host, port);
+             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
+            for (int s = 0; s < steps; s++) {
+                float[] nativeOut = stepNativeScaled(bridge, stateNative, n, nativeContext);
+                if (nativeOut == null) {
+                    bridge.releaseContext(nativeContext);
+                    return new TestResult("backend_unit_consistency", false, "native step returned null");
+                }
+                float[] socketOut = stepSocket(in, out, stateSocket, n);
+                if (socketOut == null) {
+                    bridge.releaseContext(nativeContext);
+                    return new TestResult("backend_unit_consistency", false, "socket step returned null");
+                }
+
+                nativeNear = averageSpeedInPlane(nativeOut, n, 2);
+                socketNear = averageSpeedInPlane(socketOut, n, 2);
+                nativeMax = Math.max(nativeMax, maxSpeed(nativeOut));
+                socketMax = Math.max(socketMax, maxSpeed(socketOut));
+
+                writeBackState(stateNative, nativeOut);
+                writeBackState(stateSocket, socketOut);
+            }
+        } catch (IOException e) {
+            bridge.releaseContext(nativeContext);
+            return new TestResult("backend_unit_consistency", false, "socket error: " + e.getMessage());
+        }
+
+        bridge.releaseContext(nativeContext);
+
+        double nativeNorm = nativeNear / INFLOW_SPEED;
+        double socketNorm = socketNear / INFLOW_SPEED;
+        double ratio = nativeNorm / Math.max(1e-12, socketNorm);
+
+        // Smoke-level consistency: both backends should stay on the same unit order wrt INFLOW_SPEED.
+        boolean pass = nativeNorm > 1e-4 && socketNorm > 1e-4 && ratio > 0.20 && ratio < 5.0;
+        String detail = String.format(
+            "near/native=%.3e(%.3f*inflow) near/socket=%.3e(%.3f*inflow) ratio=%.3f max(native/socket)=%.3e/%.3e",
+            nativeNear, nativeNorm, socketNear, socketNorm, ratio, nativeMax, socketMax
+        );
+        return new TestResult("backend_unit_consistency", pass, detail);
+    }
+
+    private static void seedFanInflow(float[] state, int n) {
+        int cy = n / 2;
+        int cz = n / 2;
+        int radius = Math.max(2, n / 8);
+        for (int y = 0; y < n; y++) {
+            for (int z = 0; z < n; z++) {
+                int dy = y - cy;
+                int dz = z - cz;
+                if (dy * dy + dz * dz > radius * radius) {
+                    continue;
+                }
+                int base = idx(1, y, z, n) * INPUT_CHANNELS;
+                state[base + CH_FAN_MASK] = 1.0f;
+                state[base + CH_FAN_VX] = INFLOW_SPEED;
+                state[base + CH_FAN_VY] = 0.0f;
+                state[base + CH_FAN_VZ] = 0.0f;
+            }
+        }
+    }
+
+    private static float[] stepNativeScaled(NativeLbmBridge bridge, float[] stateClientScale, int n, long context) {
+        float[] nativePayloadState = stateClientScale.clone();
+        int cells = n * n * n;
+        for (int i = 0; i < cells; i++) {
+            int base = i * INPUT_CHANNELS;
+            nativePayloadState[base + CH_VX] /= NATIVE_SCALE;
+            nativePayloadState[base + CH_VY] /= NATIVE_SCALE;
+            nativePayloadState[base + CH_VZ] /= NATIVE_SCALE;
+        }
+        float[] out = step(bridge, nativePayloadState, n, context);
+        if (out == null) {
+            return null;
+        }
+        for (int i = 0; i < cells; i++) {
+            int base = i * OUTPUT_CHANNELS;
+            out[base] *= NATIVE_SCALE;
+            out[base + 1] *= NATIVE_SCALE;
+            out[base + 2] *= NATIVE_SCALE;
+        }
+        return out;
+    }
+
+    private static float[] stepSocket(DataInputStream in, DataOutputStream out, float[] state, int n) throws IOException {
+        byte[] payload = toLittleEndianBytes(state);
+        out.writeInt(payload.length);
+        out.write(payload);
+        out.flush();
+
+        int length = in.readInt();
+        int expected = n * n * n * OUTPUT_CHANNELS * Float.BYTES;
+        if (length != expected) {
+            throw new IOException("unexpected response length: " + length + " expected " + expected);
+        }
+        byte[] response = in.readNBytes(length);
+        if (response.length != length) {
+            throw new IOException("socket closed during read");
+        }
+        ByteBuffer buf = ByteBuffer.wrap(response).order(ByteOrder.LITTLE_ENDIAN);
+        float[] outValues = new float[n * n * n * OUTPUT_CHANNELS];
+        buf.asFloatBuffer().get(outValues);
+        return outValues;
+    }
+
     private static float[] step(NativeLbmBridge bridge, float[] state, int n, long context) {
         return bridge.step(toLittleEndianBytes(state), n, OUTPUT_CHANNELS, context);
     }
@@ -327,6 +459,19 @@ public final class NativeLbmDebugHarness {
         return count > 0 ? (sum / count) : 0.0;
     }
 
+    private static double maxSpeed(float[] out) {
+        double max = 0.0;
+        int cells = out.length / OUTPUT_CHANNELS;
+        for (int i = 0; i < cells; i++) {
+            int base = i * OUTPUT_CHANNELS;
+            double vx = out[base];
+            double vy = out[base + 1];
+            double vz = out[base + 2];
+            max = Math.max(max, Math.sqrt(vx * vx + vy * vy + vz * vz));
+        }
+        return max;
+    }
+
     private static void writeBackState(float[] state, float[] out) {
         int cells = out.length / OUTPUT_CHANNELS;
         for (int i = 0; i < cells; i++) {
@@ -372,5 +517,23 @@ public final class NativeLbmDebugHarness {
             }
         }
         return fallback;
+    }
+
+    private static String parseStringArg(String[] args, String flag, String fallback) {
+        for (int i = 0; i < args.length - 1; i++) {
+            if (flag.equals(args[i])) {
+                return args[i + 1];
+            }
+        }
+        return fallback;
+    }
+
+    private static boolean hasFlag(String[] args, String flag) {
+        for (String arg : args) {
+            if (flag.equals(arg)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

@@ -188,36 +188,6 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     return kW[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
 }
 
-inline void clamp_velocity(float& ux, float& uy, float& uz) {
-    const float speed2 = ux * ux + uy * uy + uz * uz;
-    if (speed2 > kMaxSpeed * kMaxSpeed) {
-        const float scale = kMaxSpeed / std::sqrt(speed2);
-        ux *= scale;
-        uy *= scale;
-        uz *= scale;
-    }
-}
-
-void apply_zou_he_pressure_outlet_xmax(const ContextState& ctx, std::size_t cell, std::array<float, kQ>& f_local) {
-    const float rho_target = clampf(1.0f + ctx.ref_pressure[cell], kRhoMin, kRhoMax);
-    float uy_target = ctx.ref_uy[cell];
-    float uz_target = ctx.ref_uz[cell];
-    float ux_target = -1.0f + (
-        f_local[0] + f_local[3] + f_local[4] + f_local[5] + f_local[6] +
-        f_local[15] + f_local[16] + f_local[17] + f_local[18] +
-        2.0f * (f_local[1] + f_local[7] + f_local[9] + f_local[11] + f_local[13])
-    ) / rho_target;
-    clamp_velocity(ux_target, uy_target, uz_target);
-
-    constexpr std::array<int, 5> kUnknownXMinus = {2, 8, 10, 12, 14};
-    for (int q : kUnknownXMinus) {
-        const int opp = kOpp[q];
-        const float eq_q = feq(q, rho_target, ux_target, uy_target, uz_target);
-        const float eq_opp = feq(opp, rho_target, ux_target, uy_target, uz_target);
-        f_local[q] = eq_q + (f_local[opp] - eq_opp);
-    }
-}
-
 void allocate_cpu_context(ContextState& ctx, int n) {
     ctx.n = n;
     ctx.cells = static_cast<std::size_t>(n) * n * n;
@@ -395,8 +365,19 @@ void stream_and_bounce(ContextState& ctx) {
                         const int sy = y - kCy[q];
                         const int sz = z - kCz[q];
                         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-                            // Out-of-domain links use bounce-back; x-max outlet gets repaired by Zou/He below.
-                            f_local[q] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+                            // Zero-gradient boundary: pull from nearest interior neighbor along out-of-range axes.
+                            int gx = sx;
+                            int gy = sy;
+                            int gz = sz;
+                            if (sx < 0 || sx >= n) gx = std::min(n - 1, std::max(0, x + kCx[q]));
+                            if (sy < 0 || sy >= n) gy = std::min(n - 1, std::max(0, y + kCy[q]));
+                            if (sz < 0 || sz >= n) gz = std::min(n - 1, std::max(0, z + kCz[q]));
+                            const std::size_t src = cell_index(gx, gy, gz, n);
+                            if (ctx.obstacle[src]) {
+                                f_local[q] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+                            } else {
+                                f_local[q] = ctx.f_post[dist_index(src, q, ctx.cells)];
+                            }
                             continue;
                         }
 
@@ -408,9 +389,6 @@ void stream_and_bounce(ContextState& ctx) {
                         }
                     }
 
-                    if (x == n - 1 && y > 0 && y < n - 1 && z > 0 && z < n - 1) {
-                        apply_zou_he_pressure_outlet_xmax(ctx, cell, f_local);
-                    }
                 }
 
                 for (int q = 0; q < kQ; ++q) {
@@ -500,34 +478,6 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     return W[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
 }
 
-inline void clamp_velocity(__private float* ux, __private float* uy, __private float* uz) {
-    float speed2 = (*ux) * (*ux) + (*uy) * (*uy) + (*uz) * (*uz);
-    if (speed2 > MAX_SPEED * MAX_SPEED) {
-        float scale = MAX_SPEED * rsqrt(speed2);
-        *ux *= scale;
-        *uy *= scale;
-        *uz *= scale;
-    }
-}
-
-inline void apply_zou_he_pressure_outlet_xmax(__private float* f_local, float rho_target, float uy_target, float uz_target) {
-    float ux_target = -1.0f + (
-        f_local[0] + f_local[3] + f_local[4] + f_local[5] + f_local[6] +
-        f_local[15] + f_local[16] + f_local[17] + f_local[18] +
-        2.0f * (f_local[1] + f_local[7] + f_local[9] + f_local[11] + f_local[13])
-    ) / rho_target;
-    clamp_velocity(&ux_target, &uy_target, &uz_target);
-
-    const int unknown_x_minus[5] = {2, 8, 10, 12, 14};
-    for (int i = 0; i < 5; ++i) {
-        int q = unknown_x_minus[i];
-        int opp = OPP[q];
-        float eq_q = feq(q, rho_target, ux_target, uy_target, uz_target);
-        float eq_opp = feq(opp, rho_target, ux_target, uy_target, uz_target);
-        f_local[q] = eq_q + (f_local[opp] - eq_opp);
-    }
-}
-
 kernel void init_distributions(
     __global const float* payload, int in_ch, int cells,
     __global float* f, __global float* f_post
@@ -581,8 +531,19 @@ kernel void stream_collide_step(
 
         int sx = x - CX[q], sy = y - CY[q], sz = z - CZ[q];
         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-            // Out-of-domain links use bounce-back; x-max outlet gets repaired by Zou/He below.
-            f_local[q] = f_read[opp * cells + cell];
+            // Zero-gradient boundary: pull from nearest interior neighbor along out-of-range axes.
+            int gx = sx;
+            int gy = sy;
+            int gz = sz;
+            if (sx < 0 || sx >= n) gx = clampi(x + CX[q], 0, n - 1);
+            if (sy < 0 || sy >= n) gy = clampi(y + CY[q], 0, n - 1);
+            if (sz < 0 || sz >= n) gz = clampi(z + CZ[q], 0, n - 1);
+            int src = (gx * n + gy) * n + gz;
+            if (payload[src * in_ch + 0] > 0.5f) {
+                f_local[q] = f_read[opp * cells + cell];
+            } else {
+                f_local[q] = f_read[q * cells + src];
+            }
         } else {
             int src = (sx * n + sy) * n + sz;
             if (payload[src * in_ch + 0] > 0.5f) {
@@ -596,11 +557,6 @@ kernel void stream_collide_step(
     if (is_solid) {
         for (int q = 0; q < KQ; ++q) f_write[q * cells + cell] = f_local[q];
         return;
-    }
-
-    if (x == n - 1 && y > 0 && y < n - 1 && z > 0 && z < n - 1) {
-        float rho_target = clampf(1.0f + clampf(payload[base + 8], P_MIN, P_MAX), RHO_MIN, RHO_MAX);
-        apply_zou_he_pressure_outlet_xmax(f_local, rho_target, payload[base + 6], payload[base + 7]);
     }
 
     // 2. MACROSCOPIC MOMENTS
