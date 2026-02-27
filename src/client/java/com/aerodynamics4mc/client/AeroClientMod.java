@@ -59,6 +59,8 @@ public class AeroClientMod implements ClientModInitializer {
     private static final int WINDOW_REFRESH_TICKS = 20;
     private static final int OBSTACLE_REFRESH_TICKS = 200;
     private static final int PARTICLE_DEBUG_INTERVAL_TICKS = 4;
+    // Keep client-side state/visualization on SOCKET-scale velocities and convert at native boundary.
+    private static final float NATIVE_VELOCITY_SCALE = 10.0f;
 
     private enum BackendMode {
         SOCKET,
@@ -72,7 +74,7 @@ public class AeroClientMod implements ClientModInitializer {
     private boolean debugEnabled = false;
     private int tickCounter = 0;
     private volatile float maxWindSpeed = INFLOW_SPEED;
-    private volatile BackendMode backendMode = BackendMode.SOCKET;
+    private volatile BackendMode backendMode = BackendMode.NATIVE;
 
     @Override
     public void onInitializeClient() {
@@ -115,8 +117,9 @@ public class AeroClientMod implements ClientModInitializer {
             window.busy.set(true);
             executor.execute(() -> {
                 try {
-                    byte[] payload = captureWindow(window);
-                    float[] response = runSolverStep(window, payload);
+                    BackendMode activeBackend = backendMode;
+                    byte[] payload = captureWindow(window, activeBackend);
+                    float[] response = runSolverStep(window, payload, activeBackend);
                     updateBaseFieldFromResponse(window, response, maxWindSpeed);
                     window.renderer.updateFlowField(window.origin, response);
                     window.physicsHandler.updateOrigin(window.origin);
@@ -296,7 +299,7 @@ public class AeroClientMod implements ClientModInitializer {
         }
     }
 
-    private byte[] captureWindow(WindowState window) {
+    private byte[] captureWindow(WindowState window, BackendMode backend) {
         int voxelCount = GRID_SIZE * GRID_SIZE * GRID_SIZE * CHANNELS;
         window.ensureBaseFieldInitialized();
         float[] obstacleField = window.obstacleField;
@@ -333,8 +336,19 @@ public class AeroClientMod implements ClientModInitializer {
             applyFanSource(window, fan, minX, minY, minZ);
         }
 
-        for (float value : window.baseField) {
-            buffer.putFloat(value);
+        float nativeInputScale = backend == BackendMode.NATIVE ? (1.0f / NATIVE_VELOCITY_SCALE) : 1.0f;
+        int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        for (int i = 0; i < cellCount; i++) {
+            int idx = i * CHANNELS;
+            buffer.putFloat(window.baseField[idx + CH_OBSTACLE]);
+            buffer.putFloat(window.baseField[idx + CH_FAN_MASK]);
+            buffer.putFloat(window.baseField[idx + CH_FAN_VX]);
+            buffer.putFloat(window.baseField[idx + CH_FAN_VY]);
+            buffer.putFloat(window.baseField[idx + CH_FAN_VZ]);
+            buffer.putFloat(window.baseField[idx + CH_STATE_VX] * nativeInputScale);
+            buffer.putFloat(window.baseField[idx + CH_STATE_VY] * nativeInputScale);
+            buffer.putFloat(window.baseField[idx + CH_STATE_VZ] * nativeInputScale);
+            buffer.putFloat(window.baseField[idx + CH_STATE_P]);
         }
 
         return buffer.array();
@@ -421,8 +435,21 @@ public class AeroClientMod implements ClientModInitializer {
         windows.clear();
     }
 
-    private float[] runSolverStep(WindowState window, byte[] payload) throws IOException {
-        if (backendMode == BackendMode.NATIVE) {
+    private void scaleResponseVelocity(float[] response, float velocityScale) {
+        if (velocityScale == 1.0f) {
+            return;
+        }
+        int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        for (int i = 0; i < cellCount; i++) {
+            int respIdx = i * RESPONSE_CHANNELS;
+            response[respIdx] *= velocityScale;
+            response[respIdx + 1] *= velocityScale;
+            response[respIdx + 2] *= velocityScale;
+        }
+    }
+
+    private float[] runSolverStep(WindowState window, byte[] payload, BackendMode backend) throws IOException {
+        if (backend == BackendMode.NATIVE) {
             if (!nativeBackend.isLoaded()) {
                 throw new IOException("Native backend not loaded: " + nativeBackend.getLoadError());
             }
@@ -434,6 +461,7 @@ public class AeroClientMod implements ClientModInitializer {
             if (response == null || response.length != FLOW_COUNT) {
                 throw new IOException("Native backend returned invalid response");
             }
+            scaleResponseVelocity(response, NATIVE_VELOCITY_SCALE);
             return response;
         }
 

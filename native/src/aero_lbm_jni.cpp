@@ -56,8 +56,8 @@ constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
 // TRT 被彻底移除，替换为基于二阶 Hermite 的 RLBM 正则化模型
-constexpr float kTauPlus = 0.50003f;
-constexpr float kTauPlusMin = 0.50003f;
+constexpr float kTauPlus = 0.515f;
+constexpr float kTauPlusMin = 0.515f;
 constexpr float kTauPlusMax = 0.80f;
 constexpr float kSmagorinskyC = 0.10f;
 constexpr float kSmagorinskyC2 = kSmagorinskyC * kSmagorinskyC;
@@ -188,6 +188,36 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     return kW[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
 }
 
+inline void clamp_velocity(float& ux, float& uy, float& uz) {
+    const float speed2 = ux * ux + uy * uy + uz * uz;
+    if (speed2 > kMaxSpeed * kMaxSpeed) {
+        const float scale = kMaxSpeed / std::sqrt(speed2);
+        ux *= scale;
+        uy *= scale;
+        uz *= scale;
+    }
+}
+
+void apply_zou_he_pressure_outlet_xmax(const ContextState& ctx, std::size_t cell, std::array<float, kQ>& f_local) {
+    const float rho_target = clampf(1.0f + ctx.ref_pressure[cell], kRhoMin, kRhoMax);
+    float uy_target = ctx.ref_uy[cell];
+    float uz_target = ctx.ref_uz[cell];
+    float ux_target = -1.0f + (
+        f_local[0] + f_local[3] + f_local[4] + f_local[5] + f_local[6] +
+        f_local[15] + f_local[16] + f_local[17] + f_local[18] +
+        2.0f * (f_local[1] + f_local[7] + f_local[9] + f_local[11] + f_local[13])
+    ) / rho_target;
+    clamp_velocity(ux_target, uy_target, uz_target);
+
+    constexpr std::array<int, 5> kUnknownXMinus = {2, 8, 10, 12, 14};
+    for (int q : kUnknownXMinus) {
+        const int opp = kOpp[q];
+        const float eq_q = feq(q, rho_target, ux_target, uy_target, uz_target);
+        const float eq_opp = feq(opp, rho_target, ux_target, uy_target, uz_target);
+        f_local[q] = eq_q + (f_local[opp] - eq_opp);
+    }
+}
+
 void allocate_cpu_context(ContextState& ctx, int n) {
     ctx.n = n;
     ctx.cells = static_cast<std::size_t>(n) * n * n;
@@ -268,7 +298,7 @@ void collide(ContextState& ctx) {
             rho += fq;
             ux += fq * kCx[q]; uy += fq * kCy[q]; uz += fq * kCz[q];
         }
-        rho = clampf(rho, kRhoMin, kRhoMax);
+        // rho = clampf(rho, kRhoMin, kRhoMax);
         ux /= rho; uy /= rho; uz /= rho;
 
         float fx = 0.0f;
@@ -354,34 +384,37 @@ void stream_and_bounce(ContextState& ctx) {
         for (int y = 0; y < n; ++y) {
             for (int z = 0; z < n; ++z) {
                 const std::size_t cell = cell_index(x, y, z, n);
+                std::array<float, kQ> f_local{};
                 if (ctx.obstacle[cell]) {
                     for (int q = 0; q < kQ; ++q) {
-                        ctx.f[dist_index(cell, q, ctx.cells)] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+                        f_local[q] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
                     }
-                    continue;
+                } else {
+                    for (int q = 0; q < kQ; ++q) {
+                        const int sx = x - kCx[q];
+                        const int sy = y - kCy[q];
+                        const int sz = z - kCz[q];
+                        if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
+                            // Out-of-domain links use bounce-back; x-max outlet gets repaired by Zou/He below.
+                            f_local[q] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+                            continue;
+                        }
+
+                        const std::size_t src = cell_index(sx, sy, sz, n);
+                        if (ctx.obstacle[src]) {
+                            f_local[q] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+                        } else {
+                            f_local[q] = ctx.f_post[dist_index(src, q, ctx.cells)];
+                        }
+                    }
+
+                    if (x == n - 1 && y > 0 && y < n - 1 && z > 0 && z < n - 1) {
+                        apply_zou_he_pressure_outlet_xmax(ctx, cell, f_local);
+                    }
                 }
 
                 for (int q = 0; q < kQ; ++q) {
-                    const int sx = x - kCx[q], sy = y - kCy[q], sz = z - kCz[q];
-                    if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-                        const int cx = std::min(n - 1, std::max(0, (sx < 0 || sx >= n) ? (x + kCx[q]) : sx));
-                        const int cy = std::min(n - 1, std::max(0, (sy < 0 || sy >= n) ? (y + kCy[q]) : sy));
-                        const int cz = std::min(n - 1, std::max(0, (sz < 0 || sz >= n) ? (z + kCz[q]) : sz));
-                        const std::size_t src = cell_index(cx, cy, cz, n);
-                        if (ctx.obstacle[src]) {
-                            ctx.f[dist_index(cell, q, ctx.cells)] = ctx.f_post[dist_index(cell, q, ctx.cells)];
-                        } else {
-                            ctx.f[dist_index(cell, q, ctx.cells)] = ctx.f_post[dist_index(src, q, ctx.cells)];
-                        }
-                        continue;
-                    }
-
-                    const std::size_t src = cell_index(sx, sy, sz, n);
-                    if (ctx.obstacle[src]) {
-                        ctx.f[dist_index(cell, q, ctx.cells)] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
-                    } else {
-                        ctx.f[dist_index(cell, q, ctx.cells)] = ctx.f_post[dist_index(src, q, ctx.cells)];
-                    }
+                    ctx.f[dist_index(cell, q, ctx.cells)] = f_local[q];
                 }
             }
         }
@@ -443,8 +476,8 @@ __constant float W[KQ] = {
 };
 
 __constant int LES_ENABLED = 1;
-__constant float TAU_PLUS_BASE = 0.50003f;
-__constant float TAU_PLUS_MIN = 0.50003f;
+__constant float TAU_PLUS_BASE = 0.515f;
+__constant float TAU_PLUS_MIN = 0.515f;
 __constant float TAU_PLUS_MAX = 0.8f;
 __constant float SMAG_FACTOR = 0.03f;
 __constant float FAN_ACCEL = 0.0120f;
@@ -465,6 +498,34 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     float cu = 3.0f * (CX[q] * ux + CY[q] * uy + CZ[q] * uz);
     float uu = ux * ux + uy * uy + uz * uz;
     return W[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
+}
+
+inline void clamp_velocity(__private float* ux, __private float* uy, __private float* uz) {
+    float speed2 = (*ux) * (*ux) + (*uy) * (*uy) + (*uz) * (*uz);
+    if (speed2 > MAX_SPEED * MAX_SPEED) {
+        float scale = MAX_SPEED * rsqrt(speed2);
+        *ux *= scale;
+        *uy *= scale;
+        *uz *= scale;
+    }
+}
+
+inline void apply_zou_he_pressure_outlet_xmax(__private float* f_local, float rho_target, float uy_target, float uz_target) {
+    float ux_target = -1.0f + (
+        f_local[0] + f_local[3] + f_local[4] + f_local[5] + f_local[6] +
+        f_local[15] + f_local[16] + f_local[17] + f_local[18] +
+        2.0f * (f_local[1] + f_local[7] + f_local[9] + f_local[11] + f_local[13])
+    ) / rho_target;
+    clamp_velocity(&ux_target, &uy_target, &uz_target);
+
+    const int unknown_x_minus[5] = {2, 8, 10, 12, 14};
+    for (int i = 0; i < 5; ++i) {
+        int q = unknown_x_minus[i];
+        int opp = OPP[q];
+        float eq_q = feq(q, rho_target, ux_target, uy_target, uz_target);
+        float eq_opp = feq(opp, rho_target, ux_target, uy_target, uz_target);
+        f_local[q] = eq_q + (f_local[opp] - eq_opp);
+    }
 }
 
 kernel void init_distributions(
@@ -520,17 +581,8 @@ kernel void stream_collide_step(
 
         int sx = x - CX[q], sy = y - CY[q], sz = z - CZ[q];
         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-            int cx = clampi(sx, 0, n - 1), cy = clampi(sy, 0, n - 1), cz = clampi(sz, 0, n - 1);
-            if (sx < 0 || sx >= n) cx = clampi(x + CX[q], 0, n - 1);
-            if (sy < 0 || sy >= n) cy = clampi(y + CY[q], 0, n - 1);
-            if (sz < 0 || sz >= n) cz = clampi(z + CZ[q], 0, n - 1);
-            
-            int src = (cx * n + cy) * n + cz;
-            if (payload[src * in_ch + 0] > 0.5f) {
-                f_local[q] = f_read[opp * cells + cell]; 
-            } else {
-                f_local[q] = f_read[q * cells + src];
-            }
+            // Out-of-domain links use bounce-back; x-max outlet gets repaired by Zou/He below.
+            f_local[q] = f_read[opp * cells + cell];
         } else {
             int src = (sx * n + sy) * n + sz;
             if (payload[src * in_ch + 0] > 0.5f) {
@@ -546,6 +598,11 @@ kernel void stream_collide_step(
         return;
     }
 
+    if (x == n - 1 && y > 0 && y < n - 1 && z > 0 && z < n - 1) {
+        float rho_target = clampf(1.0f + clampf(payload[base + 8], P_MIN, P_MAX), RHO_MIN, RHO_MAX);
+        apply_zou_he_pressure_outlet_xmax(f_local, rho_target, payload[base + 6], payload[base + 7]);
+    }
+
     // 2. MACROSCOPIC MOMENTS
     float rho = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
     for (int q = 0; q < KQ; ++q) {
@@ -554,7 +611,7 @@ kernel void stream_collide_step(
         ux += fq * (float)CX[q]; uy += fq * (float)CY[q]; uz += fq * (float)CZ[q];
     }
 
-    rho = clampf(rho, RHO_MIN, RHO_MAX);
+    // rho = clampf(rho, RHO_MIN, RHO_MAX);
     float inv_rho = 1.0f / rho;
     ux *= inv_rho; uy *= inv_rho; uz *= inv_rho;
 
@@ -579,11 +636,11 @@ kernel void stream_collide_step(
     uy = mix(uy, payload[base + 6], STATE_NUDGE);
     uz = mix(uz, payload[base + 7], STATE_NUDGE);
 
-    float speed2 = ux * ux + uy * uy + uz * uz;
-    if (speed2 > MAX_SPEED * MAX_SPEED) {
-        float scale = MAX_SPEED * rsqrt(speed2);
-        ux *= scale; uy *= scale; uz *= scale;
-    }
+    // float speed2 = ux * ux + uy * uy + uz * uz;
+    // if (speed2 > MAX_SPEED * MAX_SPEED) {
+    //     float scale = MAX_SPEED * rsqrt(speed2);
+    //     ux *= scale; uy *= scale; uz *= scale;
+    // }
 
     // 4. COLLISION (RLBM + Smagorinsky)
     float qxx = 0.0f, qyy = 0.0f, qzz = 0.0f, qxy = 0.0f, qxz = 0.0f, qyz = 0.0f;
@@ -654,7 +711,7 @@ kernel void output_macro(
         ux += fq * (float)CX[q]; uy += fq * (float)CY[q]; uz += fq * (float)CZ[q];
     }
 
-    rho = clampf(rho, RHO_MIN, RHO_MAX);
+    // rho = clampf(rho, RHO_MIN, RHO_MAX);
     float inv_rho = 1.0f / rho;
     out[out_base + 0] = ux * inv_rho;
     out[out_base + 1] = uy * inv_rho;
