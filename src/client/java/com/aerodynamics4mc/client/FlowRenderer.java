@@ -101,7 +101,7 @@ public class FlowRenderer {
 
     private void renderVelocityField(VertexConsumer buffer, MatrixStack matrices) {
         int stride = Math.max(sampleStride, streamlineSampleStride);
-        float velScale = 0.9f;
+        float velScale = 5f;
         var entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
 
@@ -116,8 +116,8 @@ public class FlowRenderer {
                     }
 
                     Vec3d dir = vel.normalize();
-                    float lineLength = MathHelper.clamp(speedNorm * velScale, 0.05f, 0.9f);
-                    int color = getViridisColor(speedNorm);
+                    float lineLength = MathHelper.clamp(speedNorm * velScale, 0.05f, 10f);
+                    int color = getViridisColor(speedNorm * velScale);
                     int r = (color >> 16) & 0xFF;
                     int g = (color >> 8) & 0xFF;
                     int b = color & 0xFF;

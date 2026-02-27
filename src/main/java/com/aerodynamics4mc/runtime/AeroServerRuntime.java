@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
@@ -88,6 +89,9 @@ public final class AeroServerRuntime {
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int TICKS_PER_SECOND = 20;
+    private static final int PLAYER_VELOCITY_SYNC_MIN_INTERVAL_TICKS = 20;
+    private static final int PLAYER_VELOCITY_SYNC_MAX_INTERVAL_TICKS = 40;
+    private static final double PLAYER_VELOCITY_SYNC_ERROR_THRESHOLD_SQ = 2.5e-5;
 
     private enum BackendMode {
         SOCKET,
@@ -97,6 +101,8 @@ public final class AeroServerRuntime {
     private static final AeroServerRuntime INSTANCE = new AeroServerRuntime();
 
     private final Map<WindowKey, WindowState> windows = new HashMap<>();
+    private final Map<UUID, Integer> entityVelocitySyncTickById = new HashMap<>();
+    private final Map<UUID, Vec3d> entityLastSyncedVelocityById = new HashMap<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
 
     private boolean streamingEnabled = false;
@@ -243,6 +249,9 @@ public final class AeroServerRuntime {
         }
 
         tickCounter++;
+        if (tickCounter % (PLAYER_VELOCITY_SYNC_MAX_INTERVAL_TICKS * 2) == 0) {
+            pruneEntityVelocitySyncState();
+        }
         if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0) {
             refreshWindows(server);
         }
@@ -314,6 +323,8 @@ public final class AeroServerRuntime {
         secondWindowSimulationTicks = 0;
         simulationTicksPerSecond = 0.0f;
         lastMaxFlowSpeed = 0.0f;
+        entityVelocitySyncTickById.clear();
+        entityLastSyncedVelocityById.clear();
         for (WindowState window : windows.values()) {
             releaseWindow(window);
         }
@@ -674,8 +685,53 @@ public final class AeroServerRuntime {
                 continue;
             }
             entity.addVelocity(delta.x, delta.y, delta.z);
-            if (entity instanceof ServerPlayerEntity player) {
-                player.networkHandler.sendPacket(new EntityVelocityUpdateS2CPacket(player));
+            if (shouldSyncEntityVelocity(entity)) {
+                EntityVelocityUpdateS2CPacket packet = new EntityVelocityUpdateS2CPacket(entity);
+                if (entity instanceof ServerPlayerEntity player) {
+                    player.networkHandler.sendPacket(packet);
+                    world.getChunkManager().sendToOtherNearbyPlayers(player, packet);
+                } else {
+                    world.getChunkManager().sendToNearbyPlayers(entity, packet);
+                }
+            }
+        }
+    }
+
+    private boolean shouldSyncEntityVelocity(Entity entity) {
+        UUID entityId = entity.getUuid();
+        int now = tickCounter;
+        Integer lastTick = entityVelocitySyncTickById.get(entityId);
+        if (lastTick != null && (now - lastTick) < PLAYER_VELOCITY_SYNC_MIN_INTERVAL_TICKS) {
+            return false;
+        }
+
+        Vec3d currentVelocity = entity.getVelocity();
+        Vec3d lastSyncedVelocity = entityLastSyncedVelocityById.get(entityId);
+        boolean isFirstSync = lastTick == null || lastSyncedVelocity == null;
+        boolean timedOut = lastTick == null || (now - lastTick) >= PLAYER_VELOCITY_SYNC_MAX_INTERVAL_TICKS;
+        boolean driftExceeded = lastSyncedVelocity != null
+            && currentVelocity.squaredDistanceTo(lastSyncedVelocity) >= PLAYER_VELOCITY_SYNC_ERROR_THRESHOLD_SQ;
+
+        if (!isFirstSync && !timedOut && !driftExceeded) {
+            return false;
+        }
+
+        entityVelocitySyncTickById.put(entityId, now);
+        entityLastSyncedVelocityById.put(entityId, currentVelocity);
+        return true;
+    }
+
+    private void pruneEntityVelocitySyncState() {
+        if (entityVelocitySyncTickById.isEmpty()) {
+            return;
+        }
+        int staleBeforeTick = tickCounter - (PLAYER_VELOCITY_SYNC_MAX_INTERVAL_TICKS * 4);
+        Iterator<Map.Entry<UUID, Integer>> iterator = entityVelocitySyncTickById.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<UUID, Integer> entry = iterator.next();
+            if (entry.getValue() < staleBeforeTick) {
+                entityLastSyncedVelocityById.remove(entry.getKey());
+                iterator.remove();
             }
         }
     }
