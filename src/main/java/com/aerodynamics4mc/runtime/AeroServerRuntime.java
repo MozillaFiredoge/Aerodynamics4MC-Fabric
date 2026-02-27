@@ -108,6 +108,7 @@ public final class AeroServerRuntime {
     private boolean streamingEnabled = false;
     private boolean debugEnabled = false;
     private float maxWindSpeed = INFLOW_SPEED;
+    private boolean singleplayerClientMasterEnabled = false;
     private int tickCounter = 0;
     private long simulationTicks = 0L;
     private int secondWindowTotalTicks = 0;
@@ -125,9 +126,11 @@ public final class AeroServerRuntime {
     public static void init() {
         ServerTickEvents.END_SERVER_TICK.register(INSTANCE::onServerTick);
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
-            INSTANCE.sendStateToPlayer(handler.player);
-            INSTANCE.sendFlowSnapshotToPlayer(handler.player);
+            INSTANCE.sendStateToPlayer(handler.player, server);
+            INSTANCE.broadcastState(server);
+            INSTANCE.sendFlowSnapshotToPlayer(handler.player, server);
         });
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> INSTANCE.broadcastState(server));
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> INSTANCE.shutdownAll());
         CommandRegistrationCallback.EVENT.register(INSTANCE::registerCommands);
     }
@@ -183,6 +186,7 @@ public final class AeroServerRuntime {
                     .executes(ctx -> {
                         switchBackend(BackendMode.SOCKET);
                         feedback(ctx.getSource(), "Backend set to socket");
+                        broadcastState(ctx.getSource().getServer());
                         return 1;
                     }))
                 .then(CommandManager.literal("native")
@@ -198,6 +202,7 @@ public final class AeroServerRuntime {
                         switchBackend(BackendMode.NATIVE);
                         feedback(ctx.getSource(), "Backend set to native (" + nativeBackend.runtimeInfo() + ")");
                         feedback(ctx.getSource(), "Native timing: " + nativeBackend.timingInfo());
+                        broadcastState(ctx.getSource().getServer());
                         return 1;
                     }))
                 .then(CommandManager.literal("status")
@@ -212,6 +217,36 @@ public final class AeroServerRuntime {
                         }
                         return 1;
                     })))
+            .then(CommandManager.literal("clientmaster")
+                .then(CommandManager.literal("on")
+                    .executes(ctx -> {
+                        singleplayerClientMasterEnabled = true;
+                        boolean active = isClientMasterActive(ctx.getSource().getServer());
+                        feedback(
+                            ctx.getSource(),
+                            "Singleplayer client master enabled" + (active ? " (active)" : " (inactive: not singleplayer)")
+                        );
+                        broadcastState(ctx.getSource().getServer());
+                        return 1;
+                    }))
+                .then(CommandManager.literal("off")
+                    .executes(ctx -> {
+                        singleplayerClientMasterEnabled = false;
+                        feedback(ctx.getSource(), "Singleplayer client master disabled");
+                        broadcastState(ctx.getSource().getServer());
+                        return 1;
+                    }))
+                .then(CommandManager.literal("status")
+                    .executes(ctx -> {
+                        boolean active = isClientMasterActive(ctx.getSource().getServer());
+                        feedback(
+                            ctx.getSource(),
+                            "Singleplayer client master="
+                                + (singleplayerClientMasterEnabled ? "enabled" : "disabled")
+                                + " active=" + active
+                        );
+                        return 1;
+                    })))
             .then(CommandManager.literal("status")
                 .executes(ctx -> {
                     feedback(
@@ -223,6 +258,8 @@ public final class AeroServerRuntime {
                             + " windows=" + windows.size()
                             + " simTicks=" + simulationTicks
                             + " simTickPerSec=" + format2(simulationTicksPerSecond)
+                            + " clientMaster=" + (singleplayerClientMasterEnabled ? "on" : "off")
+                            + "(active=" + isClientMasterActive(ctx.getSource().getServer()) + ")"
                             + " maxFlow=" + format2(lastMaxFlowSpeed)
                     );
                     if (!lastSolverError.isEmpty()) {
@@ -252,6 +289,22 @@ public final class AeroServerRuntime {
         if (tickCounter % (PLAYER_VELOCITY_SYNC_MAX_INTERVAL_TICKS * 2) == 0) {
             pruneEntityVelocitySyncState();
         }
+
+        boolean clientMasterActive = isClientMasterActive(server);
+        if (clientMasterActive) {
+            if (!windows.isEmpty()) {
+                for (WindowState window : windows.values()) {
+                    releaseWindow(window);
+                }
+                windows.clear();
+            }
+            lastMaxFlowSpeed = 0.0f;
+            entityVelocitySyncTickById.clear();
+            entityLastSyncedVelocityById.clear();
+            updateSimulationRate(false);
+            return;
+        }
+
         if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0) {
             refreshWindows(server);
         }
@@ -283,7 +336,7 @@ public final class AeroServerRuntime {
                 steppedThisTick = true;
                 lastSolverError = "";
 
-                applyForces(world, key.origin(), response, FORCE_STRENGTH);
+                applyForces(world, key.origin(), response, FORCE_STRENGTH, clientMasterActive);
                 if (shouldSyncFlow) {
                     syncFlowToPlayers(world, key.origin(), response, streamlineSampleStride);
                 }
@@ -330,6 +383,12 @@ public final class AeroServerRuntime {
         }
         windows.clear();
         nativeBackend.shutdown();
+    }
+
+    private boolean isClientMasterActive(MinecraftServer server) {
+        return singleplayerClientMasterEnabled
+            && !server.isDedicated()
+            && server.getPlayerManager().getPlayerList().size() == 1;
     }
 
     private void shutdownAll() {
@@ -666,7 +725,7 @@ public final class AeroServerRuntime {
         lastMaxFlowSpeed = maxSpeedThisStep;
     }
 
-    private void applyForces(ServerWorld world, BlockPos origin, float[] response, double strength) {
+    private void applyForces(ServerWorld world, BlockPos origin, float[] response, double strength, boolean clientMasterActive) {
         Box box = new Box(
             origin.getX(),
             origin.getY(),
@@ -677,9 +736,14 @@ public final class AeroServerRuntime {
         );
 
         for (Entity entity : world.getEntitiesByClass(Entity.class, box, e -> e.isAlive() && !e.isSpectator())) {
+            boolean isPlayer = entity instanceof ServerPlayerEntity;
+            if (clientMasterActive && isPlayer) {
+                // Singleplayer client-master mode: player acceleration is predicted client-side.
+                continue;
+            }
             Vec3d center = entity.getBoundingBox().getCenter();
             Vec3d velocity = sampleVelocity(response, origin, center);
-            double forceScale = entity instanceof ServerPlayerEntity ? PLAYER_FORCE_STRENGTH : strength;
+            double forceScale = isPlayer ? PLAYER_FORCE_STRENGTH : strength;
             Vec3d delta = velocity.multiply(forceScale);
             if (delta.lengthSquared() < 1e-10) {
                 continue;
@@ -856,21 +920,31 @@ public final class AeroServerRuntime {
         }
     }
 
-    private void sendStateToPlayer(ServerPlayerEntity player) {
+    private void sendStateToPlayer(ServerPlayerEntity player, MinecraftServer server) {
         ServerPlayNetworking.send(
             player,
-            new AeroRuntimeStatePayload(streamingEnabled, debugEnabled, maxWindSpeed, streamlineSampleStride)
+            new AeroRuntimeStatePayload(
+                streamingEnabled,
+                debugEnabled,
+                maxWindSpeed,
+                streamlineSampleStride,
+                isClientMasterActive(server),
+                backendModeId(backendMode)
+            )
         );
     }
 
     private void broadcastState(MinecraftServer server) {
         for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            sendStateToPlayer(player);
+            sendStateToPlayer(player, server);
         }
     }
 
-    private void sendFlowSnapshotToPlayer(ServerPlayerEntity player) {
+    private void sendFlowSnapshotToPlayer(ServerPlayerEntity player, MinecraftServer server) {
         if (!debugEnabled) {
+            return;
+        }
+        if (server != null && isClientMasterActive(server)) {
             return;
         }
 
@@ -972,6 +1046,10 @@ public final class AeroServerRuntime {
 
     private String format2(float value) {
         return String.format(Locale.ROOT, "%.2f", value);
+    }
+
+    private int backendModeId(BackendMode mode) {
+        return mode == BackendMode.NATIVE ? 1 : 0;
     }
 
     private record WindowKey(RegistryKey<World> worldKey, BlockPos origin) {

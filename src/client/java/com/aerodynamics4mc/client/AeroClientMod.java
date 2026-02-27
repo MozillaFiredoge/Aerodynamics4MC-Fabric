@@ -20,14 +20,19 @@ import net.minecraft.util.math.Vec3d;
 public class AeroClientMod implements ClientModInitializer {
     private static final int GRID_SIZE = 128;
     private static final float DEFAULT_MAX_INFLOW_SPEED = 8.0f;
+    private static final int DEFAULT_BACKEND_MODE = 1;
+    private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final double PLAYER_PREDICTION_FORCE_STRENGTH = 0.02;
 
-    private final Map<WindowKey, WindowView> windows = new HashMap<>();
+    private final Map<WindowKey, WindowView> remoteWindows = new HashMap<>();
+    private final ClientFluidRuntime clientFluidRuntime = new ClientFluidRuntime(GRID_SIZE);
 
     private boolean streamingEnabled = false;
     private boolean debugEnabled = false;
+    private boolean clientPlayerAuthority = false;
     private float maxWindSpeed = DEFAULT_MAX_INFLOW_SPEED;
-    private int streamlineSampleStride = 4;
+    private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
+    private int backendMode = DEFAULT_BACKEND_MODE;
 
     @Override
     public void onInitializeClient() {
@@ -40,6 +45,10 @@ public class AeroClientMod implements ClientModInitializer {
 
     private void onClientTick(MinecraftClient client) {
         if (!streamingEnabled || client.world == null || client.player == null || client.player.isSpectator()) {
+            return;
+        }
+        if (clientPlayerAuthority) {
+            clientFluidRuntime.tick(client);
             return;
         }
 
@@ -66,9 +75,13 @@ public class AeroClientMod implements ClientModInitializer {
         if (client.world == null) {
             return;
         }
+        if (clientPlayerAuthority) {
+            clientFluidRuntime.render(context);
+            return;
+        }
 
         Identifier currentDimension = client.world.getRegistryKey().getValue();
-        for (Map.Entry<WindowKey, WindowView> entry : windows.entrySet()) {
+        for (Map.Entry<WindowKey, WindowView> entry : remoteWindows.entrySet()) {
             if (!entry.getKey().dimensionId().equals(currentDimension)) {
                 continue;
             }
@@ -83,26 +96,42 @@ public class AeroClientMod implements ClientModInitializer {
         context.client().execute(() -> {
             streamingEnabled = payload.streamingEnabled();
             debugEnabled = payload.debugEnabled();
+            clientPlayerAuthority = payload.clientPlayerAuthority();
             maxWindSpeed = Math.max(1e-6f, payload.maxWindSpeed());
             streamlineSampleStride = sanitizeStride(payload.streamlineStride());
+            backendMode = payload.backendMode();
+            clientFluidRuntime.setMaxWindSpeed(maxWindSpeed);
+            clientFluidRuntime.setStreamlineSampleStride(streamlineSampleStride);
+            clientFluidRuntime.setBackendModeId(backendMode);
 
-            for (WindowView window : windows.values()) {
+            for (WindowView window : remoteWindows.values()) {
                 FlowRenderer renderer = window.renderer();
                 renderer.setMaxInflowSpeed(maxWindSpeed);
                 renderer.setStreamlineSampleStride(streamlineSampleStride);
             }
 
             if (!streamingEnabled) {
-                windows.clear();
+                remoteWindows.clear();
+                clientFluidRuntime.clear();
+                return;
+            }
+
+            if (clientPlayerAuthority) {
+                remoteWindows.clear();
+            } else {
+                clientFluidRuntime.clear();
             }
         });
     }
 
     private void onFlowField(AeroFlowPayload payload, ClientPlayNetworking.Context context) {
         context.client().execute(() -> {
+            if (clientPlayerAuthority) {
+                return;
+            }
             int stride = sanitizeStride(payload.sampleStride());
             WindowKey key = new WindowKey(payload.dimensionId(), payload.origin());
-            WindowView view = windows.computeIfAbsent(
+            WindowView view = remoteWindows.computeIfAbsent(
                 key,
                 ignored -> new WindowView(new FlowRenderer(GRID_SIZE, maxWindSpeed))
             );
@@ -114,11 +143,11 @@ public class AeroClientMod implements ClientModInitializer {
     }
 
     private int sanitizeStride(int requested) {
-        return (requested == 1 || requested == 2 || requested == 4 || requested == 8) ? requested : 4;
+        return (requested == 1 || requested == 2 || requested == 4 || requested == 8) ? requested : DEFAULT_STREAMLINE_STRIDE;
     }
 
     private WindowView findWindowView(Identifier dimensionId, Vec3d worldPos) {
-        for (Map.Entry<WindowKey, WindowView> entry : windows.entrySet()) {
+        for (Map.Entry<WindowKey, WindowView> entry : remoteWindows.entrySet()) {
             WindowKey key = entry.getKey();
             if (!key.dimensionId().equals(dimensionId)) {
                 continue;
@@ -137,11 +166,14 @@ public class AeroClientMod implements ClientModInitializer {
     }
 
     private void clearState() {
-        windows.clear();
+        remoteWindows.clear();
+        clientFluidRuntime.clear();
         streamingEnabled = false;
         debugEnabled = false;
+        clientPlayerAuthority = false;
         maxWindSpeed = DEFAULT_MAX_INFLOW_SPEED;
-        streamlineSampleStride = 4;
+        streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
+        backendMode = DEFAULT_BACKEND_MODE;
     }
 
     private record WindowKey(Identifier dimensionId, BlockPos origin) {

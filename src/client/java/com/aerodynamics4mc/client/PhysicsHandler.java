@@ -22,7 +22,7 @@ import java.util.List;
 import java.util.UUID;
 
 public class PhysicsHandler {
-    private static final double NON_PLAYER_FORCE_MULTIPLIER = 5.0;
+    private static final double NON_PLAYER_FORCE_MULTIPLIER = 1.0;
     private final FlowRenderer flowRenderer;
     private final int gridSize;
     private BlockPos origin;

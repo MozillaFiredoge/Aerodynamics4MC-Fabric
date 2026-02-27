@@ -49,6 +49,14 @@ public class FlowRenderer {
     }
 
     public void updateFlowField(BlockPos origin, int sampleStride, float[] data) {
+        updateFlowFieldInternal(origin, sampleStride, data, true);
+    }
+
+    public void updateFlowFieldNoCopy(BlockPos origin, int sampleStride, float[] data) {
+        updateFlowFieldInternal(origin, sampleStride, data, false);
+    }
+
+    private void updateFlowFieldInternal(BlockPos origin, int sampleStride, float[] data, boolean copyData) {
         if (origin == null || data == null || data.length == 0 || data.length % CHANNELS != 0) {
             return;
         }
@@ -62,6 +70,12 @@ public class FlowRenderer {
         this.origin = origin;
         this.sampleStride = Math.max(1, sampleStride);
         this.sampledGridSize = n;
+
+        if (!copyData) {
+            flowField = data;
+            hasFlowData = true;
+            return;
+        }
 
         if (flowField.length != data.length) {
             flowField = new float[data.length];

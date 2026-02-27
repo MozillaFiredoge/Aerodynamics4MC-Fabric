@@ -11,7 +11,9 @@ public record AeroRuntimeStatePayload(
     boolean streamingEnabled,
     boolean debugEnabled,
     float maxWindSpeed,
-    int streamlineStride
+    int streamlineStride,
+    boolean clientPlayerAuthority,
+    int backendMode
 ) implements CustomPayload {
     public static final CustomPayload.Id<AeroRuntimeStatePayload> ID =
         new CustomPayload.Id<>(Identifier.of(ModBlocks.MOD_ID, "runtime_state"));
@@ -23,6 +25,8 @@ public record AeroRuntimeStatePayload(
             buf.readBoolean(),
             buf.readBoolean(),
             buf.readFloat(),
+            buf.readVarInt(),
+            buf.readBoolean(),
             buf.readVarInt()
         );
     }
@@ -32,6 +36,8 @@ public record AeroRuntimeStatePayload(
         buf.writeBoolean(debugEnabled);
         buf.writeFloat(maxWindSpeed);
         buf.writeVarInt(streamlineStride);
+        buf.writeBoolean(clientPlayerAuthority);
+        buf.writeVarInt(backendMode);
     }
 
     @Override

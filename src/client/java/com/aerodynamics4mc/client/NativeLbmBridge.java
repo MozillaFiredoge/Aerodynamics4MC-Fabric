@@ -57,11 +57,26 @@ public final class NativeLbmBridge {
         }
         int cellCount = grid * grid * grid;
         float[] output = new float[cellCount * outputCh];
-        boolean ok = nativeStep(payload, grid, contextKey, output);
+        boolean ok = step(payload, grid, outputCh, contextKey, output);
         if (!ok) {
             return null;
         }
         return output;
+    }
+
+    public synchronized boolean step(byte[] payload, int grid, int outputCh, long contextKey, float[] output) {
+        if (!initialized) {
+            return false;
+        }
+        int cellCount = grid * grid * grid;
+        if (output == null || output.length != cellCount * outputCh) {
+            return false;
+        }
+        boolean ok = nativeStep(payload, grid, contextKey, output);
+        if (!ok) {
+            return false;
+        }
+        return true;
     }
 
     public synchronized void shutdown() {
