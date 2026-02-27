@@ -56,14 +56,17 @@ constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
 // TRT 被彻底移除，替换为基于二阶 Hermite 的 RLBM 正则化模型
-constexpr float kTauPlus = 0.515f;
-constexpr float kTauPlusMin = 0.515f;
-constexpr float kTauPlusMax = 0.80f;
-constexpr float kSmagorinskyC = 0.10f;
+constexpr float kTauPlus = 0.508f;
+constexpr float kTauPlusMin = 0.503f;
+constexpr float kTauPlusMax = 0.62f;
+constexpr float kSmagorinskyC = 0.08f;
 constexpr float kSmagorinskyC2 = kSmagorinskyC * kSmagorinskyC;
-constexpr float kSmagorinskyFactor = 3.0f * kSmagorinskyC2;
+constexpr float kLesNutToNu0Max = 1.5f;
+constexpr int kLesWallDampingLayers = 2;
+constexpr float kLesWallDampingMin = 0.10f;
+constexpr float kObstacleBounceBlend = 0.30f;
 // constexpr float kLesSpeedThreshold = 0.0f;
-constexpr float kFanAccel = 0.0120f;
+constexpr float kFanAccel = 0.0140f;
 constexpr float kFanForceScalePerSpeed = 0.5f;
 constexpr float kFanForceScaleMax = 4.0f;
 constexpr float kFanPulseAmp = 0.05f;
@@ -186,6 +189,58 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     const float cu = 3.0f * (kCx[q] * ux + kCy[q] * uy + kCz[q] * uz);
     const float uu = ux * ux + uy * uy + uz * uz;
     return kW[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
+}
+
+inline void decode_cell(std::size_t cell, int n, int& x, int& y, int& z) {
+    const int yz = n * n;
+    x = static_cast<int>(cell / static_cast<std::size_t>(yz));
+    const int rem = static_cast<int>(cell - static_cast<std::size_t>(x) * yz);
+    y = rem / n;
+    z = rem - y * n;
+}
+
+inline bool solid_or_oob(const ContextState& ctx, int x, int y, int z) {
+    if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) return true;
+    return ctx.obstacle[cell_index(x, y, z, ctx.n)] != 0;
+}
+
+inline float les_wall_damping_factor(const ContextState& ctx, int x, int y, int z) {
+    if (kLesWallDampingLayers <= 0) return 1.0f;
+
+    // Treat outer-domain boundary as a virtual wall for LES damping.
+    if (solid_or_oob(ctx, x + 1, y, z) || solid_or_oob(ctx, x - 1, y, z)
+        || solid_or_oob(ctx, x, y + 1, z) || solid_or_oob(ctx, x, y - 1, z)
+        || solid_or_oob(ctx, x, y, z + 1) || solid_or_oob(ctx, x, y, z - 1)) {
+        return kLesWallDampingMin;
+    }
+
+    if (kLesWallDampingLayers >= 2) {
+        if (solid_or_oob(ctx, x + 2, y, z) || solid_or_oob(ctx, x - 2, y, z)
+            || solid_or_oob(ctx, x, y + 2, z) || solid_or_oob(ctx, x, y - 2, z)
+            || solid_or_oob(ctx, x, y, z + 2) || solid_or_oob(ctx, x, y, z - 2)) {
+            return 0.5f * (1.0f + kLesWallDampingMin);
+        }
+    }
+
+    return 1.0f;
+}
+
+inline float obstacle_bounce_value(
+    const ContextState& ctx, std::size_t cell, int x, int y, int z, int q
+) {
+    const float bounced = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+    if (kObstacleBounceBlend <= 0.0f) return bounced;
+
+    const int s2x = x - 2 * kCx[q];
+    const int s2y = y - 2 * kCy[q];
+    const int s2z = z - 2 * kCz[q];
+    if (s2x < 0 || s2y < 0 || s2z < 0 || s2x >= ctx.n || s2y >= ctx.n || s2z >= ctx.n) return bounced;
+
+    const std::size_t src2 = cell_index(s2x, s2y, s2z, ctx.n);
+    if (ctx.obstacle[src2]) return bounced;
+
+    const float upstream = ctx.f_post[dist_index(src2, q, ctx.cells)];
+    return bounced + kObstacleBounceBlend * (upstream - bounced);
 }
 
 void allocate_cpu_context(ContextState& ctx, int n) {
@@ -319,10 +374,18 @@ void collide(ContextState& ctx) {
 
         float tau_local = kTauPlus;
         if (kEnableSmagorinskyLES) {
+            int cx = 0, cy = 0, cz = 0;
+            decode_cell(cell, ctx.n, cx, cy, cz);
+
             float q_norm2 = qxx * qxx + qyy * qyy + qzz * qzz + 2.0f * (qxy * qxy + qxz * qxz + qyz * qyz);
             float q_mag = std::sqrt(std::max(0.0f, q_norm2));
             float s_mag = (3.0f / (2.0f * std::max(1e-6f, rho) * kTauPlus)) * q_mag;
-            tau_local = clampf(kTauPlus + kSmagorinskyFactor * s_mag, kTauPlusMin, kTauPlusMax);
+
+            const float nu0 = (kTauPlus - 0.5f) / 3.0f;
+            const float wall_damp = les_wall_damping_factor(ctx, cx, cy, cz);
+            float nu_t = kSmagorinskyC2 * s_mag * wall_damp;
+            nu_t = std::min(nu_t, kLesNutToNu0Max * nu0);
+            tau_local = clampf(0.5f + 3.0f * (nu0 + nu_t), kTauPlusMin, kTauPlusMax);
         }
         float omega = 1.0f / tau_local;
         float uf = ux * fx + uy * fy + uz * fz;
@@ -374,7 +437,7 @@ void stream_and_bounce(ContextState& ctx) {
                             if (sz < 0 || sz >= n) gz = std::min(n - 1, std::max(0, z + kCz[q]));
                             const std::size_t src = cell_index(gx, gy, gz, n);
                             if (ctx.obstacle[src]) {
-                                f_local[q] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+                                f_local[q] = obstacle_bounce_value(ctx, cell, x, y, z, q);
                             } else {
                                 f_local[q] = ctx.f_post[dist_index(src, q, ctx.cells)];
                             }
@@ -383,7 +446,7 @@ void stream_and_bounce(ContextState& ctx) {
 
                         const std::size_t src = cell_index(sx, sy, sz, n);
                         if (ctx.obstacle[src]) {
-                            f_local[q] = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
+                            f_local[q] = obstacle_bounce_value(ctx, cell, x, y, z, q);
                         } else {
                             f_local[q] = ctx.f_post[dist_index(src, q, ctx.cells)];
                         }
@@ -454,11 +517,15 @@ __constant float W[KQ] = {
 };
 
 __constant int LES_ENABLED = 1;
-__constant float TAU_PLUS_BASE = 0.515f;
-__constant float TAU_PLUS_MIN = 0.515f;
-__constant float TAU_PLUS_MAX = 0.8f;
-__constant float SMAG_FACTOR = 0.03f;
-__constant float FAN_ACCEL = 0.0120f;
+__constant float TAU_PLUS_BASE = 0.508f;
+__constant float TAU_PLUS_MIN = 0.503f;
+__constant float TAU_PLUS_MAX = 0.62f;
+__constant float SMAG_C2 = 0.0064f;
+__constant float LES_NUT_TO_NU0_MAX = 1.5f;
+__constant int LES_WALL_DAMPING_LAYERS = 2;
+__constant float LES_WALL_DAMPING_MIN = 0.10f;
+__constant float OBSTACLE_BOUNCE_BLEND = 0.30f;
+__constant float FAN_ACCEL = 0.0140f;
 __constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
 __constant float FAN_FORCE_SCALE_MAX = 4.0f;
 __constant float FAN_PULSE_AMP = 0.05f;
@@ -476,6 +543,51 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     float cu = 3.0f * (CX[q] * ux + CY[q] * uy + CZ[q] * uz);
     float uu = ux * ux + uy * uy + uz * uz;
     return W[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
+}
+
+inline int solid_or_oob(__global const float* payload, int in_ch, int n, int x, int y, int z) {
+    if (x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n) return 1;
+    int cell = (x * n + y) * n + z;
+    return payload[cell * in_ch + 0] > 0.5f;
+}
+
+inline float les_wall_damping(__global const float* payload, int in_ch, int n, int x, int y, int z) {
+    if (LES_WALL_DAMPING_LAYERS <= 0) return 1.0f;
+
+    if (solid_or_oob(payload, in_ch, n, x + 1, y, z) || solid_or_oob(payload, in_ch, n, x - 1, y, z)
+        || solid_or_oob(payload, in_ch, n, x, y + 1, z) || solid_or_oob(payload, in_ch, n, x, y - 1, z)
+        || solid_or_oob(payload, in_ch, n, x, y, z + 1) || solid_or_oob(payload, in_ch, n, x, y, z - 1)) {
+        return LES_WALL_DAMPING_MIN;
+    }
+
+    if (LES_WALL_DAMPING_LAYERS >= 2) {
+        if (solid_or_oob(payload, in_ch, n, x + 2, y, z) || solid_or_oob(payload, in_ch, n, x - 2, y, z)
+            || solid_or_oob(payload, in_ch, n, x, y + 2, z) || solid_or_oob(payload, in_ch, n, x, y - 2, z)
+            || solid_or_oob(payload, in_ch, n, x, y, z + 2) || solid_or_oob(payload, in_ch, n, x, y, z - 2)) {
+            return 0.5f * (1.0f + LES_WALL_DAMPING_MIN);
+        }
+    }
+
+    return 1.0f;
+}
+
+inline float obstacle_bounce_value(
+    __global const float* f_read, __global const float* payload,
+    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp
+) {
+    float bounced = f_read[opp * cells + cell];
+    if (OBSTACLE_BOUNCE_BLEND <= 0.0f) return bounced;
+
+    int s2x = x - 2 * CX[q];
+    int s2y = y - 2 * CY[q];
+    int s2z = z - 2 * CZ[q];
+    if (s2x < 0 || s2y < 0 || s2z < 0 || s2x >= n || s2y >= n || s2z >= n) return bounced;
+
+    int src2 = (s2x * n + s2y) * n + s2z;
+    if (payload[src2 * in_ch + 0] > 0.5f) return bounced;
+
+    float upstream = f_read[q * cells + src2];
+    return bounced + OBSTACLE_BOUNCE_BLEND * (upstream - bounced);
 }
 
 kernel void init_distributions(
@@ -540,14 +652,14 @@ kernel void stream_collide_step(
             if (sz < 0 || sz >= n) gz = clampi(z + CZ[q], 0, n - 1);
             int src = (gx * n + gy) * n + gz;
             if (payload[src * in_ch + 0] > 0.5f) {
-                f_local[q] = f_read[opp * cells + cell];
+                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, opp);
             } else {
                 f_local[q] = f_read[q * cells + src];
             }
         } else {
             int src = (sx * n + sy) * n + sz;
             if (payload[src * in_ch + 0] > 0.5f) {
-                f_local[q] = f_read[opp * cells + cell];
+                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, opp);
             } else {
                 f_local[q] = f_read[q * cells + src];
             }
@@ -623,7 +735,12 @@ kernel void stream_collide_step(
         float q_norm2 = qxx * qxx + qyy * qyy + qzz * qzz + 2.0f * (qxy * qxy + qxz * qxz + qyz * qyz);
         float q_mag = sqrt(fmax(0.0f, q_norm2));
         float s_mag = (3.0f / (2.0f * fmax(1e-6f, rho) * TAU_PLUS_BASE)) * q_mag;
-        tau_local = clampf(TAU_PLUS_BASE + SMAG_FACTOR * s_mag, TAU_PLUS_MIN, TAU_PLUS_MAX);
+
+        float nu0 = (TAU_PLUS_BASE - 0.5f) / 3.0f;
+        float nu_t = SMAG_C2 * s_mag;
+        nu_t *= les_wall_damping(payload, in_ch, n, x, y, z);
+        nu_t = fmin(nu_t, LES_NUT_TO_NU0_MAX * nu0);
+        tau_local = clampf(0.5f + 3.0f * (nu0 + nu_t), TAU_PLUS_MIN, TAU_PLUS_MAX);
     }
     float omega = 1.0f / tau_local;
     float uf = ux * fx + uy * fy + uz * fz;

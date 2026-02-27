@@ -109,6 +109,9 @@ public final class AeroServerRuntime {
     private boolean debugEnabled = false;
     private float maxWindSpeed = INFLOW_SPEED;
     private boolean singleplayerClientMasterEnabled = false;
+    private boolean renderVelocityVectorsEnabled = true;
+    private boolean renderStreamlinesEnabled = true;
+    private int clientMasterDetectedWindows = 0;
     private int tickCounter = 0;
     private long simulationTicks = 0L;
     private int secondWindowTotalTicks = 0;
@@ -249,13 +252,18 @@ public final class AeroServerRuntime {
                     })))
             .then(CommandManager.literal("status")
                 .executes(ctx -> {
+                    int statusWindowCount = isClientMasterActive(ctx.getSource().getServer())
+                        ? clientMasterDetectedWindows
+                        : windows.size();
                     feedback(
                         ctx.getSource(),
                         "Status streaming=" + streamingEnabled
                             + " debug=" + debugEnabled
                             + " maxspeed=" + format2(maxWindSpeed)
                             + " stride=" + streamlineSampleStride
-                            + " windows=" + windows.size()
+                            + " windows=" + statusWindowCount
+                            + " renderVectors=" + renderVelocityVectorsEnabled
+                            + " renderStreamlines=" + renderStreamlinesEnabled
                             + " simTicks=" + simulationTicks
                             + " simTickPerSec=" + format2(simulationTicksPerSecond)
                             + " clientMaster=" + (singleplayerClientMasterEnabled ? "on" : "off")
@@ -274,6 +282,47 @@ public final class AeroServerRuntime {
                     broadcastState(ctx.getSource().getServer());
                     return 1;
                 }))
+            .then(CommandManager.literal("render")
+                .then(CommandManager.literal("vectors")
+                    .then(CommandManager.literal("on")
+                        .executes(ctx -> {
+                            renderVelocityVectorsEnabled = true;
+                            feedback(ctx.getSource(), "Velocity vectors rendering enabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("off")
+                        .executes(ctx -> {
+                            renderVelocityVectorsEnabled = false;
+                            feedback(ctx.getSource(), "Velocity vectors rendering disabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("status")
+                        .executes(ctx -> {
+                            feedback(ctx.getSource(), "Velocity vectors rendering=" + renderVelocityVectorsEnabled);
+                            return 1;
+                        })))
+                .then(CommandManager.literal("streamlines")
+                    .then(CommandManager.literal("on")
+                        .executes(ctx -> {
+                            renderStreamlinesEnabled = true;
+                            feedback(ctx.getSource(), "Streamlines rendering enabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("off")
+                        .executes(ctx -> {
+                            renderStreamlinesEnabled = false;
+                            feedback(ctx.getSource(), "Streamlines rendering disabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("status")
+                        .executes(ctx -> {
+                            feedback(ctx.getSource(), "Streamlines rendering=" + renderStreamlinesEnabled);
+                            return 1;
+                        }))))
         );
     }
 
@@ -292,6 +341,9 @@ public final class AeroServerRuntime {
 
         boolean clientMasterActive = isClientMasterActive(server);
         if (clientMasterActive) {
+            if (tickCounter == 1 || tickCounter % WINDOW_REFRESH_TICKS == 0) {
+                clientMasterDetectedWindows = scanFanSources(server).size();
+            }
             if (!windows.isEmpty()) {
                 for (WindowState window : windows.values()) {
                     releaseWindow(window);
@@ -308,6 +360,7 @@ public final class AeroServerRuntime {
         if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0) {
             refreshWindows(server);
         }
+        clientMasterDetectedWindows = windows.size();
 
         if (windows.isEmpty()) {
             updateSimulationRate(false);
@@ -382,6 +435,7 @@ public final class AeroServerRuntime {
             releaseWindow(window);
         }
         windows.clear();
+        clientMasterDetectedWindows = 0;
         nativeBackend.shutdown();
     }
 
@@ -929,7 +983,9 @@ public final class AeroServerRuntime {
                 maxWindSpeed,
                 streamlineSampleStride,
                 isClientMasterActive(server),
-                backendModeId(backendMode)
+                backendModeId(backendMode),
+                renderVelocityVectorsEnabled,
+                renderStreamlinesEnabled
             )
         );
     }

@@ -33,6 +33,8 @@ public class AeroClientMod implements ClientModInitializer {
     private float maxWindSpeed = DEFAULT_MAX_INFLOW_SPEED;
     private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
     private int backendMode = DEFAULT_BACKEND_MODE;
+    private boolean renderVelocityVectors = true;
+    private boolean renderStreamlines = true;
 
     @Override
     public void onInitializeClient() {
@@ -88,6 +90,8 @@ public class AeroClientMod implements ClientModInitializer {
             FlowRenderer renderer = entry.getValue().renderer();
             renderer.setMaxInflowSpeed(maxWindSpeed);
             renderer.setStreamlineSampleStride(streamlineSampleStride);
+            renderer.setRenderVelocityVectors(renderVelocityVectors);
+            renderer.setRenderStreamlines(renderStreamlines);
             renderer.render(context);
         }
     }
@@ -100,14 +104,20 @@ public class AeroClientMod implements ClientModInitializer {
             maxWindSpeed = Math.max(1e-6f, payload.maxWindSpeed());
             streamlineSampleStride = sanitizeStride(payload.streamlineStride());
             backendMode = payload.backendMode();
+            renderVelocityVectors = payload.renderVelocityVectors();
+            renderStreamlines = payload.renderStreamlines();
             clientFluidRuntime.setMaxWindSpeed(maxWindSpeed);
             clientFluidRuntime.setStreamlineSampleStride(streamlineSampleStride);
             clientFluidRuntime.setBackendModeId(backendMode);
+            clientFluidRuntime.setRenderVelocityVectors(renderVelocityVectors);
+            clientFluidRuntime.setRenderStreamlines(renderStreamlines);
 
             for (WindowView window : remoteWindows.values()) {
                 FlowRenderer renderer = window.renderer();
                 renderer.setMaxInflowSpeed(maxWindSpeed);
                 renderer.setStreamlineSampleStride(streamlineSampleStride);
+                renderer.setRenderVelocityVectors(renderVelocityVectors);
+                renderer.setRenderStreamlines(renderStreamlines);
             }
 
             if (!streamingEnabled) {
@@ -138,6 +148,8 @@ public class AeroClientMod implements ClientModInitializer {
             FlowRenderer renderer = view.renderer();
             renderer.setMaxInflowSpeed(maxWindSpeed);
             renderer.setStreamlineSampleStride(streamlineSampleStride);
+            renderer.setRenderVelocityVectors(renderVelocityVectors);
+            renderer.setRenderStreamlines(renderStreamlines);
             renderer.updateFlowField(payload.origin(), stride, payload.flow());
         });
     }
@@ -174,6 +186,8 @@ public class AeroClientMod implements ClientModInitializer {
         maxWindSpeed = DEFAULT_MAX_INFLOW_SPEED;
         streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
         backendMode = DEFAULT_BACKEND_MODE;
+        renderVelocityVectors = true;
+        renderStreamlines = true;
     }
 
     private record WindowKey(Identifier dimensionId, BlockPos origin) {

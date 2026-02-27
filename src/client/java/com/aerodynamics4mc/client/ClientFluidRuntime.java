@@ -77,6 +77,8 @@ final class ClientFluidRuntime {
     private SolverBackend backendMode = SolverBackend.NATIVE;
     private float maxWindSpeed = INFLOW_SPEED;
     private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
+    private boolean renderVelocityVectors = true;
+    private boolean renderStreamlines = true;
     private int tickCounter = 0;
     private long nextContextId = 1L;
     private Identifier currentDimensionId;
@@ -97,6 +99,14 @@ final class ClientFluidRuntime {
 
     void setStreamlineSampleStride(int stride) {
         this.streamlineSampleStride = sanitizeStride(stride);
+    }
+
+    void setRenderVelocityVectors(boolean enabled) {
+        this.renderVelocityVectors = enabled;
+    }
+
+    void setRenderStreamlines(boolean enabled) {
+        this.renderStreamlines = enabled;
     }
 
     void tick(MinecraftClient client) {
@@ -133,6 +143,8 @@ final class ClientFluidRuntime {
                 window.latestFlow = completedFlow;
                 window.renderer.setMaxInflowSpeed(maxWindSpeed);
                 window.renderer.setStreamlineSampleStride(streamlineSampleStride);
+                window.renderer.setRenderVelocityVectors(renderVelocityVectors);
+                window.renderer.setRenderStreamlines(renderStreamlines);
                 window.renderer.updateFlowFieldNoCopy(key.origin(), 1, completedFlow);
             }
 
@@ -191,6 +203,8 @@ final class ClientFluidRuntime {
         for (WindowState window : windows.values()) {
             window.renderer.setMaxInflowSpeed(maxWindSpeed);
             window.renderer.setStreamlineSampleStride(streamlineSampleStride);
+            window.renderer.setRenderVelocityVectors(renderVelocityVectors);
+            window.renderer.setRenderStreamlines(renderStreamlines);
             window.renderer.render(context);
         }
     }

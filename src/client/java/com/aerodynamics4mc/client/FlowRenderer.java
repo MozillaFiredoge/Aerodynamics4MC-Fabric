@@ -3,6 +3,7 @@ package com.aerodynamics4mc.client;
 import org.joml.Matrix4f;
 
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.util.math.MatrixStack;
@@ -14,6 +15,7 @@ public class FlowRenderer {
     private static final int CHANNELS = 4;
     private static final float MIN_SPEED = 1e-6f;
     private static final float RENDER_THRESHOLD_NORMALIZED = 0.01f;
+    private static final int MIN_VECTOR_FIELD_STRIDE = 2;
 
     private final int gridSize;
     private float maxInflowSpeed;
@@ -24,6 +26,8 @@ public class FlowRenderer {
     private int streamlineSampleStride;
     private BlockPos origin;
     private boolean hasFlowData;
+    private boolean renderVelocityVectors = true;
+    private boolean renderStreamlines = true;
 
     public FlowRenderer(int gridSize, float maxInflowSpeed) {
         this.gridSize = gridSize;
@@ -42,6 +46,14 @@ public class FlowRenderer {
 
     public void setStreamlineSampleStride(int stride) {
         this.streamlineSampleStride = sanitizeStride(stride);
+    }
+
+    public void setRenderVelocityVectors(boolean enabled) {
+        this.renderVelocityVectors = enabled;
+    }
+
+    public void setRenderStreamlines(boolean enabled) {
+        this.renderStreamlines = enabled;
     }
 
     public void updateFlowField(BlockPos origin, float[] data) {
@@ -107,14 +119,18 @@ public class FlowRenderer {
         );
 
         VertexConsumer buffer = context.consumers().getBuffer(RenderLayers.lines());
-        renderVelocityField(buffer, matrices);
-        renderStreamlines(buffer, matrices);
+        if (renderVelocityVectors) {
+            renderVelocityField(buffer, matrices);
+        }
+        if (renderStreamlines) {
+            renderStreamlines(buffer, matrices);
+        }
 
         matrices.pop();
     }
 
     private void renderVelocityField(VertexConsumer buffer, MatrixStack matrices) {
-        int stride = Math.max(sampleStride, streamlineSampleStride);
+        int stride = Math.max(sampleStride, Math.max(streamlineSampleStride, MIN_VECTOR_FIELD_STRIDE));
         float velScale = 5f;
         var entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
@@ -164,9 +180,23 @@ public class FlowRenderer {
         int maxSteps = 80;
         var entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
+        int interleave = seedStride <= 1 ? 4 : (seedStride == 2 ? 2 : 1);
+        int phase = 0;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (interleave > 1 && client.world != null) {
+            phase = (int) (client.world.getTime() % interleave);
+        }
 
         for (int y = 0; y < gridSize; y += seedStride) {
             for (int z = 0; z < gridSize; z += seedStride) {
+                if (interleave > 1) {
+                    int seedY = y / seedStride;
+                    int seedZ = z / seedStride;
+                    int bucket = (seedY + seedZ) % interleave;
+                    if (bucket != phase) {
+                        continue;
+                    }
+                }
                 Vec3d pos = new Vec3d(0.5, y + 0.5, z + 0.5);
 
                 for (int step = 0; step < maxSteps; step++) {
