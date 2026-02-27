@@ -19,6 +19,8 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
@@ -66,8 +68,11 @@ final class ClientFluidRuntime {
     private final int gridSize;
     private final int flowCount;
     private final Map<WindowKey, WindowState> windows = new HashMap<>();
+    private final List<WindowState> retiredWindows = new ArrayList<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT);
+    private final AtomicInteger activeSolveTasks = new AtomicInteger(0);
+    private final AtomicLong runtimeGeneration = new AtomicLong(0L);
 
     private SolverBackend backendMode = SolverBackend.NATIVE;
     private float maxWindSpeed = INFLOW_SPEED;
@@ -105,7 +110,8 @@ final class ClientFluidRuntime {
         ClientWorld world = client.world;
         Identifier dimensionId = world.getRegistryKey().getValue();
         if (currentDimensionId == null || !currentDimensionId.equals(dimensionId)) {
-            clearWindowsOnly();
+            retireAllWindows();
+            cleanupRetiredWindowsIfIdle();
             currentDimensionId = dimensionId;
         }
 
@@ -134,7 +140,9 @@ final class ClientFluidRuntime {
                 BlockPos origin = key.origin();
                 SolverBackend backendSnapshot = backendMode;
                 float maxSpeedSnapshot = maxWindSpeed;
-                solverExecutor.execute(() -> runSolveTask(window, origin, backendSnapshot, maxSpeedSnapshot));
+                long generationSnapshot = runtimeGeneration.get();
+                activeSolveTasks.incrementAndGet();
+                solverExecutor.execute(() -> runSolveTask(window, origin, backendSnapshot, maxSpeedSnapshot, generationSnapshot));
             }
 
             if (window.latestFlow != null) {
@@ -144,19 +152,29 @@ final class ClientFluidRuntime {
         }
     }
 
-    private void runSolveTask(WindowState window, BlockPos origin, SolverBackend backend, float maxSpeedSnapshot) {
+    private void runSolveTask(WindowState window, BlockPos origin, SolverBackend backend, float maxSpeedSnapshot, long generationSnapshot) {
         try {
+            if (generationSnapshot != runtimeGeneration.get()) {
+                return;
+            }
             byte[] payload = captureWindow(window, origin, backend);
             float[] response = runSolverStep(window, payload, backend);
             updateBaseFieldFromResponse(window, response, maxSpeedSnapshot);
-            window.publishCompletedFlow(response);
-            lastSolverError = "";
+            if (generationSnapshot == runtimeGeneration.get()) {
+                window.publishCompletedFlow(response);
+                lastSolverError = "";
+            }
         } catch (IOException ex) {
-            lastSolverError = ex.getMessage();
-            log("Solver error for window " + formatPos(origin) + ": " + lastSolverError);
+            if (generationSnapshot == runtimeGeneration.get()) {
+                lastSolverError = ex.getMessage();
+            }
+            log("Solver error for window " + formatPos(origin) + ": " + ex.getMessage());
             closeSocket(window);
         } finally {
             window.busy.set(false);
+            if (activeSolveTasks.decrementAndGet() == 0) {
+                cleanupRetiredWindowsIfIdle();
+            }
         }
     }
 
@@ -178,32 +196,44 @@ final class ClientFluidRuntime {
     }
 
     void clear() {
+        runtimeGeneration.incrementAndGet();
         tickCounter = 0;
         currentDimensionId = null;
         lastSolverError = "";
-        clearWindowsOnly();
-        nativeBackend.shutdown();
+        retireAllWindows();
+        cleanupRetiredWindowsIfIdle();
     }
 
-    private void clearWindowsOnly() {
-        for (WindowState window : windows.values()) {
-            releaseWindow(window);
+    private void retireAllWindows() {
+        if (windows.isEmpty()) {
+            return;
+        }
+        synchronized (retiredWindows) {
+            retiredWindows.addAll(windows.values());
         }
         windows.clear();
+    }
+
+    private void cleanupRetiredWindowsIfIdle() {
+        if (activeSolveTasks.get() != 0) {
+            return;
+        }
+        List<WindowState> toRelease;
+        synchronized (retiredWindows) {
+            if (retiredWindows.isEmpty()) {
+                return;
+            }
+            toRelease = new ArrayList<>(retiredWindows);
+            retiredWindows.clear();
+        }
+        for (WindowState window : toRelease) {
+            releaseWindow(window);
+        }
     }
 
     private void switchBackend(SolverBackend mode) {
         if (backendMode == mode) {
             return;
-        }
-        if (mode == SolverBackend.SOCKET) {
-            for (WindowState window : windows.values()) {
-                nativeBackend.releaseContext(window.nativeContextId);
-            }
-        } else {
-            for (WindowState window : windows.values()) {
-                closeSocket(window);
-            }
         }
         backendMode = mode;
     }
@@ -473,6 +503,7 @@ final class ClientFluidRuntime {
     private float[] runSolverStep(WindowState window, byte[] payload, SolverBackend backend) throws IOException {
         float[] solverOutput = window.acquireSolveOutputBuffer(flowCount);
         if (backend == SolverBackend.NATIVE) {
+            closeSocket(window);
             if (!nativeBackend.isLoaded()) {
                 throw new IOException("Native backend not loaded: " + nativeBackend.getLoadError());
             }
@@ -487,6 +518,7 @@ final class ClientFluidRuntime {
             return solverOutput;
         }
 
+        nativeBackend.releaseContext(window.nativeContextId);
         ensureSocket(window);
         sendPayload(window, payload);
         receiveFlowField(window, solverOutput);
