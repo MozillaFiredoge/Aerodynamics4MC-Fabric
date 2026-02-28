@@ -18,7 +18,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 
 public class AeroClientMod implements ClientModInitializer {
-    private static final int GRID_SIZE = 128;
+    private static final int GRID_SIZE = 256;
     private static final float DEFAULT_MAX_INFLOW_SPEED = 8.0f;
     private static final int DEFAULT_BACKEND_MODE = 1;
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;

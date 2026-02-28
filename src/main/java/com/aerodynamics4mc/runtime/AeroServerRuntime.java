@@ -57,7 +57,11 @@ import net.minecraft.world.chunk.WorldChunk;
 
 public final class AeroServerRuntime {
     private static final String LOG_PREFIX = "[aerodynamics4mc] ";
-    private static final int GRID_SIZE = 128;
+    private static final int GRID_SIZE = 256;
+    private static final int TICKS_PER_SECOND = 20;
+    private static final float DOMAIN_SIZE_METERS = 4.0f;
+    private static final float SOLVER_STEP_SECONDS = 1.0f / TICKS_PER_SECOND;
+    private static final float CELL_SIZE_METERS = DOMAIN_SIZE_METERS / GRID_SIZE;
     private static final int CHANNELS = 9;
     private static final int CH_OBSTACLE = 0;
     private static final int CH_FAN_MASK = 1;
@@ -88,7 +92,6 @@ public final class AeroServerRuntime {
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
-    private static final int TICKS_PER_SECOND = 20;
     private static final int PLAYER_VELOCITY_SYNC_MIN_INTERVAL_TICKS = 20;
     private static final int PLAYER_VELOCITY_SYNC_MAX_INTERVAL_TICKS = 40;
     private static final double PLAYER_VELOCITY_SYNC_ERROR_THRESHOLD_SQ = 2.5e-5;
@@ -260,6 +263,10 @@ public final class AeroServerRuntime {
                         "Status streaming=" + streamingEnabled
                             + " debug=" + debugEnabled
                             + " maxspeed=" + format2(maxWindSpeed)
+                            + " box=" + format2(DOMAIN_SIZE_METERS) + "m"
+                            + " n=" + GRID_SIZE
+                            + " dx=" + format4(CELL_SIZE_METERS) + "m"
+                            + " dt=" + format3(SOLVER_STEP_SECONDS) + "s"
                             + " stride=" + streamlineSampleStride
                             + " windows=" + statusWindowCount
                             + " renderVectors=" + renderVelocityVectorsEnabled
@@ -1102,6 +1109,14 @@ public final class AeroServerRuntime {
 
     private String format2(float value) {
         return String.format(Locale.ROOT, "%.2f", value);
+    }
+
+    private String format3(float value) {
+        return String.format(Locale.ROOT, "%.3f", value);
+    }
+
+    private String format4(float value) {
+        return String.format(Locale.ROOT, "%.4f", value);
     }
 
     private int backendModeId(BackendMode mode) {

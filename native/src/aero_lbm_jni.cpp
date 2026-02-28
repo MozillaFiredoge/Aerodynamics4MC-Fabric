@@ -124,8 +124,8 @@ constexpr int kChannelStateVy = 6;
 constexpr int kChannelStateVz = 7;
 constexpr int kChannelStateP = 8;
 
-constexpr float kLatticeSoundSpeed = 0.57735026919f;   
-constexpr float kMaxMach = 0.35f;                      
+constexpr float kLatticeSoundSpeed = 0.57735026919f;
+constexpr float kMaxMach = 0.60f;
 constexpr float kHardMaxLatticeSpeed = kLatticeSoundSpeed * kMaxMach;
 constexpr float kCs2 = 1.0f / 3.0f;
 
@@ -134,30 +134,30 @@ constexpr float kRhoMax = 1.03f;
 constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
-// D3Q27 cumulant closure with stable baseline tau (> 0.56).
-constexpr float kTauShear = 0.56003f;
-constexpr float kTauShearMin = 0.56001f;
+// D3Q27 cumulant closure with low-viscosity baseline tau.
+constexpr float kTauShear = 0.51503f;
+constexpr float kTauShearMin = 0.51501f;
 constexpr float kTauShearMax = 0.95f;
-constexpr float kTauNormal = 0.56004f;
-constexpr float kTauNormalMin = 0.56001f;
+constexpr float kTauNormal = 0.51504f;
+constexpr float kTauNormalMin = 0.51501f;
 constexpr float kTauNormalMax = 0.95f;
 constexpr bool kEnableSgs = true;
-constexpr float kSgsC = 0.12f;
+constexpr float kSgsC = 0.10f;
 constexpr float kSgsC2 = kSgsC * kSgsC;
-constexpr float kSgsNutToNu0Max = 2.5f;
-constexpr float kSgsBulkCoupling = 0.35f;
+constexpr float kSgsNutToNu0Max = 1.0f;
+constexpr float kSgsBulkCoupling = 0.30f;
 
 constexpr int kSpongeLayers = 6;
-constexpr float kSpongeStrength = 0.22f;
-constexpr float kBoundaryConvectiveBeta = 0.35f;
+constexpr float kSpongeStrength = 0.10f;
+constexpr float kBoundaryConvectiveBeta = 0.30f;
 
 constexpr float kObstacleBounceBlend = 0.30f;
-constexpr float kFanAccel = 0.0140f;
-constexpr float kFanForceScalePerSpeed = 0.5f;
-constexpr float kFanForceScaleMax = 4.0f;
-constexpr float kFanNoiseAmp = 0.04f;
-constexpr float kFanSpeedSoftCap = 0.115f;
-constexpr float kFanSpeedDampWidth = 0.045f;
+constexpr float kFanBeta = 0.07f;
+constexpr float kFanTargetScale = 1.0f / 30.0f;
+constexpr float kFanTargetMax = 0.34f;
+constexpr float kFanNoiseAmp = 0.02f;
+constexpr float kFanSpeedSoftCap = 0.30f;
+constexpr float kFanSpeedDampWidth = 0.06f;
 constexpr float kStateNudge = 0.0f;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
@@ -599,17 +599,25 @@ void collide(ContextState& ctx) {
         if (ctx.fan_mask[cell] > 0.0f) {
             const float fan_norm = std::sqrt(ctx.fan_ux[cell] * ctx.fan_ux[cell] + ctx.fan_uy[cell] * ctx.fan_uy[cell] + ctx.fan_uz[cell] * ctx.fan_uz[cell]);
             if (fan_norm > 1e-8f) {
+                const float inv_norm = 1.0f / fan_norm;
                 const float noise = 1.0f + kFanNoiseAmp * hash_signed_noise(cell, ctx.step_counter);
-                const float force_scale_base = std::max(0.0f, std::min(kFanForceScaleMax, fan_norm * kFanForceScalePerSpeed));
+                const float target_speed = clampf(
+                    fan_norm * kFanTargetScale * std::max(0.0f, noise),
+                    0.0f,
+                    kFanTargetMax
+                );
+                const float target_ux = ctx.fan_ux[cell] * inv_norm * target_speed;
+                const float target_uy = ctx.fan_uy[cell] * inv_norm * target_speed;
+                const float target_uz = ctx.fan_uz[cell] * inv_norm * target_speed;
                 float speed_damp = 1.0f;
                 if (speed_pre > kFanSpeedSoftCap) {
                     const float r = (speed_pre - kFanSpeedSoftCap) / std::max(1e-4f, kFanSpeedDampWidth);
                     speed_damp = 1.0f / (1.0f + r * r);
                 }
-                const float thrust = ctx.fan_mask[cell] * kFanAccel * force_scale_base * speed_damp * std::max(0.0f, noise);
-                fx = thrust * ctx.fan_ux[cell] / fan_norm;
-                fy = thrust * ctx.fan_uy[cell] / fan_norm;
-                fz = thrust * ctx.fan_uz[cell] / fan_norm;
+                const float beta = ctx.fan_mask[cell] * kFanBeta * speed_damp;
+                fx = beta * rho_safe * (target_ux - ux);
+                fy = beta * rho_safe * (target_uy - uy);
+                fz = beta * rho_safe * (target_uz - uz);
             }
         }
 
@@ -848,28 +856,28 @@ __constant float TINV[3][3] = {
     {0.0f, 0.5f, 0.5f}
 };
 
-__constant float TAU_SHEAR = 0.56003f;
-__constant float TAU_SHEAR_MIN = 0.56001f;
+__constant float TAU_SHEAR = 0.51503f;
+__constant float TAU_SHEAR_MIN = 0.51501f;
 __constant float TAU_SHEAR_MAX = 0.95f;
-__constant float TAU_NORMAL = 0.56004f;
-__constant float TAU_NORMAL_MIN = 0.56001f;
+__constant float TAU_NORMAL = 0.51504f;
+__constant float TAU_NORMAL_MIN = 0.51501f;
 __constant float TAU_NORMAL_MAX = 0.95f;
 __constant int SGS_ENABLED = 1;
-__constant float SGS_C2 = 0.0144f;
-__constant float SGS_NUT_TO_NU0_MAX = 2.5f;
-__constant float SGS_BULK_COUPLING = 0.35f;
+__constant float SGS_C2 = 0.01f;
+__constant float SGS_NUT_TO_NU0_MAX = 1.0f;
+__constant float SGS_BULK_COUPLING = 0.30f;
 __constant int SPONGE_LAYERS = 6;
-__constant float SPONGE_STRENGTH = 0.22f;
-__constant float BOUNDARY_CONVECTIVE_BETA = 0.35f;
+__constant float SPONGE_STRENGTH = 0.10f;
+__constant float BOUNDARY_CONVECTIVE_BETA = 0.30f;
 __constant float OBSTACLE_BOUNCE_BLEND = 0.30f;
-__constant float FAN_ACCEL = 0.0140f;
-__constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
-__constant float FAN_FORCE_SCALE_MAX = 4.0f;
-__constant float FAN_NOISE_AMP = 0.04f;
-__constant float FAN_SPEED_SOFT_CAP = 0.115f;
-__constant float FAN_SPEED_DAMP_WIDTH = 0.045f;
+__constant float FAN_BETA = 0.07f;
+__constant float FAN_TARGET_SCALE = 0.033333335f;
+__constant float FAN_TARGET_MAX = 0.34f;
+__constant float FAN_NOISE_AMP = 0.02f;
+__constant float FAN_SPEED_SOFT_CAP = 0.30f;
+__constant float FAN_SPEED_DAMP_WIDTH = 0.06f;
 __constant float STATE_NUDGE = 0.0f;
-__constant float MAX_SPEED = 0.20207259f;
+__constant float MAX_SPEED = 0.34641016f;
 __constant float RHO_MIN = 0.97f;
 __constant float RHO_MAX = 1.03f;
 __constant float CS2 = 0.33333334f;
@@ -1052,17 +1060,24 @@ kernel void stream_collide_step(
         float fan_norm = sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
         if (fan_norm > 1e-8f) {
             float inv_norm = 1.0f / fan_norm;
-            float force_scale_base = fmax(0.0f, fmin(FAN_FORCE_SCALE_MAX, fan_norm * FAN_FORCE_SCALE_PER_SPEED));
+            float noise = 1.0f + FAN_NOISE_AMP * signed_noise((uint)cell, (uint)tick);
+            float target_speed = clampf(
+                fan_norm * FAN_TARGET_SCALE * fmax(0.0f, noise),
+                0.0f,
+                FAN_TARGET_MAX
+            );
+            float target_ux = fan_ux * inv_norm * target_speed;
+            float target_uy = fan_uy * inv_norm * target_speed;
+            float target_uz = fan_uz * inv_norm * target_speed;
             float speed_damp = 1.0f;
             if (speed_pre > FAN_SPEED_SOFT_CAP) {
                 float r = (speed_pre - FAN_SPEED_SOFT_CAP) / fmax(1e-4f, FAN_SPEED_DAMP_WIDTH);
                 speed_damp = 1.0f / (1.0f + r * r);
             }
-            float noise = 1.0f + FAN_NOISE_AMP * signed_noise((uint)cell, (uint)tick);
-            float thrust = fan * FAN_ACCEL * force_scale_base * speed_damp * fmax(0.0f, noise);
-            fx = thrust * fan_ux * inv_norm;
-            fy = thrust * fan_uy * inv_norm;
-            fz = thrust * fan_uz * inv_norm;
+            float beta = fan * FAN_BETA * speed_damp;
+            fx = beta * rho_safe * (target_ux - ux);
+            fy = beta * rho_safe * (target_uy - uy);
+            fz = beta * rho_safe * (target_uz - uz);
         }
     }
 
