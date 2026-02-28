@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -805,7 +806,8 @@ struct OpenClRuntime {
 
 OpenClRuntime g_opencl;
 
-const char* kOpenClSource = R"CLC(
+const char* kOpenClSource =
+R"CLC(
 #define KQ 27
 #define MI(a, b, c) (((a) * 3 + (b)) * 3 + (c))
 
@@ -982,6 +984,8 @@ kernel void init_distributions(
     }
 }
 
+)CLC"
+R"CLC(
 kernel void stream_collide_step(
     __global const float* f_read,
     __global const float* payload,
@@ -1122,6 +1126,8 @@ kernel void stream_collide_step(
         }
     }
 
+)CLC"
+R"CLC(
     float tau_shear_local = TAU_SHEAR;
     float tau_normal_local = clampf(TAU_NORMAL, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
     if (SGS_ENABLED) {
@@ -1254,6 +1260,8 @@ kernel void stream_collide_step(
     }
 }
 
+)CLC"
+R"CLC(
 kernel void output_macro(
     __global const float* f, __global const float* payload,
     int in_ch, int out_ch, int cells, __global float* out
@@ -1517,8 +1525,22 @@ void disable_opencl_runtime(const std::string& reason) {
 }
 
 bool should_force_cpu_backend() {
+#if defined(_MSC_VER)
+    char* env_buf = nullptr;
+    size_t env_len = 0;
+    if (_dupenv_s(&env_buf, &env_len, "AERO_LBM_CPU_ONLY") != 0 || env_buf == nullptr) {
+        return false;
+    }
+    std::string env_value(env_buf);
+    std::free(env_buf);
+    std::transform(env_value.begin(), env_value.end(), env_value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return env_value == "1" || env_value == "true";
+#else
     const char* env = std::getenv("AERO_LBM_CPU_ONLY");
     return env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0);
+#endif
 }
 
 void ensure_context_shape(ContextState& ctx, int n, std::size_t cells) {
