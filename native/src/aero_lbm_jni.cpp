@@ -23,17 +23,95 @@
 
 namespace {
 
-constexpr int kQ = 19;
-constexpr std::array<int, kQ> kCx = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0};
-constexpr std::array<int, kQ> kCy = {0, 0, 0, 1, -1, 0, 0, 1, -1, -1, 1, 0, 0, 0, 0, 1, -1, 1, -1};
-constexpr std::array<int, kQ> kCz = {0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 1, -1, -1, 1, 1, -1, -1, 1};
-constexpr std::array<int, kQ> kOpp = {0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17};
-constexpr std::array<float, kQ> kW = {
-    1.0f / 3.0f,
-    1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f, 1.0f / 18.0f,
-    1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f,
-    1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f, 1.0f / 36.0f
-};
+constexpr int kQ = 27;
+constexpr std::array<int, 3> kVel1D = {-1, 0, 1};
+constexpr std::array<float, 3> kW1D = {1.0f / 6.0f, 2.0f / 3.0f, 1.0f / 6.0f};
+constexpr std::array<std::array<float, 3>, 3> kMomentInv1D = {{
+    {{0.0f, -0.5f, 0.5f}},  // c = -1
+    {{1.0f, 0.0f, -1.0f}},  // c =  0
+    {{0.0f, 0.5f, 0.5f}}    // c = +1
+}};
+
+constexpr int lattice_q(int ix, int iy, int iz) {
+    return (ix * 3 + iy) * 3 + iz;
+}
+
+constexpr std::array<int, kQ> make_cx() {
+    std::array<int, kQ> out{};
+    int q = 0;
+    for (int ix = 0; ix < 3; ++ix) {
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < 3; ++iz) {
+                (void)iy;
+                (void)iz;
+                out[q++] = kVel1D[ix];
+            }
+        }
+    }
+    return out;
+}
+
+constexpr std::array<int, kQ> make_cy() {
+    std::array<int, kQ> out{};
+    int q = 0;
+    for (int ix = 0; ix < 3; ++ix) {
+        (void)ix;
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < 3; ++iz) {
+                (void)iz;
+                out[q++] = kVel1D[iy];
+            }
+        }
+    }
+    return out;
+}
+
+constexpr std::array<int, kQ> make_cz() {
+    std::array<int, kQ> out{};
+    int q = 0;
+    for (int ix = 0; ix < 3; ++ix) {
+        (void)ix;
+        for (int iy = 0; iy < 3; ++iy) {
+            (void)iy;
+            for (int iz = 0; iz < 3; ++iz) {
+                out[q++] = kVel1D[iz];
+            }
+        }
+    }
+    return out;
+}
+
+constexpr std::array<int, kQ> make_opp() {
+    std::array<int, kQ> out{};
+    int q = 0;
+    for (int ix = 0; ix < 3; ++ix) {
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < 3; ++iz) {
+                out[q++] = lattice_q(2 - ix, 2 - iy, 2 - iz);
+            }
+        }
+    }
+    return out;
+}
+
+constexpr std::array<float, kQ> make_w() {
+    std::array<float, kQ> out{};
+    int q = 0;
+    for (int ix = 0; ix < 3; ++ix) {
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < 3; ++iz) {
+                out[q++] = kW1D[ix] * kW1D[iy] * kW1D[iz];
+            }
+        }
+    }
+    return out;
+}
+
+constexpr std::array<int, kQ> kCx = make_cx();
+constexpr std::array<int, kQ> kCy = make_cy();
+constexpr std::array<int, kQ> kCz = make_cz();
+constexpr std::array<int, kQ> kOpp = make_opp();
+constexpr std::array<float, kQ> kW = make_w();
 
 constexpr int kChannelObstacle = 0;
 constexpr int kChannelFanMask = 1;
@@ -45,27 +123,22 @@ constexpr int kChannelStateVy = 6;
 constexpr int kChannelStateVz = 7;
 constexpr int kChannelStateP = 8;
 
-constexpr bool kEnableSmagorinskyLES = true;
 constexpr float kLatticeSoundSpeed = 0.57735026919f;   
 constexpr float kMaxMach = 0.35f;                      
 constexpr float kHardMaxLatticeSpeed = kLatticeSoundSpeed * kMaxMach;
+constexpr float kCs2 = 1.0f / 3.0f;
 
 constexpr float kRhoMin = 0.97f;
 constexpr float kRhoMax = 1.03f;
 constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
-// TRT 被彻底移除，替换为基于二阶 Hermite 的 RLBM 正则化模型
-constexpr float kTauPlus = 0.508f;
-constexpr float kTauPlusMin = 0.503f;
-constexpr float kTauPlusMax = 0.62f;
-constexpr float kSmagorinskyC = 0.08f;
-constexpr float kSmagorinskyC2 = kSmagorinskyC * kSmagorinskyC;
-constexpr float kLesNutToNu0Max = 1.5f;
-constexpr int kLesWallDampingLayers = 2;
-constexpr float kLesWallDampingMin = 0.10f;
+// D3Q27 cumulant closure near tau=0.5 to mimic low-viscosity air in lattice units.
+constexpr float kTauShear = 0.50003f;
+constexpr float kTauNormal = 0.50004f;
+constexpr float kTauNormalMin = 0.50001f;
+constexpr float kTauNormalMax = 0.55f;
 constexpr float kObstacleBounceBlend = 0.30f;
-// constexpr float kLesSpeedThreshold = 0.0f;
 constexpr float kFanAccel = 0.0140f;
 constexpr float kFanForceScalePerSpeed = 0.5f;
 constexpr float kFanForceScaleMax = 4.0f;
@@ -191,38 +264,155 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     return kW[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
 }
 
-inline void decode_cell(std::size_t cell, int n, int& x, int& y, int& z) {
-    const int yz = n * n;
-    x = static_cast<int>(cell / static_cast<std::size_t>(yz));
-    const int rem = static_cast<int>(cell - static_cast<std::size_t>(x) * yz);
-    y = rem / n;
-    z = rem - y * n;
-}
-
 inline bool solid_or_oob(const ContextState& ctx, int x, int y, int z) {
     if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) return true;
     return ctx.obstacle[cell_index(x, y, z, ctx.n)] != 0;
 }
 
-inline float les_wall_damping_factor(const ContextState& ctx, int x, int y, int z) {
-    if (kLesWallDampingLayers <= 0) return 1.0f;
+inline int binom(int n, int k) {
+    if (k < 0 || k > n) return 0;
+    if (n <= 1 || k == 0 || k == n) return 1;
+    return 2;  // only used by n=2,k=1
+}
 
-    // Treat outer-domain boundary as a virtual wall for LES damping.
-    if (solid_or_oob(ctx, x + 1, y, z) || solid_or_oob(ctx, x - 1, y, z)
-        || solid_or_oob(ctx, x, y + 1, z) || solid_or_oob(ctx, x, y - 1, z)
-        || solid_or_oob(ctx, x, y, z + 1) || solid_or_oob(ctx, x, y, z - 1)) {
-        return kLesWallDampingMin;
-    }
-
-    if (kLesWallDampingLayers >= 2) {
-        if (solid_or_oob(ctx, x + 2, y, z) || solid_or_oob(ctx, x - 2, y, z)
-            || solid_or_oob(ctx, x, y + 2, z) || solid_or_oob(ctx, x, y - 2, z)
-            || solid_or_oob(ctx, x, y, z + 2) || solid_or_oob(ctx, x, y, z - 2)) {
-            return 0.5f * (1.0f + kLesWallDampingMin);
+inline void compute_raw_moments(const std::array<float, kQ>& f_local, float raw[3][3][3]) {
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                raw[a][b][c] = 0.0f;
+            }
         }
     }
 
-    return 1.0f;
+    for (int q = 0; q < kQ; ++q) {
+        const float fq = f_local[q];
+        const float px[3] = {1.0f, static_cast<float>(kCx[q]), static_cast<float>(kCx[q] * kCx[q])};
+        const float py[3] = {1.0f, static_cast<float>(kCy[q]), static_cast<float>(kCy[q] * kCy[q])};
+        const float pz[3] = {1.0f, static_cast<float>(kCz[q]), static_cast<float>(kCz[q] * kCz[q])};
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 3; ++b) {
+                for (int c = 0; c < 3; ++c) {
+                    raw[a][b][c] += fq * px[a] * py[b] * pz[c];
+                }
+            }
+        }
+    }
+}
+
+inline void compute_central_moments(
+    const float raw[3][3][3], float ux, float uy, float uz, float central[3][3][3]
+) {
+    const float sx[3] = {1.0f, -ux, ux * ux};
+    const float sy[3] = {1.0f, -uy, uy * uy};
+    const float sz[3] = {1.0f, -uz, uz * uz};
+
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int p = 0; p <= a; ++p) {
+                    for (int q = 0; q <= b; ++q) {
+                        for (int r = 0; r <= c; ++r) {
+                            const float coeff = static_cast<float>(binom(a, p) * binom(b, q) * binom(c, r));
+                            sum += coeff * sx[a - p] * sy[b - q] * sz[c - r] * raw[p][q][r];
+                        }
+                    }
+                }
+                central[a][b][c] = sum;
+            }
+        }
+    }
+}
+
+inline void cumulant_relax_closure(
+    float rho, float central_in[3][3][3], float omega_diag, float omega_offdiag, float central_out[3][3][3]
+) {
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                central_out[a][b][c] = 0.0f;
+            }
+        }
+    }
+
+    central_out[0][0][0] = rho;
+
+    const float eq_second = rho * kCs2;
+    const float s_diag = clampf(omega_diag, 0.0f, 1.95f);
+    const float s_offdiag = clampf(omega_offdiag, 0.0f, 1.95f);
+
+    // Relax second-order cumulants (equal to second-order central moments).
+    central_out[2][0][0] = central_in[2][0][0] + s_diag * (eq_second - central_in[2][0][0]);
+    central_out[0][2][0] = central_in[0][2][0] + s_diag * (eq_second - central_in[0][2][0]);
+    central_out[0][0][2] = central_in[0][0][2] + s_diag * (eq_second - central_in[0][0][2]);
+    central_out[1][1][0] = (1.0f - s_offdiag) * central_in[1][1][0];
+    central_out[1][0][1] = (1.0f - s_offdiag) * central_in[1][0][1];
+    central_out[0][1][1] = (1.0f - s_offdiag) * central_in[0][1][1];
+
+    // Higher-order cumulants are set to zero, then reconstructed via Gaussian closure.
+    const float c200 = central_out[2][0][0];
+    const float c020 = central_out[0][2][0];
+    const float c002 = central_out[0][0][2];
+    const float c110 = central_out[1][1][0];
+    const float c101 = central_out[1][0][1];
+    const float c011 = central_out[0][1][1];
+    const float inv_rho = 1.0f / std::max(1e-6f, rho);
+
+    central_out[2][2][0] = c200 * c020 * inv_rho + 2.0f * c110 * c110 * inv_rho;
+    central_out[2][0][2] = c200 * c002 * inv_rho + 2.0f * c101 * c101 * inv_rho;
+    central_out[0][2][2] = c020 * c002 * inv_rho + 2.0f * c011 * c011 * inv_rho;
+    central_out[2][1][1] = (c200 * c011 + 2.0f * c110 * c101) * inv_rho;
+    central_out[1][2][1] = (c020 * c101 + 2.0f * c110 * c011) * inv_rho;
+    central_out[1][1][2] = (c002 * c110 + 2.0f * c101 * c011) * inv_rho;
+    central_out[2][2][2] = (c200 * c020 * c002
+                             + 2.0f * c110 * c110 * c002
+                             + 2.0f * c101 * c101 * c020
+                             + 2.0f * c011 * c011 * c200
+                             + 8.0f * c110 * c101 * c011)
+                            * inv_rho * inv_rho;
+}
+
+inline void central_to_raw(
+    const float central[3][3][3], float ux, float uy, float uz, float raw_out[3][3][3]
+) {
+    const float ux_pow[3] = {1.0f, ux, ux * ux};
+    const float uy_pow[3] = {1.0f, uy, uy * uy};
+    const float uz_pow[3] = {1.0f, uz, uz * uz};
+
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int p = 0; p <= a; ++p) {
+                    for (int q = 0; q <= b; ++q) {
+                        for (int r = 0; r <= c; ++r) {
+                            const float coeff = static_cast<float>(binom(a, p) * binom(b, q) * binom(c, r));
+                            sum += coeff * ux_pow[a - p] * uy_pow[b - q] * uz_pow[c - r] * central[p][q][r];
+                        }
+                    }
+                }
+                raw_out[a][b][c] = sum;
+            }
+        }
+    }
+}
+
+inline void raw_to_populations(const float raw[3][3][3], std::array<float, kQ>& f_out) {
+    for (int ix = 0; ix < 3; ++ix) {
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < 3; ++iz) {
+                float sum = 0.0f;
+                for (int a = 0; a < 3; ++a) {
+                    for (int b = 0; b < 3; ++b) {
+                        for (int c = 0; c < 3; ++c) {
+                            sum += kMomentInv1D[ix][a] * kMomentInv1D[iy][b] * kMomentInv1D[iz][c] * raw[a][b][c];
+                        }
+                    }
+                }
+                f_out[lattice_q(ix, iy, iz)] = sum;
+            }
+        }
+    }
 }
 
 inline float obstacle_bounce_value(
@@ -307,6 +497,10 @@ void initialize_distributions(ContextState& ctx) {
 }
 
 void collide(ContextState& ctx) {
+    const float tau_diag = clampf(kTauNormal, kTauNormalMin, kTauNormalMax);
+    const float omega_diag = 1.0f / tau_diag;
+    const float omega_offdiag = 1.0f / kTauShear;
+
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         if (ctx.obstacle[cell]) {
             ctx.rho[cell] = 1.0f;
@@ -317,14 +511,25 @@ void collide(ContextState& ctx) {
             continue;
         }
 
-        float rho = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
+        std::array<float, kQ> f_local{};
+        float rho = 0.0f;
+        float mom_x = 0.0f;
+        float mom_y = 0.0f;
+        float mom_z = 0.0f;
         for (int q = 0; q < kQ; ++q) {
             const float fq = ctx.f[dist_index(cell, q, ctx.cells)];
+            f_local[q] = fq;
             rho += fq;
-            ux += fq * kCx[q]; uy += fq * kCy[q]; uz += fq * kCz[q];
+            mom_x += fq * static_cast<float>(kCx[q]);
+            mom_y += fq * static_cast<float>(kCy[q]);
+            mom_z += fq * static_cast<float>(kCz[q]);
         }
-        // rho = clampf(rho, kRhoMin, kRhoMax);
-        ux /= rho; uy /= rho; uz /= rho;
+
+        const float rho_safe = std::max(1e-6f, rho);
+        const float inv_rho = 1.0f / rho_safe;
+        float ux = mom_x * inv_rho;
+        float uy = mom_y * inv_rho;
+        float uz = mom_z * inv_rho;
 
         float fx = 0.0f;
         float fy = 0.0f;
@@ -340,7 +545,14 @@ void collide(ContextState& ctx) {
             }
         }
 
-        ux += fx / rho * 0.5f; uy += fy / rho * 0.5f; uz += fz / rho * 0.5f;
+        const float dux = fx * inv_rho;
+        const float duy = fy * inv_rho;
+        const float duz = fz * inv_rho;
+
+        // Midpoint velocity for second-order force integration.
+        ux += 0.5f * dux;
+        uy += 0.5f * duy;
+        uz += 0.5f * duz;
 
         ux = (1.0f - kStateNudge) * ux + kStateNudge * ctx.ref_ux[cell];
         uy = (1.0f - kStateNudge) * uy + kStateNudge * ctx.ref_uy[cell];
@@ -352,61 +564,54 @@ void collide(ContextState& ctx) {
             ux *= scale; uy *= scale; uz *= scale;
         }
 
-        ctx.rho[cell] = rho; ctx.ux[cell] = ux; ctx.uy[cell] = uy; ctx.uz[cell] = uz;
+        ctx.rho[cell] = rho;
+        ctx.ux[cell] = ux;
+        ctx.uy[cell] = uy;
+        ctx.uz[cell] = uz;
 
-        float qxx = 0.0f, qyy = 0.0f, qzz = 0.0f, qxy = 0.0f, qxz = 0.0f, qyz = 0.0f;
-        std::array<float, kQ> f_eq_cache;
+        float raw[3][3][3];
+        float central_pre[3][3][3];
+        float central_post[3][3][3];
+        float raw_post[3][3][3];
+        compute_raw_moments(f_local, raw);
+        compute_central_moments(raw, ux, uy, uz, central_pre);
+        cumulant_relax_closure(rho_safe, central_pre, omega_diag, omega_offdiag, central_post);
+        central_to_raw(central_post, ux, uy, uz, raw_post);
+
+        std::array<float, kQ> f_cumulant{};
+        raw_to_populations(raw_post, f_cumulant);
+
+        // Enforce exact low-order conservation after moment inversion.
+        float rho_corr = 0.0f;
+        float mx_corr = 0.0f;
+        float my_corr = 0.0f;
+        float mz_corr = 0.0f;
         for (int q = 0; q < kQ; ++q) {
-            float eq = feq(q, rho, ux, uy, uz);
-            f_eq_cache[q] = eq;
-            float fneq = ctx.f[dist_index(cell, q, ctx.cells)] - eq;
-            float cx = kCx[q], cy = kCy[q], cz = kCz[q];
-            // Use Q = cc - cs^2 I (cs^2 = 1/3) so that q_aa is trace-free component
-            float Qxx = cx * cx - 0.33333333f;
-            float Qyy = cy * cy - 0.33333333f;
-            float Qzz = cz * cz - 0.33333333f;
-            float Qxy = cx * cy;
-            float Qxz = cx * cz;
-            float Qyz = cy * cz;
-            qxx += Qxx * fneq; qyy += Qyy * fneq; qzz += Qzz * fneq;
-            qxy += Qxy * fneq; qxz += Qxz * fneq; qyz += Qyz * fneq;
+            const float fq = f_cumulant[q];
+            rho_corr += fq;
+            mx_corr += fq * static_cast<float>(kCx[q]);
+            my_corr += fq * static_cast<float>(kCy[q]);
+            mz_corr += fq * static_cast<float>(kCz[q]);
+        }
+        const float rho_corr_safe = std::max(1e-6f, rho_corr);
+        const float ux_corr = mx_corr / rho_corr_safe;
+        const float uy_corr = my_corr / rho_corr_safe;
+        const float uz_corr = mz_corr / rho_corr_safe;
+        for (int q = 0; q < kQ; ++q) {
+            f_cumulant[q] += feq(q, rho_safe, ux, uy, uz) - feq(q, rho_corr_safe, ux_corr, uy_corr, uz_corr);
         }
 
-        float tau_local = kTauPlus;
-        if (kEnableSmagorinskyLES) {
-            int cx = 0, cy = 0, cz = 0;
-            decode_cell(cell, ctx.n, cx, cy, cz);
+        // Exact Difference Method (EDM) forcing in population space.
+        const float ux_minus = ux - 0.5f * dux;
+        const float uy_minus = uy - 0.5f * duy;
+        const float uz_minus = uz - 0.5f * duz;
+        const float ux_plus = ux + 0.5f * dux;
+        const float uy_plus = uy + 0.5f * duy;
+        const float uz_plus = uz + 0.5f * duz;
 
-            float q_norm2 = qxx * qxx + qyy * qyy + qzz * qzz + 2.0f * (qxy * qxy + qxz * qxz + qyz * qyz);
-            float q_mag = std::sqrt(std::max(0.0f, q_norm2));
-            float s_mag = (3.0f / (2.0f * std::max(1e-6f, rho) * kTauPlus)) * q_mag;
-
-            const float nu0 = (kTauPlus - 0.5f) / 3.0f;
-            const float wall_damp = les_wall_damping_factor(ctx, cx, cy, cz);
-            float nu_t = kSmagorinskyC2 * s_mag * wall_damp;
-            nu_t = std::min(nu_t, kLesNutToNu0Max * nu0);
-            tau_local = clampf(0.5f + 3.0f * (nu0 + nu_t), kTauPlusMin, kTauPlusMax);
-        }
-        float omega = 1.0f / tau_local;
-        float uf = ux * fx + uy * fy + uz * fz;
-
-        // Regularized LBM (RLBM) + Guo Forcing
         for (int q = 0; q < kQ; ++q) {
-            float cx = kCx[q], cy = kCy[q], cz = kCz[q];
-            
-            // 投影提取纯净的二阶分布，杜绝奇偶震荡
-            float Qxx = cx * cx - 0.33333333f;
-            float Qyy = cy * cy - 0.33333333f;
-            float Qzz = cz * cz - 0.33333333f;
-            float Qxy = cx * cy, Qxz = cx * cz, Qyz = cy * cz;
-            float f_neq_reg = 4.5f * kW[q] * (Qxx * qxx + Qyy * qyy + Qzz * qzz + 2.0f * (Qxy * qxy + Qxz * qxz + Qyz * qyz));
-
-            float cu = 3.0f * (cx * ux + cy * uy + cz * uz);
-            float cf = 3.0f * (cx * fx + cy * fy + cz * fz);
-            float Sq = kW[q] * (cf - 3.0f * uf + cf * cu);
-            float source = (1.0f - 0.5f * omega) * Sq;
-
-            ctx.f_post[dist_index(cell, q, ctx.cells)] = f_eq_cache[q] + (1.0f - omega) * f_neq_reg + source;
+            const float edm_source = feq(q, rho_safe, ux_plus, uy_plus, uz_plus) - feq(q, rho_safe, ux_minus, uy_minus, uz_minus);
+            ctx.f_post[dist_index(cell, q, ctx.cells)] = f_cumulant[q] + edm_source;
         }
     }
 }
@@ -478,6 +683,10 @@ void write_output(const ContextState& ctx, float* out, int out_channels) {
         }
         rho = clampf(rho, kRhoMin, kRhoMax);
         ux /= rho; uy /= rho; uz /= rho;
+        if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
+        if (std::fabs(ux) < 1e-7f) ux = 0.0f;
+        if (std::fabs(uy) < 1e-7f) uy = 0.0f;
+        if (std::fabs(uz) < 1e-7f) uz = 0.0f;
 
         out[out_base + 0] = ux; out[out_base + 1] = uy; out[out_base + 2] = uz; out[out_base + 3] = rho - 1.0f;
         for (int c = 4; c < out_channels; ++c) out[out_base + c] = 0.0f;
@@ -503,27 +712,50 @@ struct OpenClRuntime {
 OpenClRuntime g_opencl;
 
 const char* kOpenClSource = R"CLC(
-#define KQ 19
+#define KQ 27
+#define MI(a, b, c) (((a) * 3 + (b)) * 3 + (c))
 
-__constant int CX[KQ] = {0, 1, -1, 0, 0, 0, 0, 1, -1, 1, -1, 1, -1, 1, -1, 0, 0, 0, 0};
-__constant int CY[KQ] = {0, 0, 0, 1, -1, 0, 0, 1, -1, -1, 1, 0, 0, 0, 0, 1, -1, 1, -1};
-__constant int CZ[KQ] = {0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 1, -1, -1, 1, 1, -1, -1, 1};
-__constant int OPP[KQ] = {0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17};
+__constant int CX[KQ] = {
+    -1, -1, -1, -1, -1, -1, -1, -1, -1,
+     0,  0,  0,  0,  0,  0,  0,  0,  0,
+     1,  1,  1,  1,  1,  1,  1,  1,  1
+};
+__constant int CY[KQ] = {
+    -1, -1, -1,  0,  0,  0,  1,  1,  1,
+    -1, -1, -1,  0,  0,  0,  1,  1,  1,
+    -1, -1, -1,  0,  0,  0,  1,  1,  1
+};
+__constant int CZ[KQ] = {
+    -1,  0,  1, -1,  0,  1, -1,  0,  1,
+    -1,  0,  1, -1,  0,  1, -1,  0,  1,
+    -1,  0,  1, -1,  0,  1, -1,  0,  1
+};
+__constant int OPP[KQ] = {
+    26, 25, 24, 23, 22, 21, 20, 19, 18,
+    17, 16, 15, 14, 13, 12, 11, 10, 9,
+     8,  7,  6,  5,  4,  3,  2,  1, 0
+};
 __constant float W[KQ] = {
-    0.33333334f,
-    0.055555556f, 0.055555556f, 0.055555556f, 0.055555556f, 0.055555556f, 0.055555556f,
-    0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f,
-    0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f, 0.027777778f
+    0.004629630f, 0.018518519f, 0.004629630f,
+    0.018518519f, 0.074074074f, 0.018518519f,
+    0.004629630f, 0.018518519f, 0.004629630f,
+    0.018518519f, 0.074074074f, 0.018518519f,
+    0.074074074f, 0.296296296f, 0.074074074f,
+    0.018518519f, 0.074074074f, 0.018518519f,
+    0.004629630f, 0.018518519f, 0.004629630f,
+    0.018518519f, 0.074074074f, 0.018518519f,
+    0.004629630f, 0.018518519f, 0.004629630f
+};
+__constant float TINV[3][3] = {
+    {0.0f, -0.5f, 0.5f},
+    {1.0f, 0.0f, -1.0f},
+    {0.0f, 0.5f, 0.5f}
 };
 
-__constant int LES_ENABLED = 1;
-__constant float TAU_PLUS_BASE = 0.508f;
-__constant float TAU_PLUS_MIN = 0.503f;
-__constant float TAU_PLUS_MAX = 0.62f;
-__constant float SMAG_C2 = 0.0064f;
-__constant float LES_NUT_TO_NU0_MAX = 1.5f;
-__constant int LES_WALL_DAMPING_LAYERS = 2;
-__constant float LES_WALL_DAMPING_MIN = 0.10f;
+__constant float TAU_SHEAR = 0.50003f;
+__constant float TAU_NORMAL = 0.50004f;
+__constant float TAU_NORMAL_MIN = 0.50001f;
+__constant float TAU_NORMAL_MAX = 0.55f;
 __constant float OBSTACLE_BOUNCE_BLEND = 0.30f;
 __constant float FAN_ACCEL = 0.0140f;
 __constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
@@ -534,41 +766,21 @@ __constant float STATE_NUDGE = 0.0f;
 __constant float MAX_SPEED = 0.20207259f;
 __constant float RHO_MIN = 0.97f;
 __constant float RHO_MAX = 1.03f;
+__constant float CS2 = 0.33333334f;
 __constant float P_MIN = -0.03f;
 __constant float P_MAX = 0.03f;
 
 inline float clampf(float v, float lo, float hi) { return fmin(hi, fmax(lo, v)); }
 inline int clampi(int v, int lo, int hi) { return min(hi, max(lo, v)); }
+inline int binom(int n, int k) {
+    if (k < 0 || k > n) return 0;
+    if (n <= 1 || k == 0 || k == n) return 1;
+    return 2;
+}
 inline float feq(int q, float rho, float ux, float uy, float uz) {
     float cu = 3.0f * (CX[q] * ux + CY[q] * uy + CZ[q] * uz);
     float uu = ux * ux + uy * uy + uz * uz;
     return W[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
-}
-
-inline int solid_or_oob(__global const float* payload, int in_ch, int n, int x, int y, int z) {
-    if (x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n) return 1;
-    int cell = (x * n + y) * n + z;
-    return payload[cell * in_ch + 0] > 0.5f;
-}
-
-inline float les_wall_damping(__global const float* payload, int in_ch, int n, int x, int y, int z) {
-    if (LES_WALL_DAMPING_LAYERS <= 0) return 1.0f;
-
-    if (solid_or_oob(payload, in_ch, n, x + 1, y, z) || solid_or_oob(payload, in_ch, n, x - 1, y, z)
-        || solid_or_oob(payload, in_ch, n, x, y + 1, z) || solid_or_oob(payload, in_ch, n, x, y - 1, z)
-        || solid_or_oob(payload, in_ch, n, x, y, z + 1) || solid_or_oob(payload, in_ch, n, x, y, z - 1)) {
-        return LES_WALL_DAMPING_MIN;
-    }
-
-    if (LES_WALL_DAMPING_LAYERS >= 2) {
-        if (solid_or_oob(payload, in_ch, n, x + 2, y, z) || solid_or_oob(payload, in_ch, n, x - 2, y, z)
-            || solid_or_oob(payload, in_ch, n, x, y + 2, z) || solid_or_oob(payload, in_ch, n, x, y - 2, z)
-            || solid_or_oob(payload, in_ch, n, x, y, z + 2) || solid_or_oob(payload, in_ch, n, x, y, z - 2)) {
-            return 0.5f * (1.0f + LES_WALL_DAMPING_MIN);
-        }
-    }
-
-    return 1.0f;
 }
 
 inline float obstacle_bounce_value(
@@ -606,13 +818,11 @@ kernel void init_distributions(
 
     for (int q = 0; q < KQ; ++q) {
         float eq = feq(q, rho, ux, uy, uz);
-        // SoA 内存布局: 杜绝显存带宽浪费
         f[q * cells + cell] = eq;
         f_post[q * cells + cell] = eq;
     }
 }
 
-// 核心优化：Stream 与 Collide 融合为一个 Kernel (Pull Scheme)，节约 50% 全局显存带宽
 kernel void stream_collide_step(
     __global const float* f_read,
     __global const float* payload,
@@ -633,7 +843,6 @@ kernel void stream_collide_step(
 
     float f_local[KQ];
 
-    // 1. STREAMING (Pull)
     for (int q = 0; q < KQ; ++q) {
         int opp = OPP[q];
         if (is_solid) {
@@ -671,19 +880,19 @@ kernel void stream_collide_step(
         return;
     }
 
-    // 2. MACROSCOPIC MOMENTS
-    float rho = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
+    float rho = 0.0f, mx = 0.0f, my = 0.0f, mz = 0.0f;
     for (int q = 0; q < KQ; ++q) {
         float fq = f_local[q];
         rho += fq;
-        ux += fq * (float)CX[q]; uy += fq * (float)CY[q]; uz += fq * (float)CZ[q];
+        mx += fq * (float)CX[q]; my += fq * (float)CY[q]; mz += fq * (float)CZ[q];
     }
 
-    // rho = clampf(rho, RHO_MIN, RHO_MAX);
-    float inv_rho = 1.0f / rho;
-    ux *= inv_rho; uy *= inv_rho; uz *= inv_rho;
+    float rho_safe = fmax(1e-6f, rho);
+    float inv_rho = 1.0f / rho_safe;
+    float ux = mx * inv_rho;
+    float uy = my * inv_rho;
+    float uz = mz * inv_rho;
 
-    // 3. FORCING & NUDGING
     float fx = 0.0f, fy = 0.0f, fz = 0.0f;
     float fan = clampf(payload[base + 1], 0.0f, 1.0f);
     if (fan > 0.0f) {
@@ -699,7 +908,10 @@ kernel void stream_collide_step(
         }
     }
 
-    ux += fx * inv_rho * 0.5f; uy += fy * inv_rho * 0.5f; uz += fz * inv_rho * 0.5f;
+    float dux = fx * inv_rho;
+    float duy = fy * inv_rho;
+    float duz = fz * inv_rho;
+    ux += 0.5f * dux; uy += 0.5f * duy; uz += 0.5f * duz;
     ux = mix(ux, payload[base + 5], STATE_NUDGE);
     uy = mix(uy, payload[base + 6], STATE_NUDGE);
     uz = mix(uz, payload[base + 7], STATE_NUDGE);
@@ -710,57 +922,151 @@ kernel void stream_collide_step(
         ux *= scale; uy *= scale; uz *= scale;
     }
 
-    // 4. COLLISION (RLBM + Smagorinsky)
-    float qxx = 0.0f, qyy = 0.0f, qzz = 0.0f, qxy = 0.0f, qxz = 0.0f, qyz = 0.0f;
-    float f_eq_cache[KQ];
-
-    for (int q = 0; q < KQ; ++q) {
-        float eq = feq(q, rho, ux, uy, uz);
-        f_eq_cache[q] = eq;
-        float fneq = f_local[q] - eq;
-        float cx = (float)CX[q], cy = (float)CY[q], cz = (float)CZ[q];
-        float Qxx = cx * cx - 0.33333333f;
-        float Qyy = cy * cy - 0.33333333f;
-        float Qzz = cz * cz - 0.33333333f;
-        float Qxy = cx * cy;
-        float Qxz = cx * cz;
-        float Qyz = cy * cz;
-        qxx += Qxx * fneq; qyy += Qyy * fneq; qzz += Qzz * fneq;
-        qxy += Qxy * fneq; qxz += Qxz * fneq; qyz += Qyz * fneq;
-
+    float raw[27];
+    float central_pre[27];
+    float central_post[27];
+    float raw_post[27];
+    for (int i = 0; i < 27; ++i) {
+        raw[i] = 0.0f;
+        central_pre[i] = 0.0f;
+        central_post[i] = 0.0f;
+        raw_post[i] = 0.0f;
     }
 
-    float tau_local = TAU_PLUS_BASE;
-    if (LES_ENABLED) {
-        float q_norm2 = qxx * qxx + qyy * qyy + qzz * qzz + 2.0f * (qxy * qxy + qxz * qxz + qyz * qyz);
-        float q_mag = sqrt(fmax(0.0f, q_norm2));
-        float s_mag = (3.0f / (2.0f * fmax(1e-6f, rho) * TAU_PLUS_BASE)) * q_mag;
-
-        float nu0 = (TAU_PLUS_BASE - 0.5f) / 3.0f;
-        float nu_t = SMAG_C2 * s_mag;
-        nu_t *= les_wall_damping(payload, in_ch, n, x, y, z);
-        nu_t = fmin(nu_t, LES_NUT_TO_NU0_MAX * nu0);
-        tau_local = clampf(0.5f + 3.0f * (nu0 + nu_t), TAU_PLUS_MIN, TAU_PLUS_MAX);
+    for (int q = 0; q < KQ; ++q) {
+        float fq = f_local[q];
+        float cx = (float)CX[q], cy = (float)CY[q], cz = (float)CZ[q];
+        float px[3] = {1.0f, cx, cx * cx};
+        float py[3] = {1.0f, cy, cy * cy};
+        float pz[3] = {1.0f, cz, cz * cz};
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 3; ++b) {
+                for (int c = 0; c < 3; ++c) {
+                    raw[MI(a, b, c)] += fq * px[a] * py[b] * pz[c];
+                }
+            }
+        }
     }
-    float omega = 1.0f / tau_local;
-    float uf = ux * fx + uy * fy + uz * fz;
+
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int p = 0; p <= a; ++p) {
+                    for (int qm = 0; qm <= b; ++qm) {
+                        for (int rm = 0; rm <= c; ++rm) {
+                            float sx = (a - p == 0) ? 1.0f : ((a - p == 1) ? -ux : ux * ux);
+                            float sy = (b - qm == 0) ? 1.0f : ((b - qm == 1) ? -uy : uy * uy);
+                            float sz = (c - rm == 0) ? 1.0f : ((c - rm == 1) ? -uz : uz * uz);
+                            float coeff = (float)(binom(a, p) * binom(b, qm) * binom(c, rm));
+                            sum += coeff * sx * sy * sz * raw[MI(p, qm, rm)];
+                        }
+                    }
+                }
+                central_pre[MI(a, b, c)] = sum;
+            }
+        }
+    }
+
+    float tau_diag = clampf(TAU_NORMAL, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
+    float omega_diag = 1.0f / tau_diag;
+    float omega_offdiag = 1.0f / TAU_SHEAR;
+    float s_diag = clampf(omega_diag, 0.0f, 1.95f);
+    float s_offdiag = clampf(omega_offdiag, 0.0f, 1.95f);
+    float eq_second = rho_safe * CS2;
+
+    central_post[MI(0, 0, 0)] = rho_safe;
+    central_post[MI(2, 0, 0)] = central_pre[MI(2, 0, 0)] + s_diag * (eq_second - central_pre[MI(2, 0, 0)]);
+    central_post[MI(0, 2, 0)] = central_pre[MI(0, 2, 0)] + s_diag * (eq_second - central_pre[MI(0, 2, 0)]);
+    central_post[MI(0, 0, 2)] = central_pre[MI(0, 0, 2)] + s_diag * (eq_second - central_pre[MI(0, 0, 2)]);
+    central_post[MI(1, 1, 0)] = (1.0f - s_offdiag) * central_pre[MI(1, 1, 0)];
+    central_post[MI(1, 0, 1)] = (1.0f - s_offdiag) * central_pre[MI(1, 0, 1)];
+    central_post[MI(0, 1, 1)] = (1.0f - s_offdiag) * central_pre[MI(0, 1, 1)];
+
+    float c200 = central_post[MI(2, 0, 0)];
+    float c020 = central_post[MI(0, 2, 0)];
+    float c002 = central_post[MI(0, 0, 2)];
+    float c110 = central_post[MI(1, 1, 0)];
+    float c101 = central_post[MI(1, 0, 1)];
+    float c011 = central_post[MI(0, 1, 1)];
+    float inv_rho_safe = 1.0f / fmax(1e-6f, rho_safe);
+
+    central_post[MI(2, 2, 0)] = c200 * c020 * inv_rho_safe + 2.0f * c110 * c110 * inv_rho_safe;
+    central_post[MI(2, 0, 2)] = c200 * c002 * inv_rho_safe + 2.0f * c101 * c101 * inv_rho_safe;
+    central_post[MI(0, 2, 2)] = c020 * c002 * inv_rho_safe + 2.0f * c011 * c011 * inv_rho_safe;
+    central_post[MI(2, 1, 1)] = (c200 * c011 + 2.0f * c110 * c101) * inv_rho_safe;
+    central_post[MI(1, 2, 1)] = (c020 * c101 + 2.0f * c110 * c011) * inv_rho_safe;
+    central_post[MI(1, 1, 2)] = (c002 * c110 + 2.0f * c101 * c011) * inv_rho_safe;
+    central_post[MI(2, 2, 2)] = (c200 * c020 * c002
+                                + 2.0f * c110 * c110 * c002
+                                + 2.0f * c101 * c101 * c020
+                                + 2.0f * c011 * c011 * c200
+                                + 8.0f * c110 * c101 * c011) * inv_rho_safe * inv_rho_safe;
+
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int p = 0; p <= a; ++p) {
+                    for (int qm = 0; qm <= b; ++qm) {
+                        for (int rm = 0; rm <= c; ++rm) {
+                            float ux_pow = (a - p == 0) ? 1.0f : ((a - p == 1) ? ux : ux * ux);
+                            float uy_pow = (b - qm == 0) ? 1.0f : ((b - qm == 1) ? uy : uy * uy);
+                            float uz_pow = (c - rm == 0) ? 1.0f : ((c - rm == 1) ? uz : uz * uz);
+                            float coeff = (float)(binom(a, p) * binom(b, qm) * binom(c, rm));
+                            sum += coeff * ux_pow * uy_pow * uz_pow * central_post[MI(p, qm, rm)];
+                        }
+                    }
+                }
+                raw_post[MI(a, b, c)] = sum;
+            }
+        }
+    }
+
+    float f_post_local[KQ];
+    for (int ix = 0; ix < 3; ++ix) {
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < 3; ++iz) {
+                float sum = 0.0f;
+                for (int a = 0; a < 3; ++a) {
+                    for (int b = 0; b < 3; ++b) {
+                        for (int c = 0; c < 3; ++c) {
+                            sum += TINV[ix][a] * TINV[iy][b] * TINV[iz][c] * raw_post[MI(a, b, c)];
+                        }
+                    }
+                }
+                int q = (ix * 3 + iy) * 3 + iz;
+                f_post_local[q] = sum;
+            }
+        }
+    }
+
+    float rho_corr = 0.0f, mx_corr = 0.0f, my_corr = 0.0f, mz_corr = 0.0f;
+    for (int q = 0; q < KQ; ++q) {
+        float fq = f_post_local[q];
+        rho_corr += fq;
+        mx_corr += fq * (float)CX[q];
+        my_corr += fq * (float)CY[q];
+        mz_corr += fq * (float)CZ[q];
+    }
+    float inv_rho_corr = 1.0f / fmax(1e-6f, rho_corr);
+    float ux_corr = mx_corr * inv_rho_corr;
+    float uy_corr = my_corr * inv_rho_corr;
+    float uz_corr = mz_corr * inv_rho_corr;
+    for (int q = 0; q < KQ; ++q) {
+        f_post_local[q] += feq(q, rho_safe, ux, uy, uz) - feq(q, fmax(1e-6f, rho_corr), ux_corr, uy_corr, uz_corr);
+    }
+
+    float ux_minus = ux - 0.5f * dux;
+    float uy_minus = uy - 0.5f * duy;
+    float uz_minus = uz - 0.5f * duz;
+    float ux_plus = ux + 0.5f * dux;
+    float uy_plus = uy + 0.5f * duy;
+    float uz_plus = uz + 0.5f * duz;
 
     for (int q = 0; q < KQ; ++q) {
-        float cx = (float)CX[q], cy = (float)CY[q], cz = (float)CZ[q];
-        
-        // 正则化重构非平衡态，彻底断绝奇偶震荡
-        float Qxx = cx * cx - 0.33333333f;
-        float Qyy = cy * cy - 0.33333333f;
-        float Qzz = cz * cz - 0.33333333f;
-        float Qxy = cx * cy, Qxz = cx * cz, Qyz = cy * cz;
-        float f_neq_reg = 4.5f * W[q] * (Qxx * qxx + Qyy * qyy + Qzz * qzz + 2.0f * (Qxy * qxy + Qxz * qxz + Qyz * qyz));
-
-        float cu = 3.0f * (cx * ux + cy * uy + cz * uz);
-        float cf = 3.0f * (cx * fx + cy * fy + cz * fz);
-        float Sq = W[q] * (cf - 3.0f * uf + cf * cu);
-        float source = (1.0f - 0.5f * omega) * Sq;
-
-        f_write[q * cells + cell] = f_eq_cache[q] + (1.0f - omega) * f_neq_reg + source;
+        float edm_source = feq(q, rho_safe, ux_plus, uy_plus, uz_plus) - feq(q, rho_safe, ux_minus, uy_minus, uz_minus);
+        f_write[q * cells + cell] = f_post_local[q] + edm_source;
     }
 }
 
@@ -784,11 +1090,19 @@ kernel void output_macro(
         ux += fq * (float)CX[q]; uy += fq * (float)CY[q]; uz += fq * (float)CZ[q];
     }
 
-    // rho = clampf(rho, RHO_MIN, RHO_MAX);
-    float inv_rho = 1.0f / rho;
-    out[out_base + 0] = ux * inv_rho;
-    out[out_base + 1] = uy * inv_rho;
-    out[out_base + 2] = uz * inv_rho;
+    rho = clampf(rho, RHO_MIN, RHO_MAX);
+    float inv_rho = 1.0f / fmax(1e-6f, rho);
+    float vx = ux * inv_rho;
+    float vy = uy * inv_rho;
+    float vz = uz * inv_rho;
+    if (fabs(vx) < 1e-7f) vx = 0.0f;
+    if (fabs(vy) < 1e-7f) vy = 0.0f;
+    if (fabs(vz) < 1e-7f) vz = 0.0f;
+    if (fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
+
+    out[out_base + 0] = vx;
+    out[out_base + 1] = vy;
+    out[out_base + 2] = vz;
     out[out_base + 3] = rho - 1.0f;
     for (int c = 4; c < out_ch; ++c) out[out_base + c] = 0.0f;
 }
@@ -1015,7 +1329,7 @@ void disable_opencl_runtime(const std::string& reason) {
     for (auto& e : g_contexts) release_context_gpu_buffers(e.second);
     release_opencl_runtime();
     g_cfg.opencl_enabled = false;
-    g_cfg.runtime_info = kEnableSmagorinskyLES ? ("cpu|rlbm+les (" + reason + ")") : ("cpu|rlbm (" + reason + ")");
+    g_cfg.runtime_info = "cpu|cumulant-d3q27 (" + reason + ")";
 }
 
 bool should_force_cpu_backend() {
@@ -1047,14 +1361,14 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 
     if (should_force_cpu_backend()) {
         g_cfg.opencl_enabled = false;
-        g_cfg.runtime_info = kEnableSmagorinskyLES ? "cpu|rlbm+les (forced)" : "cpu|rlbm (forced)";
+        g_cfg.runtime_info = "cpu|cumulant-d3q27 (forced)";
         return JNI_TRUE;
     }
     g_cfg.opencl_enabled = initialize_opencl_runtime();
     if (g_cfg.opencl_enabled) {
-        g_cfg.runtime_info = kEnableSmagorinskyLES ? ("opencl|rlbm+les:" + g_opencl.device_name) : ("opencl|rlbm:" + g_opencl.device_name);
+        g_cfg.runtime_info = "opencl|cumulant-d3q27:" + g_opencl.device_name;
     } else {
-        g_cfg.runtime_info = kEnableSmagorinskyLES ? ("cpu|rlbm+les (" + g_opencl.error + ")") : ("cpu|rlbm (" + g_opencl.error + ")");
+        g_cfg.runtime_info = "cpu|cumulant-d3q27 (" + g_opencl.error + ")";
     }
     return JNI_TRUE;
 }
