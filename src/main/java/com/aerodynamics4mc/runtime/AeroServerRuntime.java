@@ -57,7 +57,7 @@ import net.minecraft.world.chunk.WorldChunk;
 
 public final class AeroServerRuntime {
     private static final String LOG_PREFIX = "[aerodynamics4mc] ";
-    private static final int GRID_SIZE = 256;
+    private static final int GRID_SIZE = 128;
     private static final int TICKS_PER_SECOND = 20;
     private static final float DOMAIN_SIZE_METERS = 4.0f;
     private static final float SOLVER_STEP_SECONDS = 1.0f / TICKS_PER_SECOND;
