@@ -84,6 +84,8 @@ public final class AeroServerRuntime {
     private static final int OBSTACLE_REFRESH_TICKS = 200;
     private static final int FLOW_SYNC_INTERVAL_TICKS = 2;
     private static final int FAN_SCAN_RADIUS = 48;
+    private static final int TUNNEL_INFLOW_LAYERS = 2;
+    private static final float DEFAULT_TUNNEL_SPEED = 8.0f;
 
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final int MIN_STREAMLINE_STRIDE = 1;
@@ -114,6 +116,8 @@ public final class AeroServerRuntime {
     private boolean singleplayerClientMasterEnabled = false;
     private boolean renderVelocityVectorsEnabled = true;
     private boolean renderStreamlinesEnabled = true;
+    private boolean tunnelModeEnabled = false;
+    private float tunnelSpeed = DEFAULT_TUNNEL_SPEED;
     private int clientMasterDetectedWindows = 0;
     private int tickCounter = 0;
     private long simulationTicks = 0L;
@@ -170,6 +174,41 @@ public final class AeroServerRuntime {
                         maxWindSpeed = FloatArgumentType.getFloat(ctx, "value");
                         feedback(ctx.getSource(), "Max wind speed set to " + format2(maxWindSpeed));
                         broadcastState(ctx.getSource().getServer());
+                        return 1;
+                    })))
+            .then(CommandManager.literal("tunnel")
+                .then(CommandManager.literal("on")
+                    .executes(ctx -> {
+                        tunnelModeEnabled = true;
+                        feedback(
+                            ctx.getSource(),
+                            "Tunnel mode enabled (dir=+X, speed=" + format2(tunnelSpeed) + ")"
+                        );
+                        broadcastState(ctx.getSource().getServer());
+                        return 1;
+                    }))
+                .then(CommandManager.literal("off")
+                    .executes(ctx -> {
+                        tunnelModeEnabled = false;
+                        feedback(ctx.getSource(), "Tunnel mode disabled");
+                        broadcastState(ctx.getSource().getServer());
+                        return 1;
+                    }))
+                .then(CommandManager.literal("speed")
+                    .then(CommandManager.argument("value", FloatArgumentType.floatArg(0.0f, 64.0f))
+                        .suggests((context, builder) -> CommandSource.suggestMatching(List.of("1", "2", "4", "8", "12"), builder))
+                        .executes(ctx -> {
+                            tunnelSpeed = FloatArgumentType.getFloat(ctx, "value");
+                            feedback(ctx.getSource(), "Tunnel speed set to " + format2(tunnelSpeed));
+                            return 1;
+                        })))
+                .then(CommandManager.literal("status")
+                    .executes(ctx -> {
+                        feedback(
+                            ctx.getSource(),
+                            "Tunnel mode=" + (tunnelModeEnabled ? "on" : "off")
+                                + " dir=+X speed=" + format2(tunnelSpeed)
+                        );
                         return 1;
                     })))
             .then(CommandManager.literal("streamline")
@@ -263,6 +302,8 @@ public final class AeroServerRuntime {
                         "Status streaming=" + streamingEnabled
                             + " debug=" + debugEnabled
                             + " maxspeed=" + format2(maxWindSpeed)
+                            + " tunnel=" + (tunnelModeEnabled ? "on" : "off")
+                            + "@+X:" + format2(tunnelSpeed)
                             + " box=" + format2(DOMAIN_SIZE_METERS) + "m"
                             + " n=" + GRID_SIZE
                             + " dx=" + format4(CELL_SIZE_METERS) + "m"
@@ -498,6 +539,14 @@ public final class AeroServerRuntime {
                 continue;
             }
 
+            if (tunnelModeEnabled) {
+                for (BlockPos playerPos : playerPositions) {
+                    BlockPos origin = alignToGrid(playerPos);
+                    WindowKey key = new WindowKey(world.getRegistryKey(), origin);
+                    fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
+                }
+            }
+
             Set<Long> seenFans = new HashSet<>();
             Set<Long> visitedChunks = new HashSet<>();
             int chunkRadius = Math.max(1, (FAN_SCAN_RADIUS + 15) / 16);
@@ -634,6 +683,21 @@ public final class AeroServerRuntime {
         }
     }
 
+    private void applyTunnelInflow(WindowState window) {
+        if (!tunnelModeEnabled || tunnelSpeed <= 0.0f) {
+            return;
+        }
+
+        int layers = Math.max(1, Math.min(TUNNEL_INFLOW_LAYERS, GRID_SIZE));
+        for (int x = 0; x < layers; x++) {
+            for (int y = 0; y < GRID_SIZE; y++) {
+                for (int z = 0; z < GRID_SIZE; z++) {
+                    applyFanAtVoxel(window, x, y, z, tunnelSpeed, 0.0f, 0.0f);
+                }
+            }
+        }
+    }
+
     private byte[] captureWindow(WindowState window, BlockPos origin, BackendMode backend) {
         int voxelCount = GRID_SIZE * GRID_SIZE * GRID_SIZE * CHANNELS;
         window.ensureBaseFieldInitialized();
@@ -668,6 +732,7 @@ public final class AeroServerRuntime {
         for (FanSource fan : window.fans) {
             applyFanSource(window, fan, minX, minY, minZ);
         }
+        applyTunnelInflow(window);
 
         float nativeInputScale = backend == BackendMode.NATIVE ? (1.0f / NATIVE_VELOCITY_SCALE) : 1.0f;
         int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
