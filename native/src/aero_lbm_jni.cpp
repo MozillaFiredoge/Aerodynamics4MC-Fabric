@@ -133,17 +133,30 @@ constexpr float kRhoMax = 1.03f;
 constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
-// D3Q27 cumulant closure near tau=0.5 to mimic low-viscosity air in lattice units.
-constexpr float kTauShear = 0.50003f;
-constexpr float kTauNormal = 0.50004f;
-constexpr float kTauNormalMin = 0.50001f;
-constexpr float kTauNormalMax = 0.55f;
+// D3Q27 cumulant closure with stable baseline tau (> 0.56).
+constexpr float kTauShear = 0.56003f;
+constexpr float kTauShearMin = 0.56001f;
+constexpr float kTauShearMax = 0.95f;
+constexpr float kTauNormal = 0.56004f;
+constexpr float kTauNormalMin = 0.56001f;
+constexpr float kTauNormalMax = 0.95f;
+constexpr bool kEnableSgs = true;
+constexpr float kSgsC = 0.12f;
+constexpr float kSgsC2 = kSgsC * kSgsC;
+constexpr float kSgsNutToNu0Max = 2.5f;
+constexpr float kSgsBulkCoupling = 0.35f;
+
+constexpr int kSpongeLayers = 6;
+constexpr float kSpongeStrength = 0.22f;
+constexpr float kBoundaryConvectiveBeta = 0.35f;
+
 constexpr float kObstacleBounceBlend = 0.30f;
 constexpr float kFanAccel = 0.0140f;
 constexpr float kFanForceScalePerSpeed = 0.5f;
 constexpr float kFanForceScaleMax = 4.0f;
-constexpr float kFanPulseAmp = 0.05f;
-constexpr float kFanPulseFreq = 0.12f;
+constexpr float kFanNoiseAmp = 0.04f;
+constexpr float kFanSpeedSoftCap = 0.115f;
+constexpr float kFanSpeedDampWidth = 0.045f;
 constexpr float kStateNudge = 0.0f;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
@@ -264,9 +277,36 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     return kW[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
 }
 
+inline void decode_cell(std::size_t cell, int n, int& x, int& y, int& z) {
+    const int yz = n * n;
+    x = static_cast<int>(cell / static_cast<std::size_t>(yz));
+    const int rem = static_cast<int>(cell - static_cast<std::size_t>(x) * yz);
+    y = rem / n;
+    z = rem - y * n;
+}
+
 inline bool solid_or_oob(const ContextState& ctx, int x, int y, int z) {
     if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) return true;
     return ctx.obstacle[cell_index(x, y, z, ctx.n)] != 0;
+}
+
+inline float hash_signed_noise(std::uint64_t cell, std::uint64_t tick) {
+    std::uint64_t x = cell * 0x9E3779B97F4A7C15ULL ^ tick * 0xD1B54A32D192ED03ULL;
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    const float u = static_cast<float>(x & 0x00FFFFFFULL) * (1.0f / 16777215.0f);
+    return 2.0f * u - 1.0f;
+}
+
+inline float sponge_alpha(int n, int x, int y, int z) {
+    if (kSpongeLayers <= 0) return 0.0f;
+    const int d = std::min({x, y, z, n - 1 - x, n - 1 - y, n - 1 - z});
+    if (d >= kSpongeLayers) return 0.0f;
+    const float eta = static_cast<float>(kSpongeLayers - d) / static_cast<float>(kSpongeLayers);
+    return clampf(kSpongeStrength * eta * eta, 0.0f, 0.95f);
 }
 
 inline int binom(int n, int k) {
@@ -433,6 +473,30 @@ inline float obstacle_bounce_value(
     return bounced + kObstacleBounceBlend * (upstream - bounced);
 }
 
+inline float boundary_convective_value(
+    const ContextState& ctx, std::size_t cell, int x, int y, int z, int q, int sx, int sy, int sz
+) {
+    const int dx = (sx < 0 || sx >= ctx.n) ? kCx[q] : 0;
+    const int dy = (sy < 0 || sy >= ctx.n) ? kCy[q] : 0;
+    const int dz = (sz < 0 || sz >= ctx.n) ? kCz[q] : 0;
+
+    const int i1x = std::clamp(x + dx, 0, ctx.n - 1);
+    const int i1y = std::clamp(y + dy, 0, ctx.n - 1);
+    const int i1z = std::clamp(z + dz, 0, ctx.n - 1);
+    const std::size_t src1 = cell_index(i1x, i1y, i1z, ctx.n);
+    if (ctx.obstacle[src1]) return obstacle_bounce_value(ctx, cell, x, y, z, q);
+
+    const float f1 = ctx.f_post[dist_index(src1, q, ctx.cells)];
+    const int i2x = std::clamp(x + 2 * dx, 0, ctx.n - 1);
+    const int i2y = std::clamp(y + 2 * dy, 0, ctx.n - 1);
+    const int i2z = std::clamp(z + 2 * dz, 0, ctx.n - 1);
+    const std::size_t src2 = cell_index(i2x, i2y, i2z, ctx.n);
+    if (ctx.obstacle[src2]) return f1;
+
+    const float f2 = ctx.f_post[dist_index(src2, q, ctx.cells)];
+    return f1 + kBoundaryConvectiveBeta * (f1 - f2);
+}
+
 void allocate_cpu_context(ContextState& ctx, int n) {
     ctx.n = n;
     ctx.cells = static_cast<std::size_t>(n) * n * n;
@@ -497,10 +561,6 @@ void initialize_distributions(ContextState& ctx) {
 }
 
 void collide(ContextState& ctx) {
-    const float tau_diag = clampf(kTauNormal, kTauNormalMin, kTauNormalMax);
-    const float omega_diag = 1.0f / tau_diag;
-    const float omega_offdiag = 1.0f / kTauShear;
-
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         if (ctx.obstacle[cell]) {
             ctx.rho[cell] = 1.0f;
@@ -530,18 +590,25 @@ void collide(ContextState& ctx) {
         float ux = mom_x * inv_rho;
         float uy = mom_y * inv_rho;
         float uz = mom_z * inv_rho;
+        const float speed_pre = std::sqrt(ux * ux + uy * uy + uz * uz);
 
         float fx = 0.0f;
         float fy = 0.0f;
         float fz = 0.0f;
         if (ctx.fan_mask[cell] > 0.0f) {
-            float fan_norm = std::sqrt(ctx.fan_ux[cell] * ctx.fan_ux[cell] + ctx.fan_uy[cell] * ctx.fan_uy[cell] + ctx.fan_uz[cell] * ctx.fan_uz[cell]);
+            const float fan_norm = std::sqrt(ctx.fan_ux[cell] * ctx.fan_ux[cell] + ctx.fan_uy[cell] * ctx.fan_uy[cell] + ctx.fan_uz[cell] * ctx.fan_uz[cell]);
             if (fan_norm > 1e-8f) {
-                float force_scale = std::max(0.0f, std::min(kFanForceScaleMax, fan_norm * kFanForceScalePerSpeed) * 
-                    (1.0f + kFanPulseAmp * std::sin(kFanPulseFreq * ctx.step_counter + 0.037f * cell)));
-                fx = ctx.fan_mask[cell] * kFanAccel * force_scale * ctx.fan_ux[cell] / fan_norm;
-                fy = ctx.fan_mask[cell] * kFanAccel * force_scale * ctx.fan_uy[cell] / fan_norm;
-                fz = ctx.fan_mask[cell] * kFanAccel * force_scale * ctx.fan_uz[cell] / fan_norm;
+                const float noise = 1.0f + kFanNoiseAmp * hash_signed_noise(cell, ctx.step_counter);
+                const float force_scale_base = std::max(0.0f, std::min(kFanForceScaleMax, fan_norm * kFanForceScalePerSpeed));
+                float speed_damp = 1.0f;
+                if (speed_pre > kFanSpeedSoftCap) {
+                    const float r = (speed_pre - kFanSpeedSoftCap) / std::max(1e-4f, kFanSpeedDampWidth);
+                    speed_damp = 1.0f / (1.0f + r * r);
+                }
+                const float thrust = ctx.fan_mask[cell] * kFanAccel * force_scale_base * speed_damp * std::max(0.0f, noise);
+                fx = thrust * ctx.fan_ux[cell] / fan_norm;
+                fy = thrust * ctx.fan_uy[cell] / fan_norm;
+                fz = thrust * ctx.fan_uz[cell] / fan_norm;
             }
         }
 
@@ -575,6 +642,33 @@ void collide(ContextState& ctx) {
         float raw_post[3][3][3];
         compute_raw_moments(f_local, raw);
         compute_central_moments(raw, ux, uy, uz, central_pre);
+
+        float tau_shear_local = kTauShear;
+        float tau_normal_local = clampf(kTauNormal, kTauNormalMin, kTauNormalMax);
+        if (kEnableSgs) {
+            const float nu0 = std::max(1e-6f, (kTauShear - 0.5f) / 3.0f);
+            const float neq_xx = central_pre[2][0][0] - rho_safe * kCs2;
+            const float neq_yy = central_pre[0][2][0] - rho_safe * kCs2;
+            const float neq_zz = central_pre[0][0][2] - rho_safe * kCs2;
+            const float neq_xy = central_pre[1][1][0];
+            const float neq_xz = central_pre[1][0][1];
+            const float neq_yz = central_pre[0][1][1];
+            const float q_norm2 = neq_xx * neq_xx + neq_yy * neq_yy + neq_zz * neq_zz
+                                  + 2.0f * (neq_xy * neq_xy + neq_xz * neq_xz + neq_yz * neq_yz);
+            const float q_mag = std::sqrt(std::max(0.0f, q_norm2));
+            const float s_mag = q_mag / std::max(1e-6f, 2.0f * rho_safe * nu0);
+            float nu_t = kSgsC2 * s_mag;
+            nu_t = std::min(nu_t, kSgsNutToNu0Max * nu0);
+            tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), kTauShearMin, kTauShearMax);
+            tau_normal_local = clampf(
+                kTauNormal + (tau_shear_local - kTauShear) * kSgsBulkCoupling,
+                kTauNormalMin,
+                kTauNormalMax
+            );
+        }
+
+        const float omega_diag = 1.0f / tau_normal_local;
+        const float omega_offdiag = 1.0f / tau_shear_local;
         cumulant_relax_closure(rho_safe, central_pre, omega_diag, omega_offdiag, central_post);
         central_to_raw(central_post, ux, uy, uz, raw_post);
 
@@ -613,6 +707,18 @@ void collide(ContextState& ctx) {
             const float edm_source = feq(q, rho_safe, ux_plus, uy_plus, uz_plus) - feq(q, rho_safe, ux_minus, uy_minus, uz_minus);
             ctx.f_post[dist_index(cell, q, ctx.cells)] = f_cumulant[q] + edm_source;
         }
+
+        int cx = 0, cy = 0, cz = 0;
+        decode_cell(cell, ctx.n, cx, cy, cz);
+        const float alpha = sponge_alpha(ctx.n, cx, cy, cz);
+        if (alpha > 0.0f) {
+            const float keep = 1.0f - alpha;
+            for (int q = 0; q < kQ; ++q) {
+                const float feq_far = feq(q, 1.0f, 0.0f, 0.0f, 0.0f);
+                auto& fref = ctx.f_post[dist_index(cell, q, ctx.cells)];
+                fref = keep * fref + alpha * feq_far;
+            }
+        }
     }
 }
 
@@ -633,19 +739,7 @@ void stream_and_bounce(ContextState& ctx) {
                         const int sy = y - kCy[q];
                         const int sz = z - kCz[q];
                         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-                            // Zero-gradient boundary: pull from nearest interior neighbor along out-of-range axes.
-                            int gx = sx;
-                            int gy = sy;
-                            int gz = sz;
-                            if (sx < 0 || sx >= n) gx = std::min(n - 1, std::max(0, x + kCx[q]));
-                            if (sy < 0 || sy >= n) gy = std::min(n - 1, std::max(0, y + kCy[q]));
-                            if (sz < 0 || sz >= n) gz = std::min(n - 1, std::max(0, z + kCz[q]));
-                            const std::size_t src = cell_index(gx, gy, gz, n);
-                            if (ctx.obstacle[src]) {
-                                f_local[q] = obstacle_bounce_value(ctx, cell, x, y, z, q);
-                            } else {
-                                f_local[q] = ctx.f_post[dist_index(src, q, ctx.cells)];
-                            }
+                            f_local[q] = boundary_convective_value(ctx, cell, x, y, z, q, sx, sy, sz);
                             continue;
                         }
 
@@ -752,16 +846,26 @@ __constant float TINV[3][3] = {
     {0.0f, 0.5f, 0.5f}
 };
 
-__constant float TAU_SHEAR = 0.50003f;
-__constant float TAU_NORMAL = 0.50004f;
-__constant float TAU_NORMAL_MIN = 0.50001f;
-__constant float TAU_NORMAL_MAX = 0.55f;
+__constant float TAU_SHEAR = 0.56003f;
+__constant float TAU_SHEAR_MIN = 0.56001f;
+__constant float TAU_SHEAR_MAX = 0.95f;
+__constant float TAU_NORMAL = 0.56004f;
+__constant float TAU_NORMAL_MIN = 0.56001f;
+__constant float TAU_NORMAL_MAX = 0.95f;
+__constant int SGS_ENABLED = 1;
+__constant float SGS_C2 = 0.0144f;
+__constant float SGS_NUT_TO_NU0_MAX = 2.5f;
+__constant float SGS_BULK_COUPLING = 0.35f;
+__constant int SPONGE_LAYERS = 6;
+__constant float SPONGE_STRENGTH = 0.22f;
+__constant float BOUNDARY_CONVECTIVE_BETA = 0.35f;
 __constant float OBSTACLE_BOUNCE_BLEND = 0.30f;
 __constant float FAN_ACCEL = 0.0140f;
 __constant float FAN_FORCE_SCALE_PER_SPEED = 0.5f;
 __constant float FAN_FORCE_SCALE_MAX = 4.0f;
-__constant float FAN_PULSE_AMP = 0.05f;
-__constant float FAN_PULSE_FREQ = 0.12f;
+__constant float FAN_NOISE_AMP = 0.04f;
+__constant float FAN_SPEED_SOFT_CAP = 0.115f;
+__constant float FAN_SPEED_DAMP_WIDTH = 0.045f;
 __constant float STATE_NUDGE = 0.0f;
 __constant float MAX_SPEED = 0.20207259f;
 __constant float RHO_MIN = 0.97f;
@@ -781,6 +885,61 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     float cu = 3.0f * (CX[q] * ux + CY[q] * uy + CZ[q] * uz);
     float uu = ux * ux + uy * uy + uz * uz;
     return W[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
+}
+
+inline float obstacle_bounce_value(
+    __global const float* f_read, __global const float* payload,
+    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp
+);
+
+inline uint hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+inline float signed_noise(uint cell, uint tick) {
+    uint h = hash_u32(cell * 747796405U ^ tick * 2891336453U);
+    float u = (float)(h & 0x00FFFFFFU) * (1.0f / 16777215.0f);
+    return 2.0f * u - 1.0f;
+}
+
+inline float sponge_alpha(int n, int x, int y, int z) {
+    if (SPONGE_LAYERS <= 0) return 0.0f;
+    int d = min(min(min(x, y), min(z, n - 1 - z)), min(n - 1 - x, n - 1 - y));
+    if (d >= SPONGE_LAYERS) return 0.0f;
+    float eta = (float)(SPONGE_LAYERS - d) / (float)SPONGE_LAYERS;
+    return clampf(SPONGE_STRENGTH * eta * eta, 0.0f, 0.95f);
+}
+
+inline float boundary_convective_value(
+    __global const float* f_read, __global const float* payload,
+    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int sx, int sy, int sz
+) {
+    int dx = (sx < 0 || sx >= n) ? CX[q] : 0;
+    int dy = (sy < 0 || sy >= n) ? CY[q] : 0;
+    int dz = (sz < 0 || sz >= n) ? CZ[q] : 0;
+
+    int i1x = clampi(x + dx, 0, n - 1);
+    int i1y = clampi(y + dy, 0, n - 1);
+    int i1z = clampi(z + dz, 0, n - 1);
+    int src1 = (i1x * n + i1y) * n + i1z;
+    if (payload[src1 * in_ch + 0] > 0.5f) {
+        return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q]);
+    }
+
+    float f1 = f_read[q * cells + src1];
+    int i2x = clampi(x + 2 * dx, 0, n - 1);
+    int i2y = clampi(y + 2 * dy, 0, n - 1);
+    int i2z = clampi(z + 2 * dz, 0, n - 1);
+    int src2 = (i2x * n + i2y) * n + i2z;
+    if (payload[src2 * in_ch + 0] > 0.5f) return f1;
+
+    float f2 = f_read[q * cells + src2];
+    return f1 + BOUNDARY_CONVECTIVE_BETA * (f1 - f2);
 }
 
 inline float obstacle_bounce_value(
@@ -852,19 +1011,7 @@ kernel void stream_collide_step(
 
         int sx = x - CX[q], sy = y - CY[q], sz = z - CZ[q];
         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-            // Zero-gradient boundary: pull from nearest interior neighbor along out-of-range axes.
-            int gx = sx;
-            int gy = sy;
-            int gz = sz;
-            if (sx < 0 || sx >= n) gx = clampi(x + CX[q], 0, n - 1);
-            if (sy < 0 || sy >= n) gy = clampi(y + CY[q], 0, n - 1);
-            if (sz < 0 || sz >= n) gz = clampi(z + CZ[q], 0, n - 1);
-            int src = (gx * n + gy) * n + gz;
-            if (payload[src * in_ch + 0] > 0.5f) {
-                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, opp);
-            } else {
-                f_local[q] = f_read[q * cells + src];
-            }
+            f_local[q] = boundary_convective_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz);
         } else {
             int src = (sx * n + sy) * n + sz;
             if (payload[src * in_ch + 0] > 0.5f) {
@@ -892,6 +1039,7 @@ kernel void stream_collide_step(
     float ux = mx * inv_rho;
     float uy = my * inv_rho;
     float uz = mz * inv_rho;
+    float speed_pre = sqrt(ux * ux + uy * uy + uz * uz);
 
     float fx = 0.0f, fy = 0.0f, fz = 0.0f;
     float fan = clampf(payload[base + 1], 0.0f, 1.0f);
@@ -900,11 +1048,17 @@ kernel void stream_collide_step(
         float fan_norm = sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
         if (fan_norm > 1e-8f) {
             float inv_norm = 1.0f / fan_norm;
-            float force_scale = fmax(0.0f, fmin(FAN_FORCE_SCALE_MAX, fan_norm * FAN_FORCE_SCALE_PER_SPEED) * 
-                (1.0f + FAN_PULSE_AMP * sin(FAN_PULSE_FREQ * (float)tick + 0.037f * (float)cell)));
-            fx = fan * FAN_ACCEL * force_scale * fan_ux * inv_norm;
-            fy = fan * FAN_ACCEL * force_scale * fan_uy * inv_norm;
-            fz = fan * FAN_ACCEL * force_scale * fan_uz * inv_norm;
+            float force_scale_base = fmax(0.0f, fmin(FAN_FORCE_SCALE_MAX, fan_norm * FAN_FORCE_SCALE_PER_SPEED));
+            float speed_damp = 1.0f;
+            if (speed_pre > FAN_SPEED_SOFT_CAP) {
+                float r = (speed_pre - FAN_SPEED_SOFT_CAP) / fmax(1e-4f, FAN_SPEED_DAMP_WIDTH);
+                speed_damp = 1.0f / (1.0f + r * r);
+            }
+            float noise = 1.0f + FAN_NOISE_AMP * signed_noise((uint)cell, (uint)tick);
+            float thrust = fan * FAN_ACCEL * force_scale_base * speed_damp * fmax(0.0f, noise);
+            fx = thrust * fan_ux * inv_norm;
+            fy = thrust * fan_uy * inv_norm;
+            fz = thrust * fan_uz * inv_norm;
         }
     }
 
@@ -968,9 +1122,32 @@ kernel void stream_collide_step(
         }
     }
 
-    float tau_diag = clampf(TAU_NORMAL, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
-    float omega_diag = 1.0f / tau_diag;
-    float omega_offdiag = 1.0f / TAU_SHEAR;
+    float tau_shear_local = TAU_SHEAR;
+    float tau_normal_local = clampf(TAU_NORMAL, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
+    if (SGS_ENABLED) {
+        float nu0 = fmax(1e-6f, (TAU_SHEAR - 0.5f) / 3.0f);
+        float neq_xx = central_pre[MI(2, 0, 0)] - rho_safe * CS2;
+        float neq_yy = central_pre[MI(0, 2, 0)] - rho_safe * CS2;
+        float neq_zz = central_pre[MI(0, 0, 2)] - rho_safe * CS2;
+        float neq_xy = central_pre[MI(1, 1, 0)];
+        float neq_xz = central_pre[MI(1, 0, 1)];
+        float neq_yz = central_pre[MI(0, 1, 1)];
+        float q_norm2 = neq_xx * neq_xx + neq_yy * neq_yy + neq_zz * neq_zz
+                        + 2.0f * (neq_xy * neq_xy + neq_xz * neq_xz + neq_yz * neq_yz);
+        float q_mag = sqrt(fmax(0.0f, q_norm2));
+        float s_mag = q_mag / fmax(1e-6f, 2.0f * rho_safe * nu0);
+        float nu_t = SGS_C2 * s_mag;
+        nu_t = fmin(nu_t, SGS_NUT_TO_NU0_MAX * nu0);
+        tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), TAU_SHEAR_MIN, TAU_SHEAR_MAX);
+        tau_normal_local = clampf(
+            TAU_NORMAL + (tau_shear_local - TAU_SHEAR) * SGS_BULK_COUPLING,
+            TAU_NORMAL_MIN,
+            TAU_NORMAL_MAX
+        );
+    }
+
+    float omega_diag = 1.0f / tau_normal_local;
+    float omega_offdiag = 1.0f / tau_shear_local;
     float s_diag = clampf(omega_diag, 0.0f, 1.95f);
     float s_offdiag = clampf(omega_offdiag, 0.0f, 1.95f);
     float eq_second = rho_safe * CS2;
@@ -1063,10 +1240,17 @@ kernel void stream_collide_step(
     float ux_plus = ux + 0.5f * dux;
     float uy_plus = uy + 0.5f * duy;
     float uz_plus = uz + 0.5f * duz;
+    float alpha_sponge = sponge_alpha(n, x, y, z);
+    float keep_sponge = 1.0f - alpha_sponge;
 
     for (int q = 0; q < KQ; ++q) {
         float edm_source = feq(q, rho_safe, ux_plus, uy_plus, uz_plus) - feq(q, rho_safe, ux_minus, uy_minus, uz_minus);
-        f_write[q * cells + cell] = f_post_local[q] + edm_source;
+        float f_next = f_post_local[q] + edm_source;
+        if (alpha_sponge > 0.0f) {
+            float f_far = feq(q, 1.0f, 0.0f, 0.0f, 0.0f);
+            f_next = keep_sponge * f_next + alpha_sponge * f_far;
+        }
+        f_write[q * cells + cell] = f_next;
     }
 }
 
@@ -1329,7 +1513,7 @@ void disable_opencl_runtime(const std::string& reason) {
     for (auto& e : g_contexts) release_context_gpu_buffers(e.second);
     release_opencl_runtime();
     g_cfg.opencl_enabled = false;
-    g_cfg.runtime_info = "cpu|cumulant-d3q27 (" + reason + ")";
+    g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + reason + ")";
 }
 
 bool should_force_cpu_backend() {
@@ -1361,14 +1545,14 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 
     if (should_force_cpu_backend()) {
         g_cfg.opencl_enabled = false;
-        g_cfg.runtime_info = "cpu|cumulant-d3q27 (forced)";
+        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (forced)";
         return JNI_TRUE;
     }
     g_cfg.opencl_enabled = initialize_opencl_runtime();
     if (g_cfg.opencl_enabled) {
-        g_cfg.runtime_info = "opencl|cumulant-d3q27:" + g_opencl.device_name;
+        g_cfg.runtime_info = "opencl|cumulant-d3q27+sgs:" + g_opencl.device_name;
     } else {
-        g_cfg.runtime_info = "cpu|cumulant-d3q27 (" + g_opencl.error + ")";
+        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + g_opencl.error + ")";
     }
     return JNI_TRUE;
 }
