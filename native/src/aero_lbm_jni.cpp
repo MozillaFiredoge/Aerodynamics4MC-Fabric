@@ -158,6 +158,7 @@ constexpr float kFanTargetMax = 0.34f;
 constexpr float kFanNoiseAmp = 0.02f;
 constexpr float kFanSpeedSoftCap = 0.30f;
 constexpr float kFanSpeedDampWidth = 0.06f;
+constexpr float kFanPerpDamp = 1.0f;
 constexpr float kStateNudge = 0.0f;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
@@ -606,18 +607,23 @@ void collide(ContextState& ctx) {
                     0.0f,
                     kFanTargetMax
                 );
-                const float target_ux = ctx.fan_ux[cell] * inv_norm * target_speed;
-                const float target_uy = ctx.fan_uy[cell] * inv_norm * target_speed;
-                const float target_uz = ctx.fan_uz[cell] * inv_norm * target_speed;
+                const float nx = ctx.fan_ux[cell] * inv_norm;
+                const float ny = ctx.fan_uy[cell] * inv_norm;
+                const float nz = ctx.fan_uz[cell] * inv_norm;
+                const float u_para = ux * nx + uy * ny + uz * nz;
+                const float u_perp_x = ux - u_para * nx;
+                const float u_perp_y = uy - u_para * ny;
+                const float u_perp_z = uz - u_para * nz;
+                const float axial_push = std::max(0.0f, target_speed - u_para);
                 float speed_damp = 1.0f;
                 if (speed_pre > kFanSpeedSoftCap) {
                     const float r = (speed_pre - kFanSpeedSoftCap) / std::max(1e-4f, kFanSpeedDampWidth);
                     speed_damp = 1.0f / (1.0f + r * r);
                 }
                 const float beta = ctx.fan_mask[cell] * kFanBeta * speed_damp;
-                fx = beta * rho_safe * (target_ux - ux);
-                fy = beta * rho_safe * (target_uy - uy);
-                fz = beta * rho_safe * (target_uz - uz);
+                fx = beta * rho_safe * (axial_push * nx - kFanPerpDamp * u_perp_x);
+                fy = beta * rho_safe * (axial_push * ny - kFanPerpDamp * u_perp_y);
+                fz = beta * rho_safe * (axial_push * nz - kFanPerpDamp * u_perp_z);
             }
         }
 
@@ -876,6 +882,7 @@ __constant float FAN_TARGET_MAX = 0.34f;
 __constant float FAN_NOISE_AMP = 0.02f;
 __constant float FAN_SPEED_SOFT_CAP = 0.30f;
 __constant float FAN_SPEED_DAMP_WIDTH = 0.06f;
+__constant float FAN_PERP_DAMP = 1.0f;
 __constant float STATE_NUDGE = 0.0f;
 __constant float MAX_SPEED = 0.34641016f;
 __constant float RHO_MIN = 0.97f;
@@ -1066,18 +1073,23 @@ kernel void stream_collide_step(
                 0.0f,
                 FAN_TARGET_MAX
             );
-            float target_ux = fan_ux * inv_norm * target_speed;
-            float target_uy = fan_uy * inv_norm * target_speed;
-            float target_uz = fan_uz * inv_norm * target_speed;
+            float nx = fan_ux * inv_norm;
+            float ny = fan_uy * inv_norm;
+            float nz = fan_uz * inv_norm;
+            float u_para = ux * nx + uy * ny + uz * nz;
+            float u_perp_x = ux - u_para * nx;
+            float u_perp_y = uy - u_para * ny;
+            float u_perp_z = uz - u_para * nz;
+            float axial_push = fmax(0.0f, target_speed - u_para);
             float speed_damp = 1.0f;
             if (speed_pre > FAN_SPEED_SOFT_CAP) {
                 float r = (speed_pre - FAN_SPEED_SOFT_CAP) / fmax(1e-4f, FAN_SPEED_DAMP_WIDTH);
                 speed_damp = 1.0f / (1.0f + r * r);
             }
             float beta = fan * FAN_BETA * speed_damp;
-            fx = beta * rho_safe * (target_ux - ux);
-            fy = beta * rho_safe * (target_uy - uy);
-            fz = beta * rho_safe * (target_uz - uz);
+            fx = beta * rho_safe * (axial_push * nx - FAN_PERP_DAMP * u_perp_x);
+            fy = beta * rho_safe * (axial_push * ny - FAN_PERP_DAMP * u_perp_y);
+            fz = beta * rho_safe * (axial_push * nz - FAN_PERP_DAMP * u_perp_z);
         }
     }
 
