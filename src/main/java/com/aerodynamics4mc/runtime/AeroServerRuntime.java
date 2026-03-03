@@ -901,7 +901,7 @@ public final class AeroServerRuntime {
 
     private boolean isSolidObstacle(ServerWorld world, BlockPos pos) {
         BlockState state = world.getBlockState(pos);
-        if (state.isAir()) {
+        if (state.isAir() || state.isOf(ModBlocks.DUCT_BLOCK)) {
             return false;
         }
         return !state.getCollisionShape(world, pos).isEmpty();

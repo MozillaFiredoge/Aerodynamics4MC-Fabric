@@ -627,7 +627,7 @@ final class ClientFluidRuntime {
 
     private boolean isSolidObstacle(ClientWorld world, BlockPos pos) {
         BlockState state = world.getBlockState(pos);
-        if (state.isAir()) {
+        if (state.isAir() || state.isOf(ModBlocks.DUCT_BLOCK)) {
             return false;
         }
         return !state.getCollisionShape(world, pos).isEmpty();
