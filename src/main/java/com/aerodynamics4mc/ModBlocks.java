@@ -16,8 +16,11 @@ import net.fabricmc.fabric.api.object.builder.v1.block.entity.FabricBlockEntityT
 public final class ModBlocks {
     public static final String MOD_ID = "aerodynamics4mc";
     public static final Identifier FAN_ID = Identifier.of(MOD_ID, "fan");
+    public static final Identifier DUCT_ID = Identifier.of(MOD_ID, "duct");
     public static Block FAN_BLOCK;
     public static Item FAN_ITEM;
+    public static Block DUCT_BLOCK;
+    public static Item DUCT_ITEM;
     public static BlockEntityType<FanBlockEntity> FAN_BLOCK_ENTITY;
 
     private ModBlocks() {
@@ -33,6 +36,15 @@ public final class ModBlocks {
             new BlockItem(FAN_BLOCK, new Item.Settings().registryKey(RegistryKey.of(RegistryKeys.ITEM, FAN_ID)))
         );
         ItemGroupEvents.modifyEntriesEvent(ItemGroups.FUNCTIONAL).register(entries -> entries.add(FAN_ITEM));
+        RegistryKey<Block> ductKey = RegistryKey.of(RegistryKeys.BLOCK, DUCT_ID);
+        DUCT_BLOCK = new DuctBlock(Block.Settings.create().registryKey(ductKey).strength(1.0f));
+        Registry.register(Registries.BLOCK, DUCT_ID, DUCT_BLOCK);
+        DUCT_ITEM = Registry.register(
+            Registries.ITEM,
+            DUCT_ID,
+            new BlockItem(DUCT_BLOCK, new Item.Settings().registryKey(RegistryKey.of(RegistryKeys.ITEM, DUCT_ID)))
+        );
+        ItemGroupEvents.modifyEntriesEvent(ItemGroups.FUNCTIONAL).register(entries -> entries.add(DUCT_ITEM));
         FAN_BLOCK_ENTITY = Registry.register(
             Registries.BLOCK_ENTITY_TYPE,
             FAN_ID,

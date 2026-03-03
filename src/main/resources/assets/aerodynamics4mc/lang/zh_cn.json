@@ -1,4 +1,6 @@
 {
   "block.aerodynamics4mc.fan": "风扇",
-  "item.aerodynamics4mc.fan": "风扇"
+  "item.aerodynamics4mc.fan": "风扇",
+  "block.aerodynamics4mc.duct": "整流罩",
+  "item.aerodynamics4mc.duct": "整流罩"
 }

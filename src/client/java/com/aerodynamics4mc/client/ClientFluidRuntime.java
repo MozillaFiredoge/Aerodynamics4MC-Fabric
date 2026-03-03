@@ -53,6 +53,15 @@ final class ClientFluidRuntime {
 
     private static final float INFLOW_SPEED = 8.0f;
     private static final int FAN_RADIUS = 1;
+    private static final int DUCT_SCAN_MAX = 20;
+    private static final int DUCT_RING_RADIUS = 1;
+    private static final float DUCT_RING_FILL_THRESHOLD = 0.80f;
+    private static final int DUCT_MAX_CONSECUTIVE_GAPS = 1;
+    private static final int DUCT_LEVEL_ONE_MIN = 6;
+    private static final int DUCT_LEVEL_TWO_MIN = 12;
+    private static final int DUCT_LEVEL_THREE_MIN = 20;
+    private static final int DUCT_JET_RANGE = 20;
+    private static final float DUCT_EDGE_FACTOR = 0.22f;
     private static final int SOCKET_PORT = 5001;
     private static final String SOCKET_HOST = "127.0.0.1";
     private static final int RESPONSE_CHANNELS = 4;
@@ -320,9 +329,10 @@ final class ClientFluidRuntime {
                         }
 
                         Direction facing = state.get(FanBlock.FACING);
+                        int ductLength = computeDuctLength(world, pos, facing);
                         BlockPos origin = alignToGrid(pos);
                         WindowKey key = new WindowKey(origin);
-                        fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>()).add(new FanSource(pos, facing));
+                        fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>()).add(new FanSource(pos, facing, ductLength));
                     }
                 }
             }
@@ -422,6 +432,143 @@ final class ClientFluidRuntime {
             }
             default -> applyFanAtVoxel(window, cx, cy, cz, fanVx, fanVy, fanVz);
         }
+        applyDuctJet(window, fan, minX, minY, minZ);
+    }
+
+    private void applyDuctJet(WindowState window, FanSource fan, int minX, int minY, int minZ) {
+        int level = ductLevel(fan.ductLength());
+        if (level <= 0) {
+            return;
+        }
+
+        BlockPos inflowPos = fan.pos().offset(fan.facing());
+        int sx = inflowPos.getX() - minX;
+        int sy = inflowPos.getY() - minY;
+        int sz = inflowPos.getZ() - minZ;
+        int dx = fan.facing().getOffsetX();
+        int dy = fan.facing().getOffsetY();
+        int dz = fan.facing().getOffsetZ();
+        float levelBoost = switch (level) {
+            case 1 -> 1.05f;
+            case 2 -> 1.25f;
+            default -> 1.55f;
+        };
+
+        float baseVx = dx * INFLOW_SPEED;
+        float baseVy = dy * INFLOW_SPEED;
+        float baseVz = dz * INFLOW_SPEED;
+        int range = switch (level) {
+            case 1 -> 8;
+            case 2 -> 14;
+            default -> DUCT_JET_RANGE;
+        };
+        for (int step = 0; step < range; step++) {
+            float t = range > 1 ? (float) step / (range - 1) : 0.0f;
+            float decay = 1.0f - 0.55f * t;
+            float coreScale = levelBoost * Math.max(0.35f, decay);
+            int cx = sx + dx * step;
+            int cy = sy + dy * step;
+            int cz = sz + dz * step;
+            applyFanAtVoxel(window, cx, cy, cz, baseVx * coreScale, baseVy * coreScale, baseVz * coreScale);
+
+            float edgeFalloff = Math.max(0.10f, 1.0f - 0.90f * t);
+            float edgeScale = coreScale * DUCT_EDGE_FACTOR * edgeFalloff;
+            switch (fan.facing().getAxis()) {
+                case X -> {
+                    applyFanAtVoxel(window, cx, cy + 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx, cy - 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx, cy, cz + 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx, cy, cz - 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                }
+                case Y -> {
+                    applyFanAtVoxel(window, cx + 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx - 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx, cy, cz + 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx, cy, cz - 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                }
+                case Z -> {
+                    applyFanAtVoxel(window, cx + 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx - 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx, cy + 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxel(window, cx, cy - 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                }
+            }
+        }
+    }
+
+    private int ductLevel(int ductLength) {
+        if (ductLength >= DUCT_LEVEL_THREE_MIN) {
+            return 3;
+        }
+        if (ductLength >= DUCT_LEVEL_TWO_MIN) {
+            return 2;
+        }
+        if (ductLength >= DUCT_LEVEL_ONE_MIN) {
+            return 1;
+        }
+        return 0;
+    }
+
+    private int computeDuctLength(ClientWorld world, BlockPos fanPos, Direction facing) {
+        int runLength = 0;
+        int maxRunLength = 0;
+        int consecutiveGaps = 0;
+        BlockPos.Mutable cursor = new BlockPos.Mutable();
+
+        for (int step = 1; step <= DUCT_SCAN_MAX; step++) {
+            cursor.set(
+                fanPos.getX() + facing.getOffsetX() * step,
+                fanPos.getY() + facing.getOffsetY() * step,
+                fanPos.getZ() + facing.getOffsetZ() * step
+            );
+            if (isDuctSegment(world, cursor, facing)) {
+                runLength++;
+                maxRunLength = Math.max(maxRunLength, runLength);
+                consecutiveGaps = 0;
+            } else {
+                consecutiveGaps++;
+                if (consecutiveGaps > DUCT_MAX_CONSECUTIVE_GAPS) {
+                    break;
+                }
+            }
+        }
+        return maxRunLength;
+    }
+
+    private boolean isDuctSegment(ClientWorld world, BlockPos center, Direction facing) {
+        if (isSolidObstacle(world, center)) {
+            return false;
+        }
+
+        int ringCells = 0;
+        int filledRingCells = 0;
+        BlockPos.Mutable cursor = new BlockPos.Mutable();
+        Direction.Axis axis = facing.getAxis();
+        for (int a = -DUCT_RING_RADIUS; a <= DUCT_RING_RADIUS; a++) {
+            for (int b = -DUCT_RING_RADIUS; b <= DUCT_RING_RADIUS; b++) {
+                if (!isDuctRingCell(a, b)) {
+                    continue;
+                }
+                ringCells++;
+                switch (axis) {
+                    case X -> cursor.set(center.getX(), center.getY() + a, center.getZ() + b);
+                    case Y -> cursor.set(center.getX() + a, center.getY(), center.getZ() + b);
+                    case Z -> cursor.set(center.getX() + a, center.getY() + b, center.getZ());
+                }
+                if (world.getBlockState(cursor).isOf(ModBlocks.DUCT_BLOCK)) {
+                    filledRingCells++;
+                }
+            }
+        }
+
+        if (ringCells == 0) {
+            return false;
+        }
+        return ((float) filledRingCells / ringCells) >= DUCT_RING_FILL_THRESHOLD;
+    }
+
+    private boolean isDuctRingCell(int a, int b) {
+        return Math.max(Math.abs(a), Math.abs(b)) == DUCT_RING_RADIUS;
     }
 
     private byte[] captureWindow(WindowState window, BlockPos origin, SolverBackend backend) {
@@ -678,7 +825,7 @@ final class ClientFluidRuntime {
     private record WindowKey(BlockPos origin) {
     }
 
-    private record FanSource(BlockPos pos, Direction facing) {
+    private record FanSource(BlockPos pos, Direction facing, int ductLength) {
     }
 
     private static final class WindowState {

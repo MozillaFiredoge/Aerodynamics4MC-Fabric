@@ -135,16 +135,16 @@ constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
 // D3Q27 cumulant closure with low-viscosity baseline tau.
-constexpr float kTauShear = 0.51503f;
-constexpr float kTauShearMin = 0.51501f;
+constexpr float kTauShear = 0.502f;
+constexpr float kTauShearMin = 0.5005;
 constexpr float kTauShearMax = 0.95f;
-constexpr float kTauNormal = 0.51504f;
-constexpr float kTauNormalMin = 0.51501f;
+constexpr float kTauNormal = 0.502f;
+constexpr float kTauNormalMin = 0.5005f;
 constexpr float kTauNormalMax = 0.95f;
 constexpr bool kEnableSgs = true;
-constexpr float kSgsC = 0.07f;
+constexpr float kSgsC = 0.025f;
 constexpr float kSgsC2 = kSgsC * kSgsC;
-constexpr float kSgsNutToNu0Max = 0.4f;
+constexpr float kSgsNutToNu0Max = 5.0f;
 constexpr float kSgsBulkCoupling = 0.30f;
 
 constexpr int kSpongeLayers = 4;
@@ -856,11 +856,11 @@ __constant float TINV[3][3] = {
     {0.0f, 0.5f, 0.5f}
 };
 
-__constant float TAU_SHEAR = 0.51503f;
-__constant float TAU_SHEAR_MIN = 0.51501f;
+__constant float TAU_SHEAR = 0.502f;
+__constant float TAU_SHEAR_MIN = 0.5005f;
 __constant float TAU_SHEAR_MAX = 0.95f;
-__constant float TAU_NORMAL = 0.51504f;
-__constant float TAU_NORMAL_MIN = 0.51501f;
+__constant float TAU_NORMAL = 0.502f;
+__constant float TAU_NORMAL_MIN = 0.5005f;
 __constant float TAU_NORMAL_MAX = 0.95f;
 __constant int SGS_ENABLED = 1;
 __constant float SGS_C2 = 0.0049f;
