@@ -32,9 +32,18 @@ public class AeroClientMod implements ClientModInitializer {
     private boolean clientPlayerAuthority = false;
     private float maxWindSpeed = DEFAULT_MAX_INFLOW_SPEED;
     private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
+    private boolean streamlineRoiEnabled = false;
+    private int streamlineRoiMinX = 0;
+    private int streamlineRoiMaxX = GRID_SIZE - 1;
+    private int streamlineRoiMinY = 0;
+    private int streamlineRoiMaxY = GRID_SIZE - 1;
+    private int streamlineRoiMinZ = 0;
+    private int streamlineRoiMaxZ = GRID_SIZE - 1;
     private int backendMode = DEFAULT_BACKEND_MODE;
     private boolean renderVelocityVectors = true;
     private boolean renderStreamlines = true;
+    private boolean renderBackgroundVectors = false;
+    private boolean renderThermalAnomaly = false;
 
     @Override
     public void onInitializeClient() {
@@ -90,6 +99,15 @@ public class AeroClientMod implements ClientModInitializer {
             FlowRenderer renderer = entry.getValue().renderer();
             renderer.setMaxInflowSpeed(maxWindSpeed);
             renderer.setStreamlineSampleStride(streamlineSampleStride);
+            renderer.setStreamlineRoi(
+                streamlineRoiEnabled,
+                streamlineRoiMinX,
+                streamlineRoiMaxX,
+                streamlineRoiMinY,
+                streamlineRoiMaxY,
+                streamlineRoiMinZ,
+                streamlineRoiMaxZ
+            );
             renderer.setRenderVelocityVectors(renderVelocityVectors);
             renderer.setRenderStreamlines(renderStreamlines);
             renderer.render(context);
@@ -103,19 +121,48 @@ public class AeroClientMod implements ClientModInitializer {
             clientPlayerAuthority = payload.clientPlayerAuthority();
             maxWindSpeed = Math.max(1e-6f, payload.maxWindSpeed());
             streamlineSampleStride = sanitizeStride(payload.streamlineStride());
+            streamlineRoiEnabled = payload.streamlineRoiEnabled();
+            streamlineRoiMinX = payload.streamlineRoiMinX();
+            streamlineRoiMaxX = payload.streamlineRoiMaxX();
+            streamlineRoiMinY = payload.streamlineRoiMinY();
+            streamlineRoiMaxY = payload.streamlineRoiMaxY();
+            streamlineRoiMinZ = payload.streamlineRoiMinZ();
+            streamlineRoiMaxZ = payload.streamlineRoiMaxZ();
             backendMode = payload.backendMode();
             renderVelocityVectors = payload.renderVelocityVectors();
             renderStreamlines = payload.renderStreamlines();
+            renderBackgroundVectors = payload.renderBackgroundVectors();
+            renderThermalAnomaly = payload.renderThermalAnomaly();
             clientFluidRuntime.setMaxWindSpeed(maxWindSpeed);
             clientFluidRuntime.setStreamlineSampleStride(streamlineSampleStride);
+            clientFluidRuntime.setStreamlineRoi(
+                streamlineRoiEnabled,
+                streamlineRoiMinX,
+                streamlineRoiMaxX,
+                streamlineRoiMinY,
+                streamlineRoiMaxY,
+                streamlineRoiMinZ,
+                streamlineRoiMaxZ
+            );
             clientFluidRuntime.setBackendModeId(backendMode);
             clientFluidRuntime.setRenderVelocityVectors(renderVelocityVectors);
             clientFluidRuntime.setRenderStreamlines(renderStreamlines);
+            clientFluidRuntime.setRenderBackgroundVectors(renderBackgroundVectors);
+            clientFluidRuntime.setRenderThermalAnomaly(renderThermalAnomaly);
 
             for (WindowView window : remoteWindows.values()) {
                 FlowRenderer renderer = window.renderer();
                 renderer.setMaxInflowSpeed(maxWindSpeed);
                 renderer.setStreamlineSampleStride(streamlineSampleStride);
+                renderer.setStreamlineRoi(
+                    streamlineRoiEnabled,
+                    streamlineRoiMinX,
+                    streamlineRoiMaxX,
+                    streamlineRoiMinY,
+                    streamlineRoiMaxY,
+                    streamlineRoiMinZ,
+                    streamlineRoiMaxZ
+                );
                 renderer.setRenderVelocityVectors(renderVelocityVectors);
                 renderer.setRenderStreamlines(renderStreamlines);
             }
@@ -148,6 +195,15 @@ public class AeroClientMod implements ClientModInitializer {
             FlowRenderer renderer = view.renderer();
             renderer.setMaxInflowSpeed(maxWindSpeed);
             renderer.setStreamlineSampleStride(streamlineSampleStride);
+            renderer.setStreamlineRoi(
+                streamlineRoiEnabled,
+                streamlineRoiMinX,
+                streamlineRoiMaxX,
+                streamlineRoiMinY,
+                streamlineRoiMaxY,
+                streamlineRoiMinZ,
+                streamlineRoiMaxZ
+            );
             renderer.setRenderVelocityVectors(renderVelocityVectors);
             renderer.setRenderStreamlines(renderStreamlines);
             renderer.updateFlowField(payload.origin(), stride, payload.flow());
@@ -185,9 +241,18 @@ public class AeroClientMod implements ClientModInitializer {
         clientPlayerAuthority = false;
         maxWindSpeed = DEFAULT_MAX_INFLOW_SPEED;
         streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
+        streamlineRoiEnabled = false;
+        streamlineRoiMinX = 0;
+        streamlineRoiMaxX = GRID_SIZE - 1;
+        streamlineRoiMinY = 0;
+        streamlineRoiMaxY = GRID_SIZE - 1;
+        streamlineRoiMinZ = 0;
+        streamlineRoiMaxZ = GRID_SIZE - 1;
         backendMode = DEFAULT_BACKEND_MODE;
         renderVelocityVectors = true;
         renderStreamlines = true;
+        renderBackgroundVectors = false;
+        renderThermalAnomaly = false;
     }
 
     private record WindowKey(Identifier dimensionId, BlockPos origin) {

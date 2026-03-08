@@ -22,19 +22,28 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.joml.Matrix4f;
+
 import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
+import com.aerodynamics4mc.runtime.BackgroundFieldGrid;
+import com.aerodynamics4mc.runtime.WorldThermalSampler;
 
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.render.RenderLayers;
+import net.minecraft.client.render.VertexConsumer;
+import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.chunk.WorldChunk;
 
 final class ClientFluidRuntime {
@@ -72,13 +81,31 @@ final class ClientFluidRuntime {
 
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
+    private static final float BACKGROUND_VELOCITY_COUPLING = 0.08f;
+    private static final int BACKGROUND_THERMAL_COMPONENT = 3;
     private static final double FORCE_STRENGTH = 0.02;
+    private static final int ATMOS_DEBUG_STRIDE = 16;
+    private static final float ATMOS_VECTOR_SCALE = 1.2f;
+    private static final float ATMOS_VECTOR_MIN_SPEED = 1e-4f;
+    private static final float ATMOS_THERMAL_RANGE = 6.0f;
+    private static final float ATMOS_THERMAL_MIN_MARKER = 0.10f;
 
     private final int gridSize;
     private final int flowCount;
     private final Map<WindowKey, WindowState> windows = new HashMap<>();
     private final List<WindowState> retiredWindows = new ArrayList<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
+    private final BackgroundFieldGrid backgroundField = new BackgroundFieldGrid(new BackgroundFieldGrid.FlowSolver() {
+        @Override
+        public boolean step(int gridSize, byte[] payload, long contextId, float[] output) {
+            return stepBackgroundFlow(gridSize, payload, contextId, output);
+        }
+
+        @Override
+        public void releaseContext(long contextId) {
+            releaseBackgroundFlowContext(contextId);
+        }
+    });
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT);
     private final AtomicInteger activeSolveTasks = new AtomicInteger(0);
     private final AtomicLong runtimeGeneration = new AtomicLong(0L);
@@ -86,8 +113,17 @@ final class ClientFluidRuntime {
     private SolverBackend backendMode = SolverBackend.NATIVE;
     private float maxWindSpeed = INFLOW_SPEED;
     private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
+    private boolean streamlineRoiEnabled = false;
+    private int streamlineRoiMinX = 0;
+    private int streamlineRoiMaxX = 0;
+    private int streamlineRoiMinY = 0;
+    private int streamlineRoiMaxY = 0;
+    private int streamlineRoiMinZ = 0;
+    private int streamlineRoiMaxZ = 0;
     private boolean renderVelocityVectors = true;
     private boolean renderStreamlines = true;
+    private boolean renderBackgroundVectors = false;
+    private boolean renderThermalAnomaly = false;
     private int tickCounter = 0;
     private long nextContextId = 1L;
     private Identifier currentDimensionId;
@@ -96,6 +132,9 @@ final class ClientFluidRuntime {
     ClientFluidRuntime(int gridSize) {
         this.gridSize = gridSize;
         this.flowCount = gridSize * gridSize * gridSize * RESPONSE_CHANNELS;
+        this.streamlineRoiMaxX = gridSize - 1;
+        this.streamlineRoiMaxY = gridSize - 1;
+        this.streamlineRoiMaxZ = gridSize - 1;
     }
 
     void setBackendModeId(int backendModeId) {
@@ -110,12 +149,39 @@ final class ClientFluidRuntime {
         this.streamlineSampleStride = sanitizeStride(stride);
     }
 
+    void setStreamlineRoi(boolean enabled, int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
+        streamlineRoiEnabled = enabled;
+        streamlineRoiMinX = clampRoiCoord(minX);
+        streamlineRoiMaxX = clampRoiCoord(maxX);
+        streamlineRoiMinY = clampRoiCoord(minY);
+        streamlineRoiMaxY = clampRoiCoord(maxY);
+        streamlineRoiMinZ = clampRoiCoord(minZ);
+        streamlineRoiMaxZ = clampRoiCoord(maxZ);
+        if (streamlineRoiMinX > streamlineRoiMaxX || streamlineRoiMinY > streamlineRoiMaxY || streamlineRoiMinZ > streamlineRoiMaxZ) {
+            streamlineRoiEnabled = false;
+            streamlineRoiMinX = 0;
+            streamlineRoiMaxX = gridSize - 1;
+            streamlineRoiMinY = 0;
+            streamlineRoiMaxY = gridSize - 1;
+            streamlineRoiMinZ = 0;
+            streamlineRoiMaxZ = gridSize - 1;
+        }
+    }
+
     void setRenderVelocityVectors(boolean enabled) {
         this.renderVelocityVectors = enabled;
     }
 
     void setRenderStreamlines(boolean enabled) {
         this.renderStreamlines = enabled;
+    }
+
+    void setRenderBackgroundVectors(boolean enabled) {
+        this.renderBackgroundVectors = enabled;
+    }
+
+    void setRenderThermalAnomaly(boolean enabled) {
+        this.renderThermalAnomaly = enabled;
     }
 
     void tick(MinecraftClient client) {
@@ -132,6 +198,7 @@ final class ClientFluidRuntime {
             retireAllWindows();
             cleanupRetiredWindowsIfIdle();
             currentDimensionId = dimensionId;
+            backgroundField.clear();
         }
 
         tickCounter++;
@@ -139,8 +206,22 @@ final class ClientFluidRuntime {
             refreshWindows(world);
         }
         if (windows.isEmpty()) {
+            backgroundField.clear();
             return;
         }
+
+        List<BlockPos> windowOrigins = new ArrayList<>(windows.size());
+        for (WindowKey key : windows.keySet()) {
+            windowOrigins.add(key.origin());
+        }
+        backgroundField.update(
+            currentDimensionId,
+            world.getTimeOfDay(),
+            tickCounter,
+            windowOrigins,
+            gridSize,
+            (sampleX, sampleY, sampleZ) -> WorldThermalSampler.sampleAveragedAnomaly(world, sampleX, sampleY, sampleZ)
+        );
 
         Iterator<Map.Entry<WindowKey, WindowState>> iterator = windows.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -152,6 +233,15 @@ final class ClientFluidRuntime {
                 window.latestFlow = completedFlow;
                 window.renderer.setMaxInflowSpeed(maxWindSpeed);
                 window.renderer.setStreamlineSampleStride(streamlineSampleStride);
+                window.renderer.setStreamlineRoi(
+                    streamlineRoiEnabled,
+                    streamlineRoiMinX,
+                    streamlineRoiMaxX,
+                    streamlineRoiMinY,
+                    streamlineRoiMaxY,
+                    streamlineRoiMinZ,
+                    streamlineRoiMaxZ
+                );
                 window.renderer.setRenderVelocityVectors(renderVelocityVectors);
                 window.renderer.setRenderStreamlines(renderStreamlines);
                 window.renderer.updateFlowFieldNoCopy(key.origin(), 1, completedFlow);
@@ -159,11 +249,14 @@ final class ClientFluidRuntime {
 
             if (window.busy.compareAndSet(false, true)) {
                 BlockPos origin = key.origin();
+                Identifier dimensionSnapshot = currentDimensionId;
                 SolverBackend backendSnapshot = backendMode;
                 float maxSpeedSnapshot = maxWindSpeed;
                 long generationSnapshot = runtimeGeneration.get();
                 activeSolveTasks.incrementAndGet();
-                solverExecutor.execute(() -> runSolveTask(window, origin, backendSnapshot, maxSpeedSnapshot, generationSnapshot));
+                solverExecutor.execute(
+                    () -> runSolveTask(window, origin, dimensionSnapshot, backendSnapshot, maxSpeedSnapshot, generationSnapshot)
+                );
             }
 
             if (window.latestFlow != null) {
@@ -173,12 +266,19 @@ final class ClientFluidRuntime {
         }
     }
 
-    private void runSolveTask(WindowState window, BlockPos origin, SolverBackend backend, float maxSpeedSnapshot, long generationSnapshot) {
+    private void runSolveTask(
+        WindowState window,
+        BlockPos origin,
+        Identifier dimensionId,
+        SolverBackend backend,
+        float maxSpeedSnapshot,
+        long generationSnapshot
+    ) {
         try {
             if (generationSnapshot != runtimeGeneration.get()) {
                 return;
             }
-            byte[] payload = captureWindow(window, origin, backend);
+            byte[] payload = captureWindow(window, dimensionId, origin, backend);
             float[] response = runSolverStep(window, payload, backend);
             updateBaseFieldFromResponse(window, response, maxSpeedSnapshot);
             if (generationSnapshot == runtimeGeneration.get()) {
@@ -209,13 +309,172 @@ final class ClientFluidRuntime {
             return;
         }
 
-        for (WindowState window : windows.values()) {
+        for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+            WindowKey key = entry.getKey();
+            WindowState window = entry.getValue();
             window.renderer.setMaxInflowSpeed(maxWindSpeed);
             window.renderer.setStreamlineSampleStride(streamlineSampleStride);
+            window.renderer.setStreamlineRoi(
+                streamlineRoiEnabled,
+                streamlineRoiMinX,
+                streamlineRoiMaxX,
+                streamlineRoiMinY,
+                streamlineRoiMaxY,
+                streamlineRoiMinZ,
+                streamlineRoiMaxZ
+            );
             window.renderer.setRenderVelocityVectors(renderVelocityVectors);
             window.renderer.setRenderStreamlines(renderStreamlines);
             window.renderer.render(context);
+            renderAtmosphereDebugOverlay(context, key.origin());
         }
+    }
+
+    private void renderAtmosphereDebugOverlay(WorldRenderContext context, BlockPos windowOrigin) {
+        if ((!renderBackgroundVectors && !renderThermalAnomaly)
+            || context == null
+            || context.gameRenderer() == null
+            || context.consumers() == null
+            || context.matrices() == null
+            || windowOrigin == null
+            || currentDimensionId == null) {
+            return;
+        }
+
+        var camera = context.gameRenderer().getCamera();
+        if (camera == null) {
+            return;
+        }
+
+        MatrixStack matrices = context.matrices();
+        Vec3d camPos = camera.getCameraPos();
+        matrices.push();
+        matrices.translate(
+            windowOrigin.getX() - camPos.x,
+            windowOrigin.getY() - camPos.y,
+            windowOrigin.getZ() - camPos.z
+        );
+
+        VertexConsumer buffer = context.consumers().getBuffer(RenderLayers.lines());
+        MatrixStack.Entry entry = matrices.peek();
+        Matrix4f matrix = entry.getPositionMatrix();
+        float[] sample = new float[4];
+        int stride = Math.max(2, Math.min(ATMOS_DEBUG_STRIDE, gridSize));
+
+        for (int x = 0; x < gridSize; x += stride) {
+            float localX = x + 0.5f;
+            for (int y = 0; y < gridSize; y += stride) {
+                float localY = y + 0.5f;
+                for (int z = 0; z < gridSize; z += stride) {
+                    float localZ = z + 0.5f;
+                    backgroundField.sampleInto(
+                        currentDimensionId,
+                        windowOrigin.getX() + localX,
+                        windowOrigin.getY() + localY,
+                        windowOrigin.getZ() + localZ,
+                        sample,
+                        0
+                    );
+
+                    if (renderBackgroundVectors) {
+                        float vx = sample[0];
+                        float vy = sample[1];
+                        float vz = sample[2];
+                        float speed = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
+                        if (speed > ATMOS_VECTOR_MIN_SPEED) {
+                            float speedNorm = MathHelper.clamp(speed / Math.max(maxWindSpeed, ATMOS_VECTOR_MIN_SPEED), 0.0f, 1.0f);
+                            float invSpeed = 1.0f / speed;
+                            float dx = vx * invSpeed;
+                            float dy = vy * invSpeed;
+                            float dz = vz * invSpeed;
+                            float length = MathHelper.clamp(0.25f + (speedNorm * ATMOS_VECTOR_SCALE), 0.20f, 2.50f);
+                            int r = MathHelper.clamp(Math.round(30.0f + speedNorm * 210.0f), 0, 255);
+                            int g = MathHelper.clamp(Math.round(140.0f + speedNorm * 100.0f), 0, 255);
+                            int b = MathHelper.clamp(Math.round(255.0f - speedNorm * 180.0f), 0, 255);
+                            drawDebugLine(
+                                buffer,
+                                matrix,
+                                entry,
+                                localX,
+                                localY,
+                                localZ,
+                                localX + dx * length,
+                                localY + dy * length,
+                                localZ + dz * length,
+                                r,
+                                g,
+                                b,
+                                210,
+                                1.10f
+                            );
+                        }
+                    }
+
+                    if (renderThermalAnomaly) {
+                        float thermal = sample[BACKGROUND_THERMAL_COMPONENT];
+                        float thermalNorm = MathHelper.clamp(Math.abs(thermal) / ATMOS_THERMAL_RANGE, 0.0f, 1.0f);
+                        if (thermalNorm >= ATMOS_THERMAL_MIN_MARKER) {
+                            boolean warm = thermal >= 0.0f;
+                            int r = warm ? 255 : MathHelper.clamp(Math.round(120.0f * (1.0f - thermalNorm)), 0, 255);
+                            int g = MathHelper.clamp(Math.round(120.0f + 90.0f * (1.0f - thermalNorm)), 0, 255);
+                            int b = warm ? MathHelper.clamp(Math.round(140.0f * (1.0f - thermalNorm)), 0, 255) : 255;
+                            float markerLength = 0.15f + 0.45f * thermalNorm;
+                            float markerEndY = localY + (warm ? markerLength : -markerLength);
+                            drawDebugLine(
+                                buffer,
+                                matrix,
+                                entry,
+                                localX,
+                                localY,
+                                localZ,
+                                localX,
+                                markerEndY,
+                                localZ,
+                                r,
+                                g,
+                                b,
+                                235,
+                                1.35f
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        matrices.pop();
+    }
+
+    private static void drawDebugLine(
+        VertexConsumer buffer,
+        Matrix4f matrix,
+        MatrixStack.Entry entry,
+        float x0,
+        float y0,
+        float z0,
+        float x1,
+        float y1,
+        float z1,
+        int r,
+        int g,
+        int b,
+        int a,
+        float lineWidth
+    ) {
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        float dz = z1 - z0;
+        float lengthSq = dx * dx + dy * dy + dz * dz;
+        if (lengthSq <= 1.0e-8f) {
+            return;
+        }
+        float invLength = (float) (1.0 / Math.sqrt(lengthSq));
+        float nx = dx * invLength;
+        float ny = dy * invLength;
+        float nz = dz * invLength;
+
+        buffer.vertex(matrix, x0, y0, z0).color(r, g, b, a).normal(entry, nx, ny, nz).lineWidth(lineWidth);
+        buffer.vertex(matrix, x1, y1, z1).color(r, g, b, a).normal(entry, nx, ny, nz).lineWidth(lineWidth);
     }
 
     void clear() {
@@ -223,6 +482,7 @@ final class ClientFluidRuntime {
         tickCounter = 0;
         currentDimensionId = null;
         lastSolverError = "";
+        backgroundField.clear();
         retireAllWindows();
         cleanupRetiredWindowsIfIdle();
     }
@@ -571,7 +831,7 @@ final class ClientFluidRuntime {
         return Math.max(Math.abs(a), Math.abs(b)) == DUCT_RING_RADIUS;
     }
 
-    private byte[] captureWindow(WindowState window, BlockPos origin, SolverBackend backend) {
+    private byte[] captureWindow(WindowState window, Identifier dimensionId, BlockPos origin, SolverBackend backend) {
         window.ensureBaseFieldInitialized(gridSize);
         window.ensurePayloadBuffer(gridSize);
         float[] obstacleField = window.obstacleField;
@@ -580,6 +840,7 @@ final class ClientFluidRuntime {
         int minZ = origin.getZ();
         ByteBuffer buffer = window.payloadBuffer;
         buffer.clear();
+        float[] backgroundSample = new float[4];
 
         for (int x = 0; x < gridSize; x++) {
             for (int y = 0; y < gridSize; y++) {
@@ -598,6 +859,21 @@ final class ClientFluidRuntime {
                         window.baseField[idx + CH_STATE_VY] = 0.0f;
                         window.baseField[idx + CH_STATE_VZ] = 0.0f;
                         window.baseField[idx + CH_STATE_P] = 0.0f;
+                    } else {
+                        backgroundField.sampleInto(
+                            dimensionId,
+                            minX + x + 0.5,
+                            minY + y + 0.5,
+                            minZ + z + 0.5,
+                            backgroundSample,
+                            0
+                        );
+                        float vx = window.baseField[idx + CH_STATE_VX];
+                        float vy = window.baseField[idx + CH_STATE_VY];
+                        float vz = window.baseField[idx + CH_STATE_VZ];
+                        window.baseField[idx + CH_STATE_VX] = vx + (backgroundSample[0] - vx) * BACKGROUND_VELOCITY_COUPLING;
+                        window.baseField[idx + CH_STATE_VY] = vy + (backgroundSample[1] - vy) * BACKGROUND_VELOCITY_COUPLING;
+                        window.baseField[idx + CH_STATE_VZ] = vz + (backgroundSample[2] - vz) * BACKGROUND_VELOCITY_COUPLING;
                     }
                 }
             }
@@ -659,6 +935,28 @@ final class ClientFluidRuntime {
 
         window.obstacleField = obstacle;
         window.lastObstacleRefreshTick = tickNow;
+    }
+
+    private boolean stepBackgroundFlow(int gridSize, byte[] payload, long contextId, float[] output) {
+        if (!nativeBackend.isLoaded()) {
+            return false;
+        }
+        if (!nativeBackend.ensureInitialized(gridSize, BackgroundFieldGrid.SOLVER_INPUT_CHANNELS, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS)) {
+            return false;
+        }
+        boolean ok = nativeBackend.step(payload, gridSize, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS, contextId, output);
+        if (!ok) {
+            return false;
+        }
+        scaleResponseVelocity(output, NATIVE_VELOCITY_SCALE);
+        return true;
+    }
+
+    private void releaseBackgroundFlowContext(long contextId) {
+        if (!nativeBackend.isLoaded()) {
+            return;
+        }
+        nativeBackend.releaseContext(contextId);
     }
 
     private float[] runSolverStep(WindowState window, byte[] payload, SolverBackend backend) throws IOException {
@@ -738,6 +1036,10 @@ final class ClientFluidRuntime {
 
     private int sanitizeStride(int requested) {
         return (requested == 1 || requested == 2 || requested == 4 || requested == 8) ? requested : DEFAULT_STREAMLINE_STRIDE;
+    }
+
+    private int clampRoiCoord(int value) {
+        return Math.max(0, Math.min(gridSize - 1, value));
     }
 
     private void sendPayload(WindowState window, byte[] payload) throws IOException {

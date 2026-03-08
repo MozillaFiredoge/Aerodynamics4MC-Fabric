@@ -15,7 +15,7 @@ public class FlowRenderer {
     private static final int CHANNELS = 4;
     private static final float MIN_SPEED = 1e-6f;
     private static final float RENDER_THRESHOLD_NORMALIZED = 0.01f;
-    private static final int MIN_VECTOR_FIELD_STRIDE = 2;
+    private static final int MIN_VECTOR_FIELD_STRIDE = 1;
 
     private final int gridSize;
     private float maxInflowSpeed;
@@ -28,6 +28,13 @@ public class FlowRenderer {
     private boolean hasFlowData;
     private boolean renderVelocityVectors = true;
     private boolean renderStreamlines = true;
+    private boolean streamlineRoiEnabled;
+    private int streamlineRoiMinX;
+    private int streamlineRoiMaxX;
+    private int streamlineRoiMinY;
+    private int streamlineRoiMaxY;
+    private int streamlineRoiMinZ;
+    private int streamlineRoiMaxZ;
 
     public FlowRenderer(int gridSize, float maxInflowSpeed) {
         this.gridSize = gridSize;
@@ -38,6 +45,13 @@ public class FlowRenderer {
         this.flowField = new float[sampledGridSize * sampledGridSize * sampledGridSize * CHANNELS];
         this.origin = BlockPos.ORIGIN;
         this.hasFlowData = false;
+        this.streamlineRoiEnabled = false;
+        this.streamlineRoiMinX = 0;
+        this.streamlineRoiMaxX = gridSize - 1;
+        this.streamlineRoiMinY = 0;
+        this.streamlineRoiMaxY = gridSize - 1;
+        this.streamlineRoiMinZ = 0;
+        this.streamlineRoiMaxZ = gridSize - 1;
     }
 
     public void setMaxInflowSpeed(float maxInflowSpeed) {
@@ -54,6 +68,33 @@ public class FlowRenderer {
 
     public void setRenderStreamlines(boolean enabled) {
         this.renderStreamlines = enabled;
+    }
+
+    public void setStreamlineRoi(boolean enabled, int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
+        int clampedMinX = clampRoiCoord(minX);
+        int clampedMaxX = clampRoiCoord(maxX);
+        int clampedMinY = clampRoiCoord(minY);
+        int clampedMaxY = clampRoiCoord(maxY);
+        int clampedMinZ = clampRoiCoord(minZ);
+        int clampedMaxZ = clampRoiCoord(maxZ);
+        if (clampedMinX > clampedMaxX || clampedMinY > clampedMaxY || clampedMinZ > clampedMaxZ) {
+            this.streamlineRoiEnabled = false;
+            this.streamlineRoiMinX = 0;
+            this.streamlineRoiMaxX = gridSize - 1;
+            this.streamlineRoiMinY = 0;
+            this.streamlineRoiMaxY = gridSize - 1;
+            this.streamlineRoiMinZ = 0;
+            this.streamlineRoiMaxZ = gridSize - 1;
+            return;
+        }
+
+        this.streamlineRoiEnabled = enabled;
+        this.streamlineRoiMinX = clampedMinX;
+        this.streamlineRoiMaxX = clampedMaxX;
+        this.streamlineRoiMinY = clampedMinY;
+        this.streamlineRoiMaxY = clampedMaxY;
+        this.streamlineRoiMinZ = clampedMinZ;
+        this.streamlineRoiMaxZ = clampedMaxZ;
     }
 
     public void updateFlowField(BlockPos origin, float[] data) {
@@ -177,7 +218,7 @@ public class FlowRenderer {
     private void renderStreamlines(VertexConsumer buffer, MatrixStack matrices) {
         int seedStride = streamlineSampleStride;
         float stepSize = 0.35f;
-        int maxSteps = 80;
+        int maxSteps = 5000;
         var entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
         int interleave = seedStride <= 1 ? 4 : (seedStride == 2 ? 2 : 1);
@@ -187,17 +228,28 @@ public class FlowRenderer {
             phase = (int) (client.world.getTime() % interleave);
         }
 
-        for (int y = 0; y < gridSize; y += seedStride) {
-            for (int z = 0; z < gridSize; z += seedStride) {
+        int roiMinX = streamlineRoiEnabled ? streamlineRoiMinX : 0;
+        int roiMaxX = streamlineRoiEnabled ? streamlineRoiMaxX : gridSize - 1;
+        int roiMinY = streamlineRoiEnabled ? streamlineRoiMinY : 0;
+        int roiMaxY = streamlineRoiEnabled ? streamlineRoiMaxY : gridSize - 1;
+        int roiMinZ = streamlineRoiEnabled ? streamlineRoiMinZ : 0;
+        int roiMaxZ = streamlineRoiEnabled ? streamlineRoiMaxZ : gridSize - 1;
+        double roiMaxBoundX = roiMaxX + 1.0;
+        double roiMaxBoundY = roiMaxY + 1.0;
+        double roiMaxBoundZ = roiMaxZ + 1.0;
+        double seedX = roiMinX + 0.5;
+
+        for (int y = roiMinY; y <= roiMaxY; y += seedStride) {
+            for (int z = roiMinZ; z <= roiMaxZ; z += seedStride) {
                 if (interleave > 1) {
-                    int seedY = y / seedStride;
-                    int seedZ = z / seedStride;
+                    int seedY = (y - roiMinY) / seedStride;
+                    int seedZ = (z - roiMinZ) / seedStride;
                     int bucket = (seedY + seedZ) % interleave;
                     if (bucket != phase) {
                         continue;
                     }
                 }
-                Vec3d pos = new Vec3d(0.5, y + 0.5, z + 0.5);
+                Vec3d pos = new Vec3d(seedX, y + 0.5, z + 0.5);
 
                 for (int step = 0; step < maxSteps; step++) {
                     Vec3d vel = sampleVelocityLocal(pos.x, pos.y, pos.z);
@@ -215,9 +267,9 @@ public class FlowRenderer {
                     float advectStep = stepSize * MathHelper.clamp(speedNorm * 8.0f, 0.2f, 1.25f);
                     Vec3d nextPos = pos.add(dir.multiply(advectStep));
 
-                    if (nextPos.x < 0 || nextPos.x >= gridSize
-                        || nextPos.y < 0 || nextPos.y >= gridSize
-                        || nextPos.z < 0 || nextPos.z >= gridSize) {
+                    if (nextPos.x < roiMinX || nextPos.x >= roiMaxBoundX
+                        || nextPos.y < roiMinY || nextPos.y >= roiMaxBoundY
+                        || nextPos.z < roiMinZ || nextPos.z >= roiMaxBoundZ) {
                         break;
                     }
 
@@ -387,6 +439,10 @@ public class FlowRenderer {
 
     private int sanitizeStride(int stride) {
         return (stride == 1 || stride == 2 || stride == 4 || stride == 8) ? stride : 4;
+    }
+
+    private int clampRoiCoord(int coord) {
+        return MathHelper.clamp(coord, 0, gridSize - 1);
     }
 
     private int getViridisColor(float t) {

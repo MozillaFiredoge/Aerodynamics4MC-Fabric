@@ -39,7 +39,7 @@ public class FanBlock extends BlockWithEntity {
 
     @Override
     public BlockState getPlacementState(ItemPlacementContext ctx) {
-        Direction facing = ctx.getPlayerLookDirection();
+        Direction facing = ctx.getHorizontalPlayerFacing();
         return getDefaultState().with(FACING, facing);
     }
 

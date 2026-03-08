@@ -101,6 +101,7 @@ public final class AeroServerRuntime {
     private static final int MAX_STREAMLINE_STRIDE = 8;
 
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
+    private static final float BACKGROUND_VELOCITY_COUPLING = 0.08f;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int PLAYER_VELOCITY_SYNC_MIN_INTERVAL_TICKS = 20;
@@ -118,6 +119,17 @@ public final class AeroServerRuntime {
     private final Map<UUID, Integer> entityVelocitySyncTickById = new HashMap<>();
     private final Map<UUID, Vec3d> entityLastSyncedVelocityById = new HashMap<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
+    private final BackgroundFieldGrid backgroundField = new BackgroundFieldGrid(new BackgroundFieldGrid.FlowSolver() {
+        @Override
+        public boolean step(int gridSize, byte[] payload, long contextId, float[] output) {
+            return stepBackgroundFlow(gridSize, payload, contextId, output);
+        }
+
+        @Override
+        public void releaseContext(long contextId) {
+            releaseBackgroundFlowContext(contextId);
+        }
+    });
 
     private boolean streamingEnabled = false;
     private boolean debugEnabled = false;
@@ -125,6 +137,8 @@ public final class AeroServerRuntime {
     private boolean singleplayerClientMasterEnabled = false;
     private boolean renderVelocityVectorsEnabled = true;
     private boolean renderStreamlinesEnabled = true;
+    private boolean renderBackgroundVectorsEnabled = false;
+    private boolean renderThermalAnomalyEnabled = false;
     private boolean tunnelModeEnabled = false;
     private float tunnelSpeed = DEFAULT_TUNNEL_SPEED;
     private int clientMasterDetectedWindows = 0;
@@ -136,6 +150,13 @@ public final class AeroServerRuntime {
     private float lastMaxFlowSpeed = 0.0f;
     private String lastSolverError = "";
     private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
+    private boolean streamlineRoiEnabled = false;
+    private int streamlineRoiMinX = 0;
+    private int streamlineRoiMaxX = GRID_SIZE - 1;
+    private int streamlineRoiMinY = 0;
+    private int streamlineRoiMaxY = GRID_SIZE - 1;
+    private int streamlineRoiMinZ = 0;
+    private int streamlineRoiMaxZ = GRID_SIZE - 1;
     private BackendMode backendMode = BackendMode.NATIVE;
     private long nextContextId = 1L;
 
@@ -234,7 +255,53 @@ public final class AeroServerRuntime {
                         feedback(ctx.getSource(), "Streamline sample stride set to " + stride);
                         broadcastState(ctx.getSource().getServer());
                         return 1;
-                    })))
+                    }))
+                .then(CommandManager.literal("roi")
+                    .then(CommandManager.literal("off")
+                        .executes(ctx -> {
+                            streamlineRoiEnabled = false;
+                            feedback(ctx.getSource(), "Streamline ROI disabled (full window)");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("set")
+                        .then(CommandManager.argument("minX", IntegerArgumentType.integer(0, GRID_SIZE - 1))
+                            .then(CommandManager.argument("maxX", IntegerArgumentType.integer(0, GRID_SIZE - 1))
+                                .then(CommandManager.argument("minY", IntegerArgumentType.integer(0, GRID_SIZE - 1))
+                                    .then(CommandManager.argument("maxY", IntegerArgumentType.integer(0, GRID_SIZE - 1))
+                                        .then(CommandManager.argument("minZ", IntegerArgumentType.integer(0, GRID_SIZE - 1))
+                                            .then(CommandManager.argument("maxZ", IntegerArgumentType.integer(0, GRID_SIZE - 1))
+                                                .executes(ctx -> {
+                                                    int minX = IntegerArgumentType.getInteger(ctx, "minX");
+                                                    int maxX = IntegerArgumentType.getInteger(ctx, "maxX");
+                                                    int minY = IntegerArgumentType.getInteger(ctx, "minY");
+                                                    int maxY = IntegerArgumentType.getInteger(ctx, "maxY");
+                                                    int minZ = IntegerArgumentType.getInteger(ctx, "minZ");
+                                                    int maxZ = IntegerArgumentType.getInteger(ctx, "maxZ");
+                                                    if (minX > maxX || minY > maxY || minZ > maxZ) {
+                                                        error(ctx.getSource(), "ROI min must be <= max on each axis");
+                                                        return 0;
+                                                    }
+                                                    streamlineRoiEnabled = true;
+                                                    streamlineRoiMinX = minX;
+                                                    streamlineRoiMaxX = maxX;
+                                                    streamlineRoiMinY = minY;
+                                                    streamlineRoiMaxY = maxY;
+                                                    streamlineRoiMinZ = minZ;
+                                                    streamlineRoiMaxZ = maxZ;
+                                                    feedback(ctx.getSource(), "Streamline ROI enabled " + formatStreamlineRoiBounds());
+                                                    broadcastState(ctx.getSource().getServer());
+                                                    return 1;
+                                                }))))))))
+                    .then(CommandManager.literal("status")
+                        .executes(ctx -> {
+                            feedback(
+                                ctx.getSource(),
+                                "Streamline ROI=" + (streamlineRoiEnabled ? "on " + formatStreamlineRoiBounds() : "off (full window)")
+                            );
+                            return 1;
+                        })))
+                )
             .then(CommandManager.literal("backend")
                 .then(CommandManager.literal("socket")
                     .executes(ctx -> {
@@ -318,9 +385,12 @@ public final class AeroServerRuntime {
                             + " dx=" + format4(CELL_SIZE_METERS) + "m"
                             + " dt=" + format3(SOLVER_STEP_SECONDS) + "s"
                             + " stride=" + streamlineSampleStride
+                            + " streamlineRoi=" + (streamlineRoiEnabled ? formatStreamlineRoiBounds() : "off")
                             + " windows=" + statusWindowCount
                             + " renderVectors=" + renderVelocityVectorsEnabled
                             + " renderStreamlines=" + renderStreamlinesEnabled
+                            + " renderBackgroundVectors=" + renderBackgroundVectorsEnabled
+                            + " renderThermalAnomaly=" + renderThermalAnomalyEnabled
                             + " simTicks=" + simulationTicks
                             + " simTickPerSec=" + format2(simulationTicksPerSecond)
                             + " clientMaster=" + (singleplayerClientMasterEnabled ? "on" : "off")
@@ -379,6 +449,46 @@ public final class AeroServerRuntime {
                         .executes(ctx -> {
                             feedback(ctx.getSource(), "Streamlines rendering=" + renderStreamlinesEnabled);
                             return 1;
+                        })))
+                .then(CommandManager.literal("background")
+                    .then(CommandManager.literal("on")
+                        .executes(ctx -> {
+                            renderBackgroundVectorsEnabled = true;
+                            feedback(ctx.getSource(), "Background vectors rendering enabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("off")
+                        .executes(ctx -> {
+                            renderBackgroundVectorsEnabled = false;
+                            feedback(ctx.getSource(), "Background vectors rendering disabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("status")
+                        .executes(ctx -> {
+                            feedback(ctx.getSource(), "Background vectors rendering=" + renderBackgroundVectorsEnabled);
+                            return 1;
+                        })))
+                .then(CommandManager.literal("thermal")
+                    .then(CommandManager.literal("on")
+                        .executes(ctx -> {
+                            renderThermalAnomalyEnabled = true;
+                            feedback(ctx.getSource(), "Thermal anomaly rendering enabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("off")
+                        .executes(ctx -> {
+                            renderThermalAnomalyEnabled = false;
+                            feedback(ctx.getSource(), "Thermal anomaly rendering disabled");
+                            broadcastState(ctx.getSource().getServer());
+                            return 1;
+                        }))
+                    .then(CommandManager.literal("status")
+                        .executes(ctx -> {
+                            feedback(ctx.getSource(), "Thermal anomaly rendering=" + renderThermalAnomalyEnabled);
+                            return 1;
                         }))))
         );
     }
@@ -410,6 +520,7 @@ public final class AeroServerRuntime {
             lastMaxFlowSpeed = 0.0f;
             entityVelocitySyncTickById.clear();
             entityLastSyncedVelocityById.clear();
+            backgroundField.clear();
             updateSimulationRate(false);
             return;
         }
@@ -420,9 +531,12 @@ public final class AeroServerRuntime {
         clientMasterDetectedWindows = windows.size();
 
         if (windows.isEmpty()) {
+            backgroundField.clear();
             updateSimulationRate(false);
             return;
         }
+
+        updateBackgroundFields(server);
 
         boolean shouldSyncFlow = debugEnabled && (tickCounter % FLOW_SYNC_INTERVAL_TICKS == 0);
         boolean steppedThisTick = false;
@@ -439,7 +553,7 @@ public final class AeroServerRuntime {
             }
 
             try {
-                byte[] payload = captureWindow(window, key.origin(), backendMode);
+                byte[] payload = captureWindow(window, key.worldKey().getValue(), key.origin(), backendMode);
                 float[] response = runSolverStep(window, payload, backendMode);
                 updateBaseFieldFromResponse(window, response, maxWindSpeed);
                 window.latestFlow = response;
@@ -493,6 +607,7 @@ public final class AeroServerRuntime {
         }
         windows.clear();
         clientMasterDetectedWindows = 0;
+        backgroundField.clear();
         nativeBackend.shutdown();
     }
 
@@ -535,6 +650,34 @@ public final class AeroServerRuntime {
             window.fans = List.copyOf(entry.getValue());
             refreshObstacleField(world, key.origin(), window, tickCounter);
         }
+    }
+
+    private void updateBackgroundFields(MinecraftServer server) {
+        Map<Identifier, List<BlockPos>> originsByDimension = new HashMap<>();
+        for (WindowKey key : windows.keySet()) {
+            originsByDimension
+                .computeIfAbsent(key.worldKey().getValue(), ignored -> new ArrayList<>())
+                .add(key.origin());
+        }
+
+        Set<Identifier> activeDimensions = new HashSet<>();
+        for (ServerWorld world : server.getWorlds()) {
+            Identifier dimensionId = world.getRegistryKey().getValue();
+            List<BlockPos> origins = originsByDimension.get(dimensionId);
+            if (origins == null || origins.isEmpty()) {
+                continue;
+            }
+            backgroundField.update(
+                dimensionId,
+                world.getTimeOfDay(),
+                tickCounter,
+                origins,
+                GRID_SIZE,
+                (sampleX, sampleY, sampleZ) -> WorldThermalSampler.sampleAveragedAnomaly(world, sampleX, sampleY, sampleZ)
+            );
+            activeDimensions.add(dimensionId);
+        }
+        backgroundField.retainDimensions(activeDimensions);
     }
 
     private Map<WindowKey, List<FanSource>> scanFanSources(MinecraftServer server) {
@@ -845,7 +988,7 @@ public final class AeroServerRuntime {
         }
     }
 
-    private byte[] captureWindow(WindowState window, BlockPos origin, BackendMode backend) {
+    private byte[] captureWindow(WindowState window, Identifier dimensionId, BlockPos origin, BackendMode backend) {
         int voxelCount = GRID_SIZE * GRID_SIZE * GRID_SIZE * CHANNELS;
         window.ensureBaseFieldInitialized();
         float[] obstacleField = window.obstacleField;
@@ -853,6 +996,7 @@ public final class AeroServerRuntime {
         int minY = origin.getY();
         int minZ = origin.getZ();
         ByteBuffer buffer = ByteBuffer.allocate(voxelCount * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        float[] backgroundSample = new float[4];
 
         for (int x = 0; x < GRID_SIZE; x++) {
             for (int y = 0; y < GRID_SIZE; y++) {
@@ -871,6 +1015,21 @@ public final class AeroServerRuntime {
                         window.baseField[idx + CH_STATE_VY] = 0.0f;
                         window.baseField[idx + CH_STATE_VZ] = 0.0f;
                         window.baseField[idx + CH_STATE_P] = 0.0f;
+                    } else {
+                        backgroundField.sampleInto(
+                            dimensionId,
+                            minX + x + 0.5,
+                            minY + y + 0.5,
+                            minZ + z + 0.5,
+                            backgroundSample,
+                            0
+                        );
+                        float vx = window.baseField[idx + CH_STATE_VX];
+                        float vy = window.baseField[idx + CH_STATE_VY];
+                        float vz = window.baseField[idx + CH_STATE_VZ];
+                        window.baseField[idx + CH_STATE_VX] = vx + (backgroundSample[0] - vx) * BACKGROUND_VELOCITY_COUPLING;
+                        window.baseField[idx + CH_STATE_VY] = vy + (backgroundSample[1] - vy) * BACKGROUND_VELOCITY_COUPLING;
+                        window.baseField[idx + CH_STATE_VZ] = vz + (backgroundSample[2] - vz) * BACKGROUND_VELOCITY_COUPLING;
                     }
                 }
             }
@@ -933,6 +1092,29 @@ public final class AeroServerRuntime {
 
         window.obstacleField = obstacle;
         window.lastObstacleRefreshTick = tickNow;
+    }
+
+    private boolean stepBackgroundFlow(int gridSize, byte[] payload, long contextId, float[] output) {
+        if (!nativeBackend.isLoaded()) {
+            return false;
+        }
+        if (!nativeBackend.ensureInitialized(gridSize, BackgroundFieldGrid.SOLVER_INPUT_CHANNELS, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS)) {
+            return false;
+        }
+        float[] solved = nativeBackend.step(payload, gridSize, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS, contextId);
+        if (solved == null || solved.length != output.length) {
+            return false;
+        }
+        System.arraycopy(solved, 0, output, 0, output.length);
+        scaleResponseVelocity(output, NATIVE_VELOCITY_SCALE);
+        return true;
+    }
+
+    private void releaseBackgroundFlowContext(long contextId) {
+        if (!nativeBackend.isLoaded()) {
+            return;
+        }
+        nativeBackend.releaseContext(contextId);
     }
 
     private float[] runSolverStep(WindowState window, byte[] payload, BackendMode backend) throws IOException {
@@ -1201,10 +1383,19 @@ public final class AeroServerRuntime {
                 debugEnabled,
                 maxWindSpeed,
                 streamlineSampleStride,
+                streamlineRoiEnabled,
+                streamlineRoiMinX,
+                streamlineRoiMaxX,
+                streamlineRoiMinY,
+                streamlineRoiMaxY,
+                streamlineRoiMinZ,
+                streamlineRoiMaxZ,
                 isClientMasterActive(server),
                 backendModeId(backendMode),
                 renderVelocityVectorsEnabled,
-                renderStreamlinesEnabled
+                renderStreamlinesEnabled,
+                renderBackgroundVectorsEnabled,
+                renderThermalAnomalyEnabled
             )
         );
     }
@@ -1317,6 +1508,12 @@ public final class AeroServerRuntime {
 
     private String formatPos(BlockPos pos) {
         return "(" + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")";
+    }
+
+    private String formatStreamlineRoiBounds() {
+        return "x=[" + streamlineRoiMinX + "," + streamlineRoiMaxX + "]"
+            + " y=[" + streamlineRoiMinY + "," + streamlineRoiMaxY + "]"
+            + " z=[" + streamlineRoiMinZ + "," + streamlineRoiMaxZ + "]";
     }
 
     private String format2(float value) {

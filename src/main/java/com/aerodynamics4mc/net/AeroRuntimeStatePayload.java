@@ -12,10 +12,19 @@ public record AeroRuntimeStatePayload(
     boolean debugEnabled,
     float maxWindSpeed,
     int streamlineStride,
+    boolean streamlineRoiEnabled,
+    int streamlineRoiMinX,
+    int streamlineRoiMaxX,
+    int streamlineRoiMinY,
+    int streamlineRoiMaxY,
+    int streamlineRoiMinZ,
+    int streamlineRoiMaxZ,
     boolean clientPlayerAuthority,
     int backendMode,
     boolean renderVelocityVectors,
-    boolean renderStreamlines
+    boolean renderStreamlines,
+    boolean renderBackgroundVectors,
+    boolean renderThermalAnomaly
 ) implements CustomPayload {
     public static final CustomPayload.Id<AeroRuntimeStatePayload> ID =
         new CustomPayload.Id<>(Identifier.of(ModBlocks.MOD_ID, "runtime_state"));
@@ -30,6 +39,15 @@ public record AeroRuntimeStatePayload(
             buf.readVarInt(),
             buf.readBoolean(),
             buf.readVarInt(),
+            buf.readVarInt(),
+            buf.readVarInt(),
+            buf.readVarInt(),
+            buf.readVarInt(),
+            buf.readVarInt(),
+            buf.readBoolean(),
+            buf.readVarInt(),
+            buf.readBoolean(),
+            buf.readBoolean(),
             buf.readBoolean(),
             buf.readBoolean()
         );
@@ -40,10 +58,19 @@ public record AeroRuntimeStatePayload(
         buf.writeBoolean(debugEnabled);
         buf.writeFloat(maxWindSpeed);
         buf.writeVarInt(streamlineStride);
+        buf.writeBoolean(streamlineRoiEnabled);
+        buf.writeVarInt(streamlineRoiMinX);
+        buf.writeVarInt(streamlineRoiMaxX);
+        buf.writeVarInt(streamlineRoiMinY);
+        buf.writeVarInt(streamlineRoiMaxY);
+        buf.writeVarInt(streamlineRoiMinZ);
+        buf.writeVarInt(streamlineRoiMaxZ);
         buf.writeBoolean(clientPlayerAuthority);
         buf.writeVarInt(backendMode);
         buf.writeBoolean(renderVelocityVectors);
         buf.writeBoolean(renderStreamlines);
+        buf.writeBoolean(renderBackgroundVectors);
+        buf.writeBoolean(renderThermalAnomaly);
     }
 
     @Override

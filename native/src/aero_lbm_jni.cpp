@@ -1612,7 +1612,7 @@ static jboolean native_step_impl(
     auto tick_begin = Clock::now();
     StepTiming timing;
 
-    if (!g_cfg.initialized || !payload || !output_flow || grid_size != g_cfg.grid_size) return JNI_FALSE;
+    if (!g_cfg.initialized || !payload || !output_flow) return JNI_FALSE;
     const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
     const std::size_t payload_bytes = cells * g_cfg.input_channels * sizeof(float);
     if (env->GetArrayLength(payload) != static_cast<jsize>(payload_bytes)) return JNI_FALSE;

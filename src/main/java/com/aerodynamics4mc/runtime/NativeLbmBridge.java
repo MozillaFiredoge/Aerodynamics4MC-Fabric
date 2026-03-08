@@ -35,14 +35,15 @@ public final class NativeLbmBridge {
         if (!LOADED) {
             return false;
         }
-        if (initialized && grid == gridSize && inputCh == inputChannels && outputCh == outputChannels) {
+        if (initialized && inputCh == inputChannels && outputCh == outputChannels) {
+            gridSize = grid;
             return true;
         }
         if (initialized) {
             nativeShutdown();
             initialized = false;
         }
-        initialized = nativeInit(grid, inputCh, outputCh);
+        initialized = nativeInit(Math.max(1, grid), inputCh, outputCh);
         if (initialized) {
             gridSize = grid;
             inputChannels = inputCh;

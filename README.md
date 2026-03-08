@@ -7,6 +7,7 @@
 - 采集体素窗口（障碍物、风扇源、状态场）
 - 驱动风场求解后端（Socket 或 Native）
 - 将风场作用到实体并进行可视化
+- 低分辨率背景环流场 + Boussinesq 近似浮力耦合（昼夜热异常）
 
 > 说明：核心训练/数据生成/PhiFlow Python 后端在独立仓库 `aerodynamics4mc`（core）中维护。
 
@@ -26,10 +27,15 @@ cd fabric-mod
 - `/aero start`：开始每 tick 风场更新
 - `/aero stop`：停止更新并清理状态
 - `/aero maxspeed <value>`：限制风速上限
+- `/aero streamline <1|2|4|8>`：设置流线采样步长
+- `/aero streamline roi set <minX> <maxX> <minY> <maxY> <minZ> <maxZ>`：设置局部流线 ROI（窗口局部坐标 0..127）
+- `/aero streamline roi off`：关闭 ROI，恢复全窗口流线
 - `/aero backend socket`：使用 TCP Python 后端
 - `/aero backend native`：使用 JNI Native 后端
 - `/aero backend status`：查看当前后端与 native timing
 - `/aero debug`：切换调试渲染
+- `/aero render background on|off|status`：控制/查看背景环流矢量调试叠加
+- `/aero render thermal on|off|status`：控制/查看热异常调试叠加
 
 ### 后端模式
 1. `socket`（默认）
@@ -39,6 +45,12 @@ cd fabric-mod
 2. `native`
 - 模组通过 JNI 调用内置动态库（自动从 jar 解压后加载）。
 - 支持按平台加载：`linux/windows/macos` + `x86_64/arm64`（Windows 仅 `x86_64`）。
+
+### 低分辨率背景环流场
+- 运行时会按维度维护低分辨率背景风场（默认约 `16` 方块一格），并在窗口范围扩大时自动提升 coarse cell 尺寸以扩大覆盖范围。
+- 背景场不再使用写死解析风型，改为在粗网格上用 Native C-LBM 动态推进速度场。
+- `thermal_anomaly` 由世界采样驱动（方块热源/亮度/高度/日照/生物群系/天气加权），并通过 Boussinesq 近似转化为粗网格浮力源项。
+- 在窗口求解输入阶段，状态速度会以小权重向粗网格背景风场松弛；局部窗口不再额外注入单独的“写死浮力脉冲”。
 
 ### Native 多平台构建与打包
 详见：`native/README.md`
@@ -75,6 +87,7 @@ This is the Fabric client mod repository for `Aerodynamics4MC`. It is responsibl
 - capturing voxel windows in-game (obstacles, fan sources, state fields)
 - driving airflow solver backends (Socket or Native)
 - applying wind forces to entities and rendering debug visuals
+- low-resolution background circulation solved by coarse-grid Native C-LBM with Boussinesq buoyancy
 
 > Note: dataset generation, model training, and Python solver live in a separate core repository (`aerodynamics4mc`).
 
@@ -94,10 +107,15 @@ cd fabric-mod
 - `/aero start`: start per-tick airflow updates
 - `/aero stop`: stop updates and clear runtime state
 - `/aero maxspeed <value>`: clamp max wind speed
+- `/aero streamline <1|2|4|8>`: set streamline sampling stride
+- `/aero streamline roi set <minX> <maxX> <minY> <maxY> <minZ> <maxZ>`: set local streamline ROI (window-local coords 0..127)
+- `/aero streamline roi off`: disable ROI and render streamlines for the full window
 - `/aero backend socket`: use TCP Python backend
 - `/aero backend native`: use JNI native backend
 - `/aero backend status`: print backend + native timing
 - `/aero debug`: toggle debug rendering
+- `/aero render background on|off|status`: toggle/query background circulation vector debug overlay
+- `/aero render thermal on|off|status`: toggle/query thermal anomaly debug overlay
 
 ### Backend Modes
 1. `socket` (default)
@@ -107,6 +125,12 @@ cd fabric-mod
 2. `native`
 - Calls bundled native libraries via JNI (auto-extracted from mod jar at runtime).
 - Platform-aware loading: `linux/windows/macos` + `x86_64/arm64` (Windows only `x86_64`).
+
+### Low-resolution background circulation field
+- The runtime maintains a low-resolution background wind field per dimension (roughly `16` blocks per cell by default), and automatically increases coarse cell size when active windows spread out.
+- The field no longer uses hardcoded analytic circulation; it advances velocity on a coarse grid using the Native C-LBM solver.
+- `thermal_anomaly` is sampled from world factors (block heat source/luminance, altitude, sunlight, biome, weather), then mapped to Boussinesq buoyancy forcing on the coarse solver.
+- During window capture, state velocities are lightly relaxed toward this coarse background flow without a separate hardcoded per-voxel buoyancy impulse.
 
 ### Native Multi-platform Build & Packaging
 See: `native/README.md`
