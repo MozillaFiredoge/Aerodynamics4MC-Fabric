@@ -104,12 +104,7 @@ public final class NativeLbmBridge {
             if (globalActiveHandles > 0) {
                 globalActiveHandles--;
             }
-            if (globalActiveHandles == 0 && globalInitialized) {
-                nativeShutdown();
-                globalInitialized = false;
-                globalInputChannels = -1;
-                globalOutputChannels = -1;
-            }
+            // Keep native runtime warm to avoid fragile OpenCL re-init churn on Windows drivers.
         }
     }
 

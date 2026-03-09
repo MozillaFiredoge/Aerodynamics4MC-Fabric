@@ -1592,6 +1592,13 @@ extern "C" {
 static jboolean native_init_impl(jint grid_size, jint input_channels, jint output_channels) {
     std::lock_guard<std::mutex> guard(g_runtime_mutex);
     if (grid_size <= 0 || input_channels < 9 || output_channels < 4) { reset_runtime_state(); return JNI_FALSE; }
+    if (g_cfg.initialized) {
+        if (input_channels == g_cfg.input_channels && output_channels == g_cfg.output_channels) {
+            g_cfg.grid_size = grid_size;
+            return JNI_TRUE;
+        }
+        reset_runtime_state();
+    }
     clear_all_contexts(); reset_timing_stats();
     g_cfg.grid_size = grid_size; g_cfg.input_channels = input_channels; g_cfg.output_channels = output_channels; g_cfg.initialized = true;
 
