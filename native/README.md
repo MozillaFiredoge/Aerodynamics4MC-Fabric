@@ -34,6 +34,7 @@ Current native code includes:
   - kernels: `init_distributions`, `collide_step`, `stream_step`, `output_macro`
   - per-window GPU buffers keyed by `contextKey`
   - TRT collision (same physics core as CPU path)
+  - Windows MSVC builds add guarded OpenCL init/step calls; driver-level access violations are trapped and runtime falls back to CPU instead of crashing JVM.
 - CPU reference `D3Q19` path (automatic fallback):
   - per-window context state (`contextKey`)
   - TRT collision

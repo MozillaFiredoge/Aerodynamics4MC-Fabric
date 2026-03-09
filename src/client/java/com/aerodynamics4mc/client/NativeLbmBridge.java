@@ -155,4 +155,8 @@ public final class NativeLbmBridge {
     private static native String nativeRuntimeInfo();
 
     private static native String nativeTimingInfo();
+
+    public synchronized boolean isInitialized() {
+        return initialized && globalInitialized;
+    }
 }

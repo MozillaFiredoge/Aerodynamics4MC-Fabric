@@ -15,6 +15,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32) && defined(_MSC_VER)
+#include <windows.h>
+#endif
+
 #if defined(AERO_LBM_OPENCL) && !defined(CL_TARGET_OPENCL_VERSION)
 #define CL_TARGET_OPENCL_VERSION 120
 #endif
@@ -1542,6 +1546,32 @@ bool initialize_opencl_runtime() { g_opencl.error = "Disabled"; return false; }
 bool opencl_step(ContextState&, const float*, float*, StepTiming&) { return false; }
 #endif
 
+bool try_initialize_opencl_runtime() {
+#if defined(_WIN32) && defined(_MSC_VER)
+    __try {
+        return initialize_opencl_runtime();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        g_opencl.error = "OpenCL init access violation";
+        return false;
+    }
+#else
+    return initialize_opencl_runtime();
+#endif
+}
+
+bool try_opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
+#if defined(_WIN32) && defined(_MSC_VER)
+    __try {
+        return opencl_step(ctx, payload, out, timing);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        g_opencl.error = "OpenCL step access violation";
+        return false;
+    }
+#else
+    return opencl_step(ctx, payload, out, timing);
+#endif
+}
+
 void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
 void clear_all_contexts() { for (auto& e : g_contexts) clear_context(e.second); g_contexts.clear(); }
 void reset_runtime_state() { clear_all_contexts(); release_opencl_runtime(); g_cfg = Config{}; reset_timing_stats(); }
@@ -1607,7 +1637,7 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
         g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (forced)";
         return JNI_TRUE;
     }
-    g_cfg.opencl_enabled = initialize_opencl_runtime();
+    g_cfg.opencl_enabled = try_initialize_opencl_runtime();
     if (g_cfg.opencl_enabled) {
         g_cfg.runtime_info = "opencl|cumulant-d3q27+sgs:" + g_opencl.device_name;
     } else {
@@ -1657,7 +1687,10 @@ static jboolean native_step_impl(
 
     bool ok = false;
     if (g_cfg.opencl_enabled) {
-        if (!(ok = opencl_step(ctx, ctx.packet.data(), out, timing))) disable_opencl_runtime("OpenCL fail");
+        if (!(ok = try_opencl_step(ctx, ctx.packet.data(), out, timing))) {
+            const std::string reason = g_opencl.error.empty() ? "OpenCL fail" : g_opencl.error;
+            disable_opencl_runtime(reason);
+        }
     }
     if (!ok) {
         auto solver_begin = Clock::now();

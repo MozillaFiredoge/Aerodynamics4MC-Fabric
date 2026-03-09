@@ -550,6 +550,7 @@ public final class AeroServerRuntime {
         if (tickCounter % (PLAYER_VELOCITY_SYNC_MAX_INTERVAL_TICKS * 2) == 0) {
             pruneEntityVelocitySyncState();
         }
+        prewarmNativeBackends();
 
         boolean clientMasterActive = isClientMasterActive(server);
         if (clientMasterActive) {
@@ -1285,11 +1286,7 @@ public final class AeroServerRuntime {
         if (!backgroundNativeBackend.isLoaded()) {
             return false;
         }
-        if (!backgroundNativeBackend.ensureInitialized(
-            gridSize,
-            BackgroundFieldGrid.SOLVER_INPUT_CHANNELS,
-            BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS
-        )) {
+        if (!backgroundNativeBackend.isInitialized()) {
             return false;
         }
         float[] solved = backgroundNativeBackend.step(payload, gridSize, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS, contextId);
@@ -1313,7 +1310,7 @@ public final class AeroServerRuntime {
             if (!nativeBackend.isLoaded()) {
                 throw new IOException("Native backend not loaded: " + nativeBackend.getLoadError());
             }
-            if (!nativeBackend.ensureInitialized(GRID_SIZE, CHANNELS, RESPONSE_CHANNELS)) {
+            if (!nativeBackend.isInitialized()) {
                 throw new IOException("Native backend initialization failed");
             }
             float[] response = nativeBackend.step(payload, GRID_SIZE, RESPONSE_CHANNELS, window.nativeContextId);
@@ -1327,6 +1324,29 @@ public final class AeroServerRuntime {
         ensureSocket(window);
         sendPayload(window, payload);
         return receiveFlowField(window);
+    }
+
+    private void prewarmNativeBackends() {
+        if (backendMode == BackendMode.NATIVE) {
+            if (!nativeBackend.isLoaded()) {
+                if (lastSolverError.isEmpty()) {
+                    lastSolverError = "Native backend not loaded: " + nativeBackend.getLoadError();
+                }
+            } else if (!nativeBackend.isInitialized()
+                && !nativeBackend.ensureInitialized(GRID_SIZE, CHANNELS, RESPONSE_CHANNELS)
+                && lastSolverError.isEmpty()) {
+                lastSolverError = "Native backend initialization failed";
+            }
+        }
+
+        if (backgroundNativeBackend.isLoaded()
+            && !backgroundNativeBackend.isInitialized()) {
+            backgroundNativeBackend.ensureInitialized(
+                backgroundField.solverGridSize(),
+                BackgroundFieldGrid.SOLVER_INPUT_CHANNELS,
+                BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS
+            );
+        }
     }
 
     private void updateBaseFieldFromResponse(WindowState window, float[] response, float speedCap) {
