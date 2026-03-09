@@ -16,7 +16,19 @@
 #include <vector>
 
 #if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 #endif
 
 #if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
