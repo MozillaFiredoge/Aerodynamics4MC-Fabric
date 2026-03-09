@@ -15,8 +15,14 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(_WIN32) && defined(_MSC_VER)
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
 #include <windows.h>
+#endif
+
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+#define AERO_LBM_USE_SEH_GUARD 1
+#else
+#define AERO_LBM_USE_SEH_GUARD 0
 #endif
 
 #if defined(AERO_LBM_OPENCL) && !defined(CL_TARGET_OPENCL_VERSION)
@@ -1547,26 +1553,38 @@ bool opencl_step(ContextState&, const float*, float*, StepTiming&) { return fals
 #endif
 
 bool try_initialize_opencl_runtime() {
-#if defined(_WIN32) && defined(_MSC_VER)
+#if AERO_LBM_USE_SEH_GUARD
+    bool seh_failed = false;
+    bool initialized = false;
     __try {
-        return initialize_opencl_runtime();
+        initialized = initialize_opencl_runtime();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        seh_failed = true;
+    }
+    if (seh_failed) {
         g_opencl.error = "OpenCL init access violation";
         return false;
     }
+    return initialized;
 #else
     return initialize_opencl_runtime();
 #endif
 }
 
 bool try_opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
-#if defined(_WIN32) && defined(_MSC_VER)
+#if AERO_LBM_USE_SEH_GUARD
+    bool seh_failed = false;
+    bool ok = false;
     __try {
-        return opencl_step(ctx, payload, out, timing);
+        ok = opencl_step(ctx, payload, out, timing);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        seh_failed = true;
+    }
+    if (seh_failed) {
         g_opencl.error = "OpenCL step access violation";
         return false;
     }
+    return ok;
 #else
     return opencl_step(ctx, payload, out, timing);
 #endif
