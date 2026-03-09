@@ -84,6 +84,7 @@ jobs:
 
           cmake -S native -B "build/native-${{ matrix.id }}" \
             -DAERO_LBM_ENABLE_OPENCL=${{ matrix.opencl }} \
+            -DAERO_LBM_ENABLE_CUDA=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             ${EXTRA_ARGS}
           grep -E "^AERO_LBM_ENABLE_OPENCL:BOOL=${{ matrix.opencl }}$" "build/native-${{ matrix.id }}/CMakeCache.txt"
@@ -112,7 +113,7 @@ jobs:
             $extra += "-DVCPKG_TARGET_TRIPLET=x64-windows"
           }
 
-          cmake -S native -B "build/native-${{ matrix.id }}" -DAERO_LBM_ENABLE_OPENCL=${{ matrix.opencl }} @extra
+          cmake -S native -B "build/native-${{ matrix.id }}" -DAERO_LBM_ENABLE_OPENCL=${{ matrix.opencl }} -DAERO_LBM_ENABLE_CUDA=OFF @extra
           Select-String -Path "build/native-${{ matrix.id }}/CMakeCache.txt" -Pattern '^AERO_LBM_ENABLE_OPENCL:BOOL=${{ matrix.opencl }}$' | Out-Null
           cmake --build "build/native-${{ matrix.id }}" --config Release --parallel
 

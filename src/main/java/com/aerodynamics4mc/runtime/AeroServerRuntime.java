@@ -566,11 +566,9 @@ public final class AeroServerRuntime {
             lastMaxFlowSpeed = 0.0f;
             entityVelocitySyncTickById.clear();
             entityLastSyncedVelocityById.clear();
-            backgroundWindowCount = 0;
-            backgroundLastUpdateTick = -1;
-            backgroundLastUpdateMs = 0.0f;
-            cancelBackgroundUpdateTask();
-            backgroundField.clear();
+            // Keep background field updates alive in singleplayer client-master mode.
+            // Near-field windows stay disabled on server, but atmo windows still follow players.
+            pumpBackgroundUpdate(server);
             updateSimulationRate(false);
             return;
         }
@@ -798,6 +796,9 @@ public final class AeroServerRuntime {
 
         int scheduledTick = tickCounter;
         int scheduledWindowCount = totalWindows;
+        // Reflect planned atmo windows immediately so `/aero atmo status` is not stuck at 0
+        // while the async background update task is still running.
+        backgroundWindowCount = scheduledWindowCount;
         backgroundUpdateTask = backgroundExecutor.submit(
             () -> runBackgroundUpdateTask(plans, scheduledTick, scheduledWindowCount)
         );

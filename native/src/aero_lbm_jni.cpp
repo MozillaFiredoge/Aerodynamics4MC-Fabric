@@ -13,6 +13,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -44,6 +45,11 @@
 
 #if defined(AERO_LBM_OPENCL)
 #include <CL/cl.h>
+#endif
+
+#if defined(AERO_LBM_CUDA)
+#include <cuda.h>
+#include <nvrtc.h>
 #endif
 
 namespace {
@@ -191,6 +197,7 @@ struct Config {
     int input_channels = 0;
     int output_channels = 0;
     bool initialized = false;
+    bool cuda_enabled = false;
     bool opencl_enabled = false;
     std::string runtime_info;
 };
@@ -227,6 +234,15 @@ struct ContextState {
     cl_mem d_f = nullptr;
     cl_mem d_f_post = nullptr;
     cl_mem d_output = nullptr;
+#endif
+
+#if defined(AERO_LBM_CUDA)
+    bool cuda_buffers_ready = false;
+    bool cuda_initialized = false;
+    CUdeviceptr cuda_d_payload = 0;
+    CUdeviceptr cuda_d_f = 0;
+    CUdeviceptr cuda_d_f_post = 0;
+    CUdeviceptr cuda_d_output = 0;
 #endif
 };
 
@@ -852,23 +868,7 @@ void write_output(const ContextState& ctx, float* out, int out_channels) {
     }
 }
 
-#if defined(AERO_LBM_OPENCL)
-
-struct OpenClRuntime {
-    bool available = false;
-    std::string error;
-    std::string device_name;
-    cl_platform_id platform = nullptr;
-    cl_device_id device = nullptr;
-    cl_context context = nullptr;
-    cl_command_queue queue = nullptr;
-    cl_program program = nullptr;
-    cl_kernel k_init = nullptr;
-    cl_kernel k_stream_collide = nullptr;
-    cl_kernel k_output = nullptr;
-};
-
-OpenClRuntime g_opencl;
+#if defined(AERO_LBM_OPENCL) || defined(AERO_LBM_CUDA)
 
 const char* kOpenClSource =
 R"CLC(
@@ -1377,6 +1377,26 @@ kernel void output_macro(
 }
 )CLC";
 
+#endif
+
+#if defined(AERO_LBM_OPENCL)
+
+struct OpenClRuntime {
+    bool available = false;
+    std::string error;
+    std::string device_name;
+    cl_platform_id platform = nullptr;
+    cl_device_id device = nullptr;
+    cl_context context = nullptr;
+    cl_command_queue queue = nullptr;
+    cl_program program = nullptr;
+    cl_kernel k_init = nullptr;
+    cl_kernel k_stream_collide = nullptr;
+    cl_kernel k_output = nullptr;
+};
+
+OpenClRuntime g_opencl;
+
 // const char* cl_error_to_string(cl_int err) {
 //     switch (err) {
 //         case CL_SUCCESS: return "CL_SUCCESS";
@@ -1527,7 +1547,7 @@ bool enqueue_kernel_1d(cl_kernel kernel, int cells) {
 bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
     if (!ensure_context_gpu_buffers(ctx)) return false;
 
-    const int cells_i32 = static_cast<int>(ctx.cells);
+    int cells_i32 = static_cast<int>(ctx.cells);
     const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
     const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
 
@@ -1547,7 +1567,7 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         ctx.gpu_initialized = true;
     }
 
-    const int tick_i32 = static_cast<int>(ctx.step_counter & 0x7FFFFFFF);
+    int tick_i32 = static_cast<int>(ctx.step_counter & 0x7FFFFFFF);
     
     // Ping-Pong 双重缓冲交换
     cl_mem read_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
@@ -1628,6 +1648,434 @@ bool try_opencl_step(ContextState& ctx, const float* payload, float* out, StepTi
 #endif
 }
 
+#if defined(AERO_LBM_CUDA)
+
+struct CudaRuntime {
+    bool available = false;
+    std::string error;
+    std::string device_name;
+    CUdevice device = 0;
+    CUcontext context = nullptr;
+    CUmodule module = nullptr;
+    CUfunction k_init = nullptr;
+    CUfunction k_stream_collide = nullptr;
+    CUfunction k_output = nullptr;
+};
+
+CudaRuntime g_cuda;
+
+void replace_all_inplace(std::string& text, std::string_view from, std::string_view to) {
+    if (from.empty()) return;
+    std::size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+}
+
+std::string cuda_compile_source_from_opencl() {
+    std::string source = kOpenClSource;
+    replace_all_inplace(source, "__constant ", "__device__ __constant__ ");
+    replace_all_inplace(source, "__global ", "");
+    replace_all_inplace(source, "kernel void", "extern \"C\" __global__ void");
+    replace_all_inplace(source, "inline ", "__device__ __forceinline__ ");
+    replace_all_inplace(source, "get_global_id(0)", "(blockIdx.x * blockDim.x + threadIdx.x)");
+    replace_all_inplace(source, "mix(", "mixf(");
+    return std::string(R"CUDA(
+typedef unsigned int uint;
+extern "C" __device__ __forceinline__ float mixf(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+)CUDA") + source;
+}
+
+std::string cuda_error_string(CUresult code) {
+    const char* name = nullptr;
+    const char* message = nullptr;
+    cuGetErrorName(code, &name);
+    cuGetErrorString(code, &message);
+    std::ostringstream oss;
+    oss << (name ? name : "CUDA_ERROR") << "(" << static_cast<int>(code) << ")";
+    if (message && message[0] != '\0') {
+        oss << ": " << message;
+    }
+    return oss.str();
+}
+
+std::string nvrtc_error_string(nvrtcResult code) {
+    std::ostringstream oss;
+    oss << nvrtcGetErrorString(code) << "(" << static_cast<int>(code) << ")";
+    return oss.str();
+}
+
+bool set_cuda_context_current() {
+    if (g_cuda.context == nullptr) return false;
+    CUresult result = cuCtxSetCurrent(g_cuda.context);
+    if (result != CUDA_SUCCESS) {
+        g_cuda.error = "cuCtxSetCurrent failed: " + cuda_error_string(result);
+        return false;
+    }
+    return true;
+}
+
+void release_context_cuda_buffers(ContextState& ctx) {
+    if (ctx.cuda_d_output != 0) {
+        if (set_cuda_context_current()) {
+            cuMemFree(ctx.cuda_d_output);
+        }
+        ctx.cuda_d_output = 0;
+    }
+    if (ctx.cuda_d_f_post != 0) {
+        if (set_cuda_context_current()) {
+            cuMemFree(ctx.cuda_d_f_post);
+        }
+        ctx.cuda_d_f_post = 0;
+    }
+    if (ctx.cuda_d_f != 0) {
+        if (set_cuda_context_current()) {
+            cuMemFree(ctx.cuda_d_f);
+        }
+        ctx.cuda_d_f = 0;
+    }
+    if (ctx.cuda_d_payload != 0) {
+        if (set_cuda_context_current()) {
+            cuMemFree(ctx.cuda_d_payload);
+        }
+        ctx.cuda_d_payload = 0;
+    }
+    ctx.cuda_buffers_ready = false;
+    ctx.cuda_initialized = false;
+}
+
+void release_cuda_runtime() {
+    if (g_cuda.context != nullptr) {
+        set_cuda_context_current();
+        if (g_cuda.module != nullptr) {
+            cuModuleUnload(g_cuda.module);
+        }
+        g_cuda.module = nullptr;
+        g_cuda.k_init = nullptr;
+        g_cuda.k_stream_collide = nullptr;
+        g_cuda.k_output = nullptr;
+        cuCtxDestroy(g_cuda.context);
+        g_cuda.context = nullptr;
+    }
+    g_cuda.available = false;
+    g_cuda.error.clear();
+    g_cuda.device_name.clear();
+    g_cuda.device = 0;
+}
+
+bool initialize_cuda_runtime() {
+    if (g_cuda.available) return true;
+
+    CUresult cu_status = cuInit(0);
+    if (cu_status != CUDA_SUCCESS) {
+        g_cuda.error = "cuInit failed: " + cuda_error_string(cu_status);
+        return false;
+    }
+
+    int device_count = 0;
+    cu_status = cuDeviceGetCount(&device_count);
+    if (cu_status != CUDA_SUCCESS || device_count <= 0) {
+        g_cuda.error = (cu_status == CUDA_SUCCESS)
+            ? "No CUDA device"
+            : "cuDeviceGetCount failed: " + cuda_error_string(cu_status);
+        return false;
+    }
+
+    CUdevice device = 0;
+    cu_status = cuDeviceGet(&device, 0);
+    if (cu_status != CUDA_SUCCESS) {
+        g_cuda.error = "cuDeviceGet failed: " + cuda_error_string(cu_status);
+        return false;
+    }
+
+    char name[256] = {};
+    if (cuDeviceGetName(name, static_cast<int>(sizeof(name)), device) != CUDA_SUCCESS) {
+        std::strncpy(name, "cuda-device", sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+    }
+
+    CUcontext context = nullptr;
+    cu_status = cuCtxCreate(&context, 0, device);
+    if (cu_status != CUDA_SUCCESS || context == nullptr) {
+        g_cuda.error = "cuCtxCreate failed: " + cuda_error_string(cu_status);
+        return false;
+    }
+    g_cuda.context = context;
+    g_cuda.device = device;
+
+    int cc_major = 0;
+    int cc_minor = 0;
+    cuDeviceGetAttribute(&cc_major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+    cuDeviceGetAttribute(&cc_minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+    if (cc_major <= 0) {
+        cc_major = 7;
+        cc_minor = 5;
+    }
+
+    std::string source = cuda_compile_source_from_opencl();
+    nvrtcProgram program = nullptr;
+    nvrtcResult nvrtc_status = nvrtcCreateProgram(
+        &program,
+        source.c_str(),
+        "aero_lbm_cuda.cu",
+        0,
+        nullptr,
+        nullptr
+    );
+    if (nvrtc_status != NVRTC_SUCCESS || program == nullptr) {
+        g_cuda.error = "nvrtcCreateProgram failed: " + nvrtc_error_string(nvrtc_status);
+        release_cuda_runtime();
+        return false;
+    }
+
+    std::string arch_option = "--gpu-architecture=compute_" + std::to_string(cc_major) + std::to_string(cc_minor);
+    const char* options[] = {
+        "--std=c++14",
+        "--use_fast_math",
+        arch_option.c_str()
+    };
+    nvrtc_status = nvrtcCompileProgram(program, static_cast<int>(std::size(options)), options);
+    if (nvrtc_status != NVRTC_SUCCESS) {
+        std::size_t log_size = 0;
+        nvrtcGetProgramLogSize(program, &log_size);
+        std::string log(log_size > 0 ? log_size : 1, '\0');
+        if (log_size > 0) {
+            nvrtcGetProgramLog(program, log.data());
+        }
+        g_cuda.error = "nvrtcCompileProgram failed: " + nvrtc_error_string(nvrtc_status)
+            + (log.empty() ? "" : (" | " + log));
+        nvrtcDestroyProgram(&program);
+        release_cuda_runtime();
+        return false;
+    }
+
+    std::size_t ptx_size = 0;
+    nvrtc_status = nvrtcGetPTXSize(program, &ptx_size);
+    if (nvrtc_status != NVRTC_SUCCESS || ptx_size == 0) {
+        g_cuda.error = "nvrtcGetPTXSize failed: " + nvrtc_error_string(nvrtc_status);
+        nvrtcDestroyProgram(&program);
+        release_cuda_runtime();
+        return false;
+    }
+    std::string ptx(ptx_size, '\0');
+    nvrtc_status = nvrtcGetPTX(program, ptx.data());
+    nvrtcDestroyProgram(&program);
+    if (nvrtc_status != NVRTC_SUCCESS) {
+        g_cuda.error = "nvrtcGetPTX failed: " + nvrtc_error_string(nvrtc_status);
+        release_cuda_runtime();
+        return false;
+    }
+
+    CUmodule module = nullptr;
+    cu_status = cuModuleLoadData(&module, ptx.data());
+    if (cu_status != CUDA_SUCCESS || module == nullptr) {
+        g_cuda.error = "cuModuleLoadData failed: " + cuda_error_string(cu_status);
+        release_cuda_runtime();
+        return false;
+    }
+
+    CUfunction k_init = nullptr;
+    CUfunction k_stream_collide = nullptr;
+    CUfunction k_output = nullptr;
+    cu_status = cuModuleGetFunction(&k_init, module, "init_distributions");
+    if (cu_status == CUDA_SUCCESS) cu_status = cuModuleGetFunction(&k_stream_collide, module, "stream_collide_step");
+    if (cu_status == CUDA_SUCCESS) cu_status = cuModuleGetFunction(&k_output, module, "output_macro");
+    if (cu_status != CUDA_SUCCESS || k_init == nullptr || k_stream_collide == nullptr || k_output == nullptr) {
+        g_cuda.error = "cuModuleGetFunction failed: " + cuda_error_string(cu_status);
+        cuModuleUnload(module);
+        release_cuda_runtime();
+        return false;
+    }
+
+    g_cuda.module = module;
+    g_cuda.k_init = k_init;
+    g_cuda.k_stream_collide = k_stream_collide;
+    g_cuda.k_output = k_output;
+    g_cuda.device_name = name;
+    g_cuda.available = true;
+    g_cuda.error.clear();
+    return true;
+}
+
+bool ensure_context_cuda_buffers(ContextState& ctx) {
+    if (!g_cuda.available || ctx.cells == 0) return false;
+    if (ctx.cuda_buffers_ready) return true;
+    if (!set_cuda_context_current()) return false;
+
+    const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
+    const std::size_t dist_bytes = ctx.cells * kQ * sizeof(float);
+    const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
+
+    CUresult status = CUDA_SUCCESS;
+    status = cuMemAlloc(&ctx.cuda_d_payload, payload_bytes);
+    if (status == CUDA_SUCCESS) status = cuMemAlloc(&ctx.cuda_d_f, dist_bytes);
+    if (status == CUDA_SUCCESS) status = cuMemAlloc(&ctx.cuda_d_f_post, dist_bytes);
+    if (status == CUDA_SUCCESS) status = cuMemAlloc(&ctx.cuda_d_output, output_bytes);
+    if (status != CUDA_SUCCESS) {
+        g_cuda.error = "cuMemAlloc failed: " + cuda_error_string(status);
+        release_context_cuda_buffers(ctx);
+        return false;
+    }
+
+    ctx.cuda_buffers_ready = true;
+    ctx.cuda_initialized = false;
+    return true;
+}
+
+bool launch_cuda_1d(CUfunction function, int cells, void** args) {
+    constexpr unsigned int block_size = 256;
+    const unsigned int grid_size = (static_cast<unsigned int>(cells) + block_size - 1U) / block_size;
+    CUresult status = cuLaunchKernel(
+        function,
+        grid_size,
+        1,
+        1,
+        block_size,
+        1,
+        1,
+        0,
+        nullptr,
+        args,
+        nullptr
+    );
+    if (status != CUDA_SUCCESS) {
+        g_cuda.error = "cuLaunchKernel failed: " + cuda_error_string(status);
+        return false;
+    }
+    return true;
+}
+
+bool cuda_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
+    if (!ensure_context_cuda_buffers(ctx)) return false;
+    if (!set_cuda_context_current()) return false;
+
+    int cells_i32 = static_cast<int>(ctx.cells);
+    const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
+    const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
+
+    auto upload_begin = Clock::now();
+    CUresult status = cuMemcpyHtoD(ctx.cuda_d_payload, payload, payload_bytes);
+    if (status != CUDA_SUCCESS) {
+        g_cuda.error = "cuMemcpyHtoD failed: " + cuda_error_string(status);
+        return false;
+    }
+    timing.payload_copy_ms += elapsed_ms(upload_begin, Clock::now());
+
+    auto solver_begin = Clock::now();
+    if (!ctx.cuda_initialized) {
+        void* init_args[] = {
+            &ctx.cuda_d_payload,
+            &g_cfg.input_channels,
+            &cells_i32,
+            &ctx.cuda_d_f,
+            &ctx.cuda_d_f_post
+        };
+        if (!launch_cuda_1d(g_cuda.k_init, cells_i32, init_args)) {
+            return false;
+        }
+        ctx.cuda_initialized = true;
+    }
+
+    int tick_i32 = static_cast<int>(ctx.step_counter & 0x7FFFFFFF);
+    CUdeviceptr read_buf = (ctx.step_counter % 2 == 0) ? ctx.cuda_d_f : ctx.cuda_d_f_post;
+    CUdeviceptr write_buf = (ctx.step_counter % 2 == 0) ? ctx.cuda_d_f_post : ctx.cuda_d_f;
+
+    void* stream_args[] = {
+        &read_buf,
+        &ctx.cuda_d_payload,
+        &g_cfg.input_channels,
+        &ctx.n,
+        &cells_i32,
+        &tick_i32,
+        &write_buf
+    };
+    if (!launch_cuda_1d(g_cuda.k_stream_collide, cells_i32, stream_args)) {
+        return false;
+    }
+
+    void* output_args[] = {
+        &write_buf,
+        &ctx.cuda_d_payload,
+        &g_cfg.input_channels,
+        &g_cfg.output_channels,
+        &cells_i32,
+        &ctx.cuda_d_output
+    };
+    if (!launch_cuda_1d(g_cuda.k_output, cells_i32, output_args)) {
+        return false;
+    }
+
+    status = cuCtxSynchronize();
+    if (status != CUDA_SUCCESS) {
+        g_cuda.error = "cuCtxSynchronize failed: " + cuda_error_string(status);
+        return false;
+    }
+    timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
+
+    auto readback_begin = Clock::now();
+    status = cuMemcpyDtoH(out, ctx.cuda_d_output, output_bytes);
+    if (status != CUDA_SUCCESS) {
+        g_cuda.error = "cuMemcpyDtoH failed: " + cuda_error_string(status);
+        return false;
+    }
+    timing.readback_ms += elapsed_ms(readback_begin, Clock::now());
+
+    ctx.step_counter += 1;
+    return true;
+}
+
+#else
+
+struct CudaRuntime { bool available = false; std::string error; std::string device_name; };
+CudaRuntime g_cuda;
+void release_context_cuda_buffers(ContextState&) {}
+void release_cuda_runtime() {}
+bool initialize_cuda_runtime() { g_cuda.error = "Disabled"; return false; }
+bool cuda_step(ContextState&, const float*, float*, StepTiming&) { return false; }
+
+#endif
+
+bool try_initialize_cuda_runtime() {
+#if AERO_LBM_USE_SEH_GUARD
+    bool seh_failed = false;
+    bool initialized = false;
+    __try {
+        initialized = initialize_cuda_runtime();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        seh_failed = true;
+    }
+    if (seh_failed) {
+        g_cuda.error = "CUDA init access violation";
+        return false;
+    }
+    return initialized;
+#else
+    return initialize_cuda_runtime();
+#endif
+}
+
+bool try_cuda_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
+#if AERO_LBM_USE_SEH_GUARD
+    bool seh_failed = false;
+    bool ok = false;
+    __try {
+        ok = cuda_step(ctx, payload, out, timing);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        seh_failed = true;
+    }
+    if (seh_failed) {
+        g_cuda.error = "CUDA step access violation";
+        return false;
+    }
+    return ok;
+#else
+    return cuda_step(ctx, payload, out, timing);
+#endif
+}
+
 bool env_value_truthy(const char* value) {
     if (value == nullptr) return false;
     if (value[0] == '1' && value[1] == '\0') return true;
@@ -1655,9 +2103,26 @@ bool env_flag_enabled(const char* key) {
 #endif
 }
 
-void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
+void clear_context(ContextState& ctx) {
+    release_context_gpu_buffers(ctx);
+    release_context_cuda_buffers(ctx);
+    ctx = ContextState{};
+}
 void clear_all_contexts() { for (auto& e : g_contexts) clear_context(e.second); g_contexts.clear(); }
-void reset_runtime_state() { clear_all_contexts(); release_opencl_runtime(); g_cfg = Config{}; reset_timing_stats(); }
+void reset_runtime_state() {
+    clear_all_contexts();
+    release_cuda_runtime();
+    release_opencl_runtime();
+    g_cfg = Config{};
+    reset_timing_stats();
+}
+
+void disable_cuda_runtime(const std::string& reason) {
+    for (auto& e : g_contexts) release_context_cuda_buffers(e.second);
+    release_cuda_runtime();
+    g_cfg.cuda_enabled = false;
+    g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + reason + ")";
+}
 
 void disable_opencl_runtime(const std::string& reason) {
     for (auto& e : g_contexts) release_context_gpu_buffers(e.second);
@@ -1711,6 +2176,7 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
     g_cfg.grid_size = grid_size; g_cfg.input_channels = input_channels; g_cfg.output_channels = output_channels; g_cfg.initialized = true;
 
     if (should_force_cpu_backend()) {
+        g_cfg.cuda_enabled = false;
         g_cfg.opencl_enabled = false;
 #if defined(_WIN32)
         if (!env_flag_enabled("AERO_LBM_CPU_ONLY") && !env_flag_enabled("AERO_LBM_WINDOWS_OPENCL")) {
@@ -1723,11 +2189,25 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 #endif
         return JNI_TRUE;
     }
+    g_cfg.cuda_enabled = try_initialize_cuda_runtime();
+    if (g_cfg.cuda_enabled) {
+        g_cfg.opencl_enabled = false;
+        g_cfg.runtime_info = "cuda|cumulant-d3q27+sgs:" + g_cuda.device_name;
+        return JNI_TRUE;
+    }
+
     g_cfg.opencl_enabled = try_initialize_opencl_runtime();
     if (g_cfg.opencl_enabled) {
         g_cfg.runtime_info = "opencl|cumulant-d3q27+sgs:" + g_opencl.device_name;
     } else {
-        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + g_opencl.error + ")";
+        std::string reason = g_opencl.error;
+        if (!g_cuda.error.empty()) {
+            reason = "cuda: " + g_cuda.error + "; opencl: " + reason;
+        }
+        if (reason.empty()) {
+            reason = "accelerator unavailable";
+        }
+        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + reason + ")";
     }
     return JNI_TRUE;
 }
@@ -1772,6 +2252,12 @@ static jboolean native_step_impl(
     timing.payload_copy_ms += elapsed_ms(copy_begin, Clock::now());
 
     bool ok = false;
+    if (g_cfg.cuda_enabled) {
+        if (!(ok = try_cuda_step(ctx, ctx.packet.data(), out, timing))) {
+            const std::string reason = g_cuda.error.empty() ? "CUDA fail" : g_cuda.error;
+            disable_cuda_runtime(reason);
+        }
+    }
     if (g_cfg.opencl_enabled) {
         if (!(ok = try_opencl_step(ctx, ctx.packet.data(), out, timing))) {
             const std::string reason = g_opencl.error.empty() ? "OpenCL fail" : g_opencl.error;

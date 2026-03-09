@@ -6,6 +6,7 @@ set(AERO_LBM_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/natives" CACHE PATH "Dir
 set(AERO_LBM_OUTPUT_DIR "" CACHE PATH "Optional output directory for single-target builds")
 set(AERO_LBM_BUILD_TYPE_RELEASE "Release" CACHE STRING "Build type used by AERO_LBM_SUPERBUILD")
 set(AERO_LBM_SUPERBUILD_ENABLE_OPENCL ON CACHE BOOL "Build superbuild targets with OpenCL enabled")
+set(AERO_LBM_SUPERBUILD_ENABLE_CUDA OFF CACHE BOOL "Build superbuild targets with CUDA enabled")
 set_property(CACHE AERO_LBM_BUILD_TYPE_RELEASE PROPERTY STRINGS Release RelWithDebInfo MinSizeRel Debug)
 
 if (AERO_LBM_SUPERBUILD)
@@ -26,6 +27,7 @@ if (AERO_LBM_SUPERBUILD)
             CMAKE_ARGS
                 -DAERO_LBM_SUPERBUILD=OFF
                 -DAERO_LBM_ENABLE_OPENCL=${AERO_LBM_SUPERBUILD_ENABLE_OPENCL}
+                -DAERO_LBM_ENABLE_CUDA=${AERO_LBM_SUPERBUILD_ENABLE_CUDA}
                 -DAERO_LBM_OUTPUT_DIR=${AERO_LBM_DIST_DIR}/${output_subdir}
                 -DCMAKE_BUILD_TYPE=${AERO_LBM_BUILD_TYPE_RELEASE}
                 -DCMAKE_LIBRARY_OUTPUT_DIRECTORY_${AERO_LBM_BUILD_TYPE_UPPER}=${AERO_LBM_DIST_DIR}/${output_subdir}
@@ -62,6 +64,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(JNI REQUIRED)
 
 option(AERO_LBM_ENABLE_OPENCL "Enable OpenCL backend in native solver" ON)
+option(AERO_LBM_ENABLE_CUDA "Enable CUDA backend in native solver" ON)
 
 add_library(aero_lbm SHARED
     src/aero_lbm_jni.cpp
@@ -75,6 +78,18 @@ if (AERO_LBM_ENABLE_OPENCL)
     target_link_libraries(aero_lbm PRIVATE OpenCL::OpenCL)
 else()
     message(STATUS "AERO_LBM_ENABLE_OPENCL=OFF (CPU-only native build)")
+endif()
+
+if (AERO_LBM_ENABLE_CUDA)
+    find_package(CUDAToolkit QUIET)
+    if (CUDAToolkit_FOUND)
+        target_compile_definitions(aero_lbm PRIVATE AERO_LBM_CUDA=1)
+        target_link_libraries(aero_lbm PRIVATE CUDA::cuda_driver CUDA::nvrtc)
+    else()
+        message(STATUS "AERO_LBM_ENABLE_CUDA=ON but CUDAToolkit not found (CUDA backend disabled)")
+    endif()
+else()
+    message(STATUS "AERO_LBM_ENABLE_CUDA=OFF")
 endif()
 
 if (WIN32)

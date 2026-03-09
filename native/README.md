@@ -35,13 +35,17 @@ Current native code includes:
   - per-window GPU buffers keyed by `contextKey`
   - TRT collision (same physics core as CPU path)
   - Windows MSVC builds add guarded OpenCL init/step calls; driver-level access violations are trapped and runtime falls back to CPU instead of crashing JVM.
+- CUDA path (optional when `AERO_LBM_ENABLE_CUDA=ON` and CUDA toolkit is found):
+  - reuses the same solver kernels via NVRTC compile at runtime
+  - per-window GPU buffers keyed by `contextKey`
+  - selected before OpenCL on non-forced CPU paths
 - CPU reference `D3Q19` path (automatic fallback):
   - per-window context state (`contextKey`)
   - TRT collision
   - bounce-back obstacle handling
   - fan forcing and mild state nudging
 
-Use `/aero backend status` after switching to native to confirm runtime path (`opencl|trt:<device>` or `cpu|trt...`).
+Use `/aero backend status` after switching to native to confirm runtime path (`cuda|...`, `opencl|...` or `cpu|...`).
 The status command also prints tick timing breakdown: payload copy / solver / readback / total.
 
 ## Next implementation steps
@@ -110,6 +114,7 @@ Workflow: `fabric-mod/.github/workflows/native-matrix.yml`
   - Linux amd64/arm64: `ON`
   - Windows x86_64: `ON` (OpenCL SDK provided via vcpkg in workflow)
   - macOS arm64: `OFF` (GitHub macOS runner OpenCL SDK availability is inconsistent)
+- CUDA mode in CI: `OFF` (matrix builds remain deterministic; enable CUDA in local/native builds where toolkit + driver are present)
 - verifies all 4 files exist
 - packs them into mod jar via `./gradlew remapJar`
 - uploads `mod-jar` and `natives-bundle` artifacts
@@ -124,6 +129,12 @@ To build native without OpenCL support (not default):
 
 ```bash
 cmake -S . -B build -DAERO_LBM_ENABLE_OPENCL=OFF
+```
+
+To force-disable CUDA backend at build time:
+
+```bash
+cmake -S . -B build -DAERO_LBM_ENABLE_CUDA=OFF
 ```
 
 ## Packaging in mod JAR
