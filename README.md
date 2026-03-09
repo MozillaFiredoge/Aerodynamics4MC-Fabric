@@ -46,6 +46,7 @@ cd fabric-mod
 2. `native`
 - 模组通过 JNI 调用内置动态库（自动从 jar 解压后加载）。
 - 支持按平台加载：`linux/windows/macos` + `x86_64/arm64`（Windows 仅 `x86_64`）。
+- Windows 默认走 native-CPU 稳定路径；如需尝试 Windows OpenCL，请设置环境变量 `AERO_LBM_WINDOWS_OPENCL=1`。
 
 ### 低分辨率背景环流场
 - 背景场与风扇细场解耦：背景场窗口按玩家滑动更新（每玩家一个），并且独立于风扇窗口存在。
@@ -130,6 +131,7 @@ cd fabric-mod
 2. `native`
 - Calls bundled native libraries via JNI (auto-extracted from mod jar at runtime).
 - Platform-aware loading: `linux/windows/macos` + `x86_64/arm64` (Windows only `x86_64`).
+- Windows defaults to native CPU for stability; set `AERO_LBM_WINDOWS_OPENCL=1` to opt into Windows OpenCL.
 
 ### Low-resolution background circulation field
 - The background field is decoupled from fan windows: it uses sliding player-centered windows (one per player), independent of whether fans exist.

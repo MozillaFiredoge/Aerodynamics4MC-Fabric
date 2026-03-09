@@ -1602,6 +1602,35 @@ bool try_opencl_step(ContextState& ctx, const float* payload, float* out, StepTi
 #endif
 }
 
+bool env_value_truthy(const char* value) {
+    if (value == nullptr) return false;
+    if (value[0] == '1' && value[1] == '\0') return true;
+    if ((value[0] == 't' || value[0] == 'T')
+        && (value[1] == 'r' || value[1] == 'R')
+        && (value[2] == 'u' || value[2] == 'U')
+        && (value[3] == 'e' || value[3] == 'E')
+        && value[4] == '\0') {
+        return true;
+    }
+    return false;
+}
+
+bool env_flag_enabled(const char* key) {
+    if (key == nullptr || key[0] == '\0') return false;
+#if defined(_MSC_VER)
+    char* env_buf = nullptr;
+    size_t env_len = 0;
+    if (_dupenv_s(&env_buf, &env_len, key) != 0 || env_buf == nullptr) {
+        return false;
+    }
+    const bool enabled = env_value_truthy(env_buf);
+    std::free(env_buf);
+    return enabled;
+#else
+    return env_value_truthy(std::getenv(key));
+#endif
+}
+
 void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
 void clear_all_contexts() { for (auto& e : g_contexts) clear_context(e.second); g_contexts.clear(); }
 void reset_runtime_state() { clear_all_contexts(); release_opencl_runtime(); g_cfg = Config{}; reset_timing_stats(); }
@@ -1614,22 +1643,17 @@ void disable_opencl_runtime(const std::string& reason) {
 }
 
 bool should_force_cpu_backend() {
-#if defined(_MSC_VER)
-    char* env_buf = nullptr;
-    size_t env_len = 0;
-    if (_dupenv_s(&env_buf, &env_len, "AERO_LBM_CPU_ONLY") != 0 || env_buf == nullptr) {
-        return false;
+    if (env_flag_enabled("AERO_LBM_CPU_ONLY")) {
+        return true;
     }
-    std::string env_value(env_buf);
-    std::free(env_buf);
-    std::transform(env_value.begin(), env_value.end(), env_value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return env_value == "1" || env_value == "true";
-#else
-    const char* env = std::getenv("AERO_LBM_CPU_ONLY");
-    return env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 || std::strcmp(env, "TRUE") == 0);
+#if defined(_WIN32)
+    // Windows OpenCL drivers are still fragile in nativeInit on some systems;
+    // keep CPU as stable default unless explicitly opted in.
+    if (!env_flag_enabled("AERO_LBM_WINDOWS_OPENCL")) {
+        return true;
+    }
 #endif
+    return false;
 }
 
 void ensure_context_shape(ContextState& ctx, int n, std::size_t cells) {
@@ -1664,7 +1688,13 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 
     if (should_force_cpu_backend()) {
         g_cfg.opencl_enabled = false;
-        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (forced)";
+        std::string reason = "forced";
+#if defined(_WIN32)
+        if (!env_flag_enabled("AERO_LBM_CPU_ONLY") && !env_flag_enabled("AERO_LBM_WINDOWS_OPENCL")) {
+            reason = "windows-default";
+        }
+#endif
+        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + reason + ")";
         return JNI_TRUE;
     }
     g_cfg.opencl_enabled = try_initialize_opencl_runtime();
