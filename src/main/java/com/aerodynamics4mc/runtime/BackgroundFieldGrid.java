@@ -2,7 +2,11 @@ package com.aerodynamics4mc.runtime;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,16 +23,14 @@ public final class BackgroundFieldGrid {
     private static final int THERMAL_COMPONENT_INDEX = 3;
     private static final int FIELD_COMPONENTS = 4;
 
-    private static final int DEFAULT_CELL_SIZE = 16;
-    private static final int DEFAULT_PADDING_CELLS = 2;
-    private static final int DEFAULT_UPDATE_INTERVAL_TICKS = 10;
+    private static final int DEFAULT_SOLVER_GRID_SIZE = 128;
+    private static final int DEFAULT_UPDATE_INTERVAL_TICKS = 20;
     private static final float DEFAULT_RELAXATION = 0.2f;
-    private static final int DEFAULT_MAX_TOTAL_CELLS = 96_000;
-    private static final int DEFAULT_MAX_EFFECTIVE_CELL_SIZE = 256;
     private static final float DEFAULT_WORLD_THERMAL_WEIGHT = 1.0f;
 
-    private static final float THERMAL_SOURCE_RELAXATION = 0.16f;
-    private static final float THERMAL_DIFFUSIVITY = 0.08f;
+    private static final int THERMAL_SAMPLE_STRIDE = 1;
+    private static final float THERMAL_SOURCE_RELAXATION = 0.40f;
+    private static final float THERMAL_DIFFUSIVITY = 0.03f;
     private static final float THERMAL_ADVECTION = 0.35f;
     private static final float THERMAL_MAX_ABS_K = 8.0f;
     private static final float BUOYANCY_TARGET_SPEED_PER_K = 0.65f;
@@ -38,15 +40,13 @@ public final class BackgroundFieldGrid {
 
     private static final long CONTEXT_ID_BASE = 1L << 52;
 
-    private final int cellSize;
-    private final int paddingCells;
+    private final int solverGridSize;
     private final int updateIntervalTicks;
     private final float relaxation;
-    private final int maxTotalCells;
-    private final int maxEffectiveCellSize;
     private final float worldThermalWeight;
     private final FlowSolver flowSolver;
-    private final Map<Identifier, DimensionField> fields = new ConcurrentHashMap<>();
+    private final Map<FieldKey, DimensionField> fields = new ConcurrentHashMap<>();
+    private final Map<Identifier, List<DimensionField>> fieldsByDimension = new ConcurrentHashMap<>();
     private long nextContextId = CONTEXT_ID_BASE;
 
     @FunctionalInterface
@@ -61,84 +61,38 @@ public final class BackgroundFieldGrid {
         }
     }
 
+    public record WindowSample(long windowKey, BlockPos origin) {
+    }
+
     public BackgroundFieldGrid() {
-        this(
-            null,
-            DEFAULT_CELL_SIZE,
-            DEFAULT_PADDING_CELLS,
-            DEFAULT_UPDATE_INTERVAL_TICKS,
-            DEFAULT_RELAXATION,
-            DEFAULT_MAX_TOTAL_CELLS,
-            DEFAULT_MAX_EFFECTIVE_CELL_SIZE,
-            DEFAULT_WORLD_THERMAL_WEIGHT
-        );
+        this(null, DEFAULT_SOLVER_GRID_SIZE, DEFAULT_UPDATE_INTERVAL_TICKS, DEFAULT_RELAXATION, DEFAULT_WORLD_THERMAL_WEIGHT);
     }
 
     public BackgroundFieldGrid(FlowSolver flowSolver) {
-        this(
-            flowSolver,
-            DEFAULT_CELL_SIZE,
-            DEFAULT_PADDING_CELLS,
-            DEFAULT_UPDATE_INTERVAL_TICKS,
-            DEFAULT_RELAXATION,
-            DEFAULT_MAX_TOTAL_CELLS,
-            DEFAULT_MAX_EFFECTIVE_CELL_SIZE,
-            DEFAULT_WORLD_THERMAL_WEIGHT
-        );
-    }
-
-    BackgroundFieldGrid(int cellSize, int paddingCells, int updateIntervalTicks, float relaxation) {
-        this(
-            null,
-            cellSize,
-            paddingCells,
-            updateIntervalTicks,
-            relaxation,
-            DEFAULT_MAX_TOTAL_CELLS,
-            DEFAULT_MAX_EFFECTIVE_CELL_SIZE,
-            DEFAULT_WORLD_THERMAL_WEIGHT
-        );
-    }
-
-    BackgroundFieldGrid(
-        int cellSize,
-        int paddingCells,
-        int updateIntervalTicks,
-        float relaxation,
-        int maxTotalCells,
-        int maxEffectiveCellSize,
-        float worldThermalWeight
-    ) {
-        this(
-            null,
-            cellSize,
-            paddingCells,
-            updateIntervalTicks,
-            relaxation,
-            maxTotalCells,
-            maxEffectiveCellSize,
-            worldThermalWeight
-        );
+        this(flowSolver, DEFAULT_SOLVER_GRID_SIZE, DEFAULT_UPDATE_INTERVAL_TICKS, DEFAULT_RELAXATION, DEFAULT_WORLD_THERMAL_WEIGHT);
     }
 
     BackgroundFieldGrid(
         FlowSolver flowSolver,
-        int cellSize,
-        int paddingCells,
+        int solverGridSize,
         int updateIntervalTicks,
         float relaxation,
-        int maxTotalCells,
-        int maxEffectiveCellSize,
         float worldThermalWeight
     ) {
         this.flowSolver = flowSolver;
-        this.cellSize = Math.max(4, cellSize);
-        this.paddingCells = Math.max(0, paddingCells);
+        this.solverGridSize = Math.max(8, solverGridSize);
         this.updateIntervalTicks = Math.max(1, updateIntervalTicks);
         this.relaxation = MathHelper.clamp(relaxation, 0.01f, 1.0f);
-        this.maxTotalCells = Math.max(1024, maxTotalCells);
-        this.maxEffectiveCellSize = Math.max(this.cellSize, maxEffectiveCellSize);
         this.worldThermalWeight = MathHelper.clamp(worldThermalWeight, 0.0f, 1.0f);
+    }
+
+    public int solverGridSize() {
+        return solverGridSize;
+    }
+
+    public int countWindows(Identifier dimensionId) {
+        List<DimensionField> dimensionFields = fieldsByDimension.get(dimensionId);
+        return dimensionFields == null ? 0 : dimensionFields.size();
     }
 
     public void clear() {
@@ -146,133 +100,84 @@ public final class BackgroundFieldGrid {
             releaseContext(field);
         }
         fields.clear();
+        fieldsByDimension.clear();
     }
 
     public void retainDimensions(Set<Identifier> activeDimensions) {
-        for (Map.Entry<Identifier, DimensionField> entry : fields.entrySet()) {
-            if (activeDimensions.contains(entry.getKey())) {
+        Iterator<Map.Entry<FieldKey, DimensionField>> iterator = fields.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<FieldKey, DimensionField> entry = iterator.next();
+            if (activeDimensions.contains(entry.getKey().dimensionId)) {
                 continue;
             }
-            if (fields.remove(entry.getKey(), entry.getValue())) {
-                releaseContext(entry.getValue());
-            }
+            releaseContext(entry.getValue());
+            iterator.remove();
         }
+        rebuildDimensionIndex();
     }
 
     public void update(
         Identifier dimensionId,
         long worldTime,
         int simulationTick,
-        Collection<BlockPos> windowOrigins,
-        int windowSize
-    ) {
-        update(dimensionId, worldTime, simulationTick, windowOrigins, windowSize, null);
-    }
-
-    public void update(
-        Identifier dimensionId,
-        long worldTime,
-        int simulationTick,
-        Collection<BlockPos> windowOrigins,
+        Collection<WindowSample> windows,
         int windowSize,
         ThermalSampler thermalSampler
     ) {
-        if (dimensionId == null || windowOrigins == null || windowOrigins.isEmpty()) {
+        if (dimensionId == null || windows == null || windows.isEmpty()) {
             if (dimensionId != null) {
-                DimensionField removed = fields.remove(dimensionId);
-                releaseContext(removed);
+                removeDimensionFields(dimensionId);
             }
             return;
         }
 
-        int minX = Integer.MAX_VALUE;
-        int minY = Integer.MAX_VALUE;
-        int minZ = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE;
-        int maxY = Integer.MIN_VALUE;
-        int maxZ = Integer.MIN_VALUE;
-        int clampedWindowSize = Math.max(1, windowSize);
-        for (BlockPos origin : windowOrigins) {
-            if (origin == null) {
+        int targetWindowSize = Math.max(1, windowSize);
+        Set<FieldKey> activeKeys = new HashSet<>();
+        for (WindowSample window : windows) {
+            if (window == null || window.origin() == null) {
                 continue;
             }
-            minX = Math.min(minX, origin.getX());
-            minY = Math.min(minY, origin.getY());
-            minZ = Math.min(minZ, origin.getZ());
-            maxX = Math.max(maxX, origin.getX() + clampedWindowSize - 1);
-            maxY = Math.max(maxY, origin.getY() + clampedWindowSize - 1);
-            maxZ = Math.max(maxZ, origin.getZ() + clampedWindowSize - 1);
-        }
-        if (minX == Integer.MAX_VALUE) {
-            DimensionField removed = fields.remove(dimensionId);
-            releaseContext(removed);
-            return;
-        }
+            FieldKey key = new FieldKey(dimensionId, window.windowKey());
+            activeKeys.add(key);
 
-        int paddedMinX = minX - (paddingCells * cellSize);
-        int paddedMinY = minY - (paddingCells * cellSize);
-        int paddedMinZ = minZ - (paddingCells * cellSize);
-        int paddedMaxX = maxX + (paddingCells * cellSize);
-        int paddedMaxY = maxY + (paddingCells * cellSize);
-        int paddedMaxZ = maxZ + (paddingCells * cellSize);
-
-        int spanX = Math.max(1, paddedMaxX - paddedMinX + 1);
-        int spanY = Math.max(1, paddedMaxY - paddedMinY + 1);
-        int spanZ = Math.max(1, paddedMaxZ - paddedMinZ + 1);
-
-        int effectiveCellSize = cellSize;
-        while (effectiveCellSize < maxEffectiveCellSize
-            && estimateCubeCellCount(spanX, spanY, spanZ, effectiveCellSize) > maxTotalCells) {
-            int next = Math.min(maxEffectiveCellSize, effectiveCellSize * 2);
-            if (next == effectiveCellSize) {
-                break;
+            DimensionField field = fields.get(key);
+            BlockPos origin = window.origin();
+            if (field == null || !field.matches(origin, targetWindowSize)) {
+                DimensionField replacement = new DimensionField(
+                    origin.getX(),
+                    origin.getY(),
+                    origin.getZ(),
+                    targetWindowSize,
+                    solverGridSize,
+                    allocateContextId()
+                );
+                releaseContext(field);
+                field = replacement;
             }
-            effectiveCellSize = next;
+
+            if (field.lastUpdateTick >= 0 && (simulationTick - field.lastUpdateTick) < updateIntervalTicks) {
+                fields.put(key, field);
+                continue;
+            }
+
+            sampleThermalSources(field, thermalSampler);
+            stepThermalField(field);
+            boolean solved = stepVelocityField(field);
+            commitStep(field, solved, simulationTick);
+            fields.put(key, field);
         }
 
-        int minCellX = Math.floorDiv(paddedMinX, effectiveCellSize);
-        int minCellY = Math.floorDiv(paddedMinY, effectiveCellSize);
-        int minCellZ = Math.floorDiv(paddedMinZ, effectiveCellSize);
-        int maxCellX = Math.floorDiv(paddedMaxX, effectiveCellSize);
-        int maxCellY = Math.floorDiv(paddedMaxY, effectiveCellSize);
-        int maxCellZ = Math.floorDiv(paddedMaxZ, effectiveCellSize);
-
-        int sizeX = maxCellX - minCellX + 1;
-        int sizeY = maxCellY - minCellY + 1;
-        int sizeZ = maxCellZ - minCellZ + 1;
-        int solverSize = Math.max(sizeX, Math.max(sizeY, sizeZ));
-        minCellX -= (solverSize - sizeX) / 2;
-        minCellY -= (solverSize - sizeY) / 2;
-        minCellZ -= (solverSize - sizeZ) / 2;
-
-        DimensionField previous = fields.get(dimensionId);
-        boolean boundsChanged = previous == null
-            || !previous.matches(minCellX, minCellY, minCellZ, solverSize, effectiveCellSize);
-        if (!boundsChanged
-            && previous.lastUpdateTick >= 0
-            && (simulationTick - previous.lastUpdateTick) < updateIntervalTicks) {
-            return;
-        }
-
-        DimensionField field = previous;
-        if (boundsChanged) {
-            field = new DimensionField(minCellX, minCellY, minCellZ, solverSize, effectiveCellSize, allocateContextId());
-            releaseContext(previous);
-        }
-
-        sampleThermalSources(field, thermalSampler);
-        stepThermalField(field);
-        boolean solved = stepVelocityField(field);
-        commitStep(field, solved, simulationTick);
-        fields.put(dimensionId, field);
+        pruneInactiveWindows(dimensionId, activeKeys);
+        rebuildDimensionIndex();
     }
 
     public void sampleInto(Identifier dimensionId, double worldX, double worldY, double worldZ, float[] output, int offset) {
         if (output == null || output.length < offset + VELOCITY_COMPONENTS) {
             return;
         }
-        DimensionField field = fields.get(dimensionId);
-        if (field == null) {
+
+        List<DimensionField> candidates = fieldsByDimension.get(dimensionId);
+        if (candidates == null || candidates.isEmpty()) {
             output[offset] = 0.0f;
             output[offset + 1] = 0.0f;
             output[offset + 2] = 0.0f;
@@ -282,21 +187,49 @@ public final class BackgroundFieldGrid {
             return;
         }
 
-        double gx = (worldX / field.cellSize) - field.minCellX;
-        double gy = (worldY / field.cellSize) - field.minCellY;
-        double gz = (worldZ / field.cellSize) - field.minCellZ;
+        DimensionField selected = null;
+        double bestContainedDist = Double.POSITIVE_INFINITY;
+        double bestAnyDist = Double.POSITIVE_INFINITY;
+        for (DimensionField field : candidates) {
+            double distSq = field.distanceSqToCenter(worldX, worldY, worldZ);
+            if (field.contains(worldX, worldY, worldZ)) {
+                if (distSq < bestContainedDist) {
+                    bestContainedDist = distSq;
+                    selected = field;
+                }
+                continue;
+            }
+            if (selected == null && distSq < bestAnyDist) {
+                bestAnyDist = distSq;
+                selected = field;
+            }
+        }
 
-        gx = MathHelper.clamp(gx, 0.0, field.solverSize - 1);
-        gy = MathHelper.clamp(gy, 0.0, field.solverSize - 1);
-        gz = MathHelper.clamp(gz, 0.0, field.solverSize - 1);
+        if (selected == null) {
+            output[offset] = 0.0f;
+            output[offset + 1] = 0.0f;
+            output[offset + 2] = 0.0f;
+            if (output.length >= offset + FIELD_COMPONENTS) {
+                output[offset + THERMAL_COMPONENT_INDEX] = 0.0f;
+            }
+            return;
+        }
 
-        output[offset] = sampleComponent(field.values, field.solverSize, gx, gy, gz, 0);
-        output[offset + 1] = sampleComponent(field.values, field.solverSize, gx, gy, gz, 1);
-        output[offset + 2] = sampleComponent(field.values, field.solverSize, gx, gy, gz, 2);
+        double gx = (worldX - selected.originX) * selected.invCellSize;
+        double gy = (worldY - selected.originY) * selected.invCellSize;
+        double gz = (worldZ - selected.originZ) * selected.invCellSize;
+
+        gx = MathHelper.clamp(gx, 0.0, selected.solverSize - 1);
+        gy = MathHelper.clamp(gy, 0.0, selected.solverSize - 1);
+        gz = MathHelper.clamp(gz, 0.0, selected.solverSize - 1);
+
+        output[offset] = sampleComponent(selected.values, selected.solverSize, gx, gy, gz, 0);
+        output[offset + 1] = sampleComponent(selected.values, selected.solverSize, gx, gy, gz, 1);
+        output[offset + 2] = sampleComponent(selected.values, selected.solverSize, gx, gy, gz, 2);
         if (output.length >= offset + FIELD_COMPONENTS) {
             output[offset + THERMAL_COMPONENT_INDEX] = sampleComponent(
-                field.values,
-                field.solverSize,
+                selected.values,
+                selected.solverSize,
                 gx,
                 gy,
                 gz,
@@ -306,41 +239,47 @@ public final class BackgroundFieldGrid {
     }
 
     private void sampleThermalSources(DimensionField field, ThermalSampler thermalSampler) {
-        for (int x = 0; x < field.solverSize; x++) {
-            double worldX = (field.minCellX + x + 0.5) * field.cellSize;
-            for (int y = 0; y < field.solverSize; y++) {
-                double worldY = (field.minCellY + y + 0.5) * field.cellSize;
-                for (int z = 0; z < field.solverSize; z++) {
-                    double worldZ = (field.minCellZ + z + 0.5) * field.cellSize;
-                    float sampledThermal = 0.0f;
+        int stride = Math.max(1, THERMAL_SAMPLE_STRIDE);
+        for (int x = 0; x < field.solverSize; x += stride) {
+            for (int y = 0; y < field.solverSize; y += stride) {
+                for (int z = 0; z < field.solverSize; z += stride) {
+                    float sampled = 0.0f;
                     if (thermalSampler != null) {
-                        sampledThermal = thermalSampler.sampleThermalAnomaly(
-                            (int) Math.round(worldX),
-                            (int) Math.round(worldY),
-                            (int) Math.round(worldZ)
+                        double sampleX = field.originX + (x + 0.5 * stride) * field.cellSize;
+                        double sampleY = field.originY + (y + 0.5 * stride) * field.cellSize;
+                        double sampleZ = field.originZ + (z + 0.5 * stride) * field.cellSize;
+                        sampled = thermalSampler.sampleThermalAnomaly(
+                            (int) Math.round(sampleX),
+                            (int) Math.round(sampleY),
+                            (int) Math.round(sampleZ)
                         );
                     }
-                    int cell = field.cellIndex(x, y, z);
-                    field.thermalSource[cell] = MathHelper.clamp(
-                        sampledThermal * worldThermalWeight,
-                        -THERMAL_MAX_ABS_K,
-                        THERMAL_MAX_ABS_K
-                    );
+                    float source = MathHelper.clamp(sampled * worldThermalWeight, -THERMAL_MAX_ABS_K, THERMAL_MAX_ABS_K);
+                    int maxX = Math.min(field.solverSize, x + stride);
+                    int maxY = Math.min(field.solverSize, y + stride);
+                    int maxZ = Math.min(field.solverSize, z + stride);
+                    for (int xx = x; xx < maxX; xx++) {
+                        for (int yy = y; yy < maxY; yy++) {
+                            for (int zz = z; zz < maxZ; zz++) {
+                                field.thermalSource[field.cellIndex(xx, yy, zz)] = source;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     private void stepThermalField(DimensionField field) {
-        float invCell = 1.0f / Math.max(1.0f, field.cellSize);
+        float invCell = field.invCellSize;
         for (int x = 0; x < field.solverSize; x++) {
             for (int y = 0; y < field.solverSize; y++) {
                 for (int z = 0; z < field.solverSize; z++) {
                     int cell = field.cellIndex(x, y, z);
-                    int fieldIndex = cell * FIELD_COMPONENTS;
-                    float vx = field.values[fieldIndex];
-                    float vy = field.values[fieldIndex + 1];
-                    float vz = field.values[fieldIndex + 2];
+                    int idx = cell * FIELD_COMPONENTS;
+                    float vx = field.values[idx];
+                    float vy = field.values[idx + 1];
+                    float vz = field.values[idx + 2];
 
                     double advectX = x - (THERMAL_ADVECTION * vx * invCell);
                     double advectY = y - (THERMAL_ADVECTION * vy * invCell);
@@ -360,7 +299,7 @@ public final class BackgroundFieldGrid {
     private boolean stepVelocityField(DimensionField field) {
         ByteBuffer payload = field.payloadBuffer;
         payload.clear();
-        int cells = field.solverSize * field.solverSize * field.solverSize;
+        int cells = field.cellCount;
         for (int cell = 0; cell < cells; cell++) {
             int idx = cell * FIELD_COMPONENTS;
             float thermal = field.thermalNext[cell];
@@ -388,8 +327,7 @@ public final class BackgroundFieldGrid {
     }
 
     private void commitStep(DimensionField field, boolean solved, int simulationTick) {
-        int cells = field.solverSize * field.solverSize * field.solverSize;
-        for (int cell = 0; cell < cells; cell++) {
+        for (int cell = 0; cell < field.cellCount; cell++) {
             int idx = cell * FIELD_COMPONENTS;
             if (solved) {
                 int outBase = cell * SOLVER_OUTPUT_CHANNELS;
@@ -413,10 +351,8 @@ public final class BackgroundFieldGrid {
 
     private float sampleComponent(float[] values, int side, double gx, double gy, double gz, int component) {
         if (side <= 1) {
-            int idx = component;
-            return (idx >= 0 && idx < values.length) ? values[idx] : 0.0f;
+            return componentAt(values, side, 0, 0, 0, component);
         }
-
         double clampedX = MathHelper.clamp(gx, 0.0, side - 1);
         double clampedY = MathHelper.clamp(gy, 0.0, side - 1);
         double clampedZ = MathHelper.clamp(gz, 0.0, side - 1);
@@ -472,12 +408,41 @@ public final class BackgroundFieldGrid {
         return values[idx];
     }
 
-    private long estimateCubeCellCount(int spanX, int spanY, int spanZ, int candidateCellSize) {
-        long sx = Math.max(1L, (spanX + (long) candidateCellSize - 1L) / candidateCellSize);
-        long sy = Math.max(1L, (spanY + (long) candidateCellSize - 1L) / candidateCellSize);
-        long sz = Math.max(1L, (spanZ + (long) candidateCellSize - 1L) / candidateCellSize);
-        long side = Math.max(sx, Math.max(sy, sz));
-        return side * side * side;
+    private void removeDimensionFields(Identifier dimensionId) {
+        Iterator<Map.Entry<FieldKey, DimensionField>> iterator = fields.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<FieldKey, DimensionField> entry = iterator.next();
+            if (!entry.getKey().dimensionId.equals(dimensionId)) {
+                continue;
+            }
+            releaseContext(entry.getValue());
+            iterator.remove();
+        }
+        rebuildDimensionIndex();
+    }
+
+    private void pruneInactiveWindows(Identifier dimensionId, Set<FieldKey> activeKeys) {
+        Iterator<Map.Entry<FieldKey, DimensionField>> iterator = fields.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<FieldKey, DimensionField> entry = iterator.next();
+            FieldKey key = entry.getKey();
+            if (!key.dimensionId.equals(dimensionId) || activeKeys.contains(key)) {
+                continue;
+            }
+            releaseContext(entry.getValue());
+            iterator.remove();
+        }
+    }
+
+    private void rebuildDimensionIndex() {
+        Map<Identifier, List<DimensionField>> grouped = new ConcurrentHashMap<>();
+        for (Map.Entry<FieldKey, DimensionField> entry : fields.entrySet()) {
+            grouped.computeIfAbsent(entry.getKey().dimensionId, ignored -> new ArrayList<>()).add(entry.getValue());
+        }
+        fieldsByDimension.clear();
+        for (Map.Entry<Identifier, List<DimensionField>> entry : grouped.entrySet()) {
+            fieldsByDimension.put(entry.getKey(), List.copyOf(entry.getValue()));
+        }
     }
 
     private long allocateContextId() {
@@ -495,12 +460,46 @@ public final class BackgroundFieldGrid {
         flowSolver.releaseContext(field.contextId);
     }
 
+    private static final class FieldKey {
+        private final Identifier dimensionId;
+        private final long windowKey;
+
+        private FieldKey(Identifier dimensionId, long windowKey) {
+            this.dimensionId = dimensionId;
+            this.windowKey = windowKey;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof FieldKey other)) {
+                return false;
+            }
+            return windowKey == other.windowKey && dimensionId.equals(other.dimensionId);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = dimensionId.hashCode();
+            result = 31 * result + Long.hashCode(windowKey);
+            return result;
+        }
+    }
+
     private static final class DimensionField {
-        private final int minCellX;
-        private final int minCellY;
-        private final int minCellZ;
+        private final int originX;
+        private final int originY;
+        private final int originZ;
+        private final int windowSize;
         private final int solverSize;
-        private final int cellSize;
+        private final int cellCount;
+        private final double cellSize;
+        private final float invCellSize;
+        private final double centerX;
+        private final double centerY;
+        private final double centerZ;
         private final long contextId;
         private int lastUpdateTick = -1;
 
@@ -512,29 +511,57 @@ public final class BackgroundFieldGrid {
         private final byte[] payloadBytes;
         private final ByteBuffer payloadBuffer;
 
-        private DimensionField(int minCellX, int minCellY, int minCellZ, int solverSize, int cellSize, long contextId) {
-            this.minCellX = minCellX;
-            this.minCellY = minCellY;
-            this.minCellZ = minCellZ;
-            this.solverSize = Math.max(1, solverSize);
-            this.cellSize = Math.max(1, cellSize);
+        private DimensionField(
+            int originX,
+            int originY,
+            int originZ,
+            int windowSize,
+            int solverSize,
+            long contextId
+        ) {
+            this.originX = originX;
+            this.originY = originY;
+            this.originZ = originZ;
+            this.windowSize = Math.max(1, windowSize);
+            this.solverSize = Math.max(8, solverSize);
+            this.cellCount = this.solverSize * this.solverSize * this.solverSize;
+            this.cellSize = this.windowSize / (double) this.solverSize;
+            this.invCellSize = (float) (this.solverSize / (double) this.windowSize);
+            this.centerX = originX + (this.windowSize * 0.5);
+            this.centerY = originY + (this.windowSize * 0.5);
+            this.centerZ = originZ + (this.windowSize * 0.5);
             this.contextId = contextId;
-            int cells = this.solverSize * this.solverSize * this.solverSize;
-            this.values = new float[cells * FIELD_COMPONENTS];
-            this.pressure = new float[cells];
-            this.thermalSource = new float[cells];
-            this.thermalNext = new float[cells];
-            this.solverOutput = new float[cells * SOLVER_OUTPUT_CHANNELS];
-            this.payloadBytes = new byte[cells * SOLVER_INPUT_CHANNELS * Float.BYTES];
+            this.values = new float[cellCount * FIELD_COMPONENTS];
+            this.pressure = new float[cellCount];
+            this.thermalSource = new float[cellCount];
+            this.thermalNext = new float[cellCount];
+            this.solverOutput = new float[cellCount * SOLVER_OUTPUT_CHANNELS];
+            this.payloadBytes = new byte[cellCount * SOLVER_INPUT_CHANNELS * Float.BYTES];
             this.payloadBuffer = ByteBuffer.wrap(payloadBytes).order(ByteOrder.LITTLE_ENDIAN);
         }
 
-        private boolean matches(int minCellX, int minCellY, int minCellZ, int solverSize, int cellSize) {
-            return this.minCellX == minCellX
-                && this.minCellY == minCellY
-                && this.minCellZ == minCellZ
-                && this.solverSize == solverSize
-                && this.cellSize == cellSize;
+        private boolean matches(BlockPos origin, int windowSize) {
+            return origin != null
+                && this.originX == origin.getX()
+                && this.originY == origin.getY()
+                && this.originZ == origin.getZ()
+                && this.windowSize == Math.max(1, windowSize);
+        }
+
+        private boolean contains(double worldX, double worldY, double worldZ) {
+            return worldX >= originX
+                && worldX < originX + windowSize
+                && worldY >= originY
+                && worldY < originY + windowSize
+                && worldZ >= originZ
+                && worldZ < originZ + windowSize;
+        }
+
+        private double distanceSqToCenter(double worldX, double worldY, double worldZ) {
+            double dx = worldX - centerX;
+            double dy = worldY - centerY;
+            double dz = worldZ - centerZ;
+            return dx * dx + dy * dy + dz * dz;
         }
 
         private int cellIndex(int x, int y, int z) {

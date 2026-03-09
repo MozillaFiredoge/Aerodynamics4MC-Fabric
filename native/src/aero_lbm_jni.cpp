@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -208,6 +209,7 @@ struct ContextState {
 
 Config g_cfg;
 std::unordered_map<jlong, ContextState> g_contexts;
+std::mutex g_runtime_mutex;
 
 struct StepTiming {
     double payload_copy_ms = 0.0;
@@ -1588,6 +1590,7 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
 extern "C" {
 
 static jboolean native_init_impl(jint grid_size, jint input_channels, jint output_channels) {
+    std::lock_guard<std::mutex> guard(g_runtime_mutex);
     if (grid_size <= 0 || input_channels < 9 || output_channels < 4) { reset_runtime_state(); return JNI_FALSE; }
     clear_all_contexts(); reset_timing_stats();
     g_cfg.grid_size = grid_size; g_cfg.input_channels = input_channels; g_cfg.output_channels = output_channels; g_cfg.initialized = true;
@@ -1609,6 +1612,7 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 static jboolean native_step_impl(
     JNIEnv* env, jclass, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
 ) {
+    std::lock_guard<std::mutex> guard(g_runtime_mutex);
     auto tick_begin = Clock::now();
     StepTiming timing;
 
@@ -1662,15 +1666,21 @@ static jboolean native_step_impl(
 }
 
 static void native_release_context_impl(jlong context_key) {
+    std::lock_guard<std::mutex> guard(g_runtime_mutex);
     auto it = g_contexts.find(context_key);
     if (it != g_contexts.end()) { clear_context(it->second); g_contexts.erase(it); }
 }
 
-static void native_shutdown_impl() { reset_runtime_state(); }
+static void native_shutdown_impl() {
+    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    reset_runtime_state();
+}
 static jstring native_runtime_info_impl(JNIEnv* env) {
+    std::lock_guard<std::mutex> guard(g_runtime_mutex);
     return env->NewStringUTF((g_cfg.runtime_info.empty() ? "uninitialized" : g_cfg.runtime_info).c_str());
 }
 static jstring native_timing_info_impl(JNIEnv* env) {
+    std::lock_guard<std::mutex> guard(g_runtime_mutex);
     return env->NewStringUTF(timing_info_string().c_str());
 }
 

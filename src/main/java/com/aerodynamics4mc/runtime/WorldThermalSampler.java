@@ -8,13 +8,13 @@ import net.minecraft.world.LightType;
 import net.minecraft.world.World;
 
 public final class WorldThermalSampler {
-    private static final int SAMPLE_SPACING = 6;
-    private static final float CENTER_SAMPLE_WEIGHT = 2.0f;
+    private static final int SAMPLE_SPACING = 2;
+    private static final float CENTER_SAMPLE_WEIGHT = 6.0f;
     private static final float THERMAL_LUMINANCE_SCALE = 3.0f;
     private static final float THERMAL_BIOME_SCALE = 2.2f;
     private static final float THERMAL_SKYLIGHT_SCALE = 2.4f;
     private static final float THERMAL_ALTITUDE_SCALE = 1.2f;
-    private static final float THERMAL_MAX_ABS = 8.0f;
+    private static final float THERMAL_MAX_ABS = 14.0f;
 
     private WorldThermalSampler() {
     }

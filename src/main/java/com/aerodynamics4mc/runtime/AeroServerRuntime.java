@@ -18,6 +18,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
@@ -90,6 +95,11 @@ public final class AeroServerRuntime {
     private static final int FLOW_COUNT = GRID_SIZE * GRID_SIZE * GRID_SIZE * RESPONSE_CHANNELS;
 
     private static final int WINDOW_REFRESH_TICKS = 20;
+    private static final int PLAYER_WINDOW_SLIDE_STEP = 16;
+    private static final int BACKGROUND_UPDATE_INTERVAL_TICKS = 5;
+    private static final int BACKGROUND_CELL_SIZE = 16;
+    private static final int BACKGROUND_WINDOW_SIZE = 128 * BACKGROUND_CELL_SIZE;
+    private static final int BACKGROUND_WINDOW_SLIDE_STEP = 16;
     private static final int OBSTACLE_REFRESH_TICKS = 200;
     private static final int FLOW_SYNC_INTERVAL_TICKS = 2;
     private static final int FAN_SCAN_RADIUS = 48;
@@ -101,7 +111,7 @@ public final class AeroServerRuntime {
     private static final int MAX_STREAMLINE_STRIDE = 8;
 
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
-    private static final float BACKGROUND_VELOCITY_COUPLING = 0.08f;
+    private static final float BACKGROUND_VELOCITY_COUPLING = 0.25f;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int PLAYER_VELOCITY_SYNC_MIN_INTERVAL_TICKS = 20;
@@ -119,6 +129,17 @@ public final class AeroServerRuntime {
     private final Map<UUID, Integer> entityVelocitySyncTickById = new HashMap<>();
     private final Map<UUID, Vec3d> entityLastSyncedVelocityById = new HashMap<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
+    private final NativeLbmBridge backgroundNativeBackend = new NativeLbmBridge();
+    private final ExecutorService solverExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread worker = new Thread(runnable, "aerodynamics4mc-server-solver");
+        worker.setDaemon(true);
+        return worker;
+    });
+    private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread worker = new Thread(runnable, "aerodynamics4mc-server-background");
+        worker.setDaemon(true);
+        return worker;
+    });
     private final BackgroundFieldGrid backgroundField = new BackgroundFieldGrid(new BackgroundFieldGrid.FlowSolver() {
         @Override
         public boolean step(int gridSize, byte[] payload, long contextId, float[] output) {
@@ -148,6 +169,10 @@ public final class AeroServerRuntime {
     private int secondWindowSimulationTicks = 0;
     private float simulationTicksPerSecond = 0.0f;
     private float lastMaxFlowSpeed = 0.0f;
+    private int backgroundWindowCount = 0;
+    private int backgroundLastUpdateTick = -1;
+    private float backgroundLastUpdateMs = 0.0f;
+    private Future<BackgroundUpdateResult> backgroundUpdateTask;
     private String lastSolverError = "";
     private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
     private boolean streamlineRoiEnabled = false;
@@ -338,6 +363,21 @@ public final class AeroServerRuntime {
                         }
                         return 1;
                     })))
+            .then(CommandManager.literal("atmo")
+                .then(CommandManager.literal("status")
+                    .executes(ctx -> {
+                        feedback(
+                            ctx.getSource(),
+                            "Atmo windows=" + backgroundWindowCount
+                                + " grid=" + backgroundField.solverGridSize() + "^3"
+                                + " cell=" + BACKGROUND_CELL_SIZE
+                                + " interval=" + BACKGROUND_UPDATE_INTERVAL_TICKS + "t"
+                                + " lastTick=" + backgroundLastUpdateTick
+                                + " lastMs=" + format2(backgroundLastUpdateMs)
+                                + " runtime=" + backgroundNativeBackend.runtimeInfo()
+                        );
+                        return 1;
+                    })))
             .then(CommandManager.literal("clientmaster")
                 .then(CommandManager.literal("on")
                     .executes(ctx -> {
@@ -391,6 +431,11 @@ public final class AeroServerRuntime {
                             + " renderStreamlines=" + renderStreamlinesEnabled
                             + " renderBackgroundVectors=" + renderBackgroundVectorsEnabled
                             + " renderThermalAnomaly=" + renderThermalAnomalyEnabled
+                            + " atmoWindows=" + backgroundWindowCount
+                            + " atmoGrid=" + backgroundField.solverGridSize() + "^3"
+                            + " atmoCell=" + BACKGROUND_CELL_SIZE
+                            + " atmoInterval=" + BACKGROUND_UPDATE_INTERVAL_TICKS + "t"
+                            + " atmoLastMs=" + format2(backgroundLastUpdateMs)
                             + " simTicks=" + simulationTicks
                             + " simTickPerSec=" + format2(simulationTicksPerSecond)
                             + " clientMaster=" + (singleplayerClientMasterEnabled ? "on" : "off")
@@ -520,6 +565,10 @@ public final class AeroServerRuntime {
             lastMaxFlowSpeed = 0.0f;
             entityVelocitySyncTickById.clear();
             entityLastSyncedVelocityById.clear();
+            backgroundWindowCount = 0;
+            backgroundLastUpdateTick = -1;
+            backgroundLastUpdateMs = 0.0f;
+            cancelBackgroundUpdateTask();
             backgroundField.clear();
             updateSimulationRate(false);
             return;
@@ -530,16 +579,10 @@ public final class AeroServerRuntime {
         }
         clientMasterDetectedWindows = windows.size();
 
-        if (windows.isEmpty()) {
-            backgroundField.clear();
-            updateSimulationRate(false);
-            return;
-        }
-
-        updateBackgroundFields(server);
-
         boolean shouldSyncFlow = debugEnabled && (tickCounter % FLOW_SYNC_INTERVAL_TICKS == 0);
         boolean steppedThisTick = false;
+        List<PendingSolve> pendingSolves = new ArrayList<>(windows.size());
+        BackendMode backendSnapshot = backendMode;
         Iterator<Map.Entry<WindowKey, WindowState>> it = windows.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<WindowKey, WindowState> entry = it.next();
@@ -553,20 +596,53 @@ public final class AeroServerRuntime {
             }
 
             try {
-                byte[] payload = captureWindow(window, key.worldKey().getValue(), key.origin(), backendMode);
-                float[] response = runSolverStep(window, payload, backendMode);
+                byte[] payload = captureWindow(window, key.worldKey().getValue(), key.origin(), backendSnapshot);
+                Future<float[]> solveFuture = solverExecutor.submit(() -> runSolverStep(window, payload, backendSnapshot));
+                pendingSolves.add(new PendingSolve(key, window, world, solveFuture));
+            } catch (RuntimeException ex) {
+                lastSolverError = ex.getMessage();
+                log("Solver error for window " + formatPos(key.origin()) + ": " + lastSolverError);
+                closeSocket(window);
+            }
+        }
+
+        pumpBackgroundUpdate(server);
+
+        if (pendingSolves.isEmpty()) {
+            updateSimulationRate(false);
+            return;
+        }
+
+        for (PendingSolve pending : pendingSolves) {
+            WindowState window = pending.window();
+            BlockPos origin = pending.key().origin();
+            try {
+                float[] response = pending.future().get();
                 updateBaseFieldFromResponse(window, response, maxWindSpeed);
                 window.latestFlow = response;
                 steppedThisTick = true;
                 lastSolverError = "";
 
-                applyForces(world, key.origin(), response, FORCE_STRENGTH, clientMasterActive);
+                applyForces(pending.world(), origin, response, FORCE_STRENGTH, clientMasterActive);
                 if (shouldSyncFlow) {
-                    syncFlowToPlayers(world, key.origin(), response, streamlineSampleStride);
+                    syncFlowToPlayers(pending.world(), origin, response, streamlineSampleStride);
                 }
-            } catch (IOException ex) {
-                lastSolverError = ex.getMessage();
-                log("Solver error for window " + formatPos(key.origin()) + ": " + lastSolverError);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                lastSolverError = "Solver task interrupted";
+                log("Solver error for window " + formatPos(origin) + ": " + lastSolverError);
+                closeSocket(window);
+            } catch (ExecutionException ex) {
+                Throwable cause = ex.getCause();
+                if (cause instanceof IOException io) {
+                    lastSolverError = io.getMessage();
+                } else {
+                    lastSolverError = cause != null ? cause.getMessage() : ex.getMessage();
+                }
+                if (lastSolverError == null || lastSolverError.isEmpty()) {
+                    lastSolverError = "Unknown solver task failure";
+                }
+                log("Solver error for window " + formatPos(origin) + ": " + lastSolverError);
                 closeSocket(window);
             }
         }
@@ -600,6 +676,10 @@ public final class AeroServerRuntime {
         secondWindowSimulationTicks = 0;
         simulationTicksPerSecond = 0.0f;
         lastMaxFlowSpeed = 0.0f;
+        backgroundWindowCount = 0;
+        backgroundLastUpdateTick = -1;
+        backgroundLastUpdateMs = 0.0f;
+        cancelBackgroundUpdateTask();
         entityVelocitySyncTickById.clear();
         entityLastSyncedVelocityById.clear();
         for (WindowState window : windows.values()) {
@@ -609,6 +689,7 @@ public final class AeroServerRuntime {
         clientMasterDetectedWindows = 0;
         backgroundField.clear();
         nativeBackend.shutdown();
+        backgroundNativeBackend.shutdown();
     }
 
     private boolean isClientMasterActive(MinecraftServer server) {
@@ -619,6 +700,8 @@ public final class AeroServerRuntime {
 
     private void shutdownAll() {
         stopStreaming();
+        solverExecutor.shutdownNow();
+        backgroundExecutor.shutdownNow();
     }
 
     private void refreshWindows(MinecraftServer server) {
@@ -652,32 +735,121 @@ public final class AeroServerRuntime {
         }
     }
 
-    private void updateBackgroundFields(MinecraftServer server) {
-        Map<Identifier, List<BlockPos>> originsByDimension = new HashMap<>();
-        for (WindowKey key : windows.keySet()) {
-            originsByDimension
-                .computeIfAbsent(key.worldKey().getValue(), ignored -> new ArrayList<>())
-                .add(key.origin());
+    private void pumpBackgroundUpdate(MinecraftServer server) {
+        if (backgroundUpdateTask != null) {
+            if (!backgroundUpdateTask.isDone()) {
+                return;
+            }
+            try {
+                BackgroundUpdateResult result = backgroundUpdateTask.get();
+                backgroundWindowCount = result.totalWindows();
+                backgroundLastUpdateTick = result.tick();
+                backgroundLastUpdateMs = result.elapsedMs();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                lastSolverError = "Background update interrupted";
+                log(lastSolverError);
+            } catch (CancellationException ex) {
+                // Cancellation is expected when stopping streaming or switching runtime context.
+            } catch (ExecutionException ex) {
+                Throwable cause = ex.getCause();
+                lastSolverError = cause != null ? cause.getMessage() : ex.getMessage();
+                if (lastSolverError == null || lastSolverError.isEmpty()) {
+                    lastSolverError = "Background update failed";
+                }
+                log("Background update failed: " + lastSolverError);
+            } finally {
+                backgroundUpdateTask = null;
+            }
         }
 
-        Set<Identifier> activeDimensions = new HashSet<>();
+        if (backgroundLastUpdateTick >= 0
+            && (tickCounter - backgroundLastUpdateTick) < BACKGROUND_UPDATE_INTERVAL_TICKS) {
+            return;
+        }
+
+        List<BackgroundDimensionPlan> plans = new ArrayList<>();
+        int totalWindows = 0;
         for (ServerWorld world : server.getWorlds()) {
             Identifier dimensionId = world.getRegistryKey().getValue();
-            List<BlockPos> origins = originsByDimension.get(dimensionId);
-            if (origins == null || origins.isEmpty()) {
+            List<BackgroundFieldGrid.WindowSample> samples = new ArrayList<>();
+            for (ServerPlayerEntity player : world.getPlayers()) {
+                if (player.isSpectator()) {
+                    continue;
+                }
+                BlockPos origin = alignBackgroundWindow(world, player.getBlockPos());
+                samples.add(new BackgroundFieldGrid.WindowSample(backgroundWindowKey(player.getUuid()), origin));
+            }
+            if (samples.isEmpty()) {
                 continue;
             }
+            plans.add(new BackgroundDimensionPlan(world, dimensionId, List.copyOf(samples)));
+            totalWindows += samples.size();
+        }
+
+        if (plans.isEmpty()) {
+            backgroundField.clear();
+            backgroundWindowCount = 0;
+            backgroundLastUpdateTick = tickCounter;
+            backgroundLastUpdateMs = 0.0f;
+            return;
+        }
+
+        int scheduledTick = tickCounter;
+        int scheduledWindowCount = totalWindows;
+        backgroundUpdateTask = backgroundExecutor.submit(
+            () -> runBackgroundUpdateTask(plans, scheduledTick, scheduledWindowCount)
+        );
+    }
+
+    private BackgroundUpdateResult runBackgroundUpdateTask(
+        List<BackgroundDimensionPlan> plans,
+        int simulationTick,
+        int totalWindows
+    ) {
+        long updateStartNs = System.nanoTime();
+        Set<Identifier> activeDimensions = new HashSet<>();
+        for (BackgroundDimensionPlan plan : plans) {
+            ServerWorld world = plan.world();
             backgroundField.update(
-                dimensionId,
+                plan.dimensionId(),
                 world.getTimeOfDay(),
-                tickCounter,
-                origins,
-                GRID_SIZE,
+                simulationTick,
+                plan.samples(),
+                BACKGROUND_WINDOW_SIZE,
                 (sampleX, sampleY, sampleZ) -> WorldThermalSampler.sampleAveragedAnomaly(world, sampleX, sampleY, sampleZ)
             );
-            activeDimensions.add(dimensionId);
+            activeDimensions.add(plan.dimensionId());
         }
         backgroundField.retainDimensions(activeDimensions);
+        float elapsedMs = (System.nanoTime() - updateStartNs) / 1_000_000.0f;
+        return new BackgroundUpdateResult(simulationTick, totalWindows, elapsedMs);
+    }
+
+    private void cancelBackgroundUpdateTask() {
+        if (backgroundUpdateTask == null) {
+            return;
+        }
+        backgroundUpdateTask.cancel(true);
+        backgroundUpdateTask = null;
+    }
+
+    private long backgroundWindowKey(UUID playerId) {
+        return playerId.getMostSignificantBits() ^ playerId.getLeastSignificantBits();
+    }
+
+    private BlockPos alignBackgroundWindow(ServerWorld world, BlockPos playerPos) {
+        int half = BACKGROUND_WINDOW_SIZE / 2;
+        int x = Math.floorDiv(playerPos.getX() - half, BACKGROUND_WINDOW_SLIDE_STEP) * BACKGROUND_WINDOW_SLIDE_STEP;
+        int y = Math.floorDiv(playerPos.getY() - half, BACKGROUND_WINDOW_SLIDE_STEP) * BACKGROUND_WINDOW_SLIDE_STEP;
+        int z = Math.floorDiv(playerPos.getZ() - half, BACKGROUND_WINDOW_SLIDE_STEP) * BACKGROUND_WINDOW_SLIDE_STEP;
+        int minY = world.getBottomY();
+        int maxY = (world.getBottomY() + world.getHeight()) - BACKGROUND_WINDOW_SIZE;
+        if (maxY < minY) {
+            maxY = minY;
+        }
+        y = MathHelper.clamp(y, minY, maxY);
+        return new BlockPos(x, y, z);
     }
 
     private Map<WindowKey, List<FanSource>> scanFanSources(MinecraftServer server) {
@@ -685,18 +857,19 @@ public final class AeroServerRuntime {
         for (ServerWorld world : server.getWorlds()) {
             List<BlockPos> playerPositions = new ArrayList<>();
             for (ServerPlayerEntity player : world.getPlayers()) {
+                if (player.isSpectator()) {
+                    continue;
+                }
                 playerPositions.add(player.getBlockPos());
             }
             if (playerPositions.isEmpty()) {
                 continue;
             }
 
-            if (tunnelModeEnabled) {
-                for (BlockPos playerPos : playerPositions) {
-                    BlockPos origin = alignToGrid(playerPos);
-                    WindowKey key = new WindowKey(world.getRegistryKey(), origin);
-                    fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
-                }
+            for (BlockPos playerPos : playerPositions) {
+                BlockPos origin = alignPlayerWindow(world, playerPos);
+                WindowKey key = new WindowKey(world.getRegistryKey(), origin);
+                fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
             }
 
             Set<Long> seenFans = new HashSet<>();
@@ -753,6 +926,20 @@ public final class AeroServerRuntime {
             }
         }
         return false;
+    }
+
+    private BlockPos alignPlayerWindow(ServerWorld world, BlockPos playerPos) {
+        int half = GRID_SIZE / 2;
+        int x = Math.floorDiv(playerPos.getX() - half, PLAYER_WINDOW_SLIDE_STEP) * PLAYER_WINDOW_SLIDE_STEP;
+        int y = Math.floorDiv(playerPos.getY() - half, PLAYER_WINDOW_SLIDE_STEP) * PLAYER_WINDOW_SLIDE_STEP;
+        int z = Math.floorDiv(playerPos.getZ() - half, PLAYER_WINDOW_SLIDE_STEP) * PLAYER_WINDOW_SLIDE_STEP;
+        int minY = world.getBottomY();
+        int maxY = (world.getBottomY() + world.getHeight()) - GRID_SIZE;
+        if (maxY < minY) {
+            maxY = minY;
+        }
+        y = MathHelper.clamp(y, minY, maxY);
+        return new BlockPos(x, y, z);
     }
 
     private BlockPos alignToGrid(BlockPos pos) {
@@ -1095,13 +1282,17 @@ public final class AeroServerRuntime {
     }
 
     private boolean stepBackgroundFlow(int gridSize, byte[] payload, long contextId, float[] output) {
-        if (!nativeBackend.isLoaded()) {
+        if (!backgroundNativeBackend.isLoaded()) {
             return false;
         }
-        if (!nativeBackend.ensureInitialized(gridSize, BackgroundFieldGrid.SOLVER_INPUT_CHANNELS, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS)) {
+        if (!backgroundNativeBackend.ensureInitialized(
+            gridSize,
+            BackgroundFieldGrid.SOLVER_INPUT_CHANNELS,
+            BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS
+        )) {
             return false;
         }
-        float[] solved = nativeBackend.step(payload, gridSize, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS, contextId);
+        float[] solved = backgroundNativeBackend.step(payload, gridSize, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS, contextId);
         if (solved == null || solved.length != output.length) {
             return false;
         }
@@ -1111,10 +1302,10 @@ public final class AeroServerRuntime {
     }
 
     private void releaseBackgroundFlowContext(long contextId) {
-        if (!nativeBackend.isLoaded()) {
+        if (!backgroundNativeBackend.isLoaded()) {
             return;
         }
-        nativeBackend.releaseContext(contextId);
+        backgroundNativeBackend.releaseContext(contextId);
     }
 
     private float[] runSolverStep(WindowState window, byte[] payload, BackendMode backend) throws IOException {
@@ -1311,13 +1502,16 @@ public final class AeroServerRuntime {
     }
 
     private void scaleResponseVelocity(float[] response, float velocityScale) {
-        if (velocityScale == 1.0f) {
+        if (response == null || velocityScale == 1.0f) {
             return;
         }
 
-        int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        int cellCount = response.length / RESPONSE_CHANNELS;
         for (int i = 0; i < cellCount; i++) {
             int respIdx = i * RESPONSE_CHANNELS;
+            if (respIdx + 2 >= response.length) {
+                break;
+            }
             response[respIdx] *= velocityScale;
             response[respIdx + 1] *= velocityScale;
             response[respIdx + 2] *= velocityScale;
@@ -1536,6 +1730,19 @@ public final class AeroServerRuntime {
     }
 
     private record FanSource(BlockPos pos, Direction facing, int ductLength) {
+    }
+
+    private record BackgroundDimensionPlan(
+        ServerWorld world,
+        Identifier dimensionId,
+        List<BackgroundFieldGrid.WindowSample> samples
+    ) {
+    }
+
+    private record BackgroundUpdateResult(int tick, int totalWindows, float elapsedMs) {
+    }
+
+    private record PendingSolve(WindowKey key, WindowState window, ServerWorld world, Future<float[]> future) {
     }
 
     private static final class WindowState {

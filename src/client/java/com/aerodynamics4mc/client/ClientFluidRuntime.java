@@ -16,8 +16,12 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -75,13 +79,18 @@ final class ClientFluidRuntime {
     private static final String SOCKET_HOST = "127.0.0.1";
     private static final int RESPONSE_CHANNELS = 4;
     private static final int WINDOW_REFRESH_TICKS = 20;
+    private static final int PLAYER_WINDOW_SLIDE_STEP = 16;
+    private static final int BACKGROUND_UPDATE_INTERVAL_TICKS = 5;
+    private static final int BACKGROUND_CELL_SIZE = 16;
+    private static final int BACKGROUND_WINDOW_SIZE = 128 * BACKGROUND_CELL_SIZE;
+    private static final int BACKGROUND_WINDOW_SLIDE_STEP = 16;
     private static final int OBSTACLE_REFRESH_TICKS = 200;
     private static final int FAN_SCAN_RADIUS = 48;
     private static final int SOLVER_WORKER_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
 
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
-    private static final float BACKGROUND_VELOCITY_COUPLING = 0.08f;
+    private static final float BACKGROUND_VELOCITY_COUPLING = 0.25f;
     private static final int BACKGROUND_THERMAL_COMPONENT = 3;
     private static final double FORCE_STRENGTH = 0.02;
     private static final int ATMOS_DEBUG_STRIDE = 16;
@@ -93,8 +102,10 @@ final class ClientFluidRuntime {
     private final int gridSize;
     private final int flowCount;
     private final Map<WindowKey, WindowState> windows = new HashMap<>();
+    private final Map<UUID, BlockPos> backgroundWindows = new HashMap<>();
     private final List<WindowState> retiredWindows = new ArrayList<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
+    private final NativeLbmBridge backgroundNativeBackend = new NativeLbmBridge();
     private final BackgroundFieldGrid backgroundField = new BackgroundFieldGrid(new BackgroundFieldGrid.FlowSolver() {
         @Override
         public boolean step(int gridSize, byte[] payload, long contextId, float[] output) {
@@ -107,6 +118,11 @@ final class ClientFluidRuntime {
         }
     });
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT);
+    private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread worker = new Thread(runnable, "aerodynamics4mc-client-background");
+        worker.setDaemon(true);
+        return worker;
+    });
     private final AtomicInteger activeSolveTasks = new AtomicInteger(0);
     private final AtomicLong runtimeGeneration = new AtomicLong(0L);
 
@@ -125,6 +141,8 @@ final class ClientFluidRuntime {
     private boolean renderBackgroundVectors = false;
     private boolean renderThermalAnomaly = false;
     private int tickCounter = 0;
+    private int backgroundLastUpdateTick = -1;
+    private Future<BackgroundUpdateResult> backgroundUpdateTask;
     private long nextContextId = 1L;
     private Identifier currentDimensionId;
     private String lastSolverError = "";
@@ -198,30 +216,22 @@ final class ClientFluidRuntime {
             retireAllWindows();
             cleanupRetiredWindowsIfIdle();
             currentDimensionId = dimensionId;
+            cancelBackgroundUpdateTask();
             backgroundField.clear();
+            backgroundWindows.clear();
+            backgroundLastUpdateTick = -1;
         }
 
         tickCounter++;
+        refreshBackgroundWindows(world);
+        updateBackgroundField(world);
+
         if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0) {
             refreshWindows(world);
         }
         if (windows.isEmpty()) {
-            backgroundField.clear();
             return;
         }
-
-        List<BlockPos> windowOrigins = new ArrayList<>(windows.size());
-        for (WindowKey key : windows.keySet()) {
-            windowOrigins.add(key.origin());
-        }
-        backgroundField.update(
-            currentDimensionId,
-            world.getTimeOfDay(),
-            tickCounter,
-            windowOrigins,
-            gridSize,
-            (sampleX, sampleY, sampleZ) -> WorldThermalSampler.sampleAveragedAnomaly(world, sampleX, sampleY, sampleZ)
-        );
 
         Iterator<Map.Entry<WindowKey, WindowState>> iterator = windows.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -310,7 +320,6 @@ final class ClientFluidRuntime {
         }
 
         for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
-            WindowKey key = entry.getKey();
             WindowState window = entry.getValue();
             window.renderer.setMaxInflowSpeed(maxWindSpeed);
             window.renderer.setStreamlineSampleStride(streamlineSampleStride);
@@ -326,7 +335,15 @@ final class ClientFluidRuntime {
             window.renderer.setRenderVelocityVectors(renderVelocityVectors);
             window.renderer.setRenderStreamlines(renderStreamlines);
             window.renderer.render(context);
-            renderAtmosphereDebugOverlay(context, key.origin());
+        }
+        if (renderBackgroundVectors || renderThermalAnomaly) {
+            renderBackgroundOverlays(context);
+        }
+    }
+
+    private void renderBackgroundOverlays(WorldRenderContext context) {
+        for (BlockPos origin : backgroundWindows.values()) {
+            renderAtmosphereDebugOverlay(context, origin);
         }
     }
 
@@ -359,14 +376,16 @@ final class ClientFluidRuntime {
         MatrixStack.Entry entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
         float[] sample = new float[4];
-        int stride = Math.max(2, Math.min(ATMOS_DEBUG_STRIDE, gridSize));
+        int coarseGridSize = backgroundField.solverGridSize();
+        int stride = Math.max(1, Math.min(ATMOS_DEBUG_STRIDE, coarseGridSize));
+        float cellSize = BACKGROUND_WINDOW_SIZE / (float) coarseGridSize;
 
-        for (int x = 0; x < gridSize; x += stride) {
-            float localX = x + 0.5f;
-            for (int y = 0; y < gridSize; y += stride) {
-                float localY = y + 0.5f;
-                for (int z = 0; z < gridSize; z += stride) {
-                    float localZ = z + 0.5f;
+        for (int x = 0; x < coarseGridSize; x += stride) {
+            float localX = (x + 0.5f) * cellSize;
+            for (int y = 0; y < coarseGridSize; y += stride) {
+                float localY = (y + 0.5f) * cellSize;
+                for (int z = 0; z < coarseGridSize; z += stride) {
+                    float localZ = (z + 0.5f) * cellSize;
                     backgroundField.sampleInto(
                         currentDimensionId,
                         windowOrigin.getX() + localX,
@@ -482,7 +501,11 @@ final class ClientFluidRuntime {
         tickCounter = 0;
         currentDimensionId = null;
         lastSolverError = "";
+        cancelBackgroundUpdateTask();
         backgroundField.clear();
+        backgroundWindows.clear();
+        backgroundLastUpdateTick = -1;
+        backgroundNativeBackend.shutdown();
         retireAllWindows();
         cleanupRetiredWindowsIfIdle();
     }
@@ -521,6 +544,120 @@ final class ClientFluidRuntime {
         backendMode = mode;
     }
 
+    private void refreshBackgroundWindows(ClientWorld world) {
+        Set<UUID> activePlayers = new HashSet<>();
+        for (PlayerEntity player : world.getPlayers()) {
+            if (player == null || player.isSpectator()) {
+                continue;
+            }
+            UUID playerId = player.getUuid();
+            activePlayers.add(playerId);
+            backgroundWindows.put(playerId, alignBackgroundWindow(world, player.getBlockPos()));
+        }
+        backgroundWindows.keySet().removeIf(id -> !activePlayers.contains(id));
+    }
+
+    private void updateBackgroundField(ClientWorld world) {
+        if (backgroundUpdateTask != null) {
+            if (!backgroundUpdateTask.isDone()) {
+                return;
+            }
+            try {
+                BackgroundUpdateResult result = backgroundUpdateTask.get();
+                if (result.generation() == runtimeGeneration.get()) {
+                    backgroundLastUpdateTick = result.tick();
+                }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                lastSolverError = "Background update interrupted";
+                log(lastSolverError);
+            } catch (CancellationException ex) {
+                // Expected during runtime clear/switch.
+            } catch (ExecutionException ex) {
+                Throwable cause = ex.getCause();
+                lastSolverError = cause != null ? cause.getMessage() : ex.getMessage();
+                if (lastSolverError == null || lastSolverError.isEmpty()) {
+                    lastSolverError = "Background update failed";
+                }
+                log(lastSolverError);
+            } finally {
+                backgroundUpdateTask = null;
+            }
+        }
+
+        if (backgroundWindows.isEmpty()) {
+            backgroundField.clear();
+            backgroundLastUpdateTick = -1;
+            return;
+        }
+        if (backgroundLastUpdateTick >= 0
+            && (tickCounter - backgroundLastUpdateTick) < BACKGROUND_UPDATE_INTERVAL_TICKS) {
+            return;
+        }
+
+        List<BackgroundFieldGrid.WindowSample> windowSamples = new ArrayList<>(backgroundWindows.size());
+        for (Map.Entry<UUID, BlockPos> entry : backgroundWindows.entrySet()) {
+            windowSamples.add(new BackgroundFieldGrid.WindowSample(backgroundWindowKey(entry.getKey()), entry.getValue()));
+        }
+        Identifier dimensionSnapshot = currentDimensionId;
+        long worldTimeSnapshot = world.getTimeOfDay();
+        int scheduledTick = tickCounter;
+        long generation = runtimeGeneration.get();
+        List<BackgroundFieldGrid.WindowSample> immutableSamples = List.copyOf(windowSamples);
+        backgroundUpdateTask = backgroundExecutor.submit(
+            () -> runBackgroundUpdateTask(world, dimensionSnapshot, worldTimeSnapshot, scheduledTick, immutableSamples, generation)
+        );
+    }
+
+    private BackgroundUpdateResult runBackgroundUpdateTask(
+        ClientWorld world,
+        Identifier dimensionId,
+        long worldTime,
+        int simulationTick,
+        List<BackgroundFieldGrid.WindowSample> samples,
+        long generation
+    ) {
+        if (samples.isEmpty()) {
+            backgroundField.clear();
+            return new BackgroundUpdateResult(simulationTick, generation);
+        }
+        backgroundField.update(
+            dimensionId,
+            worldTime,
+            simulationTick,
+            samples,
+            BACKGROUND_WINDOW_SIZE,
+            (sampleX, sampleY, sampleZ) -> WorldThermalSampler.sampleAveragedAnomaly(world, sampleX, sampleY, sampleZ)
+        );
+        return new BackgroundUpdateResult(simulationTick, generation);
+    }
+
+    private void cancelBackgroundUpdateTask() {
+        if (backgroundUpdateTask == null) {
+            return;
+        }
+        backgroundUpdateTask.cancel(true);
+        backgroundUpdateTask = null;
+    }
+
+    private long backgroundWindowKey(UUID playerId) {
+        return playerId.getMostSignificantBits() ^ playerId.getLeastSignificantBits();
+    }
+
+    private BlockPos alignBackgroundWindow(ClientWorld world, BlockPos playerPos) {
+        int half = BACKGROUND_WINDOW_SIZE / 2;
+        int x = Math.floorDiv(playerPos.getX() - half, BACKGROUND_WINDOW_SLIDE_STEP) * BACKGROUND_WINDOW_SLIDE_STEP;
+        int y = Math.floorDiv(playerPos.getY() - half, BACKGROUND_WINDOW_SLIDE_STEP) * BACKGROUND_WINDOW_SLIDE_STEP;
+        int z = Math.floorDiv(playerPos.getZ() - half, BACKGROUND_WINDOW_SLIDE_STEP) * BACKGROUND_WINDOW_SLIDE_STEP;
+        int minY = world.getBottomY();
+        int maxY = (world.getBottomY() + world.getHeight()) - BACKGROUND_WINDOW_SIZE;
+        if (maxY < minY) {
+            maxY = minY;
+        }
+        y = MathHelper.clamp(y, minY, maxY);
+        return new BlockPos(x, y, z);
+    }
+
     private void refreshWindows(ClientWorld world) {
         Map<WindowKey, List<FanSource>> fansByWindow = scanFanSources(world);
 
@@ -556,6 +693,12 @@ final class ClientFluidRuntime {
         }
         if (playerPositions.isEmpty()) {
             return fansByWindow;
+        }
+
+        for (BlockPos playerPos : playerPositions) {
+            BlockPos origin = alignPlayerWindow(world, playerPos);
+            WindowKey key = new WindowKey(origin);
+            fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
         }
 
         Set<Long> seenFans = new HashSet<>();
@@ -611,6 +754,20 @@ final class ClientFluidRuntime {
             }
         }
         return false;
+    }
+
+    private BlockPos alignPlayerWindow(ClientWorld world, BlockPos playerPos) {
+        int half = gridSize / 2;
+        int x = Math.floorDiv(playerPos.getX() - half, PLAYER_WINDOW_SLIDE_STEP) * PLAYER_WINDOW_SLIDE_STEP;
+        int y = Math.floorDiv(playerPos.getY() - half, PLAYER_WINDOW_SLIDE_STEP) * PLAYER_WINDOW_SLIDE_STEP;
+        int z = Math.floorDiv(playerPos.getZ() - half, PLAYER_WINDOW_SLIDE_STEP) * PLAYER_WINDOW_SLIDE_STEP;
+        int minY = world.getBottomY();
+        int maxY = (world.getBottomY() + world.getHeight()) - gridSize;
+        if (maxY < minY) {
+            maxY = minY;
+        }
+        y = MathHelper.clamp(y, minY, maxY);
+        return new BlockPos(x, y, z);
     }
 
     private BlockPos alignToGrid(BlockPos pos) {
@@ -938,13 +1095,17 @@ final class ClientFluidRuntime {
     }
 
     private boolean stepBackgroundFlow(int gridSize, byte[] payload, long contextId, float[] output) {
-        if (!nativeBackend.isLoaded()) {
+        if (!backgroundNativeBackend.isLoaded()) {
             return false;
         }
-        if (!nativeBackend.ensureInitialized(gridSize, BackgroundFieldGrid.SOLVER_INPUT_CHANNELS, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS)) {
+        if (!backgroundNativeBackend.ensureInitialized(
+            gridSize,
+            BackgroundFieldGrid.SOLVER_INPUT_CHANNELS,
+            BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS
+        )) {
             return false;
         }
-        boolean ok = nativeBackend.step(payload, gridSize, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS, contextId, output);
+        boolean ok = backgroundNativeBackend.step(payload, gridSize, BackgroundFieldGrid.SOLVER_OUTPUT_CHANNELS, contextId, output);
         if (!ok) {
             return false;
         }
@@ -953,10 +1114,10 @@ final class ClientFluidRuntime {
     }
 
     private void releaseBackgroundFlowContext(long contextId) {
-        if (!nativeBackend.isLoaded()) {
+        if (!backgroundNativeBackend.isLoaded()) {
             return;
         }
-        nativeBackend.releaseContext(contextId);
+        backgroundNativeBackend.releaseContext(contextId);
     }
 
     private float[] runSolverStep(WindowState window, byte[] payload, SolverBackend backend) throws IOException {
@@ -1021,13 +1182,16 @@ final class ClientFluidRuntime {
     }
 
     private void scaleResponseVelocity(float[] response, float velocityScale) {
-        if (velocityScale == 1.0f) {
+        if (response == null || velocityScale == 1.0f) {
             return;
         }
 
-        int cellCount = gridSize * gridSize * gridSize;
+        int cellCount = response.length / RESPONSE_CHANNELS;
         for (int i = 0; i < cellCount; i++) {
             int respIdx = i * RESPONSE_CHANNELS;
+            if (respIdx + 2 >= response.length) {
+                break;
+            }
             response[respIdx] *= velocityScale;
             response[respIdx + 1] *= velocityScale;
             response[respIdx + 2] *= velocityScale;
@@ -1122,6 +1286,9 @@ final class ClientFluidRuntime {
         private static SolverBackend fromId(int backendModeId) {
             return backendModeId == 0 ? SOCKET : NATIVE;
         }
+    }
+
+    private record BackgroundUpdateResult(int tick, long generation) {
     }
 
     private record WindowKey(BlockPos origin) {

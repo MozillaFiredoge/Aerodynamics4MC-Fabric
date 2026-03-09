@@ -33,6 +33,7 @@ cd fabric-mod
 - `/aero backend socket`：使用 TCP Python 后端
 - `/aero backend native`：使用 JNI Native 后端
 - `/aero backend status`：查看当前后端与 native timing
+- `/aero atmo status`：查看背景场窗口数量、网格尺寸、更新间隔与耗时
 - `/aero debug`：切换调试渲染
 - `/aero render background on|off|status`：控制/查看背景环流矢量调试叠加
 - `/aero render thermal on|off|status`：控制/查看热异常调试叠加
@@ -47,8 +48,11 @@ cd fabric-mod
 - 支持按平台加载：`linux/windows/macos` + `x86_64/arm64`（Windows 仅 `x86_64`）。
 
 ### 低分辨率背景环流场
-- 运行时会按维度维护低分辨率背景风场（默认约 `16` 方块一格），并在窗口范围扩大时自动提升 coarse cell 尺寸以扩大覆盖范围。
-- 背景场不再使用写死解析风型，改为在粗网格上用 Native C-LBM 动态推进速度场。
+- 背景场与风扇细场解耦：背景场窗口按玩家滑动更新（每玩家一个），并且独立于风扇窗口存在。
+- 近场窗口也改为玩家中心滑窗（16 方块步进），即使没有风扇也会初始化窗口以让玩家实时感受到背景环流；风扇源项仍会叠加到对应近场窗口。
+- 背景场统一使用 `128^3` 粗网格，且 coarse cell 固定为 `16` 方块（单窗口覆盖 `2048^3` 方块尺度，Y 方向仍按世界高度 clamp），默认每 `20` tick 更新一次。
+- 服务端窗口求解与背景场更新在同一 tick 内并行推进（细场求解线程与背景场更新线程独立），避免两者串行阻塞主线程。
+- client-master 路径同样将背景 coarse update 放到独立线程，避免客户端主线程卡顿。
 - `thermal_anomaly` 由世界采样驱动（方块热源/亮度/高度/日照/生物群系/天气加权），并通过 Boussinesq 近似转化为粗网格浮力源项。
 - 在窗口求解输入阶段，状态速度会以小权重向粗网格背景风场松弛；局部窗口不再额外注入单独的“写死浮力脉冲”。
 
@@ -113,6 +117,7 @@ cd fabric-mod
 - `/aero backend socket`: use TCP Python backend
 - `/aero backend native`: use JNI native backend
 - `/aero backend status`: print backend + native timing
+- `/aero atmo status`: print background-window count, grid size, update interval and timing
 - `/aero debug`: toggle debug rendering
 - `/aero render background on|off|status`: toggle/query background circulation vector debug overlay
 - `/aero render thermal on|off|status`: toggle/query thermal anomaly debug overlay
@@ -127,8 +132,11 @@ cd fabric-mod
 - Platform-aware loading: `linux/windows/macos` + `x86_64/arm64` (Windows only `x86_64`).
 
 ### Low-resolution background circulation field
-- The runtime maintains a low-resolution background wind field per dimension (roughly `16` blocks per cell by default), and automatically increases coarse cell size when active windows spread out.
-- The field no longer uses hardcoded analytic circulation; it advances velocity on a coarse grid using the Native C-LBM solver.
+- The background field is decoupled from fan windows: it uses sliding player-centered windows (one per player), independent of whether fans exist.
+- Fine-field windows are also player-centered sliding windows (16-block stride), so windows are initialized even without fans and players can still feel ambient circulation; fan forcing is still injected on top of those windows.
+- Each background window uses a fixed `128^3` coarse grid with fixed `16`-block cells (covering a `2048^3` block span per window, while Y origin is still clamped to world height), updated every `20` ticks by default.
+- On the server, fan-window solver steps and background-field updates are progressed in parallel within a tick (separate worker threads for fine-window solving and coarse background updates) to reduce main-thread stalls.
+- On client-master, coarse background updates are also moved to a dedicated worker thread to avoid client main-thread stalls.
 - `thermal_anomaly` is sampled from world factors (block heat source/luminance, altitude, sunlight, biome, weather), then mapped to Boussinesq buoyancy forcing on the coarse solver.
 - During window capture, state velocities are lightly relaxed toward this coarse background flow without a separate hardcoded per-voxel buoyancy impulse.
 
