@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -15,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -231,7 +232,32 @@ struct ContextState {
 
 Config g_cfg;
 std::unordered_map<jlong, ContextState> g_contexts;
-std::mutex g_runtime_mutex;
+
+struct RuntimeLock {
+#if defined(_WIN32)
+    SRWLOCK lock = SRWLOCK_INIT;
+    void enter() { AcquireSRWLockExclusive(&lock); }
+    void leave() { ReleaseSRWLockExclusive(&lock); }
+#else
+    std::mutex lock;
+    void enter() { lock.lock(); }
+    void leave() { lock.unlock(); }
+#endif
+};
+
+class RuntimeLockGuard {
+  public:
+    explicit RuntimeLockGuard(RuntimeLock& runtime_lock) : runtime_lock_(runtime_lock) { runtime_lock_.enter(); }
+    ~RuntimeLockGuard() { runtime_lock_.leave(); }
+    RuntimeLockGuard(const RuntimeLockGuard&) = delete;
+    RuntimeLockGuard& operator=(const RuntimeLockGuard&) = delete;
+
+  private:
+    RuntimeLock& runtime_lock_;
+};
+
+RuntimeLock g_runtime_lock;
+std::atomic<bool> g_runtime_poisoned{false};
 
 struct StepTiming {
     double payload_copy_ms = 0.0;
@@ -1617,15 +1643,13 @@ bool env_value_truthy(const char* value) {
 
 bool env_flag_enabled(const char* key) {
     if (key == nullptr || key[0] == '\0') return false;
-#if defined(_MSC_VER)
-    char* env_buf = nullptr;
-    size_t env_len = 0;
-    if (_dupenv_s(&env_buf, &env_len, key) != 0 || env_buf == nullptr) {
+#if defined(_WIN32)
+    char env_buf[32] = {};
+    DWORD env_len = GetEnvironmentVariableA(key, env_buf, static_cast<DWORD>(sizeof(env_buf)));
+    if (env_len == 0 || env_len >= sizeof(env_buf)) {
         return false;
     }
-    const bool enabled = env_value_truthy(env_buf);
-    std::free(env_buf);
-    return enabled;
+    return env_value_truthy(env_buf);
 #else
     return env_value_truthy(std::getenv(key));
 #endif
@@ -1674,7 +1698,7 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
 extern "C" {
 
 static jboolean native_init_impl(jint grid_size, jint input_channels, jint output_channels) {
-    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    RuntimeLockGuard guard(g_runtime_lock);
     if (grid_size <= 0 || input_channels < 9 || output_channels < 4) { reset_runtime_state(); return JNI_FALSE; }
     if (g_cfg.initialized) {
         if (input_channels == g_cfg.input_channels && output_channels == g_cfg.output_channels) {
@@ -1688,13 +1712,15 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 
     if (should_force_cpu_backend()) {
         g_cfg.opencl_enabled = false;
-        std::string reason = "forced";
 #if defined(_WIN32)
         if (!env_flag_enabled("AERO_LBM_CPU_ONLY") && !env_flag_enabled("AERO_LBM_WINDOWS_OPENCL")) {
-            reason = "windows-default";
+            g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (windows-default)";
+        } else {
+            g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (forced)";
         }
+#else
+        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (forced)";
 #endif
-        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + reason + ")";
         return JNI_TRUE;
     }
     g_cfg.opencl_enabled = try_initialize_opencl_runtime();
@@ -1709,7 +1735,7 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 static jboolean native_step_impl(
     JNIEnv* env, jclass, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
 ) {
-    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    RuntimeLockGuard guard(g_runtime_lock);
     auto tick_begin = Clock::now();
     StepTiming timing;
 
@@ -1765,45 +1791,92 @@ static jboolean native_step_impl(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+static jboolean guarded_native_init(jint grid_size, jint input_channels, jint output_channels) {
+#if AERO_LBM_USE_SEH_GUARD
+    if (g_runtime_poisoned.load(std::memory_order_acquire)) {
+        return JNI_FALSE;
+    }
+    bool seh_failed = false;
+    jboolean result = JNI_FALSE;
+    __try {
+        result = native_init_impl(grid_size, input_channels, output_channels);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        seh_failed = true;
+    }
+    if (seh_failed) {
+        g_runtime_poisoned.store(true, std::memory_order_release);
+        return JNI_FALSE;
+    }
+    return result;
+#else
+    return native_init_impl(grid_size, input_channels, output_channels);
+#endif
+}
+
+static jboolean guarded_native_step(
+    JNIEnv* env, jclass clazz, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
+) {
+#if AERO_LBM_USE_SEH_GUARD
+    if (g_runtime_poisoned.load(std::memory_order_acquire)) {
+        return JNI_FALSE;
+    }
+    bool seh_failed = false;
+    jboolean result = JNI_FALSE;
+    __try {
+        result = native_step_impl(env, clazz, payload, grid_size, context_key, output_flow);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        seh_failed = true;
+    }
+    if (seh_failed) {
+        g_runtime_poisoned.store(true, std::memory_order_release);
+        return JNI_FALSE;
+    }
+    return result;
+#else
+    return native_step_impl(env, clazz, payload, grid_size, context_key, output_flow);
+#endif
+}
+
 static void native_release_context_impl(jlong context_key) {
-    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    RuntimeLockGuard guard(g_runtime_lock);
     auto it = g_contexts.find(context_key);
     if (it != g_contexts.end()) { clear_context(it->second); g_contexts.erase(it); }
 }
 
 static void native_shutdown_impl() {
-    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    RuntimeLockGuard guard(g_runtime_lock);
     reset_runtime_state();
+    g_runtime_poisoned.store(false, std::memory_order_release);
 }
 static jstring native_runtime_info_impl(JNIEnv* env) {
-    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    RuntimeLockGuard guard(g_runtime_lock);
     return env->NewStringUTF((g_cfg.runtime_info.empty() ? "uninitialized" : g_cfg.runtime_info).c_str());
 }
 static jstring native_timing_info_impl(JNIEnv* env) {
-    std::lock_guard<std::mutex> guard(g_runtime_mutex);
+    RuntimeLockGuard guard(g_runtime_lock);
     return env->NewStringUTF(timing_info_string().c_str());
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeInit(
     JNIEnv*, jclass, jint grid_size, jint input_channels, jint output_channels
 ) {
-    return native_init_impl(grid_size, input_channels, output_channels);
+    return guarded_native_init(grid_size, input_channels, output_channels);
 }
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeInit(
     JNIEnv*, jclass, jint grid_size, jint input_channels, jint output_channels
 ) {
-    return native_init_impl(grid_size, input_channels, output_channels);
+    return guarded_native_init(grid_size, input_channels, output_channels);
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStep(
     JNIEnv* env, jclass clazz, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
 ) {
-    return native_step_impl(env, clazz, payload, grid_size, context_key, output_flow);
+    return guarded_native_step(env, clazz, payload, grid_size, context_key, output_flow);
 }
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeStep(
     JNIEnv* env, jclass clazz, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
 ) {
-    return native_step_impl(env, clazz, payload, grid_size, context_key, output_flow);
+    return guarded_native_step(env, clazz, payload, grid_size, context_key, output_flow);
 }
 
 JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeReleaseContext(JNIEnv*, jclass, jlong context_key) {
