@@ -4,6 +4,11 @@ public final class NativeLbmBridge {
     private static final String LIB_NAME = "aero_lbm";
     private static final boolean LOADED;
     private static final String LOAD_ERROR;
+    private static final Object GLOBAL_LOCK = new Object();
+    private static boolean globalInitialized;
+    private static int globalInputChannels = -1;
+    private static int globalOutputChannels = -1;
+    private static int globalActiveHandles = 0;
 
     static {
         boolean loaded = false;
@@ -35,21 +40,27 @@ public final class NativeLbmBridge {
         if (!LOADED) {
             return false;
         }
-        if (initialized && inputCh == inputChannels && outputCh == outputChannels) {
-            gridSize = grid;
-            return true;
-        }
-        if (initialized) {
-            nativeShutdown();
-            initialized = false;
-        }
-        initialized = nativeInit(Math.max(1, grid), inputCh, outputCh);
-        if (initialized) {
+        synchronized (GLOBAL_LOCK) {
+            if (!globalInitialized) {
+                globalInitialized = nativeInit(Math.max(1, grid), inputCh, outputCh);
+                if (!globalInitialized) {
+                    return false;
+                }
+                globalInputChannels = inputCh;
+                globalOutputChannels = outputCh;
+            } else if (inputCh != globalInputChannels || outputCh != globalOutputChannels) {
+                return false;
+            }
+
+            if (!initialized) {
+                initialized = true;
+                globalActiveHandles++;
+            }
             gridSize = grid;
             inputChannels = inputCh;
             outputChannels = outputCh;
+            return true;
         }
-        return initialized;
     }
 
     public synchronized float[] step(byte[] payload, int grid, int outputCh, long contextKey) {
@@ -73,46 +84,69 @@ public final class NativeLbmBridge {
         if (output == null || output.length != cellCount * outputCh) {
             return false;
         }
-        boolean ok = nativeStep(payload, grid, contextKey, output);
-        if (!ok) {
-            return false;
+        synchronized (GLOBAL_LOCK) {
+            if (!globalInitialized) {
+                return false;
+            }
+            return nativeStep(payload, grid, contextKey, output);
         }
-        return true;
     }
 
     public synchronized void shutdown() {
         if (!initialized || !LOADED) {
             return;
         }
-        nativeShutdown();
         initialized = false;
         gridSize = -1;
         inputChannels = -1;
         outputChannels = -1;
+        synchronized (GLOBAL_LOCK) {
+            if (globalActiveHandles > 0) {
+                globalActiveHandles--;
+            }
+            if (globalActiveHandles == 0 && globalInitialized) {
+                nativeShutdown();
+                globalInitialized = false;
+                globalInputChannels = -1;
+                globalOutputChannels = -1;
+            }
+        }
     }
 
     public synchronized void releaseContext(long contextKey) {
         if (!initialized || !LOADED) {
             return;
         }
-        nativeReleaseContext(contextKey);
+        synchronized (GLOBAL_LOCK) {
+            if (!globalInitialized) {
+                return;
+            }
+            nativeReleaseContext(contextKey);
+        }
     }
 
     public synchronized String runtimeInfo() {
         if (!LOADED) {
             return "not_loaded";
         }
-        if (!initialized) {
-            return "not_initialized";
+        synchronized (GLOBAL_LOCK) {
+            if (!globalInitialized) {
+                return "not_initialized";
+            }
+            return nativeRuntimeInfo();
         }
-        return nativeRuntimeInfo();
     }
 
     public synchronized String timingInfo() {
-        if (!LOADED || !initialized) {
+        if (!LOADED) {
             return "ticks=0";
         }
-        return nativeTimingInfo();
+        synchronized (GLOBAL_LOCK) {
+            if (!globalInitialized) {
+                return "ticks=0";
+            }
+            return nativeTimingInfo();
+        }
     }
 
     private static native boolean nativeInit(int gridSize, int inputChannels, int outputChannels);
