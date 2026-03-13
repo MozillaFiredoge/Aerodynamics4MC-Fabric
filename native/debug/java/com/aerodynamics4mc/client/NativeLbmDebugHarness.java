@@ -13,7 +13,7 @@ import java.util.List;
 import java.util.Random;
 
 public final class NativeLbmDebugHarness {
-    private static final int INPUT_CHANNELS = 9;
+    private static final int INPUT_CHANNELS = 10;
     private static final int OUTPUT_CHANNELS = 4;
 
     private static final int CH_OBS = 0;
@@ -25,8 +25,11 @@ public final class NativeLbmDebugHarness {
     private static final int CH_VY = 6;
     private static final int CH_VZ = 7;
     private static final int CH_P = 8;
+    private static final int CH_THERM = 9;
     private static final float INFLOW_SPEED = 8.0f;
     private static final float NATIVE_SCALE = 30.0f;
+    private static final float THERM_SOURCE_SCALE = 0.0012f;
+    private static final float THERM_SOURCE_MAX = 0.006f;
 
     private record Metrics(double mass, double momentumX, double momentumY, double momentumZ,
                            double kineticEnergy, double pressureMean, double maxSpeed,
@@ -64,6 +67,7 @@ public final class NativeLbmDebugHarness {
         results.add(runMassConservation(bridge, grid, steps));
         results.add(runObstacleNoSlip(bridge, grid, Math.min(steps, 20)));
         results.add(runFanInjection(bridge, grid, Math.min(steps, 24)));
+        results.add(runBoussinesqBuoyancy(bridge, grid, Math.min(steps, 32)));
         if (socketSmoke) {
             results.add(runBackendUnitConsistency(bridge, grid, Math.min(steps, 24), socketHost, socketPort));
         }
@@ -212,6 +216,7 @@ public final class NativeLbmDebugHarness {
                 state[base + CH_FAN_VX] = 1.5f;
                 state[base + CH_FAN_VY] = 0.0f;
                 state[base + CH_FAN_VZ] = 0.0f;
+                state[base + CH_THERM] = Math.min(THERM_SOURCE_MAX, Math.abs(state[base + CH_FAN_VX]) * THERM_SOURCE_SCALE);
             }
         }
 
@@ -236,6 +241,60 @@ public final class NativeLbmDebugHarness {
         boolean pass = nearAvg > 5e-4 && nearAvg > (farAvg * 1.2) && px > 1e-2;
         String detail = String.format("nearAvg=%.3e farAvg=%.3e momentumX=%.3e", nearAvg, farAvg, px);
         return new TestResult("fan_injection", pass, detail);
+    }
+
+    private static TestResult runBoussinesqBuoyancy(NativeLbmBridge bridge, int n, int steps) {
+        float[] state = new float[n * n * n * INPUT_CHANNELS];
+        int ySource = Math.max(1, n / 6);
+        int zCenter = n / 2;
+        int radius = Math.max(2, n / 8);
+
+        for (int y = Math.max(0, ySource - 1); y <= Math.min(n - 1, ySource + 1); y++) {
+            for (int z = Math.max(0, zCenter - radius); z <= Math.min(n - 1, zCenter + radius); z++) {
+                int dz = z - zCenter;
+                if (dz * dz > radius * radius) {
+                    continue;
+                }
+                for (int x = 1; x <= Math.min(2, n - 2); x++) {
+                    int base = idx(x, y, z, n) * INPUT_CHANNELS;
+                    state[base + CH_FAN_MASK] = 1.0f;
+                    state[base + CH_FAN_VX] = (x == 1 ? INFLOW_SPEED : -INFLOW_SPEED);
+                    state[base + CH_THERM] = Math.min(THERM_SOURCE_MAX, Math.abs(state[base + CH_FAN_VX]) * THERM_SOURCE_SCALE);
+                }
+            }
+        }
+
+        long context = 105L;
+        double peakUpperVy = 0.0;
+        double firstUpperVy = Double.NaN;
+        double finalUpperVy = 0.0;
+        for (int s = 0; s < steps; s++) {
+            float[] out = step(bridge, state, n, context);
+            if (out == null) {
+                return new TestResult("boussinesq_buoyancy", false, "native step returned null");
+            }
+
+            double upperVy = averageVyChimney(out, n, n / 2, n - 2, zCenter, radius);
+            if (Double.isNaN(firstUpperVy)) {
+                firstUpperVy = upperVy;
+            }
+            peakUpperVy = Math.max(peakUpperVy, upperVy);
+            finalUpperVy = upperVy;
+            writeBackState(state, out);
+        }
+
+        bridge.releaseContext(context);
+        if (Double.isNaN(firstUpperVy)) {
+            firstUpperVy = 0.0;
+        }
+        boolean pass = peakUpperVy > 5e-4 && finalUpperVy > firstUpperVy + 2e-4;
+        String detail = String.format(
+            "firstUpperVy=%.3e finalUpperVy=%.3e peakUpperVy=%.3e",
+            firstUpperVy,
+            finalUpperVy,
+            peakUpperVy
+        );
+        return new TestResult("boussinesq_buoyancy", pass, detail);
     }
 
     private static TestResult runBackendUnitConsistency(NativeLbmBridge bridge, int n, int steps, String host, int port) {
@@ -309,6 +368,7 @@ public final class NativeLbmDebugHarness {
                 state[base + CH_FAN_VX] = INFLOW_SPEED;
                 state[base + CH_FAN_VY] = 0.0f;
                 state[base + CH_FAN_VZ] = 0.0f;
+                state[base + CH_THERM] = Math.min(THERM_SOURCE_MAX, Math.abs(state[base + CH_FAN_VX]) * THERM_SOURCE_SCALE);
             }
         }
     }
@@ -357,7 +417,19 @@ public final class NativeLbmDebugHarness {
     }
 
     private static float[] step(NativeLbmBridge bridge, float[] state, int n, long context) {
-        return bridge.step(toLittleEndianBytes(state), n, OUTPUT_CHANNELS, context);
+        int cells = n * n * n;
+        int payloadBytes = cells * INPUT_CHANNELS * Float.BYTES;
+        ByteBuffer payload = ByteBuffer.allocateDirect(payloadBytes).order(ByteOrder.LITTLE_ENDIAN);
+        for (float v : state) {
+            payload.putFloat(v);
+        }
+        payload.clear();
+        float[] out = new float[cells * OUTPUT_CHANNELS];
+        boolean ok = bridge.step(payload, n, OUTPUT_CHANNELS, context, out);
+        if (!ok) {
+            return null;
+        }
+        return out;
     }
 
     private static Metrics metrics(float[] out, float[] state, int n) {
@@ -454,6 +526,34 @@ public final class NativeLbmDebugHarness {
                 double vz = out[base + 2];
                 sum += Math.sqrt(vx * vx + vy * vy + vz * vz);
                 count += 1;
+            }
+        }
+        return count > 0 ? (sum / count) : 0.0;
+    }
+
+    private static double averageVyChimney(float[] out, int n, int yMin, int yMax, int zCenter, int radius) {
+        int cy0 = clamp(yMin, 0, n - 1);
+        int cy1 = clamp(yMax, 0, n - 1);
+        if (cy1 < cy0) {
+            return 0.0;
+        }
+        int cz0 = clamp(zCenter - radius, 0, n - 1);
+        int cz1 = clamp(zCenter + radius, 0, n - 1);
+        int cx1 = clamp(Math.max(2, n / 4), 0, n - 1);
+
+        double sum = 0.0;
+        int count = 0;
+        for (int x = 0; x <= cx1; x++) {
+            for (int y = cy0; y <= cy1; y++) {
+                for (int z = cz0; z <= cz1; z++) {
+                    int dz = z - zCenter;
+                    if (dz * dz > radius * radius) {
+                        continue;
+                    }
+                    int base = idx(x, y, z, n) * OUTPUT_CHANNELS;
+                    sum += out[base + 1];
+                    count += 1;
+                }
             }
         }
         return count > 0 ? (sum / count) : 0.0;

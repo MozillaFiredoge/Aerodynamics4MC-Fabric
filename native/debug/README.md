@@ -9,7 +9,7 @@
 ## 文件说明
 
 - `java/com/aerodynamics4mc/client/NativeLbmDebugHarness.java`
-  - 直接调用 `NativeLbmBridge` 的 JNI 接口，走与 Mod 运行一致的 native 路径。
+  - 直接调用 `NativeLbmBridge` 的 JNI 接口（含 direct `ByteBuffer` 路径），走与 Mod 运行一致的 native 路径。
 - `run_debug_checks.sh`
   - 自动选择当前平台 native 动态库，编译并运行 debug harness。
 
@@ -36,6 +36,8 @@
   - 中央障碍体内速度应维持接近 0。
 - `fan_injection`
   - 风扇附近截面速度明显高于远场，且 `x` 向总动量为正。
+- `boussinesq_buoyancy`
+  - 使用对向风扇构造“近零净推力但有热源”的场景，检查高层 `v_y` 是否随步数显著抬升。
 
 ## 结果判读
 

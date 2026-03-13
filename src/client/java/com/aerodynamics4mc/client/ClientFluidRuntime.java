@@ -27,10 +27,12 @@ import com.aerodynamics4mc.ModBlocks;
 
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
@@ -40,7 +42,7 @@ import net.minecraft.world.chunk.WorldChunk;
 final class ClientFluidRuntime {
     private static final String LOG_PREFIX = "[aerodynamics4mc/client] ";
 
-    private static final int CHANNELS = 9;
+    private static final int CHANNELS = 10;
     private static final int CH_OBSTACLE = 0;
     private static final int CH_FAN_MASK = 1;
     private static final int CH_FAN_VX = 2;
@@ -50,6 +52,7 @@ final class ClientFluidRuntime {
     private static final int CH_STATE_VY = 6;
     private static final int CH_STATE_VZ = 7;
     private static final int CH_STATE_P = 8;
+    private static final int CH_THERMAL_SOURCE = 9;
 
     private static final float INFLOW_SPEED = 8.0f;
     private static final int FAN_RADIUS = 1;
@@ -72,6 +75,22 @@ final class ClientFluidRuntime {
 
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
+    private static final float NATIVE_THERMAL_SOURCE_SCALE = 0.0012f;
+    private static final float NATIVE_THERMAL_SOURCE_MAX = 0.006f;
+    private static final float THERMAL_SOURCE_LAVA = NATIVE_THERMAL_SOURCE_MAX;
+    private static final float THERMAL_SOURCE_MAGMA = 0.0046f;
+    private static final float THERMAL_SOURCE_CAMPFIRE = 0.0044f;
+    private static final float THERMAL_SOURCE_SOUL_CAMPFIRE = 0.0036f;
+    private static final float THERMAL_SOURCE_FIRE = 0.0048f;
+    private static final float THERMAL_SOURCE_SOUL_FIRE = 0.0038f;
+    private static final float THERMAL_SOURCE_TORCH = 0.0024f;
+    private static final float THERMAL_SOURCE_SOUL_TORCH = 0.0018f;
+    private static final float THERMAL_SOURCE_LANTERN = 0.0016f;
+    private static final float THERMAL_SOURCE_SOUL_LANTERN = 0.0012f;
+    private static final float THERMAL_SOURCE_PASSIVE_LIGHT_SCALE = 0.20f;
+    private static final float THERMAL_SOURCE_SOLID_EMISSION_SCALE = 0.85f;
+    private static final float THERMAL_SOURCE_DAY_AMBIENT = 0.00035f;
+    private static final float THERMAL_SOURCE_NIGHT_AMBIENT = -0.00020f;
     private static final double FORCE_STRENGTH = 0.02;
 
     private final int gridSize;
@@ -282,7 +301,7 @@ final class ClientFluidRuntime {
                 windows.put(key, window);
             }
             window.fans = List.copyOf(entry.getValue());
-            refreshObstacleField(world, key.origin(), window, tickCounter);
+            refreshSampleFields(world, key.origin(), window, tickCounter);
         }
     }
 
@@ -380,6 +399,17 @@ final class ClientFluidRuntime {
         window.baseField[idx + CH_FAN_VX] += fanVx;
         window.baseField[idx + CH_FAN_VY] += fanVy;
         window.baseField[idx + CH_FAN_VZ] += fanVz;
+        float localFanVx = window.baseField[idx + CH_FAN_VX];
+        float localFanVy = window.baseField[idx + CH_FAN_VY];
+        float localFanVz = window.baseField[idx + CH_FAN_VZ];
+        float localFanNorm = (float) Math.sqrt(
+            localFanVx * localFanVx + localFanVy * localFanVy + localFanVz * localFanVz
+        );
+        float fanThermal = localFanNorm * NATIVE_THERMAL_SOURCE_SCALE;
+        fanThermal = Math.max(0.0f, Math.min(fanThermal, NATIVE_THERMAL_SOURCE_MAX));
+        float combined = window.baseField[idx + CH_THERMAL_SOURCE] + fanThermal;
+        combined = Math.max(-NATIVE_THERMAL_SOURCE_MAX, Math.min(combined, NATIVE_THERMAL_SOURCE_MAX));
+        window.baseField[idx + CH_THERMAL_SOURCE] = combined;
     }
 
     private void applyFanSource(WindowState window, FanSource fan, int minX, int minY, int minZ) {
@@ -573,13 +603,23 @@ final class ClientFluidRuntime {
 
     private byte[] captureWindow(WindowState window, BlockPos origin, SolverBackend backend) {
         window.ensureBaseFieldInitialized(gridSize);
-        window.ensurePayloadBuffer(gridSize);
         float[] obstacleField = window.obstacleField;
+        float[] thermalField = window.thermalField;
+        float ambientThermal = window.ambientThermalBias;
         int minX = origin.getX();
         int minY = origin.getY();
         int minZ = origin.getZ();
-        ByteBuffer buffer = window.payloadBuffer;
-        buffer.clear();
+        int payloadBytesLength = gridSize * gridSize * gridSize * CHANNELS * Float.BYTES;
+        ByteBuffer buffer;
+        if (backend == SolverBackend.NATIVE) {
+            window.ensureNativePayloadBuffer(payloadBytesLength);
+            buffer = window.nativePayloadBuffer;
+            buffer.clear();
+        } else {
+            window.ensurePayloadBuffer(gridSize);
+            buffer = window.payloadBuffer;
+            buffer.clear();
+        }
 
         for (int x = 0; x < gridSize; x++) {
             for (int y = 0; y < gridSize; y++) {
@@ -587,12 +627,18 @@ final class ClientFluidRuntime {
                     int cell = (x * gridSize + y) * gridSize + z;
                     boolean solid = obstacleField != null && cell < obstacleField.length && obstacleField[cell] > 0.5f;
                     int idx = voxelIndex(x, y, z);
+                    float sampledThermal = ambientThermal;
+                    if (thermalField != null && cell < thermalField.length) {
+                        sampledThermal += thermalField[cell];
+                    }
+                    sampledThermal = Math.max(-NATIVE_THERMAL_SOURCE_MAX, Math.min(sampledThermal, NATIVE_THERMAL_SOURCE_MAX));
 
                     window.baseField[idx + CH_OBSTACLE] = solid ? 1.0f : 0.0f;
                     window.baseField[idx + CH_FAN_MASK] = 0.0f;
                     window.baseField[idx + CH_FAN_VX] = 0.0f;
                     window.baseField[idx + CH_FAN_VY] = 0.0f;
                     window.baseField[idx + CH_FAN_VZ] = 0.0f;
+                    window.baseField[idx + CH_THERMAL_SOURCE] = solid ? 0.0f : sampledThermal;
                     if (solid) {
                         window.baseField[idx + CH_STATE_VX] = 0.0f;
                         window.baseField[idx + CH_STATE_VY] = 0.0f;
@@ -620,21 +666,105 @@ final class ClientFluidRuntime {
             buffer.putFloat(window.baseField[idx + CH_STATE_VY] * nativeInputScale);
             buffer.putFloat(window.baseField[idx + CH_STATE_VZ] * nativeInputScale);
             buffer.putFloat(window.baseField[idx + CH_STATE_P]);
+            buffer.putFloat(window.baseField[idx + CH_THERMAL_SOURCE]);
         }
 
+        if (backend == SolverBackend.NATIVE) {
+            return null;
+        }
         return window.payloadBytes;
     }
 
     private boolean isSolidObstacle(ClientWorld world, BlockPos pos) {
-        BlockState state = world.getBlockState(pos);
+        return isSolidObstacle(world, pos, world.getBlockState(pos));
+    }
+
+    private boolean isSolidObstacle(ClientWorld world, BlockPos pos, BlockState state) {
         if (state.isAir() || state.isOf(ModBlocks.DUCT_BLOCK)) {
             return false;
         }
         return !state.getCollisionShape(world, pos).isEmpty();
     }
 
-    private void refreshObstacleField(ClientWorld world, BlockPos origin, WindowState window, int tickNow) {
+    private float sampleAmbientThermalBias(ClientWorld world) {
+        long dayTime = Math.floorMod(world.getTimeOfDay(), 24000L);
+        float phase = (float) ((dayTime / 24000.0) * (Math.PI * 2.0));
+        float daylight = 0.5f + 0.5f * (float) Math.sin(phase);
+        return THERMAL_SOURCE_NIGHT_AMBIENT + (THERMAL_SOURCE_DAY_AMBIENT - THERMAL_SOURCE_NIGHT_AMBIENT) * daylight;
+    }
+
+    private float sampleBlockThermalSource(BlockState state) {
+        if (state.isOf(Blocks.LAVA) || state.isOf(Blocks.LAVA_CAULDRON)) {
+            return THERMAL_SOURCE_LAVA;
+        }
+        if (state.isOf(Blocks.MAGMA_BLOCK)) {
+            return THERMAL_SOURCE_MAGMA;
+        }
+        if (state.isOf(Blocks.CAMPFIRE)) {
+            return state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_CAMPFIRE : 0.0f;
+        }
+        if (state.isOf(Blocks.SOUL_CAMPFIRE)) {
+            return state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_SOUL_CAMPFIRE : 0.0f;
+        }
+        if (state.isOf(Blocks.FIRE)) {
+            return THERMAL_SOURCE_FIRE;
+        }
+        if (state.isOf(Blocks.SOUL_FIRE)) {
+            return THERMAL_SOURCE_SOUL_FIRE;
+        }
+        if (state.isOf(Blocks.TORCH) || state.isOf(Blocks.WALL_TORCH)) {
+            return THERMAL_SOURCE_TORCH;
+        }
+        if (state.isOf(Blocks.SOUL_TORCH) || state.isOf(Blocks.SOUL_WALL_TORCH)) {
+            return THERMAL_SOURCE_SOUL_TORCH;
+        }
+        if (state.isOf(Blocks.LANTERN)) {
+            return THERMAL_SOURCE_LANTERN;
+        }
+        if (state.isOf(Blocks.SOUL_LANTERN)) {
+            return THERMAL_SOURCE_SOUL_LANTERN;
+        }
+        int luminance = state.getLuminance();
+        if (luminance <= 0) {
+            return 0.0f;
+        }
+        float passive = (luminance / 15.0f) * NATIVE_THERMAL_SOURCE_MAX * THERMAL_SOURCE_PASSIVE_LIGHT_SCALE;
+        return Math.max(0.0f, Math.min(passive, 0.5f * NATIVE_THERMAL_SOURCE_MAX));
+    }
+
+    private void addThermalSource(float[] thermal, int x, int y, int z, float source) {
+        if (source <= 0.0f || !inBounds(x, y, z)) {
+            return;
+        }
+        int cell = (x * gridSize + y) * gridSize + z;
+        float updated = thermal[cell] + source;
+        thermal[cell] = Math.max(0.0f, Math.min(updated, NATIVE_THERMAL_SOURCE_MAX));
+    }
+
+    private void emitSolidHeatToNeighbors(float[] thermal, int x, int y, int z, float source) {
+        int neighbors = 0;
+        if (inBounds(x + 1, y, z)) neighbors++;
+        if (inBounds(x - 1, y, z)) neighbors++;
+        if (inBounds(x, y + 1, z)) neighbors++;
+        if (inBounds(x, y - 1, z)) neighbors++;
+        if (inBounds(x, y, z + 1)) neighbors++;
+        if (inBounds(x, y, z - 1)) neighbors++;
+        if (neighbors <= 0) {
+            return;
+        }
+        float distributed = source * THERMAL_SOURCE_SOLID_EMISSION_SCALE / neighbors;
+        addThermalSource(thermal, x + 1, y, z, distributed);
+        addThermalSource(thermal, x - 1, y, z, distributed);
+        addThermalSource(thermal, x, y + 1, z, distributed);
+        addThermalSource(thermal, x, y - 1, z, distributed);
+        addThermalSource(thermal, x, y, z + 1, distributed);
+        addThermalSource(thermal, x, y, z - 1, distributed);
+    }
+
+    private void refreshSampleFields(ClientWorld world, BlockPos origin, WindowState window, int tickNow) {
+        window.ambientThermalBias = sampleAmbientThermalBias(world);
         if (window.obstacleField != null
+            && window.thermalField != null
             && window.lastObstacleRefreshTick >= 0
             && (tickNow - window.lastObstacleRefreshTick) < OBSTACLE_REFRESH_TICKS) {
             return;
@@ -642,6 +772,7 @@ final class ClientFluidRuntime {
 
         int cellCount = gridSize * gridSize * gridSize;
         float[] obstacle = new float[cellCount];
+        float[] thermal = new float[cellCount];
         int minX = origin.getX();
         int minY = origin.getY();
         int minZ = origin.getZ();
@@ -652,12 +783,24 @@ final class ClientFluidRuntime {
                 for (int z = 0; z < gridSize; z++) {
                     int cell = (x * gridSize + y) * gridSize + z;
                     cursor.set(minX + x, minY + y, minZ + z);
-                    obstacle[cell] = isSolidObstacle(world, cursor) ? 1.0f : 0.0f;
+                    BlockState state = world.getBlockState(cursor);
+                    boolean solid = isSolidObstacle(world, cursor, state);
+                    obstacle[cell] = solid ? 1.0f : 0.0f;
+                    float source = sampleBlockThermalSource(state);
+                    if (source <= 0.0f) {
+                        continue;
+                    }
+                    if (solid) {
+                        emitSolidHeatToNeighbors(thermal, x, y, z, source);
+                    } else {
+                        thermal[cell] = Math.max(0.0f, Math.min(thermal[cell] + source, NATIVE_THERMAL_SOURCE_MAX));
+                    }
                 }
             }
         }
 
         window.obstacleField = obstacle;
+        window.thermalField = thermal;
         window.lastObstacleRefreshTick = tickNow;
     }
 
@@ -671,7 +814,13 @@ final class ClientFluidRuntime {
             if (!nativeBackend.ensureInitialized(gridSize, CHANNELS, RESPONSE_CHANNELS)) {
                 throw new IOException("Native backend initialization failed");
             }
-            boolean ok = nativeBackend.step(payload, gridSize, RESPONSE_CHANNELS, window.nativeContextId, solverOutput);
+            boolean ok = nativeBackend.step(
+                window.nativePayloadBuffer,
+                gridSize,
+                RESPONSE_CHANNELS,
+                window.nativeContextId,
+                solverOutput
+            );
             if (!ok) {
                 throw new IOException("Native backend returned invalid response");
             }
@@ -838,6 +987,7 @@ final class ClientFluidRuntime {
         private DataOutputStream outputStream;
         private byte[] payloadBytes;
         private ByteBuffer payloadBuffer;
+        private ByteBuffer nativePayloadBuffer;
         private float[] solverOutputA;
         private float[] solverOutputB;
         private boolean solveIntoA = true;
@@ -845,6 +995,8 @@ final class ClientFluidRuntime {
         private byte[] socketReadBuffer;
         private float[] baseField;
         private float[] obstacleField;
+        private float[] thermalField;
+        private float ambientThermalBias = 0.0f;
         private int lastObstacleRefreshTick = -1;
         private List<FanSource> fans = List.of();
         private float[] latestFlow;
@@ -869,6 +1021,13 @@ final class ClientFluidRuntime {
             }
             payloadBytes = new byte[payloadBytesLength];
             payloadBuffer = ByteBuffer.wrap(payloadBytes).order(ByteOrder.LITTLE_ENDIAN);
+        }
+
+        private void ensureNativePayloadBuffer(int payloadBytesLength) {
+            if (nativePayloadBuffer != null && nativePayloadBuffer.capacity() == payloadBytesLength) {
+                return;
+            }
+            nativePayloadBuffer = ByteBuffer.allocateDirect(payloadBytesLength).order(ByteOrder.LITTLE_ENDIAN);
         }
 
         private synchronized float[] acquireSolveOutputBuffer(int flowCount) {

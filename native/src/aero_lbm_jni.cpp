@@ -123,6 +123,7 @@ constexpr int kChannelStateVx = 5;
 constexpr int kChannelStateVy = 6;
 constexpr int kChannelStateVz = 7;
 constexpr int kChannelStateP = 8;
+constexpr int kChannelThermalSource = 9;
 
 constexpr float kLatticeSoundSpeed = 0.57735026919f;
 constexpr float kMaxMach = 0.60f;
@@ -162,6 +163,18 @@ constexpr float kFanPerpDamp = 1.0f;
 constexpr float kStateNudge = 0.0f;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
+// Boussinesq approximation with an internal thermal scalar field.
+constexpr bool kEnableBoussinesq = true;
+constexpr float kThermalDiffusivity = 0.035f;
+constexpr float kThermalCooling = 0.020f;
+constexpr float kThermalSourceScale = 0.0012f;
+constexpr float kThermalSourceMax = 0.006f;
+constexpr float kThermalMin = -0.20f;
+constexpr float kThermalMax = 0.20f;
+constexpr int kThermalUpdateStride = 2;
+constexpr float kBoussinesqBeta = 0.12f;
+constexpr float kBoussinesqForceMax = 0.02f;
+
 struct Config {
     int grid_size = 0;
     int input_channels = 0;
@@ -193,7 +206,10 @@ struct ContextState {
     std::vector<float> fan_ux;
     std::vector<float> fan_uy;
     std::vector<float> fan_uz;
+    std::vector<float> thermal_source;
     std::vector<uint8_t> obstacle;
+    std::vector<float> temperature;
+    std::vector<float> temperature_next;
     std::uint64_t step_counter = 0;
 
 #if defined(AERO_LBM_OPENCL)
@@ -203,6 +219,8 @@ struct ContextState {
     cl_mem d_f = nullptr;
     cl_mem d_f_post = nullptr;
     cl_mem d_output = nullptr;
+    cl_mem d_temp = nullptr;
+    cl_mem d_temp_next = nullptr;
 #endif
 };
 
@@ -521,7 +539,10 @@ void allocate_cpu_context(ContextState& ctx, int n) {
     ctx.fan_ux.assign(ctx.cells, 0.0f);
     ctx.fan_uy.assign(ctx.cells, 0.0f);
     ctx.fan_uz.assign(ctx.cells, 0.0f);
+    ctx.thermal_source.assign(ctx.cells, 0.0f);
     ctx.obstacle.assign(ctx.cells, 0);
+    ctx.temperature.assign(ctx.cells, 0.0f);
+    ctx.temperature_next.assign(ctx.cells, 0.0f);
 }
 
 void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
@@ -536,6 +557,11 @@ void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
         ctx.ref_uy[cell] = payload[base + kChannelStateVy];
         ctx.ref_uz[cell] = payload[base + kChannelStateVz];
         ctx.ref_pressure[cell] = clampf(payload[base + kChannelStateP], kPressureMin, kPressureMax);
+        float thermal_src = 0.0f;
+        if (in_channels > kChannelThermalSource) {
+            thermal_src = payload[base + kChannelThermalSource];
+        }
+        ctx.thermal_source[cell] = clampf(thermal_src, -kThermalSourceMax, kThermalSourceMax);
     }
 }
 
@@ -558,8 +584,69 @@ void initialize_distributions(ContextState& ctx) {
             ctx.f[dist_index(cell, q, ctx.cells)] = eq;
             ctx.f_post[dist_index(cell, q, ctx.cells)] = eq;
         }
+        ctx.temperature[cell] = 0.0f;
+        ctx.temperature_next[cell] = 0.0f;
     }
     ctx.cpu_initialized = true;
+}
+
+inline float thermal_source_term(const ContextState& ctx, std::size_t cell) {
+    if (g_cfg.input_channels > kChannelThermalSource) {
+        return clampf(ctx.thermal_source[cell], -kThermalSourceMax, kThermalSourceMax);
+    }
+    if (ctx.fan_mask[cell] <= 0.0f) return 0.0f;
+    const float fan_norm = std::sqrt(
+        ctx.fan_ux[cell] * ctx.fan_ux[cell]
+            + ctx.fan_uy[cell] * ctx.fan_uy[cell]
+            + ctx.fan_uz[cell] * ctx.fan_uz[cell]
+    );
+    if (fan_norm <= 1e-8f) return 0.0f;
+    const float capped = clampf(fan_norm * kThermalSourceScale, 0.0f, kThermalSourceMax);
+    return ctx.fan_mask[cell] * capped;
+}
+
+inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int z, float self_value) {
+    if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) return self_value;
+    const std::size_t cell = cell_index(x, y, z, ctx.n);
+    if (ctx.obstacle[cell]) return self_value;
+    return ctx.temperature[cell];
+}
+
+void update_temperature_field(ContextState& ctx) {
+    if (!kEnableBoussinesq) return;
+    for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+        if (ctx.obstacle[cell]) {
+            ctx.temperature_next[cell] = 0.0f;
+            continue;
+        }
+
+        int x = 0, y = 0, z = 0;
+        decode_cell(cell, ctx.n, x, y, z);
+
+        const float t_center = ctx.temperature[cell];
+        const float t_sum =
+            thermal_neighbor_or_self(ctx, x + 1, y, z, t_center)
+            + thermal_neighbor_or_self(ctx, x - 1, y, z, t_center)
+            + thermal_neighbor_or_self(ctx, x, y + 1, z, t_center)
+            + thermal_neighbor_or_self(ctx, x, y - 1, z, t_center)
+            + thermal_neighbor_or_self(ctx, x, y, z + 1, t_center)
+            + thermal_neighbor_or_self(ctx, x, y, z - 1, t_center);
+
+        const float laplacian = t_sum - 6.0f * t_center;
+        const float source = thermal_source_term(ctx, cell);
+        const float t_next = t_center
+                             + kThermalDiffusivity * laplacian
+                             + source
+                             - kThermalCooling * t_center;
+        ctx.temperature_next[cell] = clampf(t_next, kThermalMin, kThermalMax);
+    }
+    ctx.temperature.swap(ctx.temperature_next);
+}
+
+inline bool should_update_temperature(std::uint64_t step_counter) {
+    if (!kEnableBoussinesq) return false;
+    if (kThermalUpdateStride <= 1) return true;
+    return (step_counter % static_cast<std::uint64_t>(kThermalUpdateStride)) == 0;
 }
 
 void collide(ContextState& ctx) {
@@ -625,6 +712,15 @@ void collide(ContextState& ctx) {
                 fy = beta * rho_safe * (axial_push * ny - kFanPerpDamp * u_perp_y);
                 fz = beta * rho_safe * (axial_push * nz - kFanPerpDamp * u_perp_z);
             }
+        }
+
+        if (kEnableBoussinesq) {
+            const float buoyancy = clampf(
+                kBoussinesqBeta * ctx.temperature[cell],
+                -kBoussinesqForceMax,
+                kBoussinesqForceMax
+            );
+            fy += rho_safe * buoyancy;
         }
 
         const float dux = fx * inv_rho;
@@ -890,6 +986,16 @@ __constant float RHO_MAX = 1.03f;
 __constant float CS2 = 0.33333334f;
 __constant float P_MIN = -0.03f;
 __constant float P_MAX = 0.03f;
+__constant int BOUSSINESQ_ENABLED = 1;
+__constant float THERMAL_DIFFUSIVITY = 0.035f;
+__constant float THERMAL_COOLING = 0.020f;
+__constant float THERMAL_SOURCE_SCALE = 0.0012f;
+__constant float THERMAL_SOURCE_MAX = 0.006f;
+__constant float THERMAL_MIN = -0.20f;
+__constant float THERMAL_MAX = 0.20f;
+__constant int THERMAL_UPDATE_STRIDE = 2;
+__constant float BOUSSINESQ_BETA = 0.12f;
+__constant float BOUSSINESQ_FORCE_MAX = 0.02f;
 
 inline float clampf(float v, float lo, float hi) { return fmin(hi, fmax(lo, v)); }
 inline int clampi(int v, int lo, int hi) { return min(hi, max(lo, v)); }
@@ -1004,8 +1110,10 @@ R"CLC(
 kernel void stream_collide_step(
     __global const float* f_read,
     __global const float* payload,
+    __global const float* temp_read,
     int in_ch, int n, int cells, int tick,
-    __global float* f_write
+    __global float* f_write,
+    __global float* temp_write
 ) {
     int cell = (int)get_global_id(0);
     if (cell >= cells) return;
@@ -1042,6 +1150,7 @@ kernel void stream_collide_step(
     }
 
     if (is_solid) {
+        temp_write[cell] = 0.0f;
         for (int q = 0; q < KQ; ++q) f_write[q * cells + cell] = f_local[q];
         return;
     }
@@ -1060,11 +1169,63 @@ kernel void stream_collide_step(
     float uz = mz * inv_rho;
     float speed_pre = sqrt(ux * ux + uy * uy + uz * uz);
 
-    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
     float fan = clampf(payload[base + 1], 0.0f, 1.0f);
+    float fan_ux = payload[base + 2];
+    float fan_uy = payload[base + 3];
+    float fan_uz = payload[base + 4];
+    float fan_norm = sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
+
+    float temp_center = temp_read[cell];
+    float temp_next = temp_center;
+    int update_temperature = BOUSSINESQ_ENABLED
+        && (THERMAL_UPDATE_STRIDE <= 1 || (tick % THERMAL_UPDATE_STRIDE) == 0);
+    if (update_temperature) {
+        float txp = temp_center, txm = temp_center;
+        float typ = temp_center, tym = temp_center;
+        float tzp = temp_center, tzm = temp_center;
+
+        if (x + 1 < n) {
+            int nb = ((x + 1) * n + y) * n + z;
+            if (payload[nb * in_ch + 0] < 0.5f) txp = temp_read[nb];
+        }
+        if (x - 1 >= 0) {
+            int nb = ((x - 1) * n + y) * n + z;
+            if (payload[nb * in_ch + 0] < 0.5f) txm = temp_read[nb];
+        }
+        if (y + 1 < n) {
+            int nb = (x * n + (y + 1)) * n + z;
+            if (payload[nb * in_ch + 0] < 0.5f) typ = temp_read[nb];
+        }
+        if (y - 1 >= 0) {
+            int nb = (x * n + (y - 1)) * n + z;
+            if (payload[nb * in_ch + 0] < 0.5f) tym = temp_read[nb];
+        }
+        if (z + 1 < n) {
+            int nb = (x * n + y) * n + (z + 1);
+            if (payload[nb * in_ch + 0] < 0.5f) tzp = temp_read[nb];
+        }
+        if (z - 1 >= 0) {
+            int nb = (x * n + y) * n + (z - 1);
+            if (payload[nb * in_ch + 0] < 0.5f) tzm = temp_read[nb];
+        }
+
+        float laplacian_t = (txp + txm + typ + tym + tzp + tzm) - 6.0f * temp_center;
+        float thermal_source = 0.0f;
+        if (in_ch > 9) {
+            thermal_source = clampf(payload[base + 9], -THERMAL_SOURCE_MAX, THERMAL_SOURCE_MAX);
+        } else if (fan > 0.0f && fan_norm > 1e-8f) {
+            thermal_source = fan * clampf(fan_norm * THERMAL_SOURCE_SCALE, 0.0f, THERMAL_SOURCE_MAX);
+        }
+        temp_next = clampf(
+            temp_center + THERMAL_DIFFUSIVITY * laplacian_t + thermal_source - THERMAL_COOLING * temp_center,
+            THERMAL_MIN,
+            THERMAL_MAX
+        );
+    }
+    temp_write[cell] = temp_next;
+
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
     if (fan > 0.0f) {
-        float fan_ux = payload[base + 2], fan_uy = payload[base + 3], fan_uz = payload[base + 4];
-        float fan_norm = sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
         if (fan_norm > 1e-8f) {
             float inv_norm = 1.0f / fan_norm;
             float noise = 1.0f + FAN_NOISE_AMP * signed_noise((uint)cell, (uint)tick);
@@ -1091,6 +1252,11 @@ kernel void stream_collide_step(
             fy = beta * rho_safe * (axial_push * ny - FAN_PERP_DAMP * u_perp_y);
             fz = beta * rho_safe * (axial_push * nz - FAN_PERP_DAMP * u_perp_z);
         }
+    }
+
+    if (BOUSSINESQ_ENABLED) {
+        float buoyancy = clampf(BOUSSINESQ_BETA * temp_next, -BOUSSINESQ_FORCE_MAX, BOUSSINESQ_FORCE_MAX);
+        fy += rho_safe * buoyancy;
     }
 
     float dux = fx * inv_rho;
@@ -1374,11 +1540,13 @@ void release_opencl_runtime() {
 }
 
 void release_context_gpu_buffers(ContextState& ctx) {
+    if (ctx.d_temp_next) clReleaseMemObject(ctx.d_temp_next);
+    if (ctx.d_temp) clReleaseMemObject(ctx.d_temp);
     if (ctx.d_output) clReleaseMemObject(ctx.d_output);
     if (ctx.d_f_post) clReleaseMemObject(ctx.d_f_post);
     if (ctx.d_f) clReleaseMemObject(ctx.d_f);
     if (ctx.d_payload) clReleaseMemObject(ctx.d_payload);
-    ctx.d_output = ctx.d_f_post = ctx.d_f = ctx.d_payload = nullptr;
+    ctx.d_temp_next = ctx.d_temp = ctx.d_output = ctx.d_f_post = ctx.d_f = ctx.d_payload = nullptr;
     ctx.gpu_buffers_ready = ctx.gpu_initialized = false;
 }
 
@@ -1455,14 +1623,17 @@ bool ensure_context_gpu_buffers(ContextState& ctx) {
     const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
     const std::size_t dist_bytes = ctx.cells * kQ * sizeof(float);
     const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
+    const std::size_t temp_bytes = ctx.cells * sizeof(float);
 
     cl_int err = CL_SUCCESS;
     ctx.d_payload = clCreateBuffer(g_opencl.context, CL_MEM_READ_ONLY, payload_bytes, nullptr, &err);
     ctx.d_f = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, dist_bytes, nullptr, &err);
     ctx.d_f_post = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, dist_bytes, nullptr, &err);
     ctx.d_output = clCreateBuffer(g_opencl.context, CL_MEM_WRITE_ONLY, output_bytes, nullptr, &err);
+    ctx.d_temp = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
+    ctx.d_temp_next = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
 
-    if (!ctx.d_payload || !ctx.d_f || !ctx.d_f_post || !ctx.d_output) {
+    if (!ctx.d_payload || !ctx.d_f || !ctx.d_f_post || !ctx.d_output || !ctx.d_temp || !ctx.d_temp_next) {
         release_context_gpu_buffers(ctx); return false;
     }
     ctx.gpu_buffers_ready = true; ctx.gpu_initialized = false;
@@ -1494,6 +1665,11 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_init, 3, sizeof(cl_mem), &ctx.d_f);
         err |= clSetKernelArg(g_opencl.k_init, 4, sizeof(cl_mem), &ctx.d_f_post);
         if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_init, cells_i32)) return false;
+
+        const float zero = 0.0f;
+        const std::size_t temp_bytes = ctx.cells * sizeof(float);
+        if (clEnqueueFillBuffer(g_opencl.queue, ctx.d_temp, &zero, sizeof(float), 0, temp_bytes, 0, nullptr, nullptr) != CL_SUCCESS) return false;
+        if (clEnqueueFillBuffer(g_opencl.queue, ctx.d_temp_next, &zero, sizeof(float), 0, temp_bytes, 0, nullptr, nullptr) != CL_SUCCESS) return false;
         ctx.gpu_initialized = true;
     }
 
@@ -1502,14 +1678,18 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     // Ping-Pong 双重缓冲交换
     cl_mem read_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
     cl_mem write_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f_post : ctx.d_f;
+    cl_mem temp_read = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
+    cl_mem temp_write = (ctx.step_counter % 2 == 0) ? ctx.d_temp_next : ctx.d_temp;
 
     err |= clSetKernelArg(g_opencl.k_stream_collide, 0, sizeof(cl_mem), &read_buf);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 1, sizeof(cl_mem), &ctx.d_payload);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 2, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 3, sizeof(int), &ctx.n);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &tick_i32);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(cl_mem), &write_buf);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 2, sizeof(cl_mem), &temp_read);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 3, sizeof(int), &g_cfg.input_channels);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &ctx.n);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(int), &tick_i32);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(cl_mem), &write_buf);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(cl_mem), &temp_write);
     if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32)) return false;
 
     err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
@@ -1548,7 +1728,7 @@ void disable_opencl_runtime(const std::string& reason) {
     for (auto& e : g_contexts) release_context_gpu_buffers(e.second);
     release_opencl_runtime();
     g_cfg.opencl_enabled = false;
-    g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + reason + ")";
+    g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs+bouss (" + reason + ")";
 }
 
 bool should_force_cpu_backend() {
@@ -1579,8 +1759,25 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
     ingest_payload(ctx, packet, g_cfg.input_channels);
     if (!ctx.cpu_initialized) initialize_distributions(ctx);
+    if (should_update_temperature(ctx.step_counter)) {
+        update_temperature_field(ctx);
+    }
     collide(ctx); stream_and_bounce(ctx); write_output(ctx, out, g_cfg.output_channels);
     ctx.step_counter += 1;
+}
+
+bool run_solver_step(ContextState& ctx, const float* packet, float* out, StepTiming& timing) {
+    bool ok = false;
+    if (g_cfg.opencl_enabled) {
+        if (!(ok = opencl_step(ctx, packet, out, timing))) disable_opencl_runtime("OpenCL fail");
+    }
+    if (!ok) {
+        auto solver_begin = Clock::now();
+        run_cpu_step(ctx, packet, out);
+        timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
+        ok = true;
+    }
+    return ok;
 }
 
 }  // namespace
@@ -1594,14 +1791,14 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
 
     if (should_force_cpu_backend()) {
         g_cfg.opencl_enabled = false;
-        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (forced)";
+        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs+bouss (forced)";
         return JNI_TRUE;
     }
     g_cfg.opencl_enabled = initialize_opencl_runtime();
     if (g_cfg.opencl_enabled) {
-        g_cfg.runtime_info = "opencl|cumulant-d3q27+sgs:" + g_opencl.device_name;
+        g_cfg.runtime_info = "opencl|cumulant-d3q27+sgs+bouss:" + g_opencl.device_name;
     } else {
-        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs (" + g_opencl.error + ")";
+        g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs+bouss (" + g_opencl.error + ")";
     }
     return JNI_TRUE;
 }
@@ -1644,16 +1841,38 @@ static jboolean native_step_impl(
     env->ReleaseByteArrayElements(payload, payload_bytes_ptr, JNI_ABORT);
     timing.payload_copy_ms += elapsed_ms(copy_begin, Clock::now());
 
-    bool ok = false;
-    if (g_cfg.opencl_enabled) {
-        if (!(ok = opencl_step(ctx, ctx.packet.data(), out, timing))) disable_opencl_runtime("OpenCL fail");
-    }
-    if (!ok) {
-        auto solver_begin = Clock::now();
-        run_cpu_step(ctx, ctx.packet.data(), out);
-        timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
-        ok = true;
-    }
+    bool ok = run_solver_step(ctx, ctx.packet.data(), out, timing);
+
+    env->ReleaseFloatArrayElements(output_flow, out, 0);
+    timing.total_ms = elapsed_ms(tick_begin, Clock::now());
+    record_timing(timing);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean native_step_direct_impl(
+    JNIEnv* env, jclass, jobject payload_buffer, jint grid_size, jlong context_key, jfloatArray output_flow
+) {
+    auto tick_begin = Clock::now();
+    StepTiming timing;
+
+    if (!g_cfg.initialized || !payload_buffer || !output_flow || grid_size != g_cfg.grid_size) return JNI_FALSE;
+    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+    const std::size_t payload_bytes = cells * g_cfg.input_channels * sizeof(float);
+
+    void* payload_raw = env->GetDirectBufferAddress(payload_buffer);
+    if (!payload_raw) return JNI_FALSE;
+    const jlong payload_capacity = env->GetDirectBufferCapacity(payload_buffer);
+    if (payload_capacity < 0 || static_cast<std::size_t>(payload_capacity) != payload_bytes) return JNI_FALSE;
+
+    jfloat* out = env->GetFloatArrayElements(output_flow, nullptr);
+    if (!out) return JNI_FALSE;
+
+    ContextState& ctx = g_contexts[context_key];
+    ensure_context_shape(ctx, grid_size, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+
+    const float* packet = reinterpret_cast<const float*>(payload_raw);
+    bool ok = run_solver_step(ctx, packet, out, timing);
 
     env->ReleaseFloatArrayElements(output_flow, out, 0);
     timing.total_ms = elapsed_ms(tick_begin, Clock::now());
@@ -1694,6 +1913,17 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nati
     JNIEnv* env, jclass clazz, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
 ) {
     return native_step_impl(env, clazz, payload, grid_size, context_key, output_flow);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeStepDirect(
+    JNIEnv* env, jclass clazz, jobject payload, jint grid_size, jlong context_key, jfloatArray output_flow
+) {
+    return native_step_direct_impl(env, clazz, payload, grid_size, context_key, output_flow);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeStepDirect(
+    JNIEnv* env, jclass clazz, jobject payload, jint grid_size, jlong context_key, jfloatArray output_flow
+) {
+    return native_step_direct_impl(env, clazz, payload, grid_size, context_key, output_flow);
 }
 
 JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeReleaseContext(JNIEnv*, jclass, jlong context_key) {

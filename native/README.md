@@ -4,10 +4,10 @@ This directory contains the native integration scaffold for embedding the CFD so
 
 ## Chosen architecture
 
-- Solver model: `D3Q19 LBM`
-- Collision: `TRT` (upgrade path to `MRT`)
+- Solver model: `D3Q27 LBM`
+- Collision: cumulant-based relaxation + SGS closure
 - Obstacles: voxel bounce-back (Minecraft block-aligned)
-- Turbulence closure: Smagorinsky SGS (optional in native path)
+- Thermal coupling: internal scalar temperature + Boussinesq buoyancy force
 - Compute backend: OpenCL kernels
 - Host bridge: JNI (`NativeLbmBridge`)
 
@@ -25,31 +25,48 @@ Reasoning:
 - `NativeLbmBridge` loads `libaero_lbm` and exposes:
   - `nativeInit(grid, inChannels, outChannels)`
   - `nativeStep(payload, grid, contextKey, output)`
+  - `nativeStepDirect(directPayloadBuffer, grid, contextKey, output)`
   - `nativeReleaseContext(contextKey)`
   - `nativeShutdown()`
 
 Current native code includes:
 
 - OpenCL path (required when `AERO_LBM_ENABLE_OPENCL=ON`, default):
-  - kernels: `init_distributions`, `collide_step`, `stream_step`, `output_macro`
+  - kernels: `init_distributions`, `stream_collide_step`, `output_macro`
   - per-window GPU buffers keyed by `contextKey`
-  - TRT collision (same physics core as CPU path)
-- CPU reference `D3Q19` path (automatic fallback):
+  - cumulant + SGS + thermal scalar + Boussinesq force
+- CPU reference `D3Q27` path (automatic fallback):
   - per-window context state (`contextKey`)
-  - TRT collision
+  - cumulant + SGS + thermal scalar + Boussinesq force
   - bounce-back obstacle handling
-  - fan forcing and mild state nudging
+  - fan forcing, thermal source injection, and mild state nudging
 
-Use `/aero backend status` after switching to native to confirm runtime path (`opencl|trt:<device>` or `cpu|trt...`).
+Use `/aero backend status` after switching to native to confirm runtime path (`opencl|cumulant-d3q27+sgs+bouss:<device>` or `cpu|cumulant-d3q27+sgs+bouss...`).
 The status command also prints tick timing breakdown: payload copy / solver / readback / total.
+
+### Boussinesq coupling notes
+
+- Native payload now supports `10 -> 4` (extra `thermal_source` at channel index 9).
+- Backward compatibility is preserved: native still accepts `9 -> 4`, and socket backend accepts `10/9/5` input forms.
+- Temperature is maintained only inside native contexts and is not sent back to Java yet.
+- Runtime thermal source is now composed from:
+  - sampled world heat blocks (torch/campfire/lava/magma/fire + low-weight luminance fallback),
+  - day-night ambient thermal bias,
+  - fan-induced heating (existing behavior, additive).
+- For solid heat blocks, runtime sampling emits heat into neighboring fluid voxels before sending channel 9.
+- Key constants live in `native/src/aero_lbm_jni.cpp`:
+  - `kThermalDiffusivity`, `kThermalCooling`
+  - `kThermalSourceScale`, `kThermalSourceMax`
+  - `kThermalUpdateStride` (multi-rate thermal update interval)
+  - `kBoussinesqBeta`, `kBoussinesqForceMax`
 
 ## Next implementation steps
 
-1. Upgrade TRT to MRT (or entropic MRT) for stronger long-rollout stability.
+1. Add configurable thermal source modes (fan-derived / block-defined / scripted regions).
 2. Reduce PCIe traffic by uploading only obstacle/fan deltas (not full state tensor every tick).
 3. Add mixed precision path (fp16/int16 storage, fp32 accumulate) for higher occupancy.
 4. Add boundary-condition variants (inflow/outflow/slip tuning) and expose via command/config.
-5. Validate native output against Python reference scenes and record perf per grid size.
+5. Validate buoyancy scenarios against reference cases and record perf per grid size.
 
 ## Build (Linux example)
 

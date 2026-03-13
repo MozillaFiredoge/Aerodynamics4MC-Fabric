@@ -1,5 +1,7 @@
 package com.aerodynamics4mc.runtime;
 
+import java.nio.ByteBuffer;
+
 public final class NativeLbmBridge {
     private static final String LIB_NAME = "aero_lbm";
     private static final boolean LOADED;
@@ -64,6 +66,23 @@ public final class NativeLbmBridge {
         return output;
     }
 
+    public synchronized float[] step(ByteBuffer payload, int grid, int outputCh, long contextKey) {
+        if (!initialized || payload == null || !payload.isDirect()) {
+            return null;
+        }
+        int payloadBytes = grid * grid * grid * inputChannels * Float.BYTES;
+        if (payload.capacity() != payloadBytes) {
+            return null;
+        }
+        int cellCount = grid * grid * grid;
+        float[] output = new float[cellCount * outputCh];
+        boolean ok = nativeStepDirect(payload, grid, contextKey, output);
+        if (!ok) {
+            return null;
+        }
+        return output;
+    }
+
     public synchronized void shutdown() {
         if (!initialized || !LOADED) {
             return;
@@ -102,6 +121,8 @@ public final class NativeLbmBridge {
     private static native boolean nativeInit(int gridSize, int inputChannels, int outputChannels);
 
     private static native boolean nativeStep(byte[] payload, int gridSize, long contextKey, float[] outputFlow);
+
+    private static native boolean nativeStepDirect(ByteBuffer payload, int gridSize, long contextKey, float[] outputFlow);
 
     private static native void nativeReleaseContext(long contextKey);
 
