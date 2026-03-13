@@ -172,7 +172,7 @@ constexpr float kThermalSourceMax = 0.006f;
 constexpr float kThermalMin = -0.20f;
 constexpr float kThermalMax = 0.20f;
 constexpr int kThermalUpdateStride = 2;
-constexpr float kBoussinesqBeta = 0.12f;
+constexpr float kBoussinesqBeta = 0.012f;
 constexpr float kBoussinesqForceMax = 0.02f;
 
 struct Config {

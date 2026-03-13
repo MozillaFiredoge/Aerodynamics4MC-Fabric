@@ -32,6 +32,7 @@ import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
@@ -89,8 +90,20 @@ final class ClientFluidRuntime {
     private static final float THERMAL_SOURCE_SOUL_LANTERN = 0.0012f;
     private static final float THERMAL_SOURCE_PASSIVE_LIGHT_SCALE = 0.20f;
     private static final float THERMAL_SOURCE_SOLID_EMISSION_SCALE = 0.85f;
-    private static final float THERMAL_SOURCE_DAY_AMBIENT = 0.00035f;
-    private static final float THERMAL_SOURCE_NIGHT_AMBIENT = -0.00020f;
+    private static final int THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT = 3;
+    private static final float THERMAL_SOURCE_WATER_COOLING = -0.0012f;
+    private static final float THERMAL_SOURCE_STONE_HEATING = 0.00045f;
+    private static final float THERMAL_SOURCE_BARE_HEATING = 0.00075f;
+    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK = 0.000020f;
+    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_MAX = 0.0020f;
+    private static final int[][] THERMAL_NEIGHBOR_OFFSETS = {
+        { 1, 0, 0 },
+        { -1, 0, 0 },
+        { 0, 1, 0 },
+        { 0, -1, 0 },
+        { 0, 0, 1 },
+        { 0, 0, -1 }
+    };
     private static final double FORCE_STRENGTH = 0.02;
 
     private final int gridSize;
@@ -687,78 +700,136 @@ final class ClientFluidRuntime {
     }
 
     private float sampleAmbientThermalBias(ClientWorld world) {
-        long dayTime = Math.floorMod(world.getTimeOfDay(), 24000L);
-        float phase = (float) ((dayTime / 24000.0) * (Math.PI * 2.0));
-        float daylight = 0.5f + 0.5f * (float) Math.sin(phase);
-        return THERMAL_SOURCE_NIGHT_AMBIENT + (THERMAL_SOURCE_DAY_AMBIENT - THERMAL_SOURCE_NIGHT_AMBIENT) * daylight;
+        return 0.0f;
     }
 
-    private float sampleBlockThermalSource(BlockState state) {
+    private float sampleBlockThermalSource(ClientWorld world, BlockPos pos, BlockState state) {
+        float source = 0.0f;
         if (state.isOf(Blocks.LAVA) || state.isOf(Blocks.LAVA_CAULDRON)) {
-            return THERMAL_SOURCE_LAVA;
+            source += THERMAL_SOURCE_LAVA;
         }
         if (state.isOf(Blocks.MAGMA_BLOCK)) {
-            return THERMAL_SOURCE_MAGMA;
+            source += THERMAL_SOURCE_MAGMA;
         }
         if (state.isOf(Blocks.CAMPFIRE)) {
-            return state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_CAMPFIRE : 0.0f;
+            source += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_CAMPFIRE : 0.0f;
         }
         if (state.isOf(Blocks.SOUL_CAMPFIRE)) {
-            return state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_SOUL_CAMPFIRE : 0.0f;
+            source += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_SOUL_CAMPFIRE : 0.0f;
         }
         if (state.isOf(Blocks.FIRE)) {
-            return THERMAL_SOURCE_FIRE;
+            source += THERMAL_SOURCE_FIRE;
         }
         if (state.isOf(Blocks.SOUL_FIRE)) {
-            return THERMAL_SOURCE_SOUL_FIRE;
+            source += THERMAL_SOURCE_SOUL_FIRE;
         }
         if (state.isOf(Blocks.TORCH) || state.isOf(Blocks.WALL_TORCH)) {
-            return THERMAL_SOURCE_TORCH;
+            source += THERMAL_SOURCE_TORCH;
         }
         if (state.isOf(Blocks.SOUL_TORCH) || state.isOf(Blocks.SOUL_WALL_TORCH)) {
-            return THERMAL_SOURCE_SOUL_TORCH;
+            source += THERMAL_SOURCE_SOUL_TORCH;
         }
         if (state.isOf(Blocks.LANTERN)) {
-            return THERMAL_SOURCE_LANTERN;
+            source += THERMAL_SOURCE_LANTERN;
         }
         if (state.isOf(Blocks.SOUL_LANTERN)) {
-            return THERMAL_SOURCE_SOUL_LANTERN;
+            source += THERMAL_SOURCE_SOUL_LANTERN;
         }
         int luminance = state.getLuminance();
-        if (luminance <= 0) {
-            return 0.0f;
+        if (luminance > 0) {
+            float passive = (luminance / 15.0f) * NATIVE_THERMAL_SOURCE_MAX * THERMAL_SOURCE_PASSIVE_LIGHT_SCALE;
+            source += Math.max(0.0f, Math.min(passive, 0.5f * NATIVE_THERMAL_SOURCE_MAX));
         }
-        float passive = (luminance / 15.0f) * NATIVE_THERMAL_SOURCE_MAX * THERMAL_SOURCE_PASSIVE_LIGHT_SCALE;
-        return Math.max(0.0f, Math.min(passive, 0.5f * NATIVE_THERMAL_SOURCE_MAX));
+
+        source += sampleTerrainThermalFlux(world, pos, state);
+        return Math.max(-NATIVE_THERMAL_SOURCE_MAX, Math.min(source, NATIVE_THERMAL_SOURCE_MAX));
+    }
+
+    private float sampleTerrainThermalFlux(ClientWorld world, BlockPos pos, BlockState state) {
+        float flux = sampleAltitudeThermalFlux(world, pos);
+        if (state.getFluidState().isIn(FluidTags.WATER)) {
+            flux += THERMAL_SOURCE_WATER_COOLING;
+        } else if (isStoneLikeTerrain(state)) {
+            flux += THERMAL_SOURCE_STONE_HEATING;
+        } else if (isBareTerrain(state)) {
+            flux += THERMAL_SOURCE_BARE_HEATING;
+        }
+        return Math.max(-NATIVE_THERMAL_SOURCE_MAX, Math.min(flux, NATIVE_THERMAL_SOURCE_MAX));
+    }
+
+    private float sampleAltitudeThermalFlux(ClientWorld world, BlockPos pos) {
+        float belowSeaLevel = Math.max(0.0f, world.getSeaLevel() - pos.getY());
+        float lapse = belowSeaLevel * THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK;
+        return Math.max(0.0f, Math.min(lapse, THERMAL_SOURCE_ALTITUDE_LAPSE_MAX));
+    }
+
+    private boolean isStoneLikeTerrain(BlockState state) {
+        return state.isOf(Blocks.STONE)
+            || state.isOf(Blocks.COBBLESTONE)
+            || state.isOf(Blocks.DEEPSLATE)
+            || state.isOf(Blocks.COBBLED_DEEPSLATE)
+            || state.isOf(Blocks.GRANITE)
+            || state.isOf(Blocks.DIORITE)
+            || state.isOf(Blocks.ANDESITE)
+            || state.isOf(Blocks.TUFF)
+            || state.isOf(Blocks.CALCITE)
+            || state.isOf(Blocks.BLACKSTONE)
+            || state.isOf(Blocks.BASALT);
+    }
+
+    private boolean isBareTerrain(BlockState state) {
+        return state.isOf(Blocks.DIRT)
+            || state.isOf(Blocks.COARSE_DIRT)
+            || state.isOf(Blocks.ROOTED_DIRT)
+            || state.isOf(Blocks.GRASS_BLOCK)
+            || state.isOf(Blocks.PODZOL)
+            || state.isOf(Blocks.MYCELIUM)
+            || state.isOf(Blocks.SAND)
+            || state.isOf(Blocks.RED_SAND)
+            || state.isOf(Blocks.GRAVEL)
+            || state.isOf(Blocks.CLAY)
+            || state.isOf(Blocks.MUD);
     }
 
     private void addThermalSource(float[] thermal, int x, int y, int z, float source) {
-        if (source <= 0.0f || !inBounds(x, y, z)) {
+        if (source == 0.0f || !inBounds(x, y, z)) {
             return;
         }
         int cell = (x * gridSize + y) * gridSize + z;
         float updated = thermal[cell] + source;
-        thermal[cell] = Math.max(0.0f, Math.min(updated, NATIVE_THERMAL_SOURCE_MAX));
+        thermal[cell] = Math.max(-NATIVE_THERMAL_SOURCE_MAX, Math.min(updated, NATIVE_THERMAL_SOURCE_MAX));
     }
 
-    private void emitSolidHeatToNeighbors(float[] thermal, int x, int y, int z, float source) {
-        int neighbors = 0;
-        if (inBounds(x + 1, y, z)) neighbors++;
-        if (inBounds(x - 1, y, z)) neighbors++;
-        if (inBounds(x, y + 1, z)) neighbors++;
-        if (inBounds(x, y - 1, z)) neighbors++;
-        if (inBounds(x, y, z + 1)) neighbors++;
-        if (inBounds(x, y, z - 1)) neighbors++;
-        if (neighbors <= 0) {
+    private void emitSolidHeatToNeighbors(float[] thermal, float[] obstacle, int x, int y, int z, float source) {
+        int selected = 0;
+        int[] selectedX = new int[THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT];
+        int[] selectedY = new int[THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT];
+        int[] selectedZ = new int[THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT];
+        int start = Math.floorMod((x * 73428767) ^ (y * 912931) ^ (z * 438289), THERMAL_NEIGHBOR_OFFSETS.length);
+        for (int i = 0; i < THERMAL_NEIGHBOR_OFFSETS.length && selected < THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT; i++) {
+            int offsetIdx = (start + i) % THERMAL_NEIGHBOR_OFFSETS.length;
+            int nx = x + THERMAL_NEIGHBOR_OFFSETS[offsetIdx][0];
+            int ny = y + THERMAL_NEIGHBOR_OFFSETS[offsetIdx][1];
+            int nz = z + THERMAL_NEIGHBOR_OFFSETS[offsetIdx][2];
+            if (!inBounds(nx, ny, nz)) {
+                continue;
+            }
+            int cell = (nx * gridSize + ny) * gridSize + nz;
+            if (obstacle[cell] > 0.5f) {
+                continue;
+            }
+            selectedX[selected] = nx;
+            selectedY[selected] = ny;
+            selectedZ[selected] = nz;
+            selected++;
+        }
+        if (selected <= 0) {
             return;
         }
-        float distributed = source * THERMAL_SOURCE_SOLID_EMISSION_SCALE / neighbors;
-        addThermalSource(thermal, x + 1, y, z, distributed);
-        addThermalSource(thermal, x - 1, y, z, distributed);
-        addThermalSource(thermal, x, y + 1, z, distributed);
-        addThermalSource(thermal, x, y - 1, z, distributed);
-        addThermalSource(thermal, x, y, z + 1, distributed);
-        addThermalSource(thermal, x, y, z - 1, distributed);
+        float distributed = source * THERMAL_SOURCE_SOLID_EMISSION_SCALE / selected;
+        for (int i = 0; i < selected; i++) {
+            addThermalSource(thermal, selectedX[i], selectedY[i], selectedZ[i], distributed);
+        }
     }
 
     private void refreshSampleFields(ClientWorld world, BlockPos origin, WindowState window, int tickNow) {
@@ -773,6 +844,7 @@ final class ClientFluidRuntime {
         int cellCount = gridSize * gridSize * gridSize;
         float[] obstacle = new float[cellCount];
         float[] thermal = new float[cellCount];
+        float[] sourceField = new float[cellCount];
         int minX = origin.getX();
         int minY = origin.getY();
         int minZ = origin.getZ();
@@ -786,14 +858,23 @@ final class ClientFluidRuntime {
                     BlockState state = world.getBlockState(cursor);
                     boolean solid = isSolidObstacle(world, cursor, state);
                     obstacle[cell] = solid ? 1.0f : 0.0f;
-                    float source = sampleBlockThermalSource(state);
-                    if (source <= 0.0f) {
+                    sourceField[cell] = sampleBlockThermalSource(world, cursor, state);
+                }
+            }
+        }
+
+        for (int x = 0; x < gridSize; x++) {
+            for (int y = 0; y < gridSize; y++) {
+                for (int z = 0; z < gridSize; z++) {
+                    int cell = (x * gridSize + y) * gridSize + z;
+                    float source = sourceField[cell];
+                    if (source == 0.0f) {
                         continue;
                     }
-                    if (solid) {
-                        emitSolidHeatToNeighbors(thermal, x, y, z, source);
+                    if (obstacle[cell] > 0.5f) {
+                        emitSolidHeatToNeighbors(thermal, obstacle, x, y, z, source);
                     } else {
-                        thermal[cell] = Math.max(0.0f, Math.min(thermal[cell] + source, NATIVE_THERMAL_SOURCE_MAX));
+                        addThermalSource(thermal, x, y, z, source);
                     }
                 }
             }
