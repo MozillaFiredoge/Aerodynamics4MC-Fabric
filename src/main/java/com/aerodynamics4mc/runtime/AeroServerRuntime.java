@@ -477,7 +477,7 @@ public final class AeroServerRuntime {
                 continue;
             }
 
-            SolveResult completed = window.consumeCompletedSolveResult();
+            SolveResult completed = consumeCompletedSolveResult(window, key.origin());
             if (completed != null) {
                 applyStateFieldFromResponse(window, completed.flow());
                 steppedThisTick = true;
@@ -492,6 +492,9 @@ public final class AeroServerRuntime {
                 }
             }
 
+            if (!window.busy.get() && window.backendResetPending()) {
+                resetWindowBackend(window);
+            }
             if (window.busy.compareAndSet(false, true)) {
                 SolveSnapshot snapshot = createSolveSnapshot(
                     window,
@@ -574,6 +577,7 @@ public final class AeroServerRuntime {
     private void refreshWindows(MinecraftServer server, boolean forceResample) {
         Map<WindowKey, List<FanSource>> fansByWindow = scanFanSources(server);
         Map<WindowKey, WindowState> nextWindows = new HashMap<>();
+        Set<WindowKey> consumed = new HashSet<>();
 
         for (Map.Entry<WindowKey, List<FanSource>> entry : fansByWindow.entrySet()) {
             WindowKey key = entry.getKey();
@@ -583,10 +587,28 @@ public final class AeroServerRuntime {
             }
 
             WindowState window = windows.get(key);
-            if (window == null) {
-                window = new WindowState(nextContextId++);
-                reloadWindowFromWorldState(world, key.origin(), window);
-            } else if (forceResample) {
+            if (window != null) {
+                consumed.add(key);
+            } else {
+                WindowKey slidingSourceKey = forceResample ? null : findSlidingSourceWindowKey(key, consumed);
+                if (slidingSourceKey != null) {
+                    window = windows.get(slidingSourceKey);
+                    consumed.add(slidingSourceKey);
+                    applyPendingSolveResult(window, slidingSourceKey.origin());
+                    if (!slideWindowSections(world, window, slidingSourceKey.origin(), key.origin())) {
+                        saveWindowStateToCache(world, slidingSourceKey.origin(), window);
+                        reloadWindowFromWorldState(world, key.origin(), window);
+                    } else {
+                        clearWindowPressure(window);
+                    }
+                    markWindowBackendDirty(window);
+                } else {
+                    window = new WindowState(nextContextId++);
+                    reloadWindowFromWorldState(world, key.origin(), window);
+                }
+            }
+
+            if (forceResample) {
                 refreshSampleFields(world, key.origin(), window, true);
             }
 
@@ -595,7 +617,7 @@ public final class AeroServerRuntime {
         }
 
         for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
-            if (!nextWindows.containsKey(entry.getKey())) {
+            if (!consumed.contains(entry.getKey())) {
                 WindowState window = entry.getValue();
                 ServerWorld world = server.getWorld(entry.getKey().worldKey());
                 deactivateWindow(world, entry.getKey().origin(), window);
@@ -603,6 +625,131 @@ public final class AeroServerRuntime {
         }
         windows.clear();
         windows.putAll(nextWindows);
+    }
+
+    private boolean slideWindowSections(ServerWorld world, WindowState window, BlockPos oldOrigin, BlockPos newOrigin) {
+        if (window.sections == null) {
+            return false;
+        }
+
+        int deltaSectionX = Math.floorDiv(newOrigin.getX() - oldOrigin.getX(), CHUNK_SIZE);
+        int deltaSectionY = Math.floorDiv(newOrigin.getY() - oldOrigin.getY(), CHUNK_SIZE);
+        int deltaSectionZ = Math.floorDiv(newOrigin.getZ() - oldOrigin.getZ(), CHUNK_SIZE);
+        if ((newOrigin.getX() - oldOrigin.getX()) % CHUNK_SIZE != 0
+            || (newOrigin.getY() - oldOrigin.getY()) % CHUNK_SIZE != 0
+            || (newOrigin.getZ() - oldOrigin.getZ()) % CHUNK_SIZE != 0
+            || Math.abs(deltaSectionX) >= WINDOW_SECTION_COUNT
+            || Math.abs(deltaSectionY) >= WINDOW_SECTION_COUNT
+            || Math.abs(deltaSectionZ) >= WINDOW_SECTION_COUNT) {
+            return false;
+        }
+
+        WindowSection[] previous = window.sections;
+        WindowSection[] next = new WindowSection[WINDOW_SECTION_VOLUME];
+        boolean[] reused = new boolean[WINDOW_SECTION_VOLUME];
+
+        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+            for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                    // Keep sections attached to world coordinates. When the window moves +X by one section,
+                    // new local section 0 should reuse old local section 1 rather than old local section 0.
+                    int oldSectionX = sx + deltaSectionX;
+                    int oldSectionY = sy + deltaSectionY;
+                    int oldSectionZ = sz + deltaSectionZ;
+                    int newIndex = windowSectionIndex(sx, sy, sz);
+                    if (oldSectionX >= 0 && oldSectionX < WINDOW_SECTION_COUNT
+                        && oldSectionY >= 0 && oldSectionY < WINDOW_SECTION_COUNT
+                        && oldSectionZ >= 0 && oldSectionZ < WINDOW_SECTION_COUNT) {
+                        int oldIndex = windowSectionIndex(oldSectionX, oldSectionY, oldSectionZ);
+                        next[newIndex] = previous[oldIndex];
+                        reused[oldIndex] = true;
+                        continue;
+                    }
+
+                    BlockPos newSectionOrigin = sectionOrigin(newOrigin, sx, sy, sz);
+                    WindowSection section = sampleWindowSection(world, newSectionOrigin);
+                    worldCache.loadSection(
+                        world,
+                        newSectionOrigin,
+                        section.obstacle,
+                        section.air,
+                        section.state,
+                        RESPONSE_CHANNELS,
+                        0,
+                        1,
+                        2,
+                        3
+                    );
+                    next[newIndex] = section;
+                }
+            }
+        }
+
+        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+            for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                    int oldIndex = windowSectionIndex(sx, sy, sz);
+                    if (reused[oldIndex]) {
+                        continue;
+                    }
+                    WindowSection section = previous[oldIndex];
+                    if (section == null) {
+                        continue;
+                    }
+                    worldCache.storeSection(
+                        world,
+                        sectionOrigin(oldOrigin, sx, sy, sz),
+                        section.obstacle,
+                        section.air,
+                        section.state,
+                        RESPONSE_CHANNELS,
+                        0,
+                        1,
+                        2,
+                        3
+                    );
+                }
+            }
+        }
+
+        window.sections = next;
+        return true;
+    }
+
+    private WindowKey findSlidingSourceWindowKey(WindowKey target, Set<WindowKey> consumed) {
+        WindowKey bestKey = null;
+        int bestOverlap = -1;
+        for (WindowKey candidate : windows.keySet()) {
+            if (consumed.contains(candidate)) {
+                continue;
+            }
+            if (!candidate.worldKey().equals(target.worldKey())) {
+                continue;
+            }
+            WindowState candidateWindow = windows.get(candidate);
+            if (candidateWindow == null || candidateWindow.detached()) {
+                continue;
+            }
+            int overlap = overlappingVolume(candidate.origin(), target.origin());
+            if (overlap > bestOverlap) {
+                bestOverlap = overlap;
+                bestKey = candidate;
+            }
+        }
+        if (bestOverlap <= 0) {
+            return null;
+        }
+        return bestKey;
+    }
+
+    private int overlappingVolume(BlockPos a, BlockPos b) {
+        int overlapX = GRID_SIZE - Math.abs(a.getX() - b.getX());
+        int overlapY = GRID_SIZE - Math.abs(a.getY() - b.getY());
+        int overlapZ = GRID_SIZE - Math.abs(a.getZ() - b.getZ());
+        if (overlapX <= 0 || overlapY <= 0 || overlapZ <= 0) {
+            return 0;
+        }
+        return overlapX * overlapY * overlapZ;
     }
 
     private boolean hasWindowOriginShifted(MinecraftServer server) {
@@ -649,6 +796,7 @@ public final class AeroServerRuntime {
     private void reloadWindowFromWorldState(ServerWorld world, BlockPos origin, WindowState window) {
         refreshSampleFields(world, origin, window, true);
         loadWindowStateFromCache(world, origin, window);
+        clearWindowPressure(window);
     }
 
     private void saveWindowStateToCache(ServerWorld world, BlockPos origin, WindowState window) {
@@ -698,11 +846,40 @@ public final class AeroServerRuntime {
         window.clearCompletedSolveResult();
     }
 
-    private void deactivateWindow(ServerWorld world, BlockPos origin, WindowState window) {
+    private void clearWindowPressure(WindowState window) {
+        if (window.sections == null) {
+            return;
+        }
+        for (WindowSection section : window.sections) {
+            if (section == null) {
+                continue;
+            }
+            for (int i = 0; i < SECTION_CELL_COUNT; i++) {
+                section.state[i * RESPONSE_CHANNELS + 3] = 0.0f;
+            }
+        }
+    }
+
+    private SolveResult consumeCompletedSolveResult(WindowState window, BlockPos expectedOrigin) {
         SolveResult completed = window.consumeCompletedSolveResult();
+        if (completed == null) {
+            return null;
+        }
+        if (!completed.origin().equals(expectedOrigin)) {
+            return null;
+        }
+        return completed;
+    }
+
+    private void applyPendingSolveResult(WindowState window, BlockPos expectedOrigin) {
+        SolveResult completed = consumeCompletedSolveResult(window, expectedOrigin);
         if (completed != null) {
             applyStateFieldFromResponse(window, completed.flow());
         }
+    }
+
+    private void deactivateWindow(ServerWorld world, BlockPos origin, WindowState window) {
+        applyPendingSolveResult(window, origin);
         if (world != null) {
             saveWindowStateToCache(world, origin, window);
         }
@@ -710,6 +887,19 @@ public final class AeroServerRuntime {
         if (!window.busy.get()) {
             releaseWindow(window);
         }
+    }
+
+    private void markWindowBackendDirty(WindowState window) {
+        window.markBackendResetPending();
+        if (!window.busy.get()) {
+            resetWindowBackend(window);
+        }
+    }
+
+    private void resetWindowBackend(WindowState window) {
+        closeSocket(window);
+        nativeBackend.releaseContext(window.nativeContextId);
+        window.clearBackendResetPending();
     }
 
     private Map<WindowKey, List<FanSource>> scanFanSources(MinecraftServer server) {
@@ -1723,7 +1913,7 @@ public final class AeroServerRuntime {
             float[] response = runSolverStep(snapshot, payload);
             float maxSpeed = sanitizeSolveResponse(response, snapshot.speedCap());
             if (snapshot.generation() == runtimeGeneration.get()) {
-                window.publishCompletedSolveResult(new SolveResult(response, maxSpeed));
+                window.publishCompletedSolveResult(new SolveResult(response, maxSpeed, snapshot.origin()));
                 lastSolverError = "";
             }
         } catch (IOException ex) {
@@ -1787,7 +1977,7 @@ public final class AeroServerRuntime {
     private record FanSource(BlockPos pos, Direction facing, int ductLength) {
     }
 
-    private record SolveResult(float[] flow, float maxSpeed) {
+    private record SolveResult(float[] flow, float maxSpeed, BlockPos origin) {
     }
 
     private record SolveSnapshot(
@@ -1819,6 +2009,7 @@ public final class AeroServerRuntime {
         private float ambientThermalBias = 0.0f;
         private List<FanSource> fans = List.of();
         private volatile boolean detached;
+        private volatile boolean backendResetPending;
 
         private WindowState(long nativeContextId) {
             this.nativeContextId = nativeContextId;
@@ -1891,6 +2082,18 @@ public final class AeroServerRuntime {
 
         private boolean detached() {
             return detached;
+        }
+
+        private void markBackendResetPending() {
+            backendResetPending = true;
+        }
+
+        private boolean backendResetPending() {
+            return backendResetPending;
+        }
+
+        private void clearBackendResetPending() {
+            backendResetPending = false;
         }
 
         private boolean markReleased() {
