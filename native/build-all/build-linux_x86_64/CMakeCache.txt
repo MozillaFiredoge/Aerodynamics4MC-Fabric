@@ -21,13 +21,16 @@ AERO_LBM_BUILD_TYPE_RELEASE:STRING=Release
 AERO_LBM_DIST_DIR:PATH=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives
 
 //Enable OpenCL backend in native solver
-AERO_LBM_ENABLE_OPENCL:BOOL=OFF
+AERO_LBM_ENABLE_OPENCL:BOOL=ON
 
 //Optional output directory for single-target builds
 AERO_LBM_OUTPUT_DIR:PATH=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/linux-x86_64
 
 //Build all platform binaries in one invocation
 AERO_LBM_SUPERBUILD:BOOL=OFF
+
+//Build superbuild targets with OpenCL enabled
+AERO_LBM_SUPERBUILD_ENABLE_OPENCL:BOOL=ON
 
 //Path to a program.
 CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line
@@ -233,8 +236,8 @@ CMAKE_STRIP:FILEPATH=/usr/bin/strip
 //Path to a program.
 CMAKE_TAPI:FILEPATH=CMAKE_TAPI-NOTFOUND
 
-//The CMake toolchain file
-CMAKE_TOOLCHAIN_FILE:FILEPATH=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/cmake/toolchains/linux-x86_64.cmake
+//No help, variable specified on the command line.
+CMAKE_TOOLCHAIN_FILE:UNINITIALIZED=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/cmake/toolchains/linux-x86_64.cmake
 
 //If this value is on, makefiles will be generated without the
 // .SILENT directive, and all commands will be echoed to the console
@@ -256,6 +259,12 @@ JAVA_INCLUDE_PATH2:PATH=/usr/lib/jvm/default-java/include/linux
 
 //Java Virtual Machine library
 JAVA_JVM_LIBRARY:FILEPATH=/usr/lib/jvm/default-java/lib/server/libjvm.so
+
+//Path to a file.
+OpenCL_INCLUDE_DIR:PATH=/usr/include
+
+//Path to a library.
+OpenCL_LIBRARY:FILEPATH=/usr/local/cuda/lib64/libOpenCL.so
 
 //Value Computed by CMake
 aero_lbm_BINARY_DIR:STATIC=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64
@@ -420,6 +429,8 @@ CMAKE_UNAME:INTERNAL=/usr/bin/uname
 CMAKE_VERBOSE_MAKEFILE-ADVANCED:INTERNAL=1
 //Details about finding JNI
 FIND_PACKAGE_MESSAGE_DETAILS_JNI:INTERNAL=[/usr/lib/jvm/default-java/include][/usr/lib/jvm/default-java/include/linux][cfound components: AWT JVM ][v()]
+//Details about finding OpenCL
+FIND_PACKAGE_MESSAGE_DETAILS_OpenCL:INTERNAL=[/usr/local/cuda/lib64/libOpenCL.so][/usr/include][v3.0()]
 //ADVANCED property for variable: JAVA_AWT_INCLUDE_PATH
 JAVA_AWT_INCLUDE_PATH-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: JAVA_AWT_LIBRARY
@@ -432,6 +443,12 @@ JAVA_INCLUDE_PATH2-ADVANCED:INTERNAL=1
 JAVA_JVM_LIBRARY-ADVANCED:INTERNAL=1
 //Test JNI_INCLUDE_PATH2_OPTIONAL
 JNI_INCLUDE_PATH2_OPTIONAL:INTERNAL=
+//Have symbol CL_VERSION_3_0
+OPENCL_VERSION_3_0:INTERNAL=1
+//ADVANCED property for variable: OpenCL_INCLUDE_DIR
+OpenCL_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OpenCL_LIBRARY
+OpenCL_LIBRARY-ADVANCED:INTERNAL=1
 //linker supports push/pop state
 _CMAKE_LINKER_PUSHPOP_STATE_SUPPORTED:INTERNAL=TRUE
 

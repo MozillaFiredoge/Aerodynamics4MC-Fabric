@@ -69,14 +69,13 @@ final class ClientFluidRuntime {
     private static final int SOCKET_PORT = 5001;
     private static final String SOCKET_HOST = "127.0.0.1";
     private static final int RESPONSE_CHANNELS = 4;
-    private static final int WINDOW_REFRESH_TICKS = 20;
-    private static final int OBSTACLE_REFRESH_TICKS = 200;
+    private static final int WINDOW_REFRESH_TICKS = 100;
     private static final int FAN_SCAN_RADIUS = 48;
+    private static final int CHUNK_SIZE = 16;
     private static final int SOLVER_WORKER_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
 
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
-    private static final float NATIVE_THERMAL_SOURCE_SCALE = 0.0012f;
     private static final float NATIVE_THERMAL_SOURCE_MAX = 0.006f;
     private static final float THERMAL_SOURCE_LAVA = NATIVE_THERMAL_SOURCE_MAX;
     private static final float THERMAL_SOURCE_MAGMA = 0.0046f;
@@ -88,7 +87,6 @@ final class ClientFluidRuntime {
     private static final float THERMAL_SOURCE_SOUL_TORCH = 0.0018f;
     private static final float THERMAL_SOURCE_LANTERN = 0.0016f;
     private static final float THERMAL_SOURCE_SOUL_LANTERN = 0.0012f;
-    private static final float THERMAL_SOURCE_PASSIVE_LIGHT_SCALE = 0.20f;
     private static final float THERMAL_SOURCE_SOLID_EMISSION_SCALE = 0.85f;
     private static final int THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT = 3;
     private static final float THERMAL_SOURCE_WATER_COOLING = -0.0012f;
@@ -167,8 +165,9 @@ final class ClientFluidRuntime {
         }
 
         tickCounter++;
-        if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0) {
-            refreshWindows(world);
+        boolean windowOriginShifted = hasWindowOriginShifted(world);
+        if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0 || windowOriginShifted) {
+            refreshWindows(world, tickCounter == 1);
         }
         if (windows.isEmpty()) {
             return;
@@ -293,29 +292,54 @@ final class ClientFluidRuntime {
         backendMode = mode;
     }
 
-    private void refreshWindows(ClientWorld world) {
+    private void refreshWindows(ClientWorld world, boolean forceResample) {
         Map<WindowKey, List<FanSource>> fansByWindow = scanFanSources(world);
-
-        Iterator<Map.Entry<WindowKey, WindowState>> iterator = windows.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<WindowKey, WindowState> entry = iterator.next();
-            if (fansByWindow.containsKey(entry.getKey())) {
-                continue;
-            }
-            releaseWindow(entry.getValue());
-            iterator.remove();
-        }
+        Map<WindowKey, WindowState> nextWindows = new HashMap<>();
+        Set<WindowKey> consumed = new HashSet<>();
 
         for (Map.Entry<WindowKey, List<FanSource>> entry : fansByWindow.entrySet()) {
             WindowKey key = entry.getKey();
             WindowState window = windows.get(key);
-            if (window == null) {
+            boolean needFullResample = forceResample;
+            if (window != null) {
+                consumed.add(key);
+            } else {
                 window = new WindowState(nextContextId++, gridSize, maxWindSpeed);
-                windows.put(key, window);
+                needFullResample = true;
             }
+
             window.fans = List.copyOf(entry.getValue());
-            refreshSampleFields(world, key.origin(), window, tickCounter);
+            if (needFullResample || window.obstacleField == null || window.sourceField == null || window.thermalField == null) {
+                refreshSampleFields(world, key.origin(), window, true);
+            }
+            nextWindows.put(key, window);
         }
+
+        for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+            if (!consumed.contains(entry.getKey())) {
+                deactivateWindow(entry.getValue());
+                releaseWindow(entry.getValue());
+            }
+        }
+        windows.clear();
+        windows.putAll(nextWindows);
+    }
+
+    private void deactivateWindow(WindowState window) {
+        window.latestFlow = null;
+        window.busy.set(false);
+        window.consumeCompletedFlow();
+        window.renderer.clearFlowData();
+    }
+
+    private boolean hasWindowOriginShifted(ClientWorld world) {
+        Set<WindowKey> expected = new HashSet<>();
+        for (PlayerEntity player : world.getPlayers()) {
+            if (!player.isSpectator()) {
+                expected.add(new WindowKey(centerWindowOnPlayer(player.getBlockPos())));
+            }
+        }
+        return !expected.equals(windows.keySet());
     }
 
     private Map<WindowKey, List<FanSource>> scanFanSources(ClientWorld world) {
@@ -330,12 +354,18 @@ final class ClientFluidRuntime {
             return fansByWindow;
         }
 
+        for (BlockPos playerPos : playerPositions) {
+            BlockPos origin = centerWindowOnPlayer(playerPos);
+            WindowKey key = new WindowKey(origin);
+            fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
+        }
+
         Set<Long> seenFans = new HashSet<>();
         Set<Long> visitedChunks = new HashSet<>();
-        int chunkRadius = Math.max(1, (FAN_SCAN_RADIUS + 15) / 16);
+        int chunkRadius = Math.max(1, (FAN_SCAN_RADIUS + CHUNK_SIZE - 1) / CHUNK_SIZE);
         for (BlockPos playerPos : playerPositions) {
-            int playerChunkX = Math.floorDiv(playerPos.getX(), 16);
-            int playerChunkZ = Math.floorDiv(playerPos.getZ(), 16);
+            int playerChunkX = Math.floorDiv(playerPos.getX(), CHUNK_SIZE);
+            int playerChunkZ = Math.floorDiv(playerPos.getZ(), CHUNK_SIZE);
             for (int chunkX = playerChunkX - chunkRadius; chunkX <= playerChunkX + chunkRadius; chunkX++) {
                 for (int chunkZ = playerChunkZ - chunkRadius; chunkZ <= playerChunkZ + chunkRadius; chunkZ++) {
                     long chunkKey = ChunkPos.toLong(chunkX, chunkZ);
@@ -362,14 +392,27 @@ final class ClientFluidRuntime {
 
                         Direction facing = state.get(FanBlock.FACING);
                         int ductLength = computeDuctLength(world, pos, facing);
-                        BlockPos origin = alignToGrid(pos);
-                        WindowKey key = new WindowKey(origin);
-                        fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>()).add(new FanSource(pos, facing, ductLength));
+                        FanSource fan = new FanSource(pos, facing, ductLength);
+                        addFanToContainingWindows(fansByWindow, pos, fan);
                     }
                 }
             }
         }
         return fansByWindow;
+    }
+
+    private void addFanToContainingWindows(
+        Map<WindowKey, List<FanSource>> fansByWindow,
+        BlockPos fanPos,
+        FanSource fan
+    ) {
+        int margin = DUCT_JET_RANGE + FAN_RADIUS + 1;
+        for (Map.Entry<WindowKey, List<FanSource>> entry : fansByWindow.entrySet()) {
+            WindowKey key = entry.getKey();
+            if (isInsideWindow(fanPos, key.origin(), margin)) {
+                entry.getValue().add(fan);
+            }
+        }
     }
 
     private boolean isWithinAnyPlayerRadius(BlockPos pos, List<BlockPos> playerPositions, int radius) {
@@ -385,10 +428,23 @@ final class ClientFluidRuntime {
         return false;
     }
 
-    private BlockPos alignToGrid(BlockPos pos) {
-        int x = Math.floorDiv(pos.getX(), gridSize) * gridSize;
-        int y = Math.floorDiv(pos.getY(), gridSize) * gridSize;
-        int z = Math.floorDiv(pos.getZ(), gridSize) * gridSize;
+    private boolean isInsideWindow(BlockPos pos, BlockPos origin, int margin) {
+        int minX = origin.getX() - margin;
+        int minY = origin.getY() - margin;
+        int minZ = origin.getZ() - margin;
+        int maxX = origin.getX() + gridSize + margin;
+        int maxY = origin.getY() + gridSize + margin;
+        int maxZ = origin.getZ() + gridSize + margin;
+        return pos.getX() >= minX && pos.getX() < maxX
+            && pos.getY() >= minY && pos.getY() < maxY
+            && pos.getZ() >= minZ && pos.getZ() < maxZ;
+    }
+
+    private BlockPos centerWindowOnPlayer(BlockPos pos) {
+        int half = gridSize / 2;
+        int x = Math.floorDiv(pos.getX() - half, CHUNK_SIZE) * CHUNK_SIZE;
+        int y = Math.floorDiv(pos.getY() - half, CHUNK_SIZE) * CHUNK_SIZE;
+        int z = Math.floorDiv(pos.getZ() - half, CHUNK_SIZE) * CHUNK_SIZE;
         return new BlockPos(x, y, z);
     }
 
@@ -412,17 +468,6 @@ final class ClientFluidRuntime {
         window.baseField[idx + CH_FAN_VX] += fanVx;
         window.baseField[idx + CH_FAN_VY] += fanVy;
         window.baseField[idx + CH_FAN_VZ] += fanVz;
-        float localFanVx = window.baseField[idx + CH_FAN_VX];
-        float localFanVy = window.baseField[idx + CH_FAN_VY];
-        float localFanVz = window.baseField[idx + CH_FAN_VZ];
-        float localFanNorm = (float) Math.sqrt(
-            localFanVx * localFanVx + localFanVy * localFanVy + localFanVz * localFanVz
-        );
-        float fanThermal = localFanNorm * NATIVE_THERMAL_SOURCE_SCALE;
-        fanThermal = Math.max(0.0f, Math.min(fanThermal, NATIVE_THERMAL_SOURCE_MAX));
-        float combined = window.baseField[idx + CH_THERMAL_SOURCE] + fanThermal;
-        combined = Math.max(-NATIVE_THERMAL_SOURCE_MAX, Math.min(combined, NATIVE_THERMAL_SOURCE_MAX));
-        window.baseField[idx + CH_THERMAL_SOURCE] = combined;
     }
 
     private void applyFanSource(WindowState window, FanSource fan, int minX, int minY, int minZ) {
@@ -618,7 +663,6 @@ final class ClientFluidRuntime {
         window.ensureBaseFieldInitialized(gridSize);
         float[] obstacleField = window.obstacleField;
         float[] thermalField = window.thermalField;
-        float ambientThermal = window.ambientThermalBias;
         int minX = origin.getX();
         int minY = origin.getY();
         int minZ = origin.getZ();
@@ -640,7 +684,7 @@ final class ClientFluidRuntime {
                     int cell = (x * gridSize + y) * gridSize + z;
                     boolean solid = obstacleField != null && cell < obstacleField.length && obstacleField[cell] > 0.5f;
                     int idx = voxelIndex(x, y, z);
-                    float sampledThermal = ambientThermal;
+                    float sampledThermal = 0.0f;
                     if (thermalField != null && cell < thermalField.length) {
                         sampledThermal += thermalField[cell];
                     }
@@ -735,12 +779,6 @@ final class ClientFluidRuntime {
         if (state.isOf(Blocks.SOUL_LANTERN)) {
             source += THERMAL_SOURCE_SOUL_LANTERN;
         }
-        int luminance = state.getLuminance();
-        if (luminance > 0) {
-            float passive = (luminance / 15.0f) * NATIVE_THERMAL_SOURCE_MAX * THERMAL_SOURCE_PASSIVE_LIGHT_SCALE;
-            source += Math.max(0.0f, Math.min(passive, 0.5f * NATIVE_THERMAL_SOURCE_MAX));
-        }
-
         source += sampleTerrainThermalFlux(world, pos, state);
         return Math.max(-NATIVE_THERMAL_SOURCE_MAX, Math.min(source, NATIVE_THERMAL_SOURCE_MAX));
     }
@@ -758,9 +796,10 @@ final class ClientFluidRuntime {
     }
 
     private float sampleAltitudeThermalFlux(ClientWorld world, BlockPos pos) {
-        float belowSeaLevel = Math.max(0.0f, world.getSeaLevel() - pos.getY());
-        float lapse = belowSeaLevel * THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK;
-        return Math.max(0.0f, Math.min(lapse, THERMAL_SOURCE_ALTITUDE_LAPSE_MAX));
+        // float belowSeaLevel = Math.max(0.0f, world.getSeaLevel() - pos.getY());
+        // float lapse = belowSeaLevel * THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK;
+        // return Math.max(0.0f, Math.min(lapse, THERMAL_SOURCE_ALTITUDE_LAPSE_MAX));
+        return 0.0f;
     }
 
     private boolean isStoneLikeTerrain(BlockState state) {
@@ -832,18 +871,14 @@ final class ClientFluidRuntime {
         }
     }
 
-    private void refreshSampleFields(ClientWorld world, BlockPos origin, WindowState window, int tickNow) {
+    private void refreshSampleFields(ClientWorld world, BlockPos origin, WindowState window, boolean forceFullResample) {
         window.ambientThermalBias = sampleAmbientThermalBias(world);
-        if (window.obstacleField != null
-            && window.thermalField != null
-            && window.lastObstacleRefreshTick >= 0
-            && (tickNow - window.lastObstacleRefreshTick) < OBSTACLE_REFRESH_TICKS) {
+        if (!forceFullResample && window.obstacleField != null && window.sourceField != null && window.thermalField != null) {
             return;
         }
 
         int cellCount = gridSize * gridSize * gridSize;
         float[] obstacle = new float[cellCount];
-        float[] thermal = new float[cellCount];
         float[] sourceField = new float[cellCount];
         int minX = origin.getX();
         int minY = origin.getY();
@@ -863,6 +898,7 @@ final class ClientFluidRuntime {
             }
         }
 
+        float[] thermal = new float[cellCount];
         for (int x = 0; x < gridSize; x++) {
             for (int y = 0; y < gridSize; y++) {
                 for (int z = 0; z < gridSize; z++) {
@@ -881,8 +917,89 @@ final class ClientFluidRuntime {
         }
 
         window.obstacleField = obstacle;
+        window.sourceField = sourceField;
         window.thermalField = thermal;
-        window.lastObstacleRefreshTick = tickNow;
+    }
+
+    private void slideWindowSamples(ClientWorld world, WindowState window, BlockPos oldOrigin, BlockPos newOrigin) {
+        if (window.obstacleField == null || window.sourceField == null || window.thermalField == null) {
+            refreshSampleFields(world, newOrigin, window, true);
+            return;
+        }
+
+        int dx = newOrigin.getX() - oldOrigin.getX();
+        int dy = newOrigin.getY() - oldOrigin.getY();
+        int dz = newOrigin.getZ() - oldOrigin.getZ();
+
+        if (Math.abs(dx) >= gridSize || Math.abs(dy) >= gridSize || Math.abs(dz) >= gridSize) {
+            refreshSampleFields(world, newOrigin, window, true);
+            return;
+        }
+
+        int cellCount = gridSize * gridSize * gridSize;
+        float[] newObstacle = new float[cellCount];
+        float[] newSource = new float[cellCount];
+
+        for (int x = 0; x < gridSize; x++) {
+            int oldX = x - dx;
+            for (int y = 0; y < gridSize; y++) {
+                int oldY = y - dy;
+                for (int z = 0; z < gridSize; z++) {
+                    int oldZ = z - dz;
+                    int newCell = (x * gridSize + y) * gridSize + z;
+                    if (inBounds(oldX, oldY, oldZ)) {
+                        int oldCell = (oldX * gridSize + oldY) * gridSize + oldZ;
+                        newObstacle[newCell] = window.obstacleField[oldCell];
+                        newSource[newCell] = window.sourceField[oldCell];
+                    } else {
+                        sampleCellFields(world, newOrigin, x, y, z, newObstacle, newSource, newCell);
+                    }
+                }
+            }
+        }
+
+        window.obstacleField = newObstacle;
+        window.sourceField = newSource;
+        rebuildThermalFromSource(window);
+    }
+
+    private void sampleCellFields(
+        ClientWorld world,
+        BlockPos origin,
+        int x,
+        int y,
+        int z,
+        float[] obstacleOut,
+        float[] sourceOut,
+        int cell
+    ) {
+        BlockPos pos = new BlockPos(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
+        BlockState state = world.getBlockState(pos);
+        boolean solid = isSolidObstacle(world, pos, state);
+        obstacleOut[cell] = solid ? 1.0f : 0.0f;
+        sourceOut[cell] = sampleBlockThermalSource(world, pos, state);
+    }
+
+    private void rebuildThermalFromSource(WindowState window) {
+        int cellCount = gridSize * gridSize * gridSize;
+        float[] thermal = new float[cellCount];
+        for (int x = 0; x < gridSize; x++) {
+            for (int y = 0; y < gridSize; y++) {
+                for (int z = 0; z < gridSize; z++) {
+                    int cell = (x * gridSize + y) * gridSize + z;
+                    float source = window.sourceField[cell];
+                    if (source == 0.0f) {
+                        continue;
+                    }
+                    if (window.obstacleField[cell] > 0.5f) {
+                        emitSolidHeatToNeighbors(thermal, window.obstacleField, x, y, z, source);
+                    } else {
+                        addThermalSource(thermal, x, y, z, source);
+                    }
+                }
+            }
+        }
+        window.thermalField = thermal;
     }
 
     private float[] runSolverStep(WindowState window, byte[] payload, SolverBackend backend) throws IOException {
@@ -1031,6 +1148,7 @@ final class ClientFluidRuntime {
     }
 
     private void releaseWindow(WindowState window) {
+        window.renderer.clearFlowData();
         closeSocket(window);
         nativeBackend.releaseContext(window.nativeContextId);
     }
@@ -1076,9 +1194,9 @@ final class ClientFluidRuntime {
         private byte[] socketReadBuffer;
         private float[] baseField;
         private float[] obstacleField;
+        private float[] sourceField;
         private float[] thermalField;
         private float ambientThermalBias = 0.0f;
-        private int lastObstacleRefreshTick = -1;
         private List<FanSource> fans = List.of();
         private float[] latestFlow;
 

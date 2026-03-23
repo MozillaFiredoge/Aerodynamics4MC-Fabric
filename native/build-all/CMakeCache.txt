@@ -26,6 +26,9 @@ AERO_LBM_OUTPUT_DIR:PATH=
 //Build all platform binaries in one invocation
 AERO_LBM_SUPERBUILD:BOOL=ON
 
+//Build superbuild targets with OpenCL enabled
+AERO_LBM_SUPERBUILD_ENABLE_OPENCL:BOOL=ON
+
 //Path to a program.
 CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line
 

@@ -15,7 +15,7 @@
 ########################
 
 //No help, variable specified on the command line.
-AERO_LBM_ENABLE_OPENCL:UNINITIALIZED=OFF
+AERO_LBM_ENABLE_OPENCL:UNINITIALIZED=ON
 
 //No help, variable specified on the command line.
 AERO_LBM_OUTPUT_DIR:UNINITIALIZED=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/windows-x86_64
@@ -211,8 +211,8 @@ CMAKE_STRIP:FILEPATH=/usr/bin/strip
 //Path to a program.
 CMAKE_TAPI:FILEPATH=CMAKE_TAPI-NOTFOUND
 
-//The CMake toolchain file
-CMAKE_TOOLCHAIN_FILE:FILEPATH=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/cmake/toolchains/windows-x86_64.cmake
+//No help, variable specified on the command line.
+CMAKE_TOOLCHAIN_FILE:UNINITIALIZED=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/cmake/toolchains/windows-x86_64.cmake
 
 //If this value is on, makefiles will be generated without the
 // .SILENT directive, and all commands will be echoed to the console

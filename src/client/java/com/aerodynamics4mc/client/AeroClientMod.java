@@ -1,6 +1,7 @@
 package com.aerodynamics4mc.client;
 
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
 
 import com.aerodynamics4mc.net.AeroFlowPayload;
@@ -23,6 +24,7 @@ public class AeroClientMod implements ClientModInitializer {
     private static final int DEFAULT_BACKEND_MODE = 1;
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final double PLAYER_PREDICTION_FORCE_STRENGTH = 0.02;
+    private static final int REMOTE_WINDOW_STALE_TICKS = 20;
 
     private final Map<WindowKey, WindowView> remoteWindows = new HashMap<>();
     private final ClientFluidRuntime clientFluidRuntime = new ClientFluidRuntime(GRID_SIZE);
@@ -35,6 +37,7 @@ public class AeroClientMod implements ClientModInitializer {
     private int backendMode = DEFAULT_BACKEND_MODE;
     private boolean renderVelocityVectors = true;
     private boolean renderStreamlines = true;
+    private long clientTickCounter = 0L;
 
     @Override
     public void onInitializeClient() {
@@ -46,6 +49,7 @@ public class AeroClientMod implements ClientModInitializer {
     }
 
     private void onClientTick(MinecraftClient client) {
+        clientTickCounter++;
         if (!streamingEnabled || client.world == null || client.player == null || client.player.isSpectator()) {
             return;
         }
@@ -53,6 +57,8 @@ public class AeroClientMod implements ClientModInitializer {
             clientFluidRuntime.tick(client);
             return;
         }
+
+        pruneStaleRemoteWindows();
 
         Identifier dimensionId = client.world.getRegistryKey().getValue();
         Vec3d center = client.player.getBoundingBox().getCenter();
@@ -143,8 +149,9 @@ public class AeroClientMod implements ClientModInitializer {
             WindowKey key = new WindowKey(payload.dimensionId(), payload.origin());
             WindowView view = remoteWindows.computeIfAbsent(
                 key,
-                ignored -> new WindowView(new FlowRenderer(GRID_SIZE, maxWindSpeed))
+                ignored -> new WindowView(new FlowRenderer(GRID_SIZE, maxWindSpeed), clientTickCounter)
             );
+            view.lastSeenTick = clientTickCounter;
             FlowRenderer renderer = view.renderer();
             renderer.setMaxInflowSpeed(maxWindSpeed);
             renderer.setStreamlineSampleStride(streamlineSampleStride);
@@ -152,6 +159,22 @@ public class AeroClientMod implements ClientModInitializer {
             renderer.setRenderStreamlines(renderStreamlines);
             renderer.updateFlowField(payload.origin(), stride, payload.flow());
         });
+    }
+
+    private void pruneStaleRemoteWindows() {
+        if (remoteWindows.isEmpty()) {
+            return;
+        }
+        long staleBefore = clientTickCounter - REMOTE_WINDOW_STALE_TICKS;
+        Iterator<Map.Entry<WindowKey, WindowView>> it = remoteWindows.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<WindowKey, WindowView> entry = it.next();
+            if (entry.getValue().lastSeenTick >= staleBefore) {
+                continue;
+            }
+            entry.getValue().renderer.clearFlowData();
+            it.remove();
+        }
     }
 
     private int sanitizeStride(int requested) {
@@ -188,11 +211,23 @@ public class AeroClientMod implements ClientModInitializer {
         backendMode = DEFAULT_BACKEND_MODE;
         renderVelocityVectors = true;
         renderStreamlines = true;
+        clientTickCounter = 0L;
     }
 
     private record WindowKey(Identifier dimensionId, BlockPos origin) {
     }
 
-    private record WindowView(FlowRenderer renderer) {
+    private static final class WindowView {
+        private final FlowRenderer renderer;
+        private long lastSeenTick;
+
+        private WindowView(FlowRenderer renderer, long lastSeenTick) {
+            this.renderer = renderer;
+            this.lastSeenTick = lastSeenTick;
+        }
+
+        private FlowRenderer renderer() {
+            return renderer;
+        }
     }
 }

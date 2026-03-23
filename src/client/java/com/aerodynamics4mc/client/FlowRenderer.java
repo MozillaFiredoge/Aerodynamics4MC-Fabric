@@ -56,6 +56,10 @@ public class FlowRenderer {
         this.renderStreamlines = enabled;
     }
 
+    public void clearFlowData() {
+        hasFlowData = false;
+    }
+
     public void updateFlowField(BlockPos origin, float[] data) {
         updateFlowField(origin, sampleStride, data);
     }

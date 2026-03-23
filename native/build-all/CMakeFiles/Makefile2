@@ -66,7 +66,6 @@ CMAKE_BINARY_DIR = /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native
 all: CMakeFiles/aero_lbm_linux_x86_64.dir/all
 all: CMakeFiles/aero_lbm_linux_arm64.dir/all
 all: CMakeFiles/aero_lbm_windows_x86_64.dir/all
-all: CMakeFiles/aero_lbm_macos_x86_64.dir/all
 all: CMakeFiles/aero_lbm_macos_arm64.dir/all
 all: CMakeFiles/aero_lbm_all.dir/all
 .PHONY : all
@@ -79,7 +78,6 @@ preinstall:
 clean: CMakeFiles/aero_lbm_linux_x86_64.dir/clean
 clean: CMakeFiles/aero_lbm_linux_arm64.dir/clean
 clean: CMakeFiles/aero_lbm_windows_x86_64.dir/clean
-clean: CMakeFiles/aero_lbm_macos_x86_64.dir/clean
 clean: CMakeFiles/aero_lbm_macos_arm64.dir/clean
 clean: CMakeFiles/aero_lbm_all.dir/clean
 .PHONY : clean
@@ -143,7 +141,7 @@ CMakeFiles/aero_lbm_linux_arm64.dir/clean:
 CMakeFiles/aero_lbm_windows_x86_64.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_windows_x86_64.dir/build.make CMakeFiles/aero_lbm_windows_x86_64.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_windows_x86_64.dir/build.make CMakeFiles/aero_lbm_windows_x86_64.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles --progress-num=33,34,35,36,37,38,39,40 "Built target aero_lbm_windows_x86_64"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles --progress-num=25,26,27,28,29,30,31,32 "Built target aero_lbm_windows_x86_64"
 .PHONY : CMakeFiles/aero_lbm_windows_x86_64.dir/all
 
 # Build rule for subdir invocation for target.
@@ -161,32 +159,6 @@ aero_lbm_windows_x86_64: CMakeFiles/aero_lbm_windows_x86_64.dir/rule
 CMakeFiles/aero_lbm_windows_x86_64.dir/clean:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_windows_x86_64.dir/build.make CMakeFiles/aero_lbm_windows_x86_64.dir/clean
 .PHONY : CMakeFiles/aero_lbm_windows_x86_64.dir/clean
-
-#=============================================================================
-# Target rules for target CMakeFiles/aero_lbm_macos_x86_64.dir
-
-# All Build rule for target.
-CMakeFiles/aero_lbm_macos_x86_64.dir/all:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_macos_x86_64.dir/build.make CMakeFiles/aero_lbm_macos_x86_64.dir/depend
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_macos_x86_64.dir/build.make CMakeFiles/aero_lbm_macos_x86_64.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles --progress-num=25,26,27,28,29,30,31,32 "Built target aero_lbm_macos_x86_64"
-.PHONY : CMakeFiles/aero_lbm_macos_x86_64.dir/all
-
-# Build rule for subdir invocation for target.
-CMakeFiles/aero_lbm_macos_x86_64.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles 8
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/aero_lbm_macos_x86_64.dir/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles 0
-.PHONY : CMakeFiles/aero_lbm_macos_x86_64.dir/rule
-
-# Convenience name for target.
-aero_lbm_macos_x86_64: CMakeFiles/aero_lbm_macos_x86_64.dir/rule
-.PHONY : aero_lbm_macos_x86_64
-
-# clean rule for target.
-CMakeFiles/aero_lbm_macos_x86_64.dir/clean:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_macos_x86_64.dir/build.make CMakeFiles/aero_lbm_macos_x86_64.dir/clean
-.PHONY : CMakeFiles/aero_lbm_macos_x86_64.dir/clean
 
 #=============================================================================
 # Target rules for target CMakeFiles/aero_lbm_macos_arm64.dir
@@ -221,7 +193,6 @@ CMakeFiles/aero_lbm_macos_arm64.dir/clean:
 CMakeFiles/aero_lbm_all.dir/all: CMakeFiles/aero_lbm_linux_x86_64.dir/all
 CMakeFiles/aero_lbm_all.dir/all: CMakeFiles/aero_lbm_linux_arm64.dir/all
 CMakeFiles/aero_lbm_all.dir/all: CMakeFiles/aero_lbm_windows_x86_64.dir/all
-CMakeFiles/aero_lbm_all.dir/all: CMakeFiles/aero_lbm_macos_x86_64.dir/all
 CMakeFiles/aero_lbm_all.dir/all: CMakeFiles/aero_lbm_macos_arm64.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_all.dir/build.make CMakeFiles/aero_lbm_all.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_all.dir/build.make CMakeFiles/aero_lbm_all.dir/build
@@ -230,7 +201,7 @@ CMakeFiles/aero_lbm_all.dir/all: CMakeFiles/aero_lbm_macos_arm64.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/aero_lbm_all.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles 40
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles 32
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/aero_lbm_all.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/CMakeFiles 0
 .PHONY : CMakeFiles/aero_lbm_all.dir/rule

@@ -92,6 +92,7 @@ aero_lbm_EXTERNAL_OBJECTS =
 
 /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/linux-x86_64/libaero_lbm.so: CMakeFiles/aero_lbm.dir/src/aero_lbm_jni.cpp.o
 /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/linux-x86_64/libaero_lbm.so: CMakeFiles/aero_lbm.dir/build.make
+/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/linux-x86_64/libaero_lbm.so: /usr/local/cuda/lib64/libOpenCL.so
 /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/linux-x86_64/libaero_lbm.so: CMakeFiles/aero_lbm.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX shared library /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/dist/natives/linux-x86_64/libaero_lbm.so"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/aero_lbm.dir/link.txt --verbose=$(VERBOSE)

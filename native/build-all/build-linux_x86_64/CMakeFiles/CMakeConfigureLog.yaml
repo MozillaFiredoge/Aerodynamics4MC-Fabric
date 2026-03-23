@@ -417,3 +417,50 @@ events:
         
       exitCode: 2
 ...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.28/Modules/CheckSymbolExists.cmake:140 (try_compile)"
+      - "/usr/share/cmake-3.28/Modules/CheckSymbolExists.cmake:66 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "/usr/share/cmake-3.28/Modules/FindOpenCL.cmake:59 (CHECK_SYMBOL_EXISTS)"
+      - "/usr/share/cmake-3.28/Modules/FindOpenCL.cmake:100 (_FIND_OPENCL_VERSION)"
+      - "CMakeLists.txt:73 (find_package)"
+    checks:
+      - "Looking for CL_VERSION_3_0"
+    directories:
+      source: "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP"
+      binary: "/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "OPENCL_VERSION_3_0"
+      cached: true
+      stdout: |
+        Change Dir: '/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_84231/fast
+        gmake[3]: Entering directory '/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP'
+        /usr/bin/gmake  -f CMakeFiles/cmTC_84231.dir/build.make CMakeFiles/cmTC_84231.dir/build
+        gmake[4]: Entering directory '/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP'
+        Building C object CMakeFiles/cmTC_84231.dir/CheckSymbolExists.c.o
+        /usr/bin/gcc    -o CMakeFiles/cmTC_84231.dir/CheckSymbolExists.c.o -c /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP/CheckSymbolExists.c
+        In file included from /usr/include/CL/cl.h:20,
+                         from /home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP/CheckSymbolExists.c:2:
+        /usr/include/CL/cl_version.h:22:9: note: ‘#pragma message: cl_version.h: CL_TARGET_OPENCL_VERSION is not defined. Defaulting to 300 (OpenCL 3.0)’
+           22 | #pragma message("cl_version.h: CL_TARGET_OPENCL_VERSION is not defined. Defaulting to 300 (OpenCL 3.0)")
+              |         ^~~~~~~
+        Linking C static library libcmTC_84231.a
+        /usr/bin/cmake -P CMakeFiles/cmTC_84231.dir/cmake_clean_target.cmake
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_84231.dir/link.txt --verbose=1
+        /usr/bin/ar qc libcmTC_84231.a CMakeFiles/cmTC_84231.dir/CheckSymbolExists.c.o
+        /usr/bin/ranlib libcmTC_84231.a
+        gmake[4]: Leaving directory '/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP'
+        gmake[3]: Leaving directory '/home/firedoge/Projects/fno/aerodynamics4mc/fabric-mod/native/build-all/build-linux_x86_64/CMakeFiles/CMakeScratch/TryCompile-C6IZSP'
+        
+      exitCode: 0
+...

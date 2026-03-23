@@ -156,19 +156,6 @@ aero_lbm_windows_x86_64/fast:
 .PHONY : aero_lbm_windows_x86_64/fast
 
 #=============================================================================
-# Target rules for targets named aero_lbm_macos_x86_64
-
-# Build rule for target.
-aero_lbm_macos_x86_64: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 aero_lbm_macos_x86_64
-.PHONY : aero_lbm_macos_x86_64
-
-# fast build rule for target.
-aero_lbm_macos_x86_64/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/aero_lbm_macos_x86_64.dir/build.make CMakeFiles/aero_lbm_macos_x86_64.dir/build
-.PHONY : aero_lbm_macos_x86_64/fast
-
-#=============================================================================
 # Target rules for targets named aero_lbm_macos_arm64
 
 # Build rule for target.
@@ -206,7 +193,6 @@ help:
 	@echo "... aero_lbm_linux_arm64"
 	@echo "... aero_lbm_linux_x86_64"
 	@echo "... aero_lbm_macos_arm64"
-	@echo "... aero_lbm_macos_x86_64"
 	@echo "... aero_lbm_windows_x86_64"
 .PHONY : help
 
