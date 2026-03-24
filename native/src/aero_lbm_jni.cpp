@@ -1845,6 +1845,26 @@ bool sync_context_temperature_from_gpu(ContextState& ctx) {
     return true;
 }
 
+bool sync_context_temperature_to_gpu(ContextState& ctx) {
+    if (!ctx.gpu_buffers_ready || !ctx.gpu_initialized) {
+        return true;
+    }
+    if (ctx.temperature.size() != ctx.cells) {
+        ctx.temperature.assign(ctx.cells, 0.0f);
+    }
+    if (ctx.temperature_next.size() != ctx.cells) {
+        ctx.temperature_next.assign(ctx.cells, 0.0f);
+    }
+    const std::size_t temp_bytes = ctx.cells * sizeof(float);
+    if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    return true;
+}
+
 #else
 struct OpenClRuntime { bool available = false; std::string error; std::string device_name; };
 OpenClRuntime g_opencl;
@@ -1853,20 +1873,12 @@ void release_opencl_runtime() {}
 bool initialize_opencl_runtime() { g_opencl.error = "Disabled"; return false; }
 bool opencl_step(ContextState&, const float*, float*, StepTiming&) { return false; }
 bool sync_context_temperature_from_gpu(ContextState&) { return true; }
+bool sync_context_temperature_to_gpu(ContextState&) { return true; }
 #endif
 
 void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
 void clear_all_contexts() { for (auto& e : g_contexts) clear_context(e.second); g_contexts.clear(); }
 void reset_runtime_state() { clear_all_contexts(); release_opencl_runtime(); g_cfg = Config{}; reset_timing_stats(); }
-
-bool migrate_all_context_temperatures_to_cpu() {
-    for (auto& entry : g_contexts) {
-        if (!sync_context_temperature_from_gpu(entry.second)) {
-            return false;
-        }
-    }
-    return true;
-}
 
 void disable_opencl_runtime(const std::string& reason) {
     for (auto& e : g_contexts) release_context_gpu_buffers(e.second);
@@ -2048,15 +2060,11 @@ static jboolean native_get_temperature_state_impl(
     const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
     if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
 
-    if (g_cfg.opencl_enabled) {
-        if (!migrate_all_context_temperatures_to_cpu()) return JNI_FALSE;
-        disable_opencl_runtime("temperature-state-sync");
-    }
-
     auto it = g_contexts.find(context_key);
     if (it == g_contexts.end()) return JNI_FALSE;
     ContextState& ctx = it->second;
     ensure_context_shape(ctx, grid_size, cells);
+    if (g_cfg.opencl_enabled && !sync_context_temperature_from_gpu(ctx)) return JNI_FALSE;
     if (ctx.temperature.size() != cells) return JNI_FALSE;
 
     env->SetFloatArrayRegion(temperature_state, 0, static_cast<jsize>(cells), ctx.temperature.data());
@@ -2070,11 +2078,6 @@ static jboolean native_set_temperature_state_impl(
     const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
     if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
 
-    if (g_cfg.opencl_enabled) {
-        if (!migrate_all_context_temperatures_to_cpu()) return JNI_FALSE;
-        disable_opencl_runtime("temperature-state-sync");
-    }
-
     ContextState& ctx = g_contexts[context_key];
     ensure_context_shape(ctx, grid_size, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
@@ -2082,6 +2085,7 @@ static jboolean native_set_temperature_state_impl(
     if (!temperature_ptr) return JNI_FALSE;
     assign_temperature_state(ctx, temperature_ptr);
     env->ReleaseFloatArrayElements(temperature_state, temperature_ptr, JNI_ABORT);
+    if (g_cfg.opencl_enabled && !sync_context_temperature_to_gpu(ctx)) return JNI_FALSE;
     return JNI_TRUE;
 }
 
