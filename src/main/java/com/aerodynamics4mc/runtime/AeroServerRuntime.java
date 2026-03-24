@@ -139,6 +139,8 @@ public final class AeroServerRuntime {
     };
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
+    private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
+    private static final float WINDOW_EDGE_STABILIZATION_MIN_KEEP = 0.15f;
 
     private enum BackendMode {
         SOCKET,
@@ -534,6 +536,11 @@ public final class AeroServerRuntime {
             }
         }
         backendMode = mode;
+        if (mode == BackendMode.NATIVE) {
+            for (WindowState window : windows.values()) {
+                window.markTemperatureRestorePending();
+            }
+        }
     }
 
     private void stopStreaming(MinecraftServer server) {
@@ -595,11 +602,13 @@ public final class AeroServerRuntime {
                     window = windows.get(slidingSourceKey);
                     consumed.add(slidingSourceKey);
                     applyPendingSolveResult(window, slidingSourceKey.origin());
+                    captureTemperatureStateFromNative(window);
                     if (!slideWindowSections(world, window, slidingSourceKey.origin(), key.origin())) {
                         saveWindowStateToCache(world, slidingSourceKey.origin(), window);
                         reloadWindowFromWorldState(world, key.origin(), window);
                     } else {
                         clearWindowPressure(window);
+                        stabilizeWindowEdges(window);
                     }
                     markWindowBackendDirty(window);
                 } else {
@@ -674,6 +683,7 @@ public final class AeroServerRuntime {
                         section.obstacle,
                         section.air,
                         section.state,
+                        section.temperatureState,
                         RESPONSE_CHANNELS,
                         0,
                         1,
@@ -702,6 +712,7 @@ public final class AeroServerRuntime {
                         section.obstacle,
                         section.air,
                         section.state,
+                        section.temperatureState,
                         RESPONSE_CHANNELS,
                         0,
                         1,
@@ -727,7 +738,7 @@ public final class AeroServerRuntime {
                 continue;
             }
             WindowState candidateWindow = windows.get(candidate);
-            if (candidateWindow == null || candidateWindow.detached()) {
+            if (candidateWindow == null || candidateWindow.detached() || candidateWindow.busy.get()) {
                 continue;
             }
             int overlap = overlappingVolume(candidate.origin(), target.origin());
@@ -780,6 +791,7 @@ public final class AeroServerRuntime {
                         section.obstacle,
                         section.air,
                         section.state,
+                        section.temperatureState,
                         RESPONSE_CHANNELS,
                         0,
                         1,
@@ -797,6 +809,8 @@ public final class AeroServerRuntime {
         refreshSampleFields(world, origin, window, true);
         loadWindowStateFromCache(world, origin, window);
         clearWindowPressure(window);
+        stabilizeWindowEdges(window);
+        window.markTemperatureRestorePending();
     }
 
     private void saveWindowStateToCache(ServerWorld world, BlockPos origin, WindowState window) {
@@ -816,6 +830,7 @@ public final class AeroServerRuntime {
                         section.obstacle,
                         section.air,
                         section.state,
+                        section.temperatureState,
                         RESPONSE_CHANNELS,
                         0,
                         1,
@@ -841,9 +856,11 @@ public final class AeroServerRuntime {
                 section.state[idx + 1] = 0.0f;
                 section.state[idx + 2] = 0.0f;
                 section.state[idx + 3] = 0.0f;
+                section.temperatureState[i] = 0.0f;
             }
         }
         window.clearCompletedSolveResult();
+        window.markTemperatureRestorePending();
     }
 
     private void clearWindowPressure(WindowState window) {
@@ -858,6 +875,116 @@ public final class AeroServerRuntime {
                 section.state[i * RESPONSE_CHANNELS + 3] = 0.0f;
             }
         }
+    }
+
+    private boolean captureTemperatureStateFromNative(WindowState window) {
+        if (backendMode != BackendMode.NATIVE || window.sections == null || window.busy.get()) {
+            return false;
+        }
+        if (!nativeBackend.isLoaded()) {
+            return false;
+        }
+        if (!nativeBackend.ensureInitialized(GRID_SIZE, CHANNELS, RESPONSE_CHANNELS)) {
+            return false;
+        }
+        float[] buffer = window.ensureTemperatureTransferBuffer();
+        if (!nativeBackend.getTemperatureState(GRID_SIZE, window.nativeContextId, buffer)) {
+            return false;
+        }
+        copyTemperatureBufferToSections(window, buffer);
+        return true;
+    }
+
+    private boolean restoreTemperatureStateToNative(WindowState window) {
+        if (backendMode != BackendMode.NATIVE || !window.temperatureRestorePending()) {
+            return false;
+        }
+        if (window.sections == null) {
+            window.clearTemperatureRestorePending();
+            return false;
+        }
+        float[] buffer = window.ensureTemperatureTransferBuffer();
+        fillTemperatureBufferFromSections(window, buffer);
+        boolean restored = nativeBackend.setTemperatureState(GRID_SIZE, window.nativeContextId, buffer);
+        if (restored) {
+            window.clearTemperatureRestorePending();
+        }
+        return restored;
+    }
+
+    private void fillTemperatureBufferFromSections(WindowState window, float[] buffer) {
+        int dst = 0;
+        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+            for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+                for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                    for (int ly = 0; ly < CHUNK_SIZE; ly++) {
+                        for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                            WindowSection section = window.sectionAt(sx, sy, sz);
+                            for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                                int localIndex = localSectionCellIndex(lx, ly, lz);
+                                buffer[dst++] = section == null ? 0.0f : section.temperatureState[localIndex];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void copyTemperatureBufferToSections(WindowState window, float[] buffer) {
+        int src = 0;
+        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+            for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+                for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                    for (int ly = 0; ly < CHUNK_SIZE; ly++) {
+                        for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                            WindowSection section = window.sectionAt(sx, sy, sz);
+                            for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                                int localIndex = localSectionCellIndex(lx, ly, lz);
+                                float value = buffer[src++];
+                                if (section != null) {
+                                    section.temperatureState[localIndex] = value;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void stabilizeWindowEdges(WindowState window) {
+        if (window.sections == null) {
+            return;
+        }
+        for (int x = 0; x < GRID_SIZE; x++) {
+            for (int y = 0; y < GRID_SIZE; y++) {
+                for (int z = 0; z < GRID_SIZE; z++) {
+                    int edgeDistance = Math.min(
+                        Math.min(Math.min(x, y), z),
+                        Math.min(Math.min(GRID_SIZE - 1 - x, GRID_SIZE - 1 - y), GRID_SIZE - 1 - z)
+                    );
+                    if (edgeDistance >= WINDOW_EDGE_STABILIZATION_LAYERS) {
+                        continue;
+                    }
+                    float eta = (WINDOW_EDGE_STABILIZATION_LAYERS - edgeDistance) / (float) WINDOW_EDGE_STABILIZATION_LAYERS;
+                    float keep = WINDOW_EDGE_STABILIZATION_MIN_KEEP
+                        + (1.0f - WINDOW_EDGE_STABILIZATION_MIN_KEEP) * (1.0f - eta * eta);
+                    WindowSection section = window.sectionAt(x / CHUNK_SIZE, y / CHUNK_SIZE, z / CHUNK_SIZE);
+                    if (section == null) {
+                        continue;
+                    }
+                    int localIndex = localSectionCellIndex(x % CHUNK_SIZE, y % CHUNK_SIZE, z % CHUNK_SIZE);
+                    int stateIdx = localIndex * RESPONSE_CHANNELS;
+                    section.state[stateIdx] *= keep;
+                    section.state[stateIdx + 1] *= keep;
+                    section.state[stateIdx + 2] *= keep;
+                    section.state[stateIdx + 3] = 0.0f;
+                    section.temperatureState[localIndex] *= keep;
+                }
+            }
+        }
+        window.markTemperatureRestorePending();
     }
 
     private SolveResult consumeCompletedSolveResult(WindowState window, BlockPos expectedOrigin) {
@@ -880,6 +1007,7 @@ public final class AeroServerRuntime {
 
     private void deactivateWindow(ServerWorld world, BlockPos origin, WindowState window) {
         applyPendingSolveResult(window, origin);
+        captureTemperatureStateFromNative(window);
         if (world != null) {
             saveWindowStateToCache(world, origin, window);
         }
@@ -1544,6 +1672,7 @@ public final class AeroServerRuntime {
             if (!nativeBackend.ensureInitialized(GRID_SIZE, CHANNELS, RESPONSE_CHANNELS)) {
                 throw new IOException("Native backend initialization failed");
             }
+            restoreTemperatureStateToNative(snapshot.window());
             float[] response = nativeBackend.step(
                 payload.nativePayload(),
                 GRID_SIZE,
@@ -2006,10 +2135,12 @@ public final class AeroServerRuntime {
         private SolveResult completedSolveResult;
         private WindowSection[] sections;
         private float[] solveField;
+        private float[] temperatureTransferBuffer;
         private float ambientThermalBias = 0.0f;
         private List<FanSource> fans = List.of();
         private volatile boolean detached;
         private volatile boolean backendResetPending;
+        private volatile boolean temperatureRestorePending = true;
 
         private WindowState(long nativeContextId) {
             this.nativeContextId = nativeContextId;
@@ -2040,6 +2171,14 @@ public final class AeroServerRuntime {
                 socketPayloadBuffer = ByteBuffer.allocate(payloadBytes).order(ByteOrder.LITTLE_ENDIAN);
             }
             return socketPayloadBuffer;
+        }
+
+        private float[] ensureTemperatureTransferBuffer() {
+            int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+            if (temperatureTransferBuffer == null || temperatureTransferBuffer.length != cellCount) {
+                temperatureTransferBuffer = new float[cellCount];
+            }
+            return temperatureTransferBuffer;
         }
 
         private WindowSection sectionAt(int sx, int sy, int sz) {
@@ -2086,6 +2225,7 @@ public final class AeroServerRuntime {
 
         private void markBackendResetPending() {
             backendResetPending = true;
+            temperatureRestorePending = true;
         }
 
         private boolean backendResetPending() {
@@ -2094,6 +2234,18 @@ public final class AeroServerRuntime {
 
         private void clearBackendResetPending() {
             backendResetPending = false;
+        }
+
+        private void markTemperatureRestorePending() {
+            temperatureRestorePending = true;
+        }
+
+        private boolean temperatureRestorePending() {
+            return temperatureRestorePending;
+        }
+
+        private void clearTemperatureRestorePending() {
+            temperatureRestorePending = false;
         }
 
         private boolean markReleased() {
@@ -2105,6 +2257,7 @@ public final class AeroServerRuntime {
         private final float[] obstacle = new float[SECTION_CELL_COUNT];
         private final float[] air = new float[SECTION_CELL_COUNT];
         private final float[] thermal = new float[SECTION_CELL_COUNT];
+        private final float[] temperatureState = new float[SECTION_CELL_COUNT];
         private final float[] state = new float[SECTION_CELL_COUNT * RESPONSE_CHANNELS];
     }
 }

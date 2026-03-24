@@ -584,8 +584,8 @@ void initialize_distributions(ContextState& ctx) {
             ctx.f[dist_index(cell, q, ctx.cells)] = eq;
             ctx.f_post[dist_index(cell, q, ctx.cells)] = eq;
         }
-        ctx.temperature[cell] = 0.0f;
-        ctx.temperature_next[cell] = 0.0f;
+        ctx.temperature[cell] = clampf(ctx.temperature[cell], kThermalMin, kThermalMax);
+        ctx.temperature_next[cell] = ctx.temperature[cell];
     }
     ctx.cpu_initialized = true;
 }
@@ -612,6 +612,43 @@ inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int
     return ctx.temperature[cell];
 }
 
+inline float sample_temperature_trilinear(
+    const ContextState& ctx, float x, float y, float z, float fallback
+) {
+    const float max_coord = static_cast<float>(ctx.n - 1);
+    x = clampf(x, 0.0f, max_coord);
+    y = clampf(y, 0.0f, max_coord);
+    z = clampf(z, 0.0f, max_coord);
+
+    const int x0 = static_cast<int>(std::floor(x));
+    const int y0 = static_cast<int>(std::floor(y));
+    const int z0 = static_cast<int>(std::floor(z));
+    const int x1 = std::min(ctx.n - 1, x0 + 1);
+    const int y1 = std::min(ctx.n - 1, y0 + 1);
+    const int z1 = std::min(ctx.n - 1, z0 + 1);
+
+    const float fx = x - static_cast<float>(x0);
+    const float fy = y - static_cast<float>(y0);
+    const float fz = z - static_cast<float>(z0);
+
+    const float c000 = thermal_neighbor_or_self(ctx, x0, y0, z0, fallback);
+    const float c100 = thermal_neighbor_or_self(ctx, x1, y0, z0, fallback);
+    const float c010 = thermal_neighbor_or_self(ctx, x0, y1, z0, fallback);
+    const float c110 = thermal_neighbor_or_self(ctx, x1, y1, z0, fallback);
+    const float c001 = thermal_neighbor_or_self(ctx, x0, y0, z1, fallback);
+    const float c101 = thermal_neighbor_or_self(ctx, x1, y0, z1, fallback);
+    const float c011 = thermal_neighbor_or_self(ctx, x0, y1, z1, fallback);
+    const float c111 = thermal_neighbor_or_self(ctx, x1, y1, z1, fallback);
+
+    const float c00 = c000 + (c100 - c000) * fx;
+    const float c10 = c010 + (c110 - c010) * fx;
+    const float c01 = c001 + (c101 - c001) * fx;
+    const float c11 = c011 + (c111 - c011) * fx;
+    const float c0 = c00 + (c10 - c00) * fy;
+    const float c1 = c01 + (c11 - c01) * fy;
+    return c0 + (c1 - c0) * fz;
+}
+
 void update_temperature_field(ContextState& ctx) {
     if (!kEnableBoussinesq) return;
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
@@ -624,6 +661,13 @@ void update_temperature_field(ContextState& ctx) {
         decode_cell(cell, ctx.n, x, y, z);
 
         const float t_center = ctx.temperature[cell];
+        const float advected = sample_temperature_trilinear(
+            ctx,
+            static_cast<float>(x) - ctx.ux[cell],
+            static_cast<float>(y) - ctx.uy[cell],
+            static_cast<float>(z) - ctx.uz[cell],
+            t_center
+        );
         const float t_sum =
             thermal_neighbor_or_self(ctx, x + 1, y, z, t_center)
             + thermal_neighbor_or_self(ctx, x - 1, y, z, t_center)
@@ -634,10 +678,10 @@ void update_temperature_field(ContextState& ctx) {
 
         const float laplacian = t_sum - 6.0f * t_center;
         const float source = thermal_source_term(ctx, cell);
-        const float t_next = t_center
+        const float t_next = advected
                              + kThermalDiffusivity * laplacian
                              + source
-                             - kThermalCooling * t_center;
+                             - kThermalCooling * advected;
         ctx.temperature_next[cell] = clampf(t_next, kThermalMin, kThermalMax);
     }
     ctx.temperature.swap(ctx.temperature_next);
@@ -1065,6 +1109,66 @@ inline float boundary_convective_value(
     return f1 + BOUNDARY_CONVECTIVE_BETA * (f1 - f2);
 }
 
+inline float temperature_or_self(
+    __global const float* temp,
+    __global const float* payload,
+    int in_ch,
+    int n,
+    int x,
+    int y,
+    int z,
+    float self_value
+) {
+    if (x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n) return self_value;
+    int cell = (x * n + y) * n + z;
+    if (payload[cell * in_ch + 0] > 0.5f) return self_value;
+    return temp[cell];
+}
+
+inline float sample_temperature_trilinear(
+    __global const float* temp,
+    __global const float* payload,
+    int in_ch,
+    int n,
+    float px,
+    float py,
+    float pz,
+    float fallback
+) {
+    float max_coord = (float)(n - 1);
+    px = clampf(px, 0.0f, max_coord);
+    py = clampf(py, 0.0f, max_coord);
+    pz = clampf(pz, 0.0f, max_coord);
+
+    int x0 = (int)floor(px);
+    int y0 = (int)floor(py);
+    int z0 = (int)floor(pz);
+    int x1 = min(n - 1, x0 + 1);
+    int y1 = min(n - 1, y0 + 1);
+    int z1 = min(n - 1, z0 + 1);
+
+    float fx = px - (float)x0;
+    float fy = py - (float)y0;
+    float fz = pz - (float)z0;
+
+    float c000 = temperature_or_self(temp, payload, in_ch, n, x0, y0, z0, fallback);
+    float c100 = temperature_or_self(temp, payload, in_ch, n, x1, y0, z0, fallback);
+    float c010 = temperature_or_self(temp, payload, in_ch, n, x0, y1, z0, fallback);
+    float c110 = temperature_or_self(temp, payload, in_ch, n, x1, y1, z0, fallback);
+    float c001 = temperature_or_self(temp, payload, in_ch, n, x0, y0, z1, fallback);
+    float c101 = temperature_or_self(temp, payload, in_ch, n, x1, y0, z1, fallback);
+    float c011 = temperature_or_self(temp, payload, in_ch, n, x0, y1, z1, fallback);
+    float c111 = temperature_or_self(temp, payload, in_ch, n, x1, y1, z1, fallback);
+
+    float c00 = c000 + (c100 - c000) * fx;
+    float c10 = c010 + (c110 - c010) * fx;
+    float c01 = c001 + (c101 - c001) * fx;
+    float c11 = c011 + (c111 - c011) * fx;
+    float c0 = c00 + (c10 - c00) * fy;
+    float c1 = c01 + (c11 - c01) * fy;
+    return c0 + (c1 - c0) * fz;
+}
+
 inline float obstacle_bounce_value(
     __global const float* f_read, __global const float* payload,
     int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp
@@ -1180,6 +1284,16 @@ kernel void stream_collide_step(
     int update_temperature = BOUSSINESQ_ENABLED
         && (THERMAL_UPDATE_STRIDE <= 1 || (tick % THERMAL_UPDATE_STRIDE) == 0);
     if (update_temperature) {
+        float temp_advected = sample_temperature_trilinear(
+            temp_read,
+            payload,
+            in_ch,
+            n,
+            (float)x - ux,
+            (float)y - uy,
+            (float)z - uz,
+            temp_center
+        );
         float txp = temp_center, txm = temp_center;
         float typ = temp_center, tym = temp_center;
         float tzp = temp_center, tzm = temp_center;
@@ -1217,7 +1331,7 @@ kernel void stream_collide_step(
             thermal_source = fan * clampf(fan_norm * THERMAL_SOURCE_SCALE, 0.0f, THERMAL_SOURCE_MAX);
         }
         temp_next = clampf(
-            temp_center + THERMAL_DIFFUSIVITY * laplacian_t + thermal_source - THERMAL_COOLING * temp_center,
+            temp_advected + THERMAL_DIFFUSIVITY * laplacian_t + thermal_source - THERMAL_COOLING * temp_advected,
             THERMAL_MIN,
             THERMAL_MAX
         );
@@ -1666,10 +1780,13 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_init, 4, sizeof(cl_mem), &ctx.d_f_post);
         if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_init, cells_i32)) return false;
 
-        const float zero = 0.0f;
         const std::size_t temp_bytes = ctx.cells * sizeof(float);
-        if (clEnqueueFillBuffer(g_opencl.queue, ctx.d_temp, &zero, sizeof(float), 0, temp_bytes, 0, nullptr, nullptr) != CL_SUCCESS) return false;
-        if (clEnqueueFillBuffer(g_opencl.queue, ctx.d_temp_next, &zero, sizeof(float), 0, temp_bytes, 0, nullptr, nullptr) != CL_SUCCESS) return false;
+        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
         ctx.gpu_initialized = true;
     }
 
@@ -1711,6 +1828,23 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     return true;
 }
 
+bool sync_context_temperature_from_gpu(ContextState& ctx) {
+    if (!ctx.gpu_buffers_ready || !ctx.gpu_initialized) {
+        return true;
+    }
+    if (ctx.temperature.size() != ctx.cells) {
+        ctx.temperature.assign(ctx.cells, 0.0f);
+        ctx.temperature_next.assign(ctx.cells, 0.0f);
+    }
+    cl_mem current_temp = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
+    const std::size_t temp_bytes = ctx.cells * sizeof(float);
+    if (clEnqueueReadBuffer(g_opencl.queue, current_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    std::copy(ctx.temperature.begin(), ctx.temperature.end(), ctx.temperature_next.begin());
+    return true;
+}
+
 #else
 struct OpenClRuntime { bool available = false; std::string error; std::string device_name; };
 OpenClRuntime g_opencl;
@@ -1718,11 +1852,21 @@ void release_context_gpu_buffers(ContextState&) {}
 void release_opencl_runtime() {}
 bool initialize_opencl_runtime() { g_opencl.error = "Disabled"; return false; }
 bool opencl_step(ContextState&, const float*, float*, StepTiming&) { return false; }
+bool sync_context_temperature_from_gpu(ContextState&) { return true; }
 #endif
 
 void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
 void clear_all_contexts() { for (auto& e : g_contexts) clear_context(e.second); g_contexts.clear(); }
 void reset_runtime_state() { clear_all_contexts(); release_opencl_runtime(); g_cfg = Config{}; reset_timing_stats(); }
+
+bool migrate_all_context_temperatures_to_cpu() {
+    for (auto& entry : g_contexts) {
+        if (!sync_context_temperature_from_gpu(entry.second)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void disable_opencl_runtime(const std::string& reason) {
     for (auto& e : g_contexts) release_context_gpu_buffers(e.second);
@@ -1753,6 +1897,23 @@ bool should_force_cpu_backend() {
 void ensure_context_shape(ContextState& ctx, int n, std::size_t cells) {
     if (ctx.n == n && ctx.cells == cells) return;
     clear_context(ctx); ctx.n = n; ctx.cells = cells;
+}
+
+void ensure_context_temperature_storage(ContextState& ctx) {
+    if (ctx.temperature.size() != ctx.cells) {
+        ctx.temperature.assign(ctx.cells, 0.0f);
+    }
+    if (ctx.temperature_next.size() != ctx.cells) {
+        ctx.temperature_next.assign(ctx.cells, 0.0f);
+    }
+}
+
+void assign_temperature_state(ContextState& ctx, const float* temperature_state) {
+    ensure_context_temperature_storage(ctx);
+    for (std::size_t i = 0; i < ctx.cells; ++i) {
+        ctx.temperature[i] = clampf(temperature_state[i], kThermalMin, kThermalMax);
+    }
+    std::copy(ctx.temperature.begin(), ctx.temperature.end(), ctx.temperature_next.begin());
 }
 
 void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
@@ -1880,6 +2041,50 @@ static jboolean native_step_direct_impl(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+static jboolean native_get_temperature_state_impl(
+    JNIEnv* env, jclass, jint grid_size, jlong context_key, jfloatArray temperature_state
+) {
+    if (!g_cfg.initialized || !temperature_state || grid_size != g_cfg.grid_size) return JNI_FALSE;
+    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+    if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
+
+    if (g_cfg.opencl_enabled) {
+        if (!migrate_all_context_temperatures_to_cpu()) return JNI_FALSE;
+        disable_opencl_runtime("temperature-state-sync");
+    }
+
+    auto it = g_contexts.find(context_key);
+    if (it == g_contexts.end()) return JNI_FALSE;
+    ContextState& ctx = it->second;
+    ensure_context_shape(ctx, grid_size, cells);
+    if (ctx.temperature.size() != cells) return JNI_FALSE;
+
+    env->SetFloatArrayRegion(temperature_state, 0, static_cast<jsize>(cells), ctx.temperature.data());
+    return JNI_TRUE;
+}
+
+static jboolean native_set_temperature_state_impl(
+    JNIEnv* env, jclass, jint grid_size, jlong context_key, jfloatArray temperature_state
+) {
+    if (!g_cfg.initialized || !temperature_state || grid_size != g_cfg.grid_size) return JNI_FALSE;
+    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+    if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
+
+    if (g_cfg.opencl_enabled) {
+        if (!migrate_all_context_temperatures_to_cpu()) return JNI_FALSE;
+        disable_opencl_runtime("temperature-state-sync");
+    }
+
+    ContextState& ctx = g_contexts[context_key];
+    ensure_context_shape(ctx, grid_size, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+    jfloat* temperature_ptr = env->GetFloatArrayElements(temperature_state, nullptr);
+    if (!temperature_ptr) return JNI_FALSE;
+    assign_temperature_state(ctx, temperature_ptr);
+    env->ReleaseFloatArrayElements(temperature_state, temperature_ptr, JNI_ABORT);
+    return JNI_TRUE;
+}
+
 static void native_release_context_impl(jlong context_key) {
     auto it = g_contexts.find(context_key);
     if (it != g_contexts.end()) { clear_context(it->second); g_contexts.erase(it); }
@@ -1931,6 +2136,28 @@ JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeRel
 }
 JNIEXPORT void JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeReleaseContext(JNIEnv*, jclass, jlong context_key) {
     native_release_context_impl(context_key);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeGetTemperatureState(
+    JNIEnv* env, jclass clazz, jint grid_size, jlong context_key, jfloatArray temperature_state
+) {
+    return native_get_temperature_state_impl(env, clazz, grid_size, context_key, temperature_state);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeGetTemperatureState(
+    JNIEnv* env, jclass clazz, jint grid_size, jlong context_key, jfloatArray temperature_state
+) {
+    return native_get_temperature_state_impl(env, clazz, grid_size, context_key, temperature_state);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeSetTemperatureState(
+    JNIEnv* env, jclass clazz, jint grid_size, jlong context_key, jfloatArray temperature_state
+) {
+    return native_set_temperature_state_impl(env, clazz, grid_size, context_key, temperature_state);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeSetTemperatureState(
+    JNIEnv* env, jclass clazz, jint grid_size, jlong context_key, jfloatArray temperature_state
+) {
+    return native_set_temperature_state_impl(env, clazz, grid_size, context_key, temperature_state);
 }
 
 JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeShutdown(JNIEnv*, jclass) {

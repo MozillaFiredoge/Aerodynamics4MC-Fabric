@@ -30,16 +30,17 @@ final class ActiveWindowWorldCache {
     private static final String LOG_PREFIX = "[aerodynamics4mc/cache] ";
     private static final int SECTION_SIZE = 16;
     private static final int SECTION_CELLS = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE;
-    private static final int CHANNELS = 4; // vx vy vz p
+    private static final int CHANNELS = 5; // vx vy vz p temperature
     private static final int MASK_WORDS = SECTION_CELLS / Long.SIZE;
     private static final int VALUES_BYTES = SECTION_CELLS * CHANNELS;
 
-    private static final int FORMAT_VERSION = 1;
+    private static final int FORMAT_VERSION = 2;
     private static final int MAGIC = 0x41575743; // "AWWC"
     private static final String FILE_SUFFIX = ".awwc.zst";
 
     private static final float SCALE_VELOCITY = 32.0f;
     private static final float SCALE_PRESSURE = 1.0f;
+    private static final float SCALE_TEMPERATURE = 0.25f;
     private static final float INV_127 = 1.0f / 127.0f;
 
     private final Map<RegistryKey<World>, DimensionCache> dimensions = new HashMap<>();
@@ -58,6 +59,7 @@ final class ActiveWindowWorldCache {
         float[] obstacleField,
         float[] airField,
         float[] baseField,
+        float[] temperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -90,6 +92,9 @@ final class ActiveWindowWorldCache {
                         baseField[idx + chStateVy] = 0.0f;
                         baseField[idx + chStateVz] = 0.0f;
                         baseField[idx + chStateP] = 0.0f;
+                        if (temperatureField != null && cell < temperatureField.length) {
+                            temperatureField[cell] = 0.0f;
+                        }
                         continue;
                     }
                     expectedAirCells++;
@@ -105,6 +110,9 @@ final class ActiveWindowWorldCache {
                     baseField[idx + chStateVy] = dequantize(section.values[valueBase + 1], SCALE_VELOCITY);
                     baseField[idx + chStateVz] = dequantize(section.values[valueBase + 2], SCALE_VELOCITY);
                     baseField[idx + chStateP] = dequantize(section.values[valueBase + 3], SCALE_PRESSURE);
+                    if (temperatureField != null && cell < temperatureField.length) {
+                        temperatureField[cell] = dequantize(section.values[valueBase + 4], SCALE_TEMPERATURE);
+                    }
                     loadedAirCells++;
                 }
             }
@@ -118,6 +126,7 @@ final class ActiveWindowWorldCache {
         float[] obstacleField,
         float[] airField,
         float[] stateField,
+        float[] temperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -145,6 +154,9 @@ final class ActiveWindowWorldCache {
                 stateField[idx + chStateVy] = 0.0f;
                 stateField[idx + chStateVz] = 0.0f;
                 stateField[idx + chStateP] = 0.0f;
+                if (temperatureField != null && localIndex < temperatureField.length) {
+                    temperatureField[localIndex] = 0.0f;
+                }
                 continue;
             }
             expectedAirCells++;
@@ -153,6 +165,9 @@ final class ActiveWindowWorldCache {
                 stateField[idx + chStateVy] = 0.0f;
                 stateField[idx + chStateVz] = 0.0f;
                 stateField[idx + chStateP] = 0.0f;
+                if (temperatureField != null && localIndex < temperatureField.length) {
+                    temperatureField[localIndex] = 0.0f;
+                }
                 continue;
             }
             int valueBase = localIndex * CHANNELS;
@@ -160,6 +175,9 @@ final class ActiveWindowWorldCache {
             stateField[idx + chStateVy] = dequantize(section.values[valueBase + 1], SCALE_VELOCITY);
             stateField[idx + chStateVz] = dequantize(section.values[valueBase + 2], SCALE_VELOCITY);
             stateField[idx + chStateP] = dequantize(section.values[valueBase + 3], SCALE_PRESSURE);
+            if (temperatureField != null && localIndex < temperatureField.length) {
+                temperatureField[localIndex] = dequantize(section.values[valueBase + 4], SCALE_TEMPERATURE);
+            }
             loadedAirCells++;
         }
         return expectedAirCells > 0 && loadedAirCells == expectedAirCells;
@@ -172,6 +190,7 @@ final class ActiveWindowWorldCache {
         float[] obstacleField,
         float[] airField,
         float[] baseField,
+        float[] temperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -209,6 +228,8 @@ final class ActiveWindowWorldCache {
                     section.values[valueBase + 1] = quantize(baseField[idx + chStateVy], SCALE_VELOCITY);
                     section.values[valueBase + 2] = quantize(baseField[idx + chStateVz], SCALE_VELOCITY);
                     section.values[valueBase + 3] = quantize(baseField[idx + chStateP], SCALE_PRESSURE);
+                    float temperature = temperatureField != null && cell < temperatureField.length ? temperatureField[cell] : 0.0f;
+                    section.values[valueBase + 4] = quantize(temperature, SCALE_TEMPERATURE);
                     section.markValid(address.localIndex());
                 }
             }
@@ -225,6 +246,7 @@ final class ActiveWindowWorldCache {
         float[] obstacleField,
         float[] airField,
         float[] stateField,
+        float[] temperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -255,6 +277,8 @@ final class ActiveWindowWorldCache {
             section.values[valueBase + 1] = quantize(stateField[idx + chStateVy], SCALE_VELOCITY);
             section.values[valueBase + 2] = quantize(stateField[idx + chStateVz], SCALE_VELOCITY);
             section.values[valueBase + 3] = quantize(stateField[idx + chStateP], SCALE_PRESSURE);
+            float temperature = temperatureField != null && localIndex < temperatureField.length ? temperatureField[localIndex] : 0.0f;
+            section.values[valueBase + 4] = quantize(temperature, SCALE_TEMPERATURE);
             section.markValid(localIndex);
         }
 
@@ -538,6 +562,7 @@ final class ActiveWindowWorldCache {
             values[base + 1] = 0;
             values[base + 2] = 0;
             values[base + 3] = 0;
+            values[base + 4] = 0;
         }
 
         private boolean isEmpty() {

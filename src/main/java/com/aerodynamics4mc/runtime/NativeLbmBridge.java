@@ -118,6 +118,28 @@ public final class NativeLbmBridge {
         return nativeTimingInfo();
     }
 
+    public synchronized boolean getTemperatureState(int grid, long contextKey, float[] temperatureState) {
+        if (!initialized || temperatureState == null) {
+            return false;
+        }
+        int cellCount = grid * grid * grid;
+        if (temperatureState.length != cellCount) {
+            return false;
+        }
+        return nativeGetTemperatureState(grid, contextKey, temperatureState);
+    }
+
+    public synchronized boolean setTemperatureState(int grid, long contextKey, float[] temperatureState) {
+        if (!initialized || temperatureState == null) {
+            return false;
+        }
+        int cellCount = grid * grid * grid;
+        if (temperatureState.length != cellCount) {
+            return false;
+        }
+        return nativeSetTemperatureState(grid, contextKey, temperatureState);
+    }
+
     private static native boolean nativeInit(int gridSize, int inputChannels, int outputChannels);
 
     private static native boolean nativeStep(byte[] payload, int gridSize, long contextKey, float[] outputFlow);
@@ -131,4 +153,8 @@ public final class NativeLbmBridge {
     private static native String nativeRuntimeInfo();
 
     private static native String nativeTimingInfo();
+
+    private static native boolean nativeGetTemperatureState(int gridSize, long contextKey, float[] temperatureState);
+
+    private static native boolean nativeSetTemperatureState(int gridSize, long contextKey, float[] temperatureState);
 }
