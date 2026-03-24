@@ -24,6 +24,7 @@ public class AeroClientMod implements ClientModInitializer {
     private static final int DEFAULT_BACKEND_MODE = 1;
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final double PLAYER_PREDICTION_FORCE_STRENGTH = 0.02;
+    private static final double PARTICLE_FORCE_STRENGTH = 0.02;
     private static final int REMOTE_WINDOW_STALE_TICKS = 20;
 
     private final Map<WindowKey, WindowView> remoteWindows = new HashMap<>();
@@ -70,9 +71,15 @@ public class AeroClientMod implements ClientModInitializer {
         Vec3d windVelocity = window.renderer().sampleVelocity(center);
         Vec3d delta = windVelocity.multiply(PLAYER_PREDICTION_FORCE_STRENGTH);
         if (delta.lengthSquared() < 1e-10) {
+            window.physics().updateOrigin(window.origin());
+            window.physics().applyParticleForcesOnly(client, PARTICLE_FORCE_STRENGTH);
+            window.physics().tickVisualFeedback(client, clientTickCounter);
             return;
         }
         client.player.addVelocity(delta.x, delta.y, delta.z);
+        window.physics().updateOrigin(window.origin());
+        window.physics().applyParticleForcesOnly(client, PARTICLE_FORCE_STRENGTH);
+        window.physics().tickVisualFeedback(client, clientTickCounter);
     }
 
     private void onRender(WorldRenderContext context) {
@@ -188,7 +195,9 @@ public class AeroClientMod implements ClientModInitializer {
                 continue;
             }
             if (isInsideWindow(key.origin(), worldPos)) {
-                return entry.getValue();
+                WindowView view = entry.getValue();
+                view.origin = key.origin();
+                return view;
             }
         }
         return null;
@@ -219,15 +228,27 @@ public class AeroClientMod implements ClientModInitializer {
 
     private static final class WindowView {
         private final FlowRenderer renderer;
+        private final PhysicsHandler physics;
         private long lastSeenTick;
+        private BlockPos origin;
 
         private WindowView(FlowRenderer renderer, long lastSeenTick) {
             this.renderer = renderer;
+            this.physics = new PhysicsHandler(renderer, GRID_SIZE);
             this.lastSeenTick = lastSeenTick;
+            this.origin = BlockPos.ORIGIN;
         }
 
         private FlowRenderer renderer() {
             return renderer;
+        }
+
+        private PhysicsHandler physics() {
+            return physics;
+        }
+
+        private BlockPos origin() {
+            return origin;
         }
     }
 }

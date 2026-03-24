@@ -38,6 +38,7 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.chunk.WorldChunk;
 
 final class ClientFluidRuntime {
@@ -202,6 +203,11 @@ final class ClientFluidRuntime {
                 window.physics.applyForces(client, FORCE_STRENGTH);
             }
         }
+
+        WindowState feedbackWindow = findWindowContaining(client.player.getBoundingBox().getCenter());
+        if (feedbackWindow != null && feedbackWindow.latestFlow != null) {
+            feedbackWindow.physics.tickVisualFeedback(client, tickCounter);
+        }
     }
 
     private void runSolveTask(WindowState window, BlockPos origin, SolverBackend backend, float maxSpeedSnapshot, long generationSnapshot) {
@@ -342,6 +348,15 @@ final class ClientFluidRuntime {
         return !expected.equals(windows.keySet());
     }
 
+    private WindowState findWindowContaining(Vec3d worldPos) {
+        for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+            if (isInsideWindow(worldPos, entry.getKey().origin(), 0)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
     private Map<WindowKey, List<FanSource>> scanFanSources(ClientWorld world) {
         Map<WindowKey, List<FanSource>> fansByWindow = new HashMap<>();
         List<BlockPos> playerPositions = new ArrayList<>();
@@ -438,6 +453,18 @@ final class ClientFluidRuntime {
         return pos.getX() >= minX && pos.getX() < maxX
             && pos.getY() >= minY && pos.getY() < maxY
             && pos.getZ() >= minZ && pos.getZ() < maxZ;
+    }
+
+    private boolean isInsideWindow(Vec3d pos, BlockPos origin, int margin) {
+        int minX = origin.getX() - margin;
+        int minY = origin.getY() - margin;
+        int minZ = origin.getZ() - margin;
+        int maxX = origin.getX() + gridSize + margin;
+        int maxY = origin.getY() + gridSize + margin;
+        int maxZ = origin.getZ() + gridSize + margin;
+        return pos.x >= minX && pos.x < maxX
+            && pos.y >= minY && pos.y < maxY
+            && pos.z >= minZ && pos.z < maxZ;
     }
 
     private BlockPos centerWindowOnPlayer(BlockPos pos) {

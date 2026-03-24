@@ -58,6 +58,7 @@ import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.LightType;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
 
@@ -122,25 +123,24 @@ public final class AeroServerRuntime {
     private static final float THERMAL_SOURCE_SOUL_TORCH = 0.0018f;
     private static final float THERMAL_SOURCE_LANTERN = 0.0016f;
     private static final float THERMAL_SOURCE_SOUL_LANTERN = 0.0012f;
-    private static final float THERMAL_SOURCE_SOLID_EMISSION_SCALE = 0.85f;
-    private static final int THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT = 3;
-    private static final float THERMAL_SOURCE_WATER_COOLING = -0.0012f;
-    private static final float THERMAL_SOURCE_STONE_HEATING = 0.00045f;
-    private static final float THERMAL_SOURCE_BARE_HEATING = 0.00075f;
-    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK = 0.000020f;
-    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_MAX = 0.0020f;
-    private static final int[][] THERMAL_NEIGHBOR_OFFSETS = {
-        { 1, 0, 0 },
-        { -1, 0, 0 },
-        { 0, 1, 0 },
-        { 0, -1, 0 },
-        { 0, 0, 1 },
-        { 0, 0, -1 }
-    };
+    private static final float THERMAL_SOURCE_SOLID_FACE_COUPLING = 0.90f;
+    private static final float THERMAL_SOURCE_SOLAR_DIRECT = 0.00155f;
+    private static final float THERMAL_SOURCE_SOLAR_DIFFUSE = 0.00045f;
+    private static final float THERMAL_SOURCE_SKY_COOLING_DAY = 0.00018f;
+    private static final float THERMAL_SOURCE_SKY_COOLING_NIGHT = 0.00110f;
+    private static final float THERMAL_SOURCE_PRECIP_COOLING = 0.00090f;
+    private static final float THERMAL_SOURCE_OPEN_WATER_BASE_COOLING = 0.00035f;
+    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK = 0.000010f;
+    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_MAX = 0.0012f;
+    private static final float THERMAL_SOURCE_BIOME_COUPLING = 0.00040f;
+    private static final float THERMAL_SOURCE_SNOW_BASE_COOLING = 0.00045f;
+    private static final float THERMAL_SOURCE_VEGETATION_BASE_COOLING = 0.00012f;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
     private static final float WINDOW_EDGE_STABILIZATION_MIN_KEEP = 0.15f;
+    private static final int WINDOW_STICKY_MARGIN_SECTIONS = 2;
+    private static final int WINDOW_STICKY_MARGIN_BLOCKS = WINDOW_STICKY_MARGIN_SECTIONS * CHUNK_SIZE;
 
     private enum BackendMode {
         SOCKET,
@@ -607,7 +607,7 @@ public final class AeroServerRuntime {
                         saveWindowStateToCache(world, slidingSourceKey.origin(), window);
                         reloadWindowFromWorldState(world, key.origin(), window);
                     } else {
-                        clearWindowPressure(window);
+                        clearWindowPressureForExposedFringe(window, sectionShift(slidingSourceKey.origin(), key.origin()));
                         stabilizeWindowEdges(window);
                     }
                     markWindowBackendDirty(window);
@@ -641,9 +641,10 @@ public final class AeroServerRuntime {
             return false;
         }
 
-        int deltaSectionX = Math.floorDiv(newOrigin.getX() - oldOrigin.getX(), CHUNK_SIZE);
-        int deltaSectionY = Math.floorDiv(newOrigin.getY() - oldOrigin.getY(), CHUNK_SIZE);
-        int deltaSectionZ = Math.floorDiv(newOrigin.getZ() - oldOrigin.getZ(), CHUNK_SIZE);
+        SectionShift shift = sectionShift(oldOrigin, newOrigin);
+        int deltaSectionX = shift.dx();
+        int deltaSectionY = shift.dy();
+        int deltaSectionZ = shift.dz();
         if ((newOrigin.getX() - oldOrigin.getX()) % CHUNK_SIZE != 0
             || (newOrigin.getY() - oldOrigin.getY()) % CHUNK_SIZE != 0
             || (newOrigin.getZ() - oldOrigin.getZ()) % CHUNK_SIZE != 0
@@ -767,7 +768,7 @@ public final class AeroServerRuntime {
         Set<WindowKey> expected = new HashSet<>();
         for (ServerWorld world : server.getWorlds()) {
             for (ServerPlayerEntity player : world.getPlayers()) {
-                expected.add(new WindowKey(world.getRegistryKey(), centerWindowOnPlayer(player.getBlockPos())));
+                expected.add(new WindowKey(world.getRegistryKey(), anchoredWindowOrigin(world.getRegistryKey(), player.getBlockPos())));
             }
         }
         return !expected.equals(windows.keySet());
@@ -873,6 +874,43 @@ public final class AeroServerRuntime {
             }
             for (int i = 0; i < SECTION_CELL_COUNT; i++) {
                 section.state[i * RESPONSE_CHANNELS + 3] = 0.0f;
+            }
+        }
+    }
+
+    private void clearWindowPressureForExposedFringe(WindowState window, SectionShift shift) {
+        if (window.sections == null) {
+            return;
+        }
+        int dx = shift.dx();
+        int dy = shift.dy();
+        int dz = shift.dz();
+        if (dx == 0 && dy == 0 && dz == 0) {
+            return;
+        }
+        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+            boolean exposedX = dx > 0
+                ? sx >= WINDOW_SECTION_COUNT - dx
+                : dx < 0 && sx < -dx;
+            for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                boolean exposedY = dy > 0
+                    ? sy >= WINDOW_SECTION_COUNT - dy
+                    : dy < 0 && sy < -dy;
+                for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                    boolean exposedZ = dz > 0
+                        ? sz >= WINDOW_SECTION_COUNT - dz
+                        : dz < 0 && sz < -dz;
+                    if (!exposedX && !exposedY && !exposedZ) {
+                        continue;
+                    }
+                    WindowSection section = window.sectionAt(sx, sy, sz);
+                    if (section == null) {
+                        continue;
+                    }
+                    for (int i = 0; i < SECTION_CELL_COUNT; i++) {
+                        section.state[i * RESPONSE_CHANNELS + 3] = 0.0f;
+                    }
+                }
             }
         }
     }
@@ -1034,7 +1072,7 @@ public final class AeroServerRuntime {
         Map<WindowKey, List<FanSource>> fansByWindow = new HashMap<>();
         for (ServerWorld world : server.getWorlds()) {
             for (ServerPlayerEntity player : world.getPlayers()) {
-                BlockPos origin = centerWindowOnPlayer(player.getBlockPos());
+                BlockPos origin = anchoredWindowOrigin(world.getRegistryKey(), player.getBlockPos());
                 WindowKey key = new WindowKey(world.getRegistryKey(), origin);
                 fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
             }
@@ -1123,6 +1161,54 @@ public final class AeroServerRuntime {
         int y = (Math.floorDiv(pos.getY(), CHUNK_SIZE) - halfSections) * CHUNK_SIZE;
         int z = (Math.floorDiv(pos.getZ(), CHUNK_SIZE) - halfSections) * CHUNK_SIZE;
         return new BlockPos(x, y, z);
+    }
+
+    private BlockPos anchoredWindowOrigin(RegistryKey<World> worldKey, BlockPos playerPos) {
+        BlockPos anchored = findAnchoredWindowOrigin(worldKey, playerPos);
+        return anchored != null ? anchored : centerWindowOnPlayer(playerPos);
+    }
+
+    private BlockPos findAnchoredWindowOrigin(RegistryKey<World> worldKey, BlockPos playerPos) {
+        BlockPos bestOrigin = null;
+        int bestEdgeDistance = -1;
+        for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+            WindowKey key = entry.getKey();
+            if (!key.worldKey().equals(worldKey)) {
+                continue;
+            }
+            int edgeDistance = stickyEdgeDistance(key.origin(), playerPos);
+            if (edgeDistance > bestEdgeDistance) {
+                bestEdgeDistance = edgeDistance;
+                bestOrigin = key.origin();
+            }
+        }
+        return bestOrigin;
+    }
+
+    private int stickyEdgeDistance(BlockPos origin, BlockPos pos) {
+        int min = WINDOW_STICKY_MARGIN_BLOCKS;
+        int maxExclusive = GRID_SIZE - WINDOW_STICKY_MARGIN_BLOCKS;
+
+        int localX = pos.getX() - origin.getX();
+        int localY = pos.getY() - origin.getY();
+        int localZ = pos.getZ() - origin.getZ();
+        if (localX < min || localY < min || localZ < min
+            || localX >= maxExclusive || localY >= maxExclusive || localZ >= maxExclusive) {
+            return -1;
+        }
+
+        int dx = Math.min(localX - min, maxExclusive - 1 - localX);
+        int dy = Math.min(localY - min, maxExclusive - 1 - localY);
+        int dz = Math.min(localZ - min, maxExclusive - 1 - localZ);
+        return Math.min(dx, Math.min(dy, dz));
+    }
+
+    private SectionShift sectionShift(BlockPos oldOrigin, BlockPos newOrigin) {
+        return new SectionShift(
+            Math.floorDiv(newOrigin.getX() - oldOrigin.getX(), CHUNK_SIZE),
+            Math.floorDiv(newOrigin.getY() - oldOrigin.getY(), CHUNK_SIZE),
+            Math.floorDiv(newOrigin.getZ() - oldOrigin.getZ(), CHUNK_SIZE)
+        );
     }
 
     private int voxelIndex(int x, int y, int z) {
@@ -1483,10 +1569,14 @@ public final class AeroServerRuntime {
     }
 
     private float sampleAmbientThermalBias(ServerWorld world) {
-        return 0.0f;
+        ThermalEnvironment environment = sampleThermalEnvironment(
+            world,
+            new BlockPos(0, world.getSeaLevel(), 0)
+        );
+        return MathHelper.clamp(environment.biomeBias() * 0.10f, -0.00008f, 0.00008f);
     }
 
-    private float sampleBlockThermalSource(ServerWorld world, BlockPos pos, BlockState state) {
+    private float sampleEmitterThermalSource(BlockState state) {
         float source = 0.0f;
         if (state.isOf(Blocks.LAVA) || state.isOf(Blocks.LAVA_CAULDRON)) {
             source += THERMAL_SOURCE_LAVA;
@@ -1518,27 +1608,177 @@ public final class AeroServerRuntime {
         if (state.isOf(Blocks.SOUL_LANTERN)) {
             source += THERMAL_SOURCE_SOUL_LANTERN;
         }
-        source += sampleTerrainThermalFlux(world, pos, state);
         return MathHelper.clamp(source, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
     }
 
-    private float sampleTerrainThermalFlux(ServerWorld world, BlockPos pos, BlockState state) {
-        float flux = sampleAltitudeThermalFlux(world, pos);
-        if (state.getFluidState().isIn(FluidTags.WATER)) {
-            flux += THERMAL_SOURCE_WATER_COOLING;
-        } else if (isStoneLikeTerrain(state)) {
-            flux += THERMAL_SOURCE_STONE_HEATING;
-        } else if (isBareTerrain(state)) {
-            flux += THERMAL_SOURCE_BARE_HEATING;
+    private float sampleFluidThermalSource(ServerWorld world, BlockPos pos, BlockState state, ThermalEnvironment environment) {
+        if (!state.getFluidState().isIn(FluidTags.WATER)) {
+            return 0.0f;
+        }
+        float diffuseSky = sampleSkyExposure(world, pos);
+        float directSky = sampleDirectSunExposure(world, pos);
+        float source = environment.biomeBias() * 0.20f;
+        source += sampleAltitudeThermalFlux(world, pos) * 0.25f;
+        source += environment.directRadiation() * 0.10f * directSky;
+        source += environment.diffuseRadiation() * 0.18f * diffuseSky;
+        source -= THERMAL_SOURCE_OPEN_WATER_BASE_COOLING;
+        source -= environment.skyCooling() * 0.70f * diffuseSky;
+        source -= environment.precipitationCooling() * diffuseSky;
+        return MathHelper.clamp(source, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
+    }
+
+    private float sampleAltitudeThermalFlux(World world, BlockPos pos) {
+        float lapse = (world.getSeaLevel() - pos.getY()) * THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK;
+        return MathHelper.clamp(lapse, -THERMAL_SOURCE_ALTITUDE_LAPSE_MAX, THERMAL_SOURCE_ALTITUDE_LAPSE_MAX);
+    }
+
+    private ThermalEnvironment sampleThermalEnvironment(ServerWorld world, BlockPos samplePos) {
+        float dayPhase = (float) Math.floorMod(world.getTimeOfDay(), 24000L) / 24000.0f;
+        float solarAltitude = Math.max(0.0f, (float) Math.sin(dayPhase * (float) (Math.PI * 2.0)));
+        float rain = world.getRainGradient(1.0f);
+        float thunder = world.getThunderGradient(1.0f);
+        float clearSky = MathHelper.clamp(1.0f - 0.65f * rain - 0.25f * thunder, 0.15f, 1.0f);
+        float directRadiation = THERMAL_SOURCE_SOLAR_DIRECT * solarAltitude * clearSky;
+        float diffuseRadiation = THERMAL_SOURCE_SOLAR_DIFFUSE
+            * (0.30f + 0.70f * solarAltitude)
+            * (0.55f + 0.45f * clearSky);
+        float skyCooling = (THERMAL_SOURCE_SKY_COOLING_DAY + THERMAL_SOURCE_SKY_COOLING_NIGHT * (1.0f - solarAltitude))
+            * (0.45f + 0.55f * clearSky);
+        float precipitationCooling = THERMAL_SOURCE_PRECIP_COOLING * Math.max(rain, thunder * 0.60f);
+        float biomeTemperature = world.getBiome(samplePos).value().getTemperature();
+        float biomeBias = MathHelper.clamp(
+            (biomeTemperature - 0.8f) * THERMAL_SOURCE_BIOME_COUPLING,
+            -0.00045f,
+            0.00045f
+        );
+        float azimuth = dayPhase * (float) (Math.PI * 2.0) - (float) (Math.PI * 0.5);
+        float horizontal = (float) Math.sqrt(Math.max(0.0, 1.0 - solarAltitude * solarAltitude));
+        return new ThermalEnvironment(
+            biomeBias,
+            directRadiation,
+            diffuseRadiation,
+            skyCooling,
+            precipitationCooling,
+            (float) Math.cos(azimuth) * horizontal,
+            solarAltitude,
+            (float) Math.sin(azimuth) * horizontal
+        );
+    }
+
+    private float sampleSkyExposure(ServerWorld world, BlockPos pos) {
+        return world.getLightLevel(LightType.SKY, pos) / 15.0f;
+    }
+
+    private float sampleDirectSunExposure(ServerWorld world, BlockPos pos) {
+        return world.isSkyVisibleAllowingSea(pos) ? 1.0f : 0.0f;
+    }
+
+    private float samplePassiveSurfaceFlux(
+        ServerWorld world,
+        BlockPos airPos,
+        Direction face,
+        ThermalMaterial material,
+        ThermalEnvironment environment,
+        float altitudeFlux
+    ) {
+        if (material == null) {
+            return 0.0f;
+        }
+        float diffuseSky = sampleSkyExposure(world, airPos);
+        float exposure = 0.20f + 0.80f * diffuseSky;
+        float directSky = sampleDirectSunExposure(world, airPos);
+        float sunDot = Math.max(
+            0.0f,
+            face.getOffsetX() * environment.sunX()
+                + face.getOffsetY() * environment.sunY()
+                + face.getOffsetZ() * environment.sunZ()
+        );
+        float diffuseWeight = switch (face) {
+            case UP -> 1.0f;
+            case DOWN -> 0.05f;
+            default -> 0.42f;
+        };
+        float coolingWeight = switch (face) {
+            case UP -> 1.0f;
+            case DOWN -> 0.08f;
+            default -> 0.55f;
+        };
+        float rainWeight = switch (face) {
+            case UP -> 1.0f;
+            case DOWN -> 0.0f;
+            default -> 0.35f;
+        };
+        float baseWeight = switch (face) {
+            case UP -> 1.0f;
+            case DOWN -> 0.15f;
+            default -> 0.45f;
+        };
+        float direct = environment.directRadiation() * material.directAbsorption() * directSky * sunDot;
+        float diffuse = environment.diffuseRadiation() * material.diffuseAbsorption() * diffuseSky * diffuseWeight;
+        float skyCooling = environment.skyCooling() * material.skyCooling() * diffuseSky * coolingWeight;
+        float rainCooling = environment.precipitationCooling() * material.rainCooling() * diffuseSky * rainWeight;
+        float biome = environment.biomeBias() * material.biomeCoupling() * exposure * coolingWeight;
+        float altitude = altitudeFlux * material.altitudeCoupling() * exposure * coolingWeight;
+        float base = material.baseFlux() * exposure * baseWeight;
+        float flux = base + direct + diffuse + biome + altitude - skyCooling - rainCooling;
+        if (face.getAxis().isHorizontal()) {
+            flux *= material.wallMultiplier();
         }
         return MathHelper.clamp(flux, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
     }
 
-    private float sampleAltitudeThermalFlux(World world, BlockPos pos) {
-        // float belowSeaLevel = Math.max(0.0f, world.getSeaLevel() - pos.getY());
-        // float lapse = belowSeaLevel * THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK;
-        // return MathHelper.clamp(lapse, 0.0f, THERMAL_SOURCE_ALTITUDE_LAPSE_MAX);
-        return 0.0f;
+    private void emitSolidBlockThermalSource(
+        float[] thermal,
+        ServerWorld world,
+        BlockPos pos,
+        BlockState state,
+        int x,
+        int y,
+        int z,
+        ThermalEnvironment environment,
+        BlockPos.Mutable neighborCursor
+    ) {
+        ThermalMaterial material = thermalMaterial(state);
+        float emitterSource = sampleEmitterThermalSource(state);
+        float altitudeFlux = sampleAltitudeThermalFlux(world, pos);
+        int openFaces = 0;
+        for (Direction direction : Direction.values()) {
+            neighborCursor.set(
+                pos.getX() + direction.getOffsetX(),
+                pos.getY() + direction.getOffsetY(),
+                pos.getZ() + direction.getOffsetZ()
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            if (!isSolidObstacle(world, neighborCursor, neighborState)) {
+                openFaces++;
+            }
+        }
+        if (openFaces <= 0) {
+            return;
+        }
+        float emitterPerFace = emitterSource == 0.0f
+            ? 0.0f
+            : (emitterSource * THERMAL_SOURCE_SOLID_FACE_COUPLING) / openFaces;
+        for (Direction direction : Direction.values()) {
+            neighborCursor.set(
+                pos.getX() + direction.getOffsetX(),
+                pos.getY() + direction.getOffsetY(),
+                pos.getZ() + direction.getOffsetZ()
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            if (isSolidObstacle(world, neighborCursor, neighborState)) {
+                continue;
+            }
+            float faceFlux = emitterPerFace
+                + samplePassiveSurfaceFlux(world, neighborCursor, direction, material, environment, altitudeFlux);
+            addSectionThermalSource(
+                thermal,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                faceFlux
+            );
+        }
     }
 
     private boolean isStoneLikeTerrain(BlockState state) {
@@ -1555,18 +1795,45 @@ public final class AeroServerRuntime {
             || state.isOf(Blocks.BASALT);
     }
 
-    private boolean isBareTerrain(BlockState state) {
+    private boolean isSoilSurface(BlockState state) {
         return state.isOf(Blocks.DIRT)
             || state.isOf(Blocks.COARSE_DIRT)
             || state.isOf(Blocks.ROOTED_DIRT)
-            || state.isOf(Blocks.GRASS_BLOCK)
             || state.isOf(Blocks.PODZOL)
-            || state.isOf(Blocks.MYCELIUM)
             || state.isOf(Blocks.SAND)
             || state.isOf(Blocks.RED_SAND)
             || state.isOf(Blocks.GRAVEL)
             || state.isOf(Blocks.CLAY)
             || state.isOf(Blocks.MUD);
+    }
+
+    private boolean isVegetatedSurface(BlockState state) {
+        return state.isOf(Blocks.GRASS_BLOCK)
+            || state.isOf(Blocks.MYCELIUM)
+            || state.isOf(Blocks.MOSS_BLOCK);
+    }
+
+    private boolean isSnowOrIceSurface(BlockState state) {
+        return state.isOf(Blocks.SNOW_BLOCK)
+            || state.isOf(Blocks.ICE)
+            || state.isOf(Blocks.PACKED_ICE)
+            || state.isOf(Blocks.BLUE_ICE);
+    }
+
+    private ThermalMaterial thermalMaterial(BlockState state) {
+        if (isSnowOrIceSurface(state)) {
+            return ThermalMaterial.SNOW_ICE;
+        }
+        if (isVegetatedSurface(state)) {
+            return ThermalMaterial.VEGETATION;
+        }
+        if (isSoilSurface(state)) {
+            return ThermalMaterial.SOIL;
+        }
+        if (isStoneLikeTerrain(state)) {
+            return ThermalMaterial.ROCK;
+        }
+        return null;
     }
 
     private void addSectionThermalSource(float[] thermal, int x, int y, int z, float source) {
@@ -1576,38 +1843,6 @@ public final class AeroServerRuntime {
         int cell = localSectionCellIndex(x, y, z);
         float updated = thermal[cell] + source;
         thermal[cell] = MathHelper.clamp(updated, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
-    }
-
-    private void emitSolidHeatToSection(float[] thermal, float[] obstacle, int x, int y, int z, float source) {
-        int selected = 0;
-        int[] selectedX = new int[THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT];
-        int[] selectedY = new int[THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT];
-        int[] selectedZ = new int[THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT];
-        int start = Math.floorMod((x * 73428767) ^ (y * 912931) ^ (z * 438289), THERMAL_NEIGHBOR_OFFSETS.length);
-        for (int i = 0; i < THERMAL_NEIGHBOR_OFFSETS.length && selected < THERMAL_SOURCE_SOLID_NEIGHBOR_COUNT; i++) {
-            int offsetIdx = (start + i) % THERMAL_NEIGHBOR_OFFSETS.length;
-            int nx = x + THERMAL_NEIGHBOR_OFFSETS[offsetIdx][0];
-            int ny = y + THERMAL_NEIGHBOR_OFFSETS[offsetIdx][1];
-            int nz = z + THERMAL_NEIGHBOR_OFFSETS[offsetIdx][2];
-            if (!inSectionBounds(nx, ny, nz)) {
-                continue;
-            }
-            int cell = localSectionCellIndex(nx, ny, nz);
-            if (obstacle[cell] > 0.5f) {
-                continue;
-            }
-            selectedX[selected] = nx;
-            selectedY[selected] = ny;
-            selectedZ[selected] = nz;
-            selected++;
-        }
-        if (selected <= 0) {
-            return;
-        }
-        float distributed = source * THERMAL_SOURCE_SOLID_EMISSION_SCALE / selected;
-        for (int i = 0; i < selected; i++) {
-            addSectionThermalSource(thermal, selectedX[i], selectedY[i], selectedZ[i], distributed);
-        }
     }
 
     private WindowSection sampleWindowSection(ServerWorld world, BlockPos origin) {
@@ -1626,21 +1861,23 @@ public final class AeroServerRuntime {
             }
         }
 
+        ThermalEnvironment environment = sampleThermalEnvironment(
+            world,
+            new BlockPos(origin.getX() + CHUNK_SIZE / 2, origin.getY() + CHUNK_SIZE / 2, origin.getZ() + CHUNK_SIZE / 2)
+        );
+        BlockPos.Mutable neighborCursor = new BlockPos.Mutable();
         for (int x = -1; x <= CHUNK_SIZE; x++) {
             for (int y = -1; y <= CHUNK_SIZE; y++) {
                 for (int z = -1; z <= CHUNK_SIZE; z++) {
                     cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
                     BlockState state = world.getBlockState(cursor);
-                    float source = sampleBlockThermalSource(world, cursor, state);
-                    if (source == 0.0f) {
-                        continue;
-                    }
                     boolean solid = isSolidObstacle(world, cursor, state);
-                    if (!solid) {
+                    if (solid) {
+                        emitSolidBlockThermalSource(section.thermal, world, cursor, state, x, y, z, environment, neighborCursor);
+                    } else {
+                        float source = sampleEmitterThermalSource(state) + sampleFluidThermalSource(world, cursor, state, environment);
                         addSectionThermalSource(section.thermal, x, y, z, source);
-                        continue;
                     }
-                    emitSolidHeatToSection(section.thermal, section.obstacle, x, y, z, source);
                 }
             }
         }
@@ -2101,6 +2338,37 @@ public final class AeroServerRuntime {
     }
 
     private record WindowKey(RegistryKey<World> worldKey, BlockPos origin) {
+    }
+
+    private record SectionShift(int dx, int dy, int dz) {
+    }
+
+    private record ThermalEnvironment(
+        float biomeBias,
+        float directRadiation,
+        float diffuseRadiation,
+        float skyCooling,
+        float precipitationCooling,
+        float sunX,
+        float sunY,
+        float sunZ
+    ) {
+    }
+
+    private record ThermalMaterial(
+        float directAbsorption,
+        float diffuseAbsorption,
+        float skyCooling,
+        float rainCooling,
+        float biomeCoupling,
+        float altitudeCoupling,
+        float wallMultiplier,
+        float baseFlux
+    ) {
+        private static final ThermalMaterial ROCK = new ThermalMaterial(0.78f, 0.52f, 0.70f, 0.18f, 0.30f, 0.28f, 0.72f, 0.0f);
+        private static final ThermalMaterial SOIL = new ThermalMaterial(1.00f, 0.68f, 0.55f, 0.25f, 0.40f, 0.42f, 0.60f, 0.0f);
+        private static final ThermalMaterial VEGETATION = new ThermalMaterial(0.62f, 0.55f, 0.72f, 0.85f, 0.25f, 0.25f, 0.58f, -THERMAL_SOURCE_VEGETATION_BASE_COOLING);
+        private static final ThermalMaterial SNOW_ICE = new ThermalMaterial(0.18f, 0.24f, 0.88f, 0.10f, 0.15f, 0.22f, 0.62f, -THERMAL_SOURCE_SNOW_BASE_COOLING);
     }
 
     private record FanSource(BlockPos pos, Direction facing, int ductLength) {
