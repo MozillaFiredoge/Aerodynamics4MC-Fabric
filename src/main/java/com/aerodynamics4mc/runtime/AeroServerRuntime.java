@@ -113,6 +113,8 @@ public final class AeroServerRuntime {
 
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
     private static final float NATIVE_THERMAL_SOURCE_MAX = 0.006f;
+    private static final float STATE_PRESSURE_MIN = -0.03f;
+    private static final float STATE_PRESSURE_MAX = 0.03f;
     private static final float THERMAL_SOURCE_LAVA = NATIVE_THERMAL_SOURCE_MAX;
     private static final float THERMAL_SOURCE_MAGMA = 0.0046f;
     private static final float THERMAL_SOURCE_CAMPFIRE = 0.0044f;
@@ -1518,10 +1520,16 @@ public final class AeroServerRuntime {
                                     solveField[idx + CH_STATE_VZ] = 0.0f;
                                     solveField[idx + CH_STATE_P] = 0.0f;
                                 } else {
-                                    solveField[idx + CH_STATE_VX] = section.state[stateIdx];
-                                    solveField[idx + CH_STATE_VY] = section.state[stateIdx + 1];
-                                    solveField[idx + CH_STATE_VZ] = section.state[stateIdx + 2];
-                                    solveField[idx + CH_STATE_P] = section.state[stateIdx + 3];
+                                    float vx = section.state[stateIdx];
+                                    float vy = section.state[stateIdx + 1];
+                                    float vz = section.state[stateIdx + 2];
+                                    float p = section.state[stateIdx + 3];
+                                    solveField[idx + CH_STATE_VX] = Float.isFinite(vx) ? vx : 0.0f;
+                                    solveField[idx + CH_STATE_VY] = Float.isFinite(vy) ? vy : 0.0f;
+                                    solveField[idx + CH_STATE_VZ] = Float.isFinite(vz) ? vz : 0.0f;
+                                    solveField[idx + CH_STATE_P] = Float.isFinite(p)
+                                        ? MathHelper.clamp(p, STATE_PRESSURE_MIN, STATE_PRESSURE_MAX)
+                                        : 0.0f;
                                 }
                             }
                         }
@@ -1928,40 +1936,75 @@ public final class AeroServerRuntime {
         return receiveFlowField(snapshot.window());
     }
 
-    private float sanitizeSolveResponse(float[] response, float speedCap) {
+    private SolveSanitizeResult sanitizeSolveResponse(float[] response, float speedCap) {
         if (response == null) {
-            return 0.0f;
+            return new SolveSanitizeResult(0.0f, 0);
         }
 
         int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
         float capped = Math.max(0.0f, speedCap);
         float maxSpeedThisStep = 0.0f;
+        int invalidComponents = 0;
         for (int i = 0; i < cellCount; i++) {
             int respIdx = i * RESPONSE_CHANNELS;
             float vx = response[respIdx];
             float vy = response[respIdx + 1];
             float vz = response[respIdx + 2];
+            float p = response[respIdx + 3];
+
+            if (!Float.isFinite(vx)) {
+                vx = 0.0f;
+                invalidComponents++;
+            }
+            if (!Float.isFinite(vy)) {
+                vy = 0.0f;
+                invalidComponents++;
+            }
+            if (!Float.isFinite(vz)) {
+                vz = 0.0f;
+                invalidComponents++;
+            }
+            if (!Float.isFinite(p)) {
+                p = 0.0f;
+                invalidComponents++;
+            }
+            p = MathHelper.clamp(p, STATE_PRESSURE_MIN, STATE_PRESSURE_MAX);
 
             if (capped > 0.0f) {
                 float speedSq = vx * vx + vy * vy + vz * vz;
+                if (!Float.isFinite(speedSq)) {
+                    vx = 0.0f;
+                    vy = 0.0f;
+                    vz = 0.0f;
+                    invalidComponents += 3;
+                    speedSq = 0.0f;
+                }
                 float capSq = capped * capped;
                 if (speedSq > capSq) {
                     float scale = capped / (float) Math.sqrt(speedSq);
-                    vx *= scale;
-                    vy *= scale;
-                    vz *= scale;
+                    if (!Float.isFinite(scale)) {
+                        vx = 0.0f;
+                        vy = 0.0f;
+                        vz = 0.0f;
+                        invalidComponents += 3;
+                    } else {
+                        vx *= scale;
+                        vy *= scale;
+                        vz *= scale;
+                    }
                 }
             }
 
             response[respIdx] = vx;
             response[respIdx + 1] = vy;
             response[respIdx + 2] = vz;
+            response[respIdx + 3] = p;
             float speed = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
-            if (speed > maxSpeedThisStep) {
+            if (Float.isFinite(speed) && speed > maxSpeedThisStep) {
                 maxSpeedThisStep = speed;
             }
         }
-        return maxSpeedThisStep;
+        return new SolveSanitizeResult(maxSpeedThisStep, invalidComponents);
     }
 
     private void applyStateFieldFromResponse(WindowState window, float[] response) {
@@ -2277,10 +2320,24 @@ public final class AeroServerRuntime {
             }
             PreparedPayload payload = captureWindow(snapshot);
             float[] response = runSolverStep(snapshot, payload);
-            float maxSpeed = sanitizeSolveResponse(response, snapshot.speedCap());
-            if (snapshot.generation() == runtimeGeneration.get()) {
-                window.publishCompletedSolveResult(new SolveResult(response, maxSpeed, snapshot.origin()));
+            SolveSanitizeResult sanitize = sanitizeSolveResponse(response, snapshot.speedCap());
+            if (sanitize.invalidComponents() > 0) {
+                boolean resetWasPending = window.backendResetPending();
+                window.markBackendResetPending();
+                String message = "Detected non-finite solver response at "
+                    + formatPos(snapshot.origin())
+                    + " (" + sanitize.invalidComponents() + " components sanitized)";
+                if (!resetWasPending) {
+                    log(message + "; backend reset scheduled");
+                }
+                if (snapshot.generation() == runtimeGeneration.get()) {
+                    lastSolverError = message;
+                }
+            } else if (snapshot.generation() == runtimeGeneration.get()) {
                 lastSolverError = "";
+            }
+            if (snapshot.generation() == runtimeGeneration.get()) {
+                window.publishCompletedSolveResult(new SolveResult(response, sanitize.maxSpeed(), snapshot.origin()));
             }
         } catch (IOException ex) {
             if (snapshot.generation() == runtimeGeneration.get()) {
@@ -2389,6 +2446,9 @@ public final class AeroServerRuntime {
     }
 
     private record PreparedPayload(byte[] socketPayload, ByteBuffer nativePayload) {
+    }
+
+    private record SolveSanitizeResult(float maxSpeed, int invalidComponents) {
     }
 
     private static final class WindowState {

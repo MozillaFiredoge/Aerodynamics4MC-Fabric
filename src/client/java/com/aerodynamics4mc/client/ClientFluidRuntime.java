@@ -38,6 +38,7 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.chunk.WorldChunk;
 
@@ -78,6 +79,8 @@ final class ClientFluidRuntime {
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
     private static final float NATIVE_THERMAL_SOURCE_MAX = 0.006f;
+    private static final float STATE_PRESSURE_MIN = -0.03f;
+    private static final float STATE_PRESSURE_MAX = 0.03f;
     private static final float THERMAL_SOURCE_LAVA = NATIVE_THERMAL_SOURCE_MAX;
     private static final float THERMAL_SOURCE_MAGMA = 0.0046f;
     private static final float THERMAL_SOURCE_CAMPFIRE = 0.0044f;
@@ -217,10 +220,21 @@ final class ClientFluidRuntime {
             }
             byte[] payload = captureWindow(window, origin, backend);
             float[] response = runSolverStep(window, payload, backend);
-            updateBaseFieldFromResponse(window, response, maxSpeedSnapshot);
+            int invalidComponents = updateBaseFieldFromResponse(window, response, maxSpeedSnapshot);
+            if (invalidComponents > 0) {
+                invalidateBackendState(window, backend);
+                String message = "Detected non-finite solver response for window "
+                    + formatPos(origin)
+                    + " (" + invalidComponents + " components sanitized)";
+                log(message + "; backend state reset");
+                if (generationSnapshot == runtimeGeneration.get()) {
+                    lastSolverError = message;
+                }
+            } else if (generationSnapshot == runtimeGeneration.get()) {
+                lastSolverError = "";
+            }
             if (generationSnapshot == runtimeGeneration.get()) {
                 window.publishCompletedFlow(response);
-                lastSolverError = "";
             }
         } catch (IOException ex) {
             if (generationSnapshot == runtimeGeneration.get()) {
@@ -741,15 +755,36 @@ final class ClientFluidRuntime {
         int cellCount = gridSize * gridSize * gridSize;
         for (int i = 0; i < cellCount; i++) {
             int idx = i * CHANNELS;
+            float stateVx = window.baseField[idx + CH_STATE_VX];
+            float stateVy = window.baseField[idx + CH_STATE_VY];
+            float stateVz = window.baseField[idx + CH_STATE_VZ];
+            float stateP = window.baseField[idx + CH_STATE_P];
+            if (!Float.isFinite(stateVx)) {
+                stateVx = 0.0f;
+            }
+            if (!Float.isFinite(stateVy)) {
+                stateVy = 0.0f;
+            }
+            if (!Float.isFinite(stateVz)) {
+                stateVz = 0.0f;
+            }
+            if (!Float.isFinite(stateP)) {
+                stateP = 0.0f;
+            }
+            stateP = MathHelper.clamp(stateP, STATE_PRESSURE_MIN, STATE_PRESSURE_MAX);
+            window.baseField[idx + CH_STATE_VX] = stateVx;
+            window.baseField[idx + CH_STATE_VY] = stateVy;
+            window.baseField[idx + CH_STATE_VZ] = stateVz;
+            window.baseField[idx + CH_STATE_P] = stateP;
             buffer.putFloat(window.baseField[idx + CH_OBSTACLE]);
             buffer.putFloat(window.baseField[idx + CH_FAN_MASK]);
             buffer.putFloat(window.baseField[idx + CH_FAN_VX]);
             buffer.putFloat(window.baseField[idx + CH_FAN_VY]);
             buffer.putFloat(window.baseField[idx + CH_FAN_VZ]);
-            buffer.putFloat(window.baseField[idx + CH_STATE_VX] * nativeInputScale);
-            buffer.putFloat(window.baseField[idx + CH_STATE_VY] * nativeInputScale);
-            buffer.putFloat(window.baseField[idx + CH_STATE_VZ] * nativeInputScale);
-            buffer.putFloat(window.baseField[idx + CH_STATE_P]);
+            buffer.putFloat(stateVx * nativeInputScale);
+            buffer.putFloat(stateVy * nativeInputScale);
+            buffer.putFloat(stateVz * nativeInputScale);
+            buffer.putFloat(stateP);
             buffer.putFloat(window.baseField[idx + CH_THERMAL_SOURCE]);
         }
 
@@ -1060,40 +1095,76 @@ final class ClientFluidRuntime {
         return solverOutput;
     }
 
-    private void updateBaseFieldFromResponse(WindowState window, float[] response, float speedCap) {
+    private int updateBaseFieldFromResponse(WindowState window, float[] response, float speedCap) {
         if (window.baseField == null) {
-            return;
+            return 0;
         }
 
         int cellCount = gridSize * gridSize * gridSize;
         float capped = Math.max(0.0f, speedCap);
+        int invalidComponents = 0;
         for (int i = 0; i < cellCount; i++) {
             int baseIdx = i * CHANNELS;
             int respIdx = i * RESPONSE_CHANNELS;
             float vx = response[respIdx];
             float vy = response[respIdx + 1];
             float vz = response[respIdx + 2];
+            float p = response[respIdx + 3];
+
+            if (!Float.isFinite(vx)) {
+                vx = 0.0f;
+                invalidComponents++;
+            }
+            if (!Float.isFinite(vy)) {
+                vy = 0.0f;
+                invalidComponents++;
+            }
+            if (!Float.isFinite(vz)) {
+                vz = 0.0f;
+                invalidComponents++;
+            }
+            if (!Float.isFinite(p)) {
+                p = 0.0f;
+                invalidComponents++;
+            }
+            p = MathHelper.clamp(p, STATE_PRESSURE_MIN, STATE_PRESSURE_MAX);
 
             if (capped > 0.0f) {
                 float speedSq = vx * vx + vy * vy + vz * vz;
+                if (!Float.isFinite(speedSq)) {
+                    vx = 0.0f;
+                    vy = 0.0f;
+                    vz = 0.0f;
+                    invalidComponents += 3;
+                    speedSq = 0.0f;
+                }
                 float capSq = capped * capped;
                 if (speedSq > capSq) {
                     float scale = capped / (float) Math.sqrt(speedSq);
-                    vx *= scale;
-                    vy *= scale;
-                    vz *= scale;
+                    if (!Float.isFinite(scale)) {
+                        vx = 0.0f;
+                        vy = 0.0f;
+                        vz = 0.0f;
+                        invalidComponents += 3;
+                    } else {
+                        vx *= scale;
+                        vy *= scale;
+                        vz *= scale;
+                    }
                 }
             }
 
             response[respIdx] = vx;
             response[respIdx + 1] = vy;
             response[respIdx + 2] = vz;
+            response[respIdx + 3] = p;
 
             window.baseField[baseIdx + CH_STATE_VX] = vx;
             window.baseField[baseIdx + CH_STATE_VY] = vy;
             window.baseField[baseIdx + CH_STATE_VZ] = vz;
-            window.baseField[baseIdx + CH_STATE_P] = response[respIdx + 3];
+            window.baseField[baseIdx + CH_STATE_P] = p;
         }
+        return invalidComponents;
     }
 
     private void scaleResponseVelocity(float[] response, float velocityScale) {
@@ -1172,6 +1243,13 @@ final class ClientFluidRuntime {
         window.inputStream = null;
         window.outputStream = null;
         window.socket = null;
+    }
+
+    private void invalidateBackendState(WindowState window, SolverBackend backend) {
+        closeSocket(window);
+        if (backend == SolverBackend.NATIVE) {
+            nativeBackend.releaseContext(window.nativeContextId);
+        }
     }
 
     private void releaseWindow(WindowState window) {

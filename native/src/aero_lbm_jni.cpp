@@ -291,6 +291,14 @@ inline float clampf(float v, float lo, float hi) {
     return std::min(hi, std::max(lo, v));
 }
 
+inline bool finitef(float v) {
+    return std::isfinite(v);
+}
+
+inline float finite_or(float v, float fallback) {
+    return finitef(v) ? v : fallback;
+}
+
 inline float feq(int q, float rho, float ux, float uy, float uz) {
     const float cu = 3.0f * (kCx[q] * ux + kCy[q] * uy + kCz[q] * uz);
     const float uu = ux * ux + uy * uy + uz * uz;
@@ -550,18 +558,46 @@ void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
         const std::size_t base = cell * in_channels;
         ctx.obstacle[cell] = payload[base + kChannelObstacle] > 0.5f ? 1 : 0;
         ctx.fan_mask[cell] = clampf(payload[base + kChannelFanMask], 0.0f, 1.0f);
-        ctx.fan_ux[cell] = payload[base + kChannelFanVx];
-        ctx.fan_uy[cell] = payload[base + kChannelFanVy];
-        ctx.fan_uz[cell] = payload[base + kChannelFanVz];
-        ctx.ref_ux[cell] = payload[base + kChannelStateVx];
-        ctx.ref_uy[cell] = payload[base + kChannelStateVy];
-        ctx.ref_uz[cell] = payload[base + kChannelStateVz];
+        ctx.fan_ux[cell] = finite_or(payload[base + kChannelFanVx], 0.0f);
+        ctx.fan_uy[cell] = finite_or(payload[base + kChannelFanVy], 0.0f);
+        ctx.fan_uz[cell] = finite_or(payload[base + kChannelFanVz], 0.0f);
+        ctx.ref_ux[cell] = finite_or(payload[base + kChannelStateVx], 0.0f);
+        ctx.ref_uy[cell] = finite_or(payload[base + kChannelStateVy], 0.0f);
+        ctx.ref_uz[cell] = finite_or(payload[base + kChannelStateVz], 0.0f);
         ctx.ref_pressure[cell] = clampf(payload[base + kChannelStateP], kPressureMin, kPressureMax);
         float thermal_src = 0.0f;
         if (in_channels > kChannelThermalSource) {
             thermal_src = payload[base + kChannelThermalSource];
         }
         ctx.thermal_source[cell] = clampf(thermal_src, -kThermalSourceMax, kThermalSourceMax);
+    }
+}
+
+void reseed_cell_from_reference(ContextState& ctx, std::size_t cell) {
+    const float pressure = clampf(finite_or(ctx.ref_pressure[cell], 0.0f), kPressureMin, kPressureMax);
+    const float rho = clampf(1.0f + pressure, kRhoMin, kRhoMax);
+    float ux = finite_or(ctx.ref_ux[cell], 0.0f);
+    float uy = finite_or(ctx.ref_uy[cell], 0.0f);
+    float uz = finite_or(ctx.ref_uz[cell], 0.0f);
+    float speed2 = ux * ux + uy * uy + uz * uz;
+    if (!finitef(speed2) || speed2 > kMaxSpeed * kMaxSpeed) {
+        if (!finitef(speed2) || speed2 <= 0.0f) {
+            ux = 0.0f;
+            uy = 0.0f;
+            uz = 0.0f;
+        } else {
+            const float scale = kMaxSpeed / std::sqrt(speed2);
+            ux *= scale;
+            uy *= scale;
+            uz *= scale;
+        }
+    }
+    ctx.rho[cell] = rho;
+    ctx.ux[cell] = ux;
+    ctx.uy[cell] = uy;
+    ctx.uz[cell] = uz;
+    for (int q = 0; q < kQ; ++q) {
+        ctx.f_post[dist_index(cell, q, ctx.cells)] = feq(q, rho, ux, uy, uz);
     }
 }
 
@@ -709,13 +745,22 @@ void collide(ContextState& ctx) {
         float mom_x = 0.0f;
         float mom_y = 0.0f;
         float mom_z = 0.0f;
+        bool non_finite_distribution = false;
         for (int q = 0; q < kQ; ++q) {
             const float fq = ctx.f[dist_index(cell, q, ctx.cells)];
+            if (!finitef(fq)) {
+                non_finite_distribution = true;
+                break;
+            }
             f_local[q] = fq;
             rho += fq;
             mom_x += fq * static_cast<float>(kCx[q]);
             mom_y += fq * static_cast<float>(kCy[q]);
             mom_z += fq * static_cast<float>(kCz[q]);
+        }
+        if (non_finite_distribution || !finitef(rho) || !finitef(mom_x) || !finitef(mom_y) || !finitef(mom_z)) {
+            reseed_cell_from_reference(ctx, cell);
+            continue;
         }
 
         const float rho_safe = std::max(1e-6f, rho);
@@ -723,6 +768,10 @@ void collide(ContextState& ctx) {
         float ux = mom_x * inv_rho;
         float uy = mom_y * inv_rho;
         float uz = mom_z * inv_rho;
+        if (!finitef(rho_safe) || !finitef(inv_rho) || !finitef(ux) || !finitef(uy) || !finitef(uz)) {
+            reseed_cell_from_reference(ctx, cell);
+            continue;
+        }
         const float speed_pre = std::sqrt(ux * ux + uy * uy + uz * uz);
 
         float fx = 0.0f;
@@ -779,8 +828,16 @@ void collide(ContextState& ctx) {
         ux = (1.0f - kStateNudge) * ux + kStateNudge * ctx.ref_ux[cell];
         uy = (1.0f - kStateNudge) * uy + kStateNudge * ctx.ref_uy[cell];
         uz = (1.0f - kStateNudge) * uz + kStateNudge * ctx.ref_uz[cell];
+        if (!finitef(ux) || !finitef(uy) || !finitef(uz)) {
+            reseed_cell_from_reference(ctx, cell);
+            continue;
+        }
 
         float speed2 = ux * ux + uy * uy + uz * uz;
+        if (!finitef(speed2)) {
+            reseed_cell_from_reference(ctx, cell);
+            continue;
+        }
         if (speed2 > kMaxSpeed * kMaxSpeed) {
             float scale = kMaxSpeed / std::sqrt(speed2);
             ux *= scale; uy *= scale; uz *= scale;
@@ -927,18 +984,40 @@ void write_output(const ContextState& ctx, float* out, int out_channels) {
         float rho = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
         for (int q = 0; q < kQ; ++q) {
             const float fq = ctx.f[dist_index(cell, q, ctx.cells)];
+            if (!finitef(fq)) {
+                rho = 1.0f;
+                ux = uy = uz = 0.0f;
+                for (int c = 0; c < out_channels; ++c) out[out_base + c] = 0.0f;
+                goto next_cell;
+            }
             rho += fq;
             ux += fq * kCx[q]; uy += fq * kCy[q]; uz += fq * kCz[q];
         }
+        if (!finitef(rho) || !finitef(ux) || !finitef(uy) || !finitef(uz)) {
+            for (int c = 0; c < out_channels; ++c) out[out_base + c] = 0.0f;
+            goto next_cell;
+        }
         rho = clampf(rho, kRhoMin, kRhoMax);
+        if (!finitef(rho) || rho <= 1e-6f) {
+            for (int c = 0; c < out_channels; ++c) out[out_base + c] = 0.0f;
+            goto next_cell;
+        }
         ux /= rho; uy /= rho; uz /= rho;
+        if (!finitef(ux) || !finitef(uy) || !finitef(uz)) {
+            ux = uy = uz = 0.0f;
+        }
         if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
         if (std::fabs(ux) < 1e-7f) ux = 0.0f;
         if (std::fabs(uy) < 1e-7f) uy = 0.0f;
         if (std::fabs(uz) < 1e-7f) uz = 0.0f;
 
-        out[out_base + 0] = ux; out[out_base + 1] = uy; out[out_base + 2] = uz; out[out_base + 3] = rho - 1.0f;
+        out[out_base + 0] = ux;
+        out[out_base + 1] = uy;
+        out[out_base + 2] = uz;
+        out[out_base + 3] = clampf(rho - 1.0f, kPressureMin, kPressureMax);
         for (int c = 4; c < out_channels; ++c) out[out_base + c] = 0.0f;
+next_cell:
+        (void)0;
     }
 }
 
