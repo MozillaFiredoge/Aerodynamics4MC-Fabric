@@ -68,6 +68,7 @@ add_library(aero_lbm SHARED
 )
 
 target_include_directories(aero_lbm PRIVATE ${JNI_INCLUDE_DIRS})
+target_include_directories(aero_lbm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if (AERO_LBM_ENABLE_OPENCL)
     find_package(OpenCL REQUIRED)

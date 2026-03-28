@@ -1,5 +1,7 @@
 #include <jni.h>
 
+#include "aero_lbm_capi.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -175,6 +177,278 @@ constexpr int kThermalUpdateStride = 2;
 constexpr float kBoussinesqBeta = 0.12f;
 constexpr float kBoussinesqForceMax = 0.02f;
 
+inline float clampf(float v, float lo, float hi);
+inline float finite_or(float v, float fallback);
+
+constexpr std::uint32_t kBenchmarkKnownFlags =
+    AERO_LBM_BENCHMARK_FLAG_DISABLE_FAN_FORCING
+    | AERO_LBM_BENCHMARK_FLAG_DISABLE_FAN_NOISE
+    | AERO_LBM_BENCHMARK_FLAG_DISABLE_SPONGE
+    | AERO_LBM_BENCHMARK_FLAG_DISABLE_CONVECTIVE_OUTFLOW
+    | AERO_LBM_BENCHMARK_FLAG_DISABLE_OBSTACLE_BOUNCE_BLEND
+    | AERO_LBM_BENCHMARK_FLAG_DISABLE_SGS
+    | AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE
+    | AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY;
+
+inline AeroLbmBoundaryFaceConfig make_face_config(int hydro_kind, int thermal_kind) {
+    AeroLbmBoundaryFaceConfig face{};
+    face.hydrodynamic_kind = hydro_kind;
+    face.thermal_kind = thermal_kind;
+    return face;
+}
+
+bool valid_benchmark_preset(int preset) {
+    switch (preset) {
+        case AERO_LBM_BENCHMARK_PRESET_NONE:
+        case AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D:
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D:
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D:
+        case AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D:
+        case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_2D:
+        case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool valid_hydrodynamic_boundary_kind(int kind) {
+    switch (kind) {
+        case AERO_LBM_HYDRO_BOUNDARY_INHERIT_GAME:
+        case AERO_LBM_HYDRO_BOUNDARY_PERIODIC:
+        case AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK:
+        case AERO_LBM_HYDRO_BOUNDARY_MOVING_WALL:
+        case AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET:
+        case AERO_LBM_HYDRO_BOUNDARY_PRESSURE_DIRICHLET:
+        case AERO_LBM_HYDRO_BOUNDARY_CONVECTIVE_OUTFLOW:
+        case AERO_LBM_HYDRO_BOUNDARY_SYMMETRY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool valid_thermal_boundary_kind(int kind) {
+    switch (kind) {
+        case AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME:
+        case AERO_LBM_THERMAL_BOUNDARY_DISABLED:
+        case AERO_LBM_THERMAL_BOUNDARY_PERIODIC:
+        case AERO_LBM_THERMAL_BOUNDARY_ADIABATIC:
+        case AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET:
+        case AERO_LBM_THERMAL_BOUNDARY_HEAT_FLUX_NEUMANN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline void sanitize_face_config(AeroLbmBoundaryFaceConfig& face) {
+    if (!valid_hydrodynamic_boundary_kind(face.hydrodynamic_kind)) {
+        face.hydrodynamic_kind = AERO_LBM_HYDRO_BOUNDARY_INHERIT_GAME;
+    }
+    if (!valid_thermal_boundary_kind(face.thermal_kind)) {
+        face.thermal_kind = AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME;
+    }
+    face.velocity[0] = finite_or(face.velocity[0], 0.0f);
+    face.velocity[1] = finite_or(face.velocity[1], 0.0f);
+    face.velocity[2] = finite_or(face.velocity[2], 0.0f);
+    face.pressure = finite_or(face.pressure, 0.0f);
+    face.temperature = finite_or(face.temperature, 0.0f);
+    face.heat_flux = finite_or(face.heat_flux, 0.0f);
+}
+
+void set_all_faces(
+    AeroLbmBenchmarkConfig& cfg, int hydro_kind, int thermal_kind
+) {
+    cfg.x_min = make_face_config(hydro_kind, thermal_kind);
+    cfg.x_max = make_face_config(hydro_kind, thermal_kind);
+    cfg.y_min = make_face_config(hydro_kind, thermal_kind);
+    cfg.y_max = make_face_config(hydro_kind, thermal_kind);
+    cfg.z_min = make_face_config(hydro_kind, thermal_kind);
+    cfg.z_max = make_face_config(hydro_kind, thermal_kind);
+}
+
+inline AeroLbmBenchmarkConfig make_default_benchmark_config() {
+    AeroLbmBenchmarkConfig cfg{};
+    cfg.abi_version = AERO_LBM_BENCHMARK_ABI_VERSION;
+    cfg.struct_size = sizeof(AeroLbmBenchmarkConfig);
+    cfg.flags =
+        AERO_LBM_BENCHMARK_FLAG_DISABLE_FAN_FORCING
+        | AERO_LBM_BENCHMARK_FLAG_DISABLE_FAN_NOISE
+        | AERO_LBM_BENCHMARK_FLAG_DISABLE_SPONGE
+        | AERO_LBM_BENCHMARK_FLAG_DISABLE_OBSTACLE_BOUNCE_BLEND
+        | AERO_LBM_BENCHMARK_FLAG_DISABLE_SGS;
+    cfg.enabled = 0;
+    cfg.preset = AERO_LBM_BENCHMARK_PRESET_NONE;
+    cfg.reynolds_number = 100.0f;
+    cfg.rayleigh_number = 1.0e5f;
+    cfg.prandtl_number = 0.71f;
+    cfg.mach_number = 0.05f;
+    cfg.reference_density = 1.0f;
+    cfg.reference_temperature = 0.0f;
+    cfg.reference_length = 1.0f;
+    cfg.body_force[0] = 0.0f;
+    cfg.body_force[1] = 0.0f;
+    cfg.body_force[2] = 0.0f;
+    cfg.gravity[0] = 0.0f;
+    cfg.gravity[1] = -1.0f;
+    cfg.gravity[2] = 0.0f;
+    cfg.initial_velocity[0] = 0.0f;
+    cfg.initial_velocity[1] = 0.0f;
+    cfg.initial_velocity[2] = 0.0f;
+    cfg.initial_pressure = 0.0f;
+    cfg.initial_temperature = 0.0f;
+    set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_INHERIT_GAME, AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME);
+    return cfg;
+}
+
+void apply_benchmark_preset_defaults(AeroLbmBenchmarkConfig& cfg, int preset) {
+    cfg = make_default_benchmark_config();
+    cfg.enabled = 1;
+    cfg.preset = preset;
+
+    switch (preset) {
+        case AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D:
+            cfg.flags |=
+                AERO_LBM_BENCHMARK_FLAG_DISABLE_CONVECTIVE_OUTFLOW
+                | AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE
+                | AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY;
+            set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+            break;
+
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D:
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D:
+            cfg.reynolds_number = 1000.0f;
+            set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_ADIABATIC);
+            cfg.y_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_MOVING_WALL, AERO_LBM_THERMAL_BOUNDARY_ADIABATIC);
+            cfg.y_max.velocity[0] = 0.10f;
+            cfg.flags |=
+                AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE
+                | AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY;
+            if (preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D) {
+                cfg.z_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
+                cfg.z_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
+            }
+            break;
+
+        case AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D:
+            cfg.reynolds_number = 100.0f;
+            cfg.flags |=
+                AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE
+                | AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY;
+            set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_SYMMETRY, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+            cfg.x_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+            cfg.x_min.velocity[0] = 0.08f;
+            cfg.x_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_CONVECTIVE_OUTFLOW, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+            cfg.z_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
+            cfg.z_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
+            break;
+
+        case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_2D:
+        case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D:
+            cfg.rayleigh_number = 1.0e5f;
+            cfg.prandtl_number = 0.71f;
+            set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_ADIABATIC);
+            cfg.x_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET);
+            cfg.x_min.temperature = 0.5f;
+            cfg.x_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET);
+            cfg.x_max.temperature = -0.5f;
+            if (preset == AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_2D) {
+                cfg.z_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
+                cfg.z_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
+            }
+            break;
+
+        case AERO_LBM_BENCHMARK_PRESET_NONE:
+        default:
+            cfg.enabled = 0;
+            cfg.preset = AERO_LBM_BENCHMARK_PRESET_NONE;
+            break;
+    }
+}
+
+void sanitize_benchmark_config(AeroLbmBenchmarkConfig& cfg) {
+    cfg.abi_version = AERO_LBM_BENCHMARK_ABI_VERSION;
+    cfg.struct_size = sizeof(AeroLbmBenchmarkConfig);
+    cfg.flags &= kBenchmarkKnownFlags;
+    cfg.enabled = cfg.enabled != 0 ? 1 : 0;
+    if (!valid_benchmark_preset(cfg.preset)) {
+        cfg.preset = AERO_LBM_BENCHMARK_PRESET_NONE;
+    }
+    cfg.reynolds_number = finite_or(cfg.reynolds_number, 100.0f);
+    cfg.rayleigh_number = finite_or(cfg.rayleigh_number, 1.0e5f);
+    cfg.prandtl_number = finite_or(cfg.prandtl_number, 0.71f);
+    cfg.mach_number = clampf(finite_or(cfg.mach_number, 0.05f), 1.0e-4f, 0.30f);
+    cfg.reference_density = finite_or(cfg.reference_density, 1.0f);
+    cfg.reference_temperature = finite_or(cfg.reference_temperature, 0.0f);
+    cfg.reference_length = std::max(1.0e-6f, finite_or(cfg.reference_length, 1.0f));
+    cfg.body_force[0] = finite_or(cfg.body_force[0], 0.0f);
+    cfg.body_force[1] = finite_or(cfg.body_force[1], 0.0f);
+    cfg.body_force[2] = finite_or(cfg.body_force[2], 0.0f);
+    cfg.gravity[0] = finite_or(cfg.gravity[0], 0.0f);
+    cfg.gravity[1] = finite_or(cfg.gravity[1], -1.0f);
+    cfg.gravity[2] = finite_or(cfg.gravity[2], 0.0f);
+    cfg.initial_velocity[0] = finite_or(cfg.initial_velocity[0], 0.0f);
+    cfg.initial_velocity[1] = finite_or(cfg.initial_velocity[1], 0.0f);
+    cfg.initial_velocity[2] = finite_or(cfg.initial_velocity[2], 0.0f);
+    cfg.initial_pressure = finite_or(cfg.initial_pressure, 0.0f);
+    cfg.initial_temperature = finite_or(cfg.initial_temperature, 0.0f);
+    sanitize_face_config(cfg.x_min);
+    sanitize_face_config(cfg.x_max);
+    sanitize_face_config(cfg.y_min);
+    sanitize_face_config(cfg.y_max);
+    sanitize_face_config(cfg.z_min);
+    sanitize_face_config(cfg.z_max);
+}
+
+const char* benchmark_preset_name(int preset) {
+    switch (preset) {
+        case AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D: return "taylor_green_3d";
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D: return "lid_driven_cavity_2d";
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D: return "lid_driven_cavity_3d";
+        case AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D: return "cylinder_crossflow_2d";
+        case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_2D: return "heated_cavity_2d";
+        case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D: return "heated_cavity_3d";
+        case AERO_LBM_BENCHMARK_PRESET_NONE:
+        default:
+            return "none";
+    }
+}
+
+const char* hydrodynamic_boundary_name(int kind) {
+    switch (kind) {
+        case AERO_LBM_HYDRO_BOUNDARY_PERIODIC: return "periodic";
+        case AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK: return "bounce_back";
+        case AERO_LBM_HYDRO_BOUNDARY_MOVING_WALL: return "moving_wall";
+        case AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET: return "velocity";
+        case AERO_LBM_HYDRO_BOUNDARY_PRESSURE_DIRICHLET: return "pressure";
+        case AERO_LBM_HYDRO_BOUNDARY_CONVECTIVE_OUTFLOW: return "convective_outflow";
+        case AERO_LBM_HYDRO_BOUNDARY_SYMMETRY: return "symmetry";
+        case AERO_LBM_HYDRO_BOUNDARY_INHERIT_GAME:
+        default:
+            return "inherit_game";
+    }
+}
+
+std::string benchmark_info_string(const AeroLbmBenchmarkConfig& cfg) {
+    std::ostringstream oss;
+    oss << "enabled=" << cfg.enabled
+        << " preset=" << benchmark_preset_name(cfg.preset)
+        << " flags=0x" << std::hex << cfg.flags << std::dec
+        << " Re=" << cfg.reynolds_number
+        << " Ra=" << cfg.rayleigh_number
+        << " Pr=" << cfg.prandtl_number
+        << " Ma=" << cfg.mach_number
+        << " boundaries={x-:" << hydrodynamic_boundary_name(cfg.x_min.hydrodynamic_kind)
+        << ",x+:" << hydrodynamic_boundary_name(cfg.x_max.hydrodynamic_kind)
+        << ",y-:" << hydrodynamic_boundary_name(cfg.y_min.hydrodynamic_kind)
+        << ",y+:" << hydrodynamic_boundary_name(cfg.y_max.hydrodynamic_kind)
+        << ",z-:" << hydrodynamic_boundary_name(cfg.z_min.hydrodynamic_kind)
+        << ",z+:" << hydrodynamic_boundary_name(cfg.z_max.hydrodynamic_kind)
+        << "}";
+    return oss.str();
+}
+
 struct Config {
     int grid_size = 0;
     int input_channels = 0;
@@ -210,6 +484,7 @@ struct ContextState {
     std::vector<uint8_t> obstacle;
     std::vector<float> temperature;
     std::vector<float> temperature_next;
+    float last_force[3] = {0.0f, 0.0f, 0.0f};
     std::uint64_t step_counter = 0;
 
 #if defined(AERO_LBM_OPENCL)
@@ -244,7 +519,227 @@ struct TimingStats {
 };
 
 TimingStats g_timing;
+AeroLbmBenchmarkConfig g_benchmark_cfg = make_default_benchmark_config();
 using Clock = std::chrono::steady_clock;
+
+enum BoundaryFaceIndex {
+    kFaceXMin = 0,
+    kFaceXMax = 1,
+    kFaceYMin = 2,
+    kFaceYMax = 3,
+    kFaceZMin = 4,
+    kFaceZMax = 5,
+};
+
+inline bool benchmark_mode_active() {
+    return g_benchmark_cfg.enabled != 0;
+}
+
+inline bool benchmark_flag_enabled(std::uint32_t flag) {
+    return benchmark_mode_active() && (g_benchmark_cfg.flags & flag) != 0;
+}
+
+inline const AeroLbmBoundaryFaceConfig& boundary_face_config(int face_index) {
+    switch (face_index) {
+        case kFaceXMin: return g_benchmark_cfg.x_min;
+        case kFaceXMax: return g_benchmark_cfg.x_max;
+        case kFaceYMin: return g_benchmark_cfg.y_min;
+        case kFaceYMax: return g_benchmark_cfg.y_max;
+        case kFaceZMin: return g_benchmark_cfg.z_min;
+        case kFaceZMax: return g_benchmark_cfg.z_max;
+        default: return g_benchmark_cfg.x_min;
+    }
+}
+
+inline bool wrap_axis_periodic(int& coord, int n, int min_face, int max_face, bool thermal) {
+    if (coord >= 0 && coord < n) return false;
+    const int face = coord < 0 ? min_face : max_face;
+    const AeroLbmBoundaryFaceConfig& cfg = boundary_face_config(face);
+    const int kind = thermal ? cfg.thermal_kind : cfg.hydrodynamic_kind;
+    const int periodic_kind = thermal ? static_cast<int>(AERO_LBM_THERMAL_BOUNDARY_PERIODIC)
+                                      : static_cast<int>(AERO_LBM_HYDRO_BOUNDARY_PERIODIC);
+    if (kind != periodic_kind) return false;
+    coord %= n;
+    if (coord < 0) coord += n;
+    return true;
+}
+
+inline const AeroLbmBoundaryFaceConfig* hydrodynamic_face_for_oob(int x, int y, int z, int n) {
+    if (x < 0) return &boundary_face_config(kFaceXMin);
+    if (x >= n) return &boundary_face_config(kFaceXMax);
+    if (y < 0) return &boundary_face_config(kFaceYMin);
+    if (y >= n) return &boundary_face_config(kFaceYMax);
+    if (z < 0) return &boundary_face_config(kFaceZMin);
+    if (z >= n) return &boundary_face_config(kFaceZMax);
+    return nullptr;
+}
+
+inline const AeroLbmBoundaryFaceConfig* thermal_face_for_oob(int x, int y, int z, int n) {
+    if (x < 0) return &boundary_face_config(kFaceXMin);
+    if (x >= n) return &boundary_face_config(kFaceXMax);
+    if (y < 0) return &boundary_face_config(kFaceYMin);
+    if (y >= n) return &boundary_face_config(kFaceYMax);
+    if (z < 0) return &boundary_face_config(kFaceZMin);
+    if (z >= n) return &boundary_face_config(kFaceZMax);
+    return nullptr;
+}
+
+inline bool remap_hydrodynamic_coords(int& x, int& y, int& z, int n) {
+    bool changed = false;
+    changed |= wrap_axis_periodic(x, n, kFaceXMin, kFaceXMax, false);
+    changed |= wrap_axis_periodic(y, n, kFaceYMin, kFaceYMax, false);
+    changed |= wrap_axis_periodic(z, n, kFaceZMin, kFaceZMax, false);
+    return changed;
+}
+
+inline bool remap_thermal_coords(int& x, int& y, int& z, int n) {
+    bool changed = false;
+    changed |= wrap_axis_periodic(x, n, kFaceXMin, kFaceXMax, true);
+    changed |= wrap_axis_periodic(y, n, kFaceYMin, kFaceYMax, true);
+    changed |= wrap_axis_periodic(z, n, kFaceZMin, kFaceZMax, true);
+    return changed;
+}
+
+inline float effective_sponge_alpha(int n, int x, int y, int z) {
+    if (benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_SPONGE)) return 0.0f;
+    if (kSpongeLayers <= 0) return 0.0f;
+    const int d = std::min({x, y, z, n - 1 - x, n - 1 - y, n - 1 - z});
+    if (d >= kSpongeLayers) return 0.0f;
+    const float eta = static_cast<float>(kSpongeLayers - d) / static_cast<float>(kSpongeLayers);
+    return clampf(kSpongeStrength * eta * eta, 0.0f, 0.95f);
+}
+
+inline float effective_obstacle_bounce_blend() {
+    return benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_OBSTACLE_BOUNCE_BLEND) ? 0.0f : kObstacleBounceBlend;
+}
+
+inline bool effective_enable_sgs() {
+    return kEnableSgs && !benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_SGS);
+}
+
+inline bool effective_enable_buoyancy() {
+    return kEnableBoussinesq && !benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY);
+}
+
+inline bool effective_enable_internal_thermal_source() {
+    return !benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE);
+}
+
+inline bool effective_enable_fan_forcing() {
+    return !benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_FAN_FORCING);
+}
+
+inline float effective_fan_noise_amp() {
+    return benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_FAN_NOISE) ? 0.0f : kFanNoiseAmp;
+}
+
+inline float effective_fan_beta() {
+    return effective_enable_fan_forcing() ? kFanBeta : 0.0f;
+}
+
+inline float benchmark_reference_speed() {
+    if (!benchmark_mode_active()) return 0.0f;
+    float speed = std::sqrt(
+        g_benchmark_cfg.initial_velocity[0] * g_benchmark_cfg.initial_velocity[0]
+        + g_benchmark_cfg.initial_velocity[1] * g_benchmark_cfg.initial_velocity[1]
+        + g_benchmark_cfg.initial_velocity[2] * g_benchmark_cfg.initial_velocity[2]
+    );
+    const AeroLbmBoundaryFaceConfig faces[6] = {
+        g_benchmark_cfg.x_min, g_benchmark_cfg.x_max,
+        g_benchmark_cfg.y_min, g_benchmark_cfg.y_max,
+        g_benchmark_cfg.z_min, g_benchmark_cfg.z_max,
+    };
+    for (const AeroLbmBoundaryFaceConfig& face : faces) {
+        const float face_speed = std::sqrt(
+            face.velocity[0] * face.velocity[0]
+            + face.velocity[1] * face.velocity[1]
+            + face.velocity[2] * face.velocity[2]
+        );
+        speed = std::max(speed, face_speed);
+    }
+    return speed;
+}
+
+inline float effective_benchmark_tau_shear() {
+    if (!benchmark_mode_active()) return kTauShear;
+    const float re = finite_or(g_benchmark_cfg.reynolds_number, 0.0f);
+    const float ref_speed = benchmark_reference_speed();
+    const float ref_length = std::max(1.0e-6f, finite_or(g_benchmark_cfg.reference_length, 1.0f));
+    if (re <= 1.0e-6f || ref_speed <= 1.0e-8f) return kTauShear;
+    const float nu = ref_speed * ref_length / re;
+    return clampf(0.5f + 3.0f * nu, kTauShearMin, kTauShearMax);
+}
+
+inline float effective_benchmark_tau_normal(float tau_shear_eff) {
+    if (!benchmark_mode_active()) return clampf(kTauNormal, kTauNormalMin, kTauNormalMax);
+    return clampf(tau_shear_eff, kTauNormalMin, kTauNormalMax);
+}
+
+inline int opencl_benchmark_flags() {
+    if (!benchmark_mode_active()) return 0;
+    return static_cast<int>(g_benchmark_cfg.flags & kBenchmarkKnownFlags);
+}
+
+inline int opencl_hydrodynamic_periodic_mask() {
+    if (!benchmark_mode_active()) return 0;
+    int mask = 0;
+    if (g_benchmark_cfg.x_min.hydrodynamic_kind == AERO_LBM_HYDRO_BOUNDARY_PERIODIC
+        && g_benchmark_cfg.x_max.hydrodynamic_kind == AERO_LBM_HYDRO_BOUNDARY_PERIODIC) {
+        mask |= 1;
+    }
+    if (g_benchmark_cfg.y_min.hydrodynamic_kind == AERO_LBM_HYDRO_BOUNDARY_PERIODIC
+        && g_benchmark_cfg.y_max.hydrodynamic_kind == AERO_LBM_HYDRO_BOUNDARY_PERIODIC) {
+        mask |= 2;
+    }
+    if (g_benchmark_cfg.z_min.hydrodynamic_kind == AERO_LBM_HYDRO_BOUNDARY_PERIODIC
+        && g_benchmark_cfg.z_max.hydrodynamic_kind == AERO_LBM_HYDRO_BOUNDARY_PERIODIC) {
+        mask |= 4;
+    }
+    return mask;
+}
+
+inline bool benchmark_opencl_supported() {
+    if (!benchmark_mode_active()) return true;
+    switch (g_benchmark_cfg.preset) {
+        case AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D:
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D:
+        case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D:
+        case AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D:
+            return true;
+        default:
+            return false;
+    }
+}
+
+using OpenClFaceData = std::array<float, 4>;
+
+inline std::array<int, 6> opencl_hydrodynamic_face_kinds() {
+    return {
+        g_benchmark_cfg.x_min.hydrodynamic_kind,
+        g_benchmark_cfg.x_max.hydrodynamic_kind,
+        g_benchmark_cfg.y_min.hydrodynamic_kind,
+        g_benchmark_cfg.y_max.hydrodynamic_kind,
+        g_benchmark_cfg.z_min.hydrodynamic_kind,
+        g_benchmark_cfg.z_max.hydrodynamic_kind,
+    };
+}
+
+inline std::array<OpenClFaceData, 6> opencl_hydrodynamic_face_data() {
+    return {{
+        {{g_benchmark_cfg.x_min.velocity[0], g_benchmark_cfg.x_min.velocity[1], g_benchmark_cfg.x_min.velocity[2], g_benchmark_cfg.x_min.pressure}},
+        {{g_benchmark_cfg.x_max.velocity[0], g_benchmark_cfg.x_max.velocity[1], g_benchmark_cfg.x_max.velocity[2], g_benchmark_cfg.x_max.pressure}},
+        {{g_benchmark_cfg.y_min.velocity[0], g_benchmark_cfg.y_min.velocity[1], g_benchmark_cfg.y_min.velocity[2], g_benchmark_cfg.y_min.pressure}},
+        {{g_benchmark_cfg.y_max.velocity[0], g_benchmark_cfg.y_max.velocity[1], g_benchmark_cfg.y_max.velocity[2], g_benchmark_cfg.y_max.pressure}},
+        {{g_benchmark_cfg.z_min.velocity[0], g_benchmark_cfg.z_min.velocity[1], g_benchmark_cfg.z_min.velocity[2], g_benchmark_cfg.z_min.pressure}},
+        {{g_benchmark_cfg.z_max.velocity[0], g_benchmark_cfg.z_max.velocity[1], g_benchmark_cfg.z_max.velocity[2], g_benchmark_cfg.z_max.pressure}},
+    }};
+}
+
+inline std::array<float, 2> opencl_effective_tau_pair() {
+    const float tau_shear = effective_benchmark_tau_shear();
+    const float tau_normal = effective_benchmark_tau_normal(tau_shear);
+    return {tau_shear, tau_normal};
+}
 
 double elapsed_ms(const Clock::time_point& begin, const Clock::time_point& end) {
     return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -314,6 +809,7 @@ inline void decode_cell(std::size_t cell, int n, int& x, int& y, int& z) {
 }
 
 inline bool solid_or_oob(const ContextState& ctx, int x, int y, int z) {
+    remap_hydrodynamic_coords(x, y, z, ctx.n);
     if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) return true;
     return ctx.obstacle[cell_index(x, y, z, ctx.n)] != 0;
 }
@@ -327,14 +823,6 @@ inline float hash_signed_noise(std::uint64_t cell, std::uint64_t tick) {
     x ^= x >> 31;
     const float u = static_cast<float>(x & 0x00FFFFFFULL) * (1.0f / 16777215.0f);
     return 2.0f * u - 1.0f;
-}
-
-inline float sponge_alpha(int n, int x, int y, int z) {
-    if (kSpongeLayers <= 0) return 0.0f;
-    const int d = std::min({x, y, z, n - 1 - x, n - 1 - y, n - 1 - z});
-    if (d >= kSpongeLayers) return 0.0f;
-    const float eta = static_cast<float>(kSpongeLayers - d) / static_cast<float>(kSpongeLayers);
-    return clampf(kSpongeStrength * eta * eta, 0.0f, 0.95f);
 }
 
 inline int binom(int n, int k) {
@@ -487,7 +975,8 @@ inline float obstacle_bounce_value(
     const ContextState& ctx, std::size_t cell, int x, int y, int z, int q
 ) {
     const float bounced = ctx.f_post[dist_index(cell, kOpp[q], ctx.cells)];
-    if (kObstacleBounceBlend <= 0.0f) return bounced;
+    const float blend = effective_obstacle_bounce_blend();
+    if (blend <= 0.0f) return bounced;
 
     const int s2x = x - 2 * kCx[q];
     const int s2y = y - 2 * kCy[q];
@@ -498,7 +987,7 @@ inline float obstacle_bounce_value(
     if (ctx.obstacle[src2]) return bounced;
 
     const float upstream = ctx.f_post[dist_index(src2, q, ctx.cells)];
-    return bounced + kObstacleBounceBlend * (upstream - bounced);
+    return bounced + blend * (upstream - bounced);
 }
 
 inline float boundary_convective_value(
@@ -523,6 +1012,78 @@ inline float boundary_convective_value(
 
     const float f2 = ctx.f_post[dist_index(src2, q, ctx.cells)];
     return f1 + kBoundaryConvectiveBeta * (f1 - f2);
+}
+
+inline float boundary_equilibrium_value(
+    const ContextState& ctx, std::size_t cell, int q, const AeroLbmBoundaryFaceConfig& face
+) {
+    float rho = 1.0f + clampf(ctx.ref_pressure[cell], kPressureMin, kPressureMax);
+    float ux = 0.0f;
+    float uy = 0.0f;
+    float uz = 0.0f;
+    switch (face.hydrodynamic_kind) {
+        case AERO_LBM_HYDRO_BOUNDARY_MOVING_WALL:
+        case AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET:
+            ux = face.velocity[0];
+            uy = face.velocity[1];
+            uz = face.velocity[2];
+            break;
+        case AERO_LBM_HYDRO_BOUNDARY_PRESSURE_DIRICHLET:
+            rho = 1.0f + clampf(face.pressure, kPressureMin, kPressureMax);
+            break;
+        default:
+            break;
+    }
+    rho = clampf(rho, kRhoMin, kRhoMax);
+    float speed2 = ux * ux + uy * uy + uz * uz;
+    if (speed2 > kMaxSpeed * kMaxSpeed && speed2 > 0.0f) {
+        const float scale = kMaxSpeed / std::sqrt(speed2);
+        ux *= scale;
+        uy *= scale;
+        uz *= scale;
+    }
+    return feq(q, rho, ux, uy, uz);
+}
+
+inline float benchmark_hydrodynamic_boundary_value(
+    const ContextState& ctx,
+    std::size_t cell,
+    int x,
+    int y,
+    int z,
+    int q,
+    int sx,
+    int sy,
+    int sz
+) {
+    const AeroLbmBoundaryFaceConfig* face = hydrodynamic_face_for_oob(sx, sy, sz, ctx.n);
+    const int kind = face ? face->hydrodynamic_kind : AERO_LBM_HYDRO_BOUNDARY_INHERIT_GAME;
+    switch (kind) {
+        case AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK:
+            return obstacle_bounce_value(ctx, cell, x, y, z, q);
+        case AERO_LBM_HYDRO_BOUNDARY_MOVING_WALL:
+        case AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET:
+        case AERO_LBM_HYDRO_BOUNDARY_PRESSURE_DIRICHLET:
+            return boundary_equilibrium_value(ctx, cell, q, *face);
+        case AERO_LBM_HYDRO_BOUNDARY_SYMMETRY: {
+            const int ix = std::clamp(sx, 0, ctx.n - 1);
+            const int iy = std::clamp(sy, 0, ctx.n - 1);
+            const int iz = std::clamp(sz, 0, ctx.n - 1);
+            const std::size_t src = cell_index(ix, iy, iz, ctx.n);
+            return ctx.obstacle[src] ? obstacle_bounce_value(ctx, cell, x, y, z, q) : ctx.f_post[dist_index(src, q, ctx.cells)];
+        }
+        case AERO_LBM_HYDRO_BOUNDARY_CONVECTIVE_OUTFLOW:
+            return boundary_convective_value(ctx, cell, x, y, z, q, sx, sy, sz);
+        case AERO_LBM_HYDRO_BOUNDARY_PERIODIC:
+            break;
+        case AERO_LBM_HYDRO_BOUNDARY_INHERIT_GAME:
+        default:
+            if (benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_CONVECTIVE_OUTFLOW)) {
+                return obstacle_bounce_value(ctx, cell, x, y, z, q);
+            }
+            return boundary_convective_value(ctx, cell, x, y, z, q, sx, sy, sz);
+    }
+    return boundary_convective_value(ctx, cell, x, y, z, q, sx, sy, sz);
 }
 
 void allocate_cpu_context(ContextState& ctx, int n) {
@@ -551,6 +1112,9 @@ void allocate_cpu_context(ContextState& ctx, int n) {
     ctx.obstacle.assign(ctx.cells, 0);
     ctx.temperature.assign(ctx.cells, 0.0f);
     ctx.temperature_next.assign(ctx.cells, 0.0f);
+    ctx.last_force[0] = 0.0f;
+    ctx.last_force[1] = 0.0f;
+    ctx.last_force[2] = 0.0f;
 }
 
 void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
@@ -620,6 +1184,9 @@ void initialize_distributions(ContextState& ctx) {
             ctx.f[dist_index(cell, q, ctx.cells)] = eq;
             ctx.f_post[dist_index(cell, q, ctx.cells)] = eq;
         }
+        if (benchmark_mode_active() && std::fabs(ctx.temperature[cell]) < 1e-8f) {
+            ctx.temperature[cell] = clampf(g_benchmark_cfg.initial_temperature, kThermalMin, kThermalMax);
+        }
         ctx.temperature[cell] = clampf(ctx.temperature[cell], kThermalMin, kThermalMax);
         ctx.temperature_next[cell] = ctx.temperature[cell];
     }
@@ -627,6 +1194,7 @@ void initialize_distributions(ContextState& ctx) {
 }
 
 inline float thermal_source_term(const ContextState& ctx, std::size_t cell) {
+    if (!effective_enable_internal_thermal_source()) return 0.0f;
     if (g_cfg.input_channels > kChannelThermalSource) {
         return clampf(ctx.thermal_source[cell], -kThermalSourceMax, kThermalSourceMax);
     }
@@ -642,7 +1210,22 @@ inline float thermal_source_term(const ContextState& ctx, std::size_t cell) {
 }
 
 inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int z, float self_value) {
-    if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) return self_value;
+    remap_thermal_coords(x, y, z, ctx.n);
+    if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) {
+        const AeroLbmBoundaryFaceConfig* face = thermal_face_for_oob(x, y, z, ctx.n);
+        const int kind = face ? face->thermal_kind : AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME;
+        switch (kind) {
+            case AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET:
+                return clampf(face->temperature, kThermalMin, kThermalMax);
+            case AERO_LBM_THERMAL_BOUNDARY_HEAT_FLUX_NEUMANN:
+                return clampf(self_value + face->heat_flux, kThermalMin, kThermalMax);
+            case AERO_LBM_THERMAL_BOUNDARY_DISABLED:
+            case AERO_LBM_THERMAL_BOUNDARY_ADIABATIC:
+            case AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME:
+            default:
+                return self_value;
+        }
+    }
     const std::size_t cell = cell_index(x, y, z, ctx.n);
     if (ctx.obstacle[cell]) return self_value;
     return ctx.temperature[cell];
@@ -777,11 +1360,11 @@ void collide(ContextState& ctx) {
         float fx = 0.0f;
         float fy = 0.0f;
         float fz = 0.0f;
-        if (ctx.fan_mask[cell] > 0.0f) {
+        if (effective_enable_fan_forcing() && ctx.fan_mask[cell] > 0.0f) {
             const float fan_norm = std::sqrt(ctx.fan_ux[cell] * ctx.fan_ux[cell] + ctx.fan_uy[cell] * ctx.fan_uy[cell] + ctx.fan_uz[cell] * ctx.fan_uz[cell]);
             if (fan_norm > 1e-8f) {
                 const float inv_norm = 1.0f / fan_norm;
-                const float noise = 1.0f + kFanNoiseAmp * hash_signed_noise(cell, ctx.step_counter);
+                const float noise = 1.0f + effective_fan_noise_amp() * hash_signed_noise(cell, ctx.step_counter);
                 const float target_speed = clampf(
                     fan_norm * kFanTargetScale * std::max(0.0f, noise),
                     0.0f,
@@ -800,14 +1383,14 @@ void collide(ContextState& ctx) {
                     const float r = (speed_pre - kFanSpeedSoftCap) / std::max(1e-4f, kFanSpeedDampWidth);
                     speed_damp = 1.0f / (1.0f + r * r);
                 }
-                const float beta = ctx.fan_mask[cell] * kFanBeta * speed_damp;
+                const float beta = ctx.fan_mask[cell] * effective_fan_beta() * speed_damp;
                 fx = beta * rho_safe * (axial_push * nx - kFanPerpDamp * u_perp_x);
                 fy = beta * rho_safe * (axial_push * ny - kFanPerpDamp * u_perp_y);
                 fz = beta * rho_safe * (axial_push * nz - kFanPerpDamp * u_perp_z);
             }
         }
 
-        if (kEnableBoussinesq) {
+        if (effective_enable_buoyancy()) {
             const float buoyancy = clampf(
                 kBoussinesqBeta * ctx.temperature[cell],
                 -kBoussinesqForceMax,
@@ -855,9 +1438,9 @@ void collide(ContextState& ctx) {
         compute_raw_moments(f_local, raw);
         compute_central_moments(raw, ux, uy, uz, central_pre);
 
-        float tau_shear_local = kTauShear;
-        float tau_normal_local = clampf(kTauNormal, kTauNormalMin, kTauNormalMax);
-        if (kEnableSgs) {
+        float tau_shear_local = effective_benchmark_tau_shear();
+        float tau_normal_local = effective_benchmark_tau_normal(tau_shear_local);
+        if (effective_enable_sgs()) {
             const float nu0 = std::max(1e-6f, (kTauShear - 0.5f) / 3.0f);
             const float neq_xx = central_pre[2][0][0] - rho_safe * kCs2;
             const float neq_yy = central_pre[0][2][0] - rho_safe * kCs2;
@@ -922,7 +1505,7 @@ void collide(ContextState& ctx) {
 
         int cx = 0, cy = 0, cz = 0;
         decode_cell(cell, ctx.n, cx, cy, cz);
-        const float alpha = sponge_alpha(ctx.n, cx, cy, cz);
+        const float alpha = effective_sponge_alpha(ctx.n, cx, cy, cz);
         if (alpha > 0.0f) {
             const float keep = 1.0f - alpha;
             for (int q = 0; q < kQ; ++q) {
@@ -947,11 +1530,12 @@ void stream_and_bounce(ContextState& ctx) {
                     }
                 } else {
                     for (int q = 0; q < kQ; ++q) {
-                        const int sx = x - kCx[q];
-                        const int sy = y - kCy[q];
-                        const int sz = z - kCz[q];
+                        int sx = x - kCx[q];
+                        int sy = y - kCy[q];
+                        int sz = z - kCz[q];
+                        remap_hydrodynamic_coords(sx, sy, sz, n);
                         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-                            f_local[q] = boundary_convective_value(ctx, cell, x, y, z, q, sx, sy, sz);
+                            f_local[q] = benchmark_hydrodynamic_boundary_value(ctx, cell, x, y, z, q, sx, sy, sz);
                             continue;
                         }
 
@@ -971,6 +1555,85 @@ void stream_and_bounce(ContextState& ctx) {
             }
         }
     }
+}
+
+void compute_benchmark_force(ContextState& ctx) {
+    ctx.last_force[0] = 0.0f;
+    ctx.last_force[1] = 0.0f;
+    ctx.last_force[2] = 0.0f;
+    if (!benchmark_mode_active() || g_benchmark_cfg.preset != AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
+        return;
+    }
+
+    double fx = 0.0;
+    double fy = 0.0;
+    double fz = 0.0;
+    for (int x = 0; x < ctx.n; ++x) {
+        for (int y = 0; y < ctx.n; ++y) {
+            for (int z = 0; z < ctx.n; ++z) {
+                const std::size_t cell = cell_index(x, y, z, ctx.n);
+                if (ctx.obstacle[cell]) continue;
+                for (int q = 1; q < kQ; ++q) {
+                    if (kCz[q] != 0) continue;
+                    const int nx = x + kCx[q];
+                    const int ny = y + kCy[q];
+                    const int nz = z + kCz[q];
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.n || ny >= ctx.n || nz >= ctx.n) continue;
+                    const std::size_t neighbor = cell_index(nx, ny, nz, ctx.n);
+                    if (!ctx.obstacle[neighbor]) continue;
+                    const float fq = ctx.f_post[dist_index(cell, q, ctx.cells)];
+                    fx += 2.0 * static_cast<double>(fq) * static_cast<double>(kCx[q]);
+                    fy += 2.0 * static_cast<double>(fq) * static_cast<double>(kCy[q]);
+                    fz += 2.0 * static_cast<double>(fq) * static_cast<double>(kCz[q]);
+                }
+            }
+        }
+    }
+
+    const double inv_depth = ctx.n > 0 ? (1.0 / static_cast<double>(ctx.n)) : 1.0;
+    ctx.last_force[0] = static_cast<float>(fx * inv_depth);
+    ctx.last_force[1] = static_cast<float>(fy * inv_depth);
+    ctx.last_force[2] = static_cast<float>(fz * inv_depth);
+}
+
+void compute_benchmark_force_from_distributions(ContextState& ctx, const float* dist_data) {
+    ctx.last_force[0] = 0.0f;
+    ctx.last_force[1] = 0.0f;
+    ctx.last_force[2] = 0.0f;
+    if (!dist_data) return;
+    if (!benchmark_mode_active() || g_benchmark_cfg.preset != AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
+        return;
+    }
+
+    double fx = 0.0;
+    double fy = 0.0;
+    double fz = 0.0;
+    for (int x = 0; x < ctx.n; ++x) {
+        for (int y = 0; y < ctx.n; ++y) {
+            for (int z = 0; z < ctx.n; ++z) {
+                const std::size_t cell = cell_index(x, y, z, ctx.n);
+                if (ctx.obstacle[cell]) continue;
+                for (int q = 1; q < kQ; ++q) {
+                    if (kCz[q] != 0) continue;
+                    const int nx = x + kCx[q];
+                    const int ny = y + kCy[q];
+                    const int nz = z + kCz[q];
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.n || ny >= ctx.n || nz >= ctx.n) continue;
+                    const std::size_t neighbor = cell_index(nx, ny, nz, ctx.n);
+                    if (!ctx.obstacle[neighbor]) continue;
+                    const float fq = dist_data[dist_index(cell, q, ctx.cells)];
+                    fx += 2.0 * static_cast<double>(fq) * static_cast<double>(kCx[q]);
+                    fy += 2.0 * static_cast<double>(fq) * static_cast<double>(kCy[q]);
+                    fz += 2.0 * static_cast<double>(fq) * static_cast<double>(kCz[q]);
+                }
+            }
+        }
+    }
+
+    const double inv_depth = ctx.n > 0 ? (1.0 / static_cast<double>(ctx.n)) : 1.0;
+    ctx.last_force[0] = static_cast<float>(fx * inv_depth);
+    ctx.last_force[1] = static_cast<float>(fy * inv_depth);
+    ctx.last_force[2] = static_cast<float>(fz * inv_depth);
 }
 
 void write_output(const ContextState& ctx, float* out, int out_channels) {
@@ -1120,6 +1783,19 @@ __constant int THERMAL_UPDATE_STRIDE = 2;
 __constant float BOUSSINESQ_BETA = 0.12f;
 __constant float BOUSSINESQ_FORCE_MAX = 0.02f;
 
+#define BENCH_DISABLE_FAN_FORCING (1 << 0)
+#define BENCH_DISABLE_FAN_NOISE (1 << 1)
+#define BENCH_DISABLE_SPONGE (1 << 2)
+#define BENCH_DISABLE_CONVECTIVE_OUTFLOW (1 << 3)
+#define BENCH_DISABLE_OBSTACLE_BOUNCE_BLEND (1 << 4)
+#define BENCH_DISABLE_SGS (1 << 5)
+#define BENCH_DISABLE_INTERNAL_THERMAL_SOURCE (1 << 6)
+#define BENCH_DISABLE_BUOYANCY (1 << 7)
+
+#define PERIODIC_AXIS_X 1
+#define PERIODIC_AXIS_Y 2
+#define PERIODIC_AXIS_Z 4
+
 inline float clampf(float v, float lo, float hi) { return fmin(hi, fmax(lo, v)); }
 inline int clampi(int v, int lo, int hi) { return min(hi, max(lo, v)); }
 inline int binom(int n, int k) {
@@ -1135,8 +1811,46 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
 
 inline float obstacle_bounce_value(
     __global const float* f_read, __global const float* payload,
-    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp
+    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp, int benchmark_flags
 );
+
+inline int wrap_axis_if_periodic(int coord, int n, int axis_bit, int periodic_mask) {
+    if (coord >= 0 && coord < n) return coord;
+    if ((periodic_mask & axis_bit) == 0) return coord;
+    coord %= n;
+    if (coord < 0) coord += n;
+    return coord;
+}
+
+inline int face_kind_for_oob(
+    int sx, int sy, int sz, int n,
+    int x_min_kind, int x_max_kind,
+    int y_min_kind, int y_max_kind,
+    int z_min_kind, int z_max_kind
+) {
+    if (sx < 0) return x_min_kind;
+    if (sx >= n) return x_max_kind;
+    if (sy < 0) return y_min_kind;
+    if (sy >= n) return y_max_kind;
+    if (sz < 0) return z_min_kind;
+    if (sz >= n) return z_max_kind;
+    return 0;
+}
+
+inline float4 face_data_for_oob(
+    int sx, int sy, int sz, int n,
+    float4 x_min_data, float4 x_max_data,
+    float4 y_min_data, float4 y_max_data,
+    float4 z_min_data, float4 z_max_data
+) {
+    if (sx < 0) return x_min_data;
+    if (sx >= n) return x_max_data;
+    if (sy < 0) return y_min_data;
+    if (sy >= n) return y_max_data;
+    if (sz < 0) return z_min_data;
+    if (sz >= n) return z_max_data;
+    return (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+}
 
 inline uint hash_u32(uint x) {
     x ^= x >> 16;
@@ -1163,7 +1877,7 @@ inline float sponge_alpha(int n, int x, int y, int z) {
 
 inline float boundary_convective_value(
     __global const float* f_read, __global const float* payload,
-    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int sx, int sy, int sz
+    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int sx, int sy, int sz, int benchmark_flags
 ) {
     int dx = (sx < 0 || sx >= n) ? CX[q] : 0;
     int dy = (sy < 0 || sy >= n) ? CY[q] : 0;
@@ -1174,7 +1888,7 @@ inline float boundary_convective_value(
     int i1z = clampi(z + dz, 0, n - 1);
     int src1 = (i1x * n + i1y) * n + i1z;
     if (payload[src1 * in_ch + 0] > 0.5f) {
-        return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q]);
+        return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
     }
 
     float f1 = f_read[q * cells + src1];
@@ -1186,6 +1900,87 @@ inline float boundary_convective_value(
 
     float f2 = f_read[q * cells + src2];
     return f1 + BOUNDARY_CONVECTIVE_BETA * (f1 - f2);
+}
+
+inline float boundary_equilibrium_value(int q, float4 face_data, float ref_pressure, int use_face_pressure) {
+    float rho = 1.0f + clampf(ref_pressure, P_MIN, P_MAX);
+    float ux = face_data.x;
+    float uy = face_data.y;
+    float uz = face_data.z;
+    float pressure = face_data.w;
+    if (use_face_pressure != 0) {
+        rho = 1.0f + clampf(pressure, P_MIN, P_MAX);
+    }
+    rho = clampf(rho, RHO_MIN, RHO_MAX);
+    float speed2 = ux * ux + uy * uy + uz * uz;
+    if (speed2 > MAX_SPEED * MAX_SPEED && speed2 > 0.0f) {
+        float scale = MAX_SPEED * rsqrt(speed2);
+        ux *= scale;
+        uy *= scale;
+        uz *= scale;
+    }
+    return feq(q, rho, ux, uy, uz);
+}
+
+inline float benchmark_boundary_value(
+    __global const float* f_read,
+    __global const float* payload,
+    int in_ch,
+    int n,
+    int cells,
+    int cell,
+    int x,
+    int y,
+    int z,
+    int q,
+    int sx,
+    int sy,
+    int sz,
+    int benchmark_flags,
+    int x_min_kind,
+    int x_max_kind,
+    int y_min_kind,
+    int y_max_kind,
+    int z_min_kind,
+    int z_max_kind,
+    float4 x_min_data,
+    float4 x_max_data,
+    float4 y_min_data,
+    float4 y_max_data,
+    float4 z_min_data,
+    float4 z_max_data
+) {
+    int kind = face_kind_for_oob(sx, sy, sz, n, x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind);
+    float4 face_data = face_data_for_oob(sx, sy, sz, n, x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data);
+    switch (kind) {
+        case 2:
+            return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
+        case 3:
+        case 4:
+            return boundary_equilibrium_value(q, face_data, payload[cell * in_ch + 8], 0);
+        case 5: {
+            float4 pressure_face = (float4)(0.0f, 0.0f, 0.0f, face_data.w);
+            return boundary_equilibrium_value(q, pressure_face, payload[cell * in_ch + 8], 1);
+        }
+        case 7: {
+            int ix = clampi(sx, 0, n - 1);
+            int iy = clampi(sy, 0, n - 1);
+            int iz = clampi(sz, 0, n - 1);
+            int src = (ix * n + iy) * n + iz;
+            if (payload[src * in_ch + 0] > 0.5f) {
+                return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
+            }
+            return f_read[q * cells + src];
+        }
+        case 6:
+            return boundary_convective_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags);
+        case 0:
+        default:
+            if ((benchmark_flags & BENCH_DISABLE_CONVECTIVE_OUTFLOW) != 0) {
+                return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
+            }
+            return boundary_convective_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags);
+    }
 }
 
 inline float temperature_or_self(
@@ -1250,10 +2045,11 @@ inline float sample_temperature_trilinear(
 
 inline float obstacle_bounce_value(
     __global const float* f_read, __global const float* payload,
-    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp
+    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp, int benchmark_flags
 ) {
     float bounced = f_read[opp * cells + cell];
-    if (OBSTACLE_BOUNCE_BLEND <= 0.0f) return bounced;
+    float blend = (benchmark_flags & BENCH_DISABLE_OBSTACLE_BOUNCE_BLEND) ? 0.0f : OBSTACLE_BOUNCE_BLEND;
+    if (blend <= 0.0f) return bounced;
 
     int s2x = x - 2 * CX[q];
     int s2y = y - 2 * CY[q];
@@ -1264,7 +2060,7 @@ inline float obstacle_bounce_value(
     if (payload[src2 * in_ch + 0] > 0.5f) return bounced;
 
     float upstream = f_read[q * cells + src2];
-    return bounced + OBSTACLE_BOUNCE_BLEND * (upstream - bounced);
+    return bounced + blend * (upstream - bounced);
 }
 
 kernel void init_distributions(
@@ -1294,7 +2090,10 @@ kernel void stream_collide_step(
     __global const float* f_read,
     __global const float* payload,
     __global const float* temp_read,
-    int in_ch, int n, int cells, int tick,
+    int in_ch, int n, int cells, int tick, int benchmark_flags, int hydro_periodic_mask,
+    float tau_shear_eff, float tau_normal_eff,
+    int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
+    float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
     __global float* f_write,
     __global float* temp_write
 ) {
@@ -1320,12 +2119,19 @@ kernel void stream_collide_step(
         }
 
         int sx = x - CX[q], sy = y - CY[q], sz = z - CZ[q];
+        sx = wrap_axis_if_periodic(sx, n, PERIODIC_AXIS_X, hydro_periodic_mask);
+        sy = wrap_axis_if_periodic(sy, n, PERIODIC_AXIS_Y, hydro_periodic_mask);
+        sz = wrap_axis_if_periodic(sz, n, PERIODIC_AXIS_Z, hydro_periodic_mask);
         if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
-            f_local[q] = boundary_convective_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz);
+            f_local[q] = benchmark_boundary_value(
+                f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags,
+                x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind,
+                x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data
+            );
         } else {
             int src = (sx * n + sy) * n + sz;
             if (payload[src * in_ch + 0] > 0.5f) {
-                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, opp);
+                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, opp, benchmark_flags);
             } else {
                 f_local[q] = f_read[q * cells + src];
             }
@@ -1352,7 +2158,7 @@ kernel void stream_collide_step(
     float uz = mz * inv_rho;
     float speed_pre = sqrt(ux * ux + uy * uy + uz * uz);
 
-    float fan = clampf(payload[base + 1], 0.0f, 1.0f);
+    float fan = (benchmark_flags & BENCH_DISABLE_FAN_FORCING) ? 0.0f : clampf(payload[base + 1], 0.0f, 1.0f);
     float fan_ux = payload[base + 2];
     float fan_uy = payload[base + 3];
     float fan_uz = payload[base + 4];
@@ -1404,7 +2210,9 @@ kernel void stream_collide_step(
 
         float laplacian_t = (txp + txm + typ + tym + tzp + tzm) - 6.0f * temp_center;
         float thermal_source = 0.0f;
-        if (in_ch > 9) {
+        if ((benchmark_flags & BENCH_DISABLE_INTERNAL_THERMAL_SOURCE) != 0) {
+            thermal_source = 0.0f;
+        } else if (in_ch > 9) {
             thermal_source = clampf(payload[base + 9], -THERMAL_SOURCE_MAX, THERMAL_SOURCE_MAX);
         } else if (fan > 0.0f && fan_norm > 1e-8f) {
             thermal_source = fan * clampf(fan_norm * THERMAL_SOURCE_SCALE, 0.0f, THERMAL_SOURCE_MAX);
@@ -1421,7 +2229,8 @@ kernel void stream_collide_step(
     if (fan > 0.0f) {
         if (fan_norm > 1e-8f) {
             float inv_norm = 1.0f / fan_norm;
-            float noise = 1.0f + FAN_NOISE_AMP * signed_noise((uint)cell, (uint)tick);
+            float noise_amp = (benchmark_flags & BENCH_DISABLE_FAN_NOISE) ? 0.0f : FAN_NOISE_AMP;
+            float noise = 1.0f + noise_amp * signed_noise((uint)cell, (uint)tick);
             float target_speed = clampf(
                 fan_norm * FAN_TARGET_SCALE * fmax(0.0f, noise),
                 0.0f,
@@ -1447,7 +2256,7 @@ kernel void stream_collide_step(
         }
     }
 
-    if (BOUSSINESQ_ENABLED) {
+    if (BOUSSINESQ_ENABLED && (benchmark_flags & BENCH_DISABLE_BUOYANCY) == 0) {
         float buoyancy = clampf(BOUSSINESQ_BETA * temp_next, -BOUSSINESQ_FORCE_MAX, BOUSSINESQ_FORCE_MAX);
         fy += rho_safe * buoyancy;
     }
@@ -1514,9 +2323,9 @@ kernel void stream_collide_step(
 
 )CLC"
 R"CLC(
-    float tau_shear_local = TAU_SHEAR;
-    float tau_normal_local = clampf(TAU_NORMAL, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
-    if (SGS_ENABLED) {
+    float tau_shear_local = tau_shear_eff;
+    float tau_normal_local = clampf(tau_normal_eff, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
+    if (SGS_ENABLED && (benchmark_flags & BENCH_DISABLE_SGS) == 0) {
         float nu0 = fmax(1e-6f, (TAU_SHEAR - 0.5f) / 3.0f);
         float neq_xx = central_pre[MI(2, 0, 0)] - rho_safe * CS2;
         float neq_yy = central_pre[MI(0, 2, 0)] - rho_safe * CS2;
@@ -1632,7 +2441,7 @@ R"CLC(
     float ux_plus = ux + 0.5f * dux;
     float uy_plus = uy + 0.5f * duy;
     float uz_plus = uz + 0.5f * duz;
-    float alpha_sponge = sponge_alpha(n, x, y, z);
+    float alpha_sponge = (benchmark_flags & BENCH_DISABLE_SPONGE) ? 0.0f : sponge_alpha(n, x, y, z);
     float keep_sponge = 1.0f - alpha_sponge;
 
     for (int q = 0; q < KQ; ++q) {
@@ -1845,6 +2654,16 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
     const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
 
+    if (benchmark_mode_active() && g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
+        if (ctx.obstacle.size() != ctx.cells) {
+            ctx.obstacle.assign(ctx.cells, 0);
+        }
+        for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+            const std::size_t base = cell * g_cfg.input_channels;
+            ctx.obstacle[cell] = payload[base + kChannelObstacle] > 0.5f ? 1 : 0;
+        }
+    }
+
     auto upload_begin = Clock::now();
     if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_payload, CL_TRUE, 0, payload_bytes, payload, 0, nullptr, nullptr) != CL_SUCCESS) return false;
     timing.payload_copy_ms += elapsed_ms(upload_begin, Clock::now());
@@ -1870,6 +2689,11 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     }
 
     const int tick_i32 = static_cast<int>(ctx.step_counter & 0x7FFFFFFF);
+    const int benchmark_flags = opencl_benchmark_flags();
+    const int hydro_periodic_mask = opencl_hydrodynamic_periodic_mask();
+    const auto face_kinds = opencl_hydrodynamic_face_kinds();
+    const auto face_data = opencl_hydrodynamic_face_data();
+    const auto tau_pair = opencl_effective_tau_pair();
     
     // Ping-Pong 双重缓冲交换
     cl_mem read_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
@@ -1884,8 +2708,24 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &ctx.n);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &cells_i32);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(int), &tick_i32);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(cl_mem), &write_buf);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(cl_mem), &temp_write);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(int), &benchmark_flags);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(int), &hydro_periodic_mask);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 9, sizeof(float), &tau_pair[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 10, sizeof(float), &tau_pair[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 11, sizeof(int), &face_kinds[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 12, sizeof(int), &face_kinds[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 13, sizeof(int), &face_kinds[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(int), &face_kinds[3]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(int), &face_kinds[4]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(int), &face_kinds[5]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(OpenClFaceData), face_data[0].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(OpenClFaceData), face_data[1].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(OpenClFaceData), face_data[2].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(OpenClFaceData), face_data[3].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(OpenClFaceData), face_data[4].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(OpenClFaceData), face_data[5].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(cl_mem), &write_buf);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(cl_mem), &temp_write);
     if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32)) return false;
 
     err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
@@ -1901,6 +2741,20 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
 
     auto readback_begin = Clock::now();
     if (clEnqueueReadBuffer(g_opencl.queue, ctx.d_output, CL_TRUE, 0, output_bytes, out, 0, nullptr, nullptr) != CL_SUCCESS) return false;
+    if (benchmark_mode_active() && g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
+        const std::size_t dist_bytes = ctx.cells * kQ * sizeof(float);
+        if (ctx.f.size() != ctx.cells * kQ) {
+            ctx.f.assign(ctx.cells * kQ, 0.0f);
+        }
+        if (clEnqueueReadBuffer(g_opencl.queue, write_buf, CL_TRUE, 0, dist_bytes, ctx.f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+        compute_benchmark_force_from_distributions(ctx, ctx.f.data());
+    } else {
+        ctx.last_force[0] = 0.0f;
+        ctx.last_force[1] = 0.0f;
+        ctx.last_force[2] = 0.0f;
+    }
     timing.readback_ms += elapsed_ms(readback_begin, Clock::now());
     
     ctx.step_counter += 1;
@@ -2014,13 +2868,16 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
     if (should_update_temperature(ctx.step_counter)) {
         update_temperature_field(ctx);
     }
-    collide(ctx); stream_and_bounce(ctx); write_output(ctx, out, g_cfg.output_channels);
+    collide(ctx);
+    compute_benchmark_force(ctx);
+    stream_and_bounce(ctx);
+    write_output(ctx, out, g_cfg.output_channels);
     ctx.step_counter += 1;
 }
 
 bool run_solver_step(ContextState& ctx, const float* packet, float* out, StepTiming& timing) {
     bool ok = false;
-    if (g_cfg.opencl_enabled) {
+    if (g_cfg.opencl_enabled && benchmark_opencl_supported()) {
         if (!(ok = opencl_step(ctx, packet, out, timing))) disable_opencl_runtime("OpenCL fail");
     }
     if (!ok) {
@@ -2132,6 +2989,23 @@ static jboolean native_step_direct_impl(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+static bool native_step_raw_impl(const float* packet, jint grid_size, jlong context_key, float* output_flow) {
+    auto tick_begin = Clock::now();
+    StepTiming timing;
+
+    if (!g_cfg.initialized || !packet || !output_flow || grid_size != g_cfg.grid_size) return false;
+    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+
+    ContextState& ctx = g_contexts[context_key];
+    ensure_context_shape(ctx, grid_size, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+
+    const bool ok = run_solver_step(ctx, packet, output_flow, timing);
+    timing.total_ms = elapsed_ms(tick_begin, Clock::now());
+    record_timing(timing);
+    return ok;
+}
+
 static jboolean native_get_temperature_state_impl(
     JNIEnv* env, jclass, jint grid_size, jlong context_key, jfloatArray temperature_state
 ) {
@@ -2179,6 +3053,122 @@ static jstring native_runtime_info_impl(JNIEnv* env) {
 }
 static jstring native_timing_info_impl(JNIEnv* env) {
     return env->NewStringUTF(timing_info_string().c_str());
+}
+
+static void native_benchmark_default_config_impl(AeroLbmBenchmarkConfig* out_config) {
+    if (!out_config) return;
+    *out_config = make_default_benchmark_config();
+}
+
+static jboolean native_benchmark_default_preset_config_impl(jint preset, AeroLbmBenchmarkConfig* out_config) {
+    if (!out_config || !valid_benchmark_preset(preset)) return JNI_FALSE;
+    AeroLbmBenchmarkConfig cfg{};
+    apply_benchmark_preset_defaults(cfg, preset);
+    sanitize_benchmark_config(cfg);
+    *out_config = cfg;
+    return JNI_TRUE;
+}
+
+static jboolean native_benchmark_set_config_impl(const AeroLbmBenchmarkConfig* config) {
+    if (!config) return JNI_FALSE;
+    if (config->abi_version != AERO_LBM_BENCHMARK_ABI_VERSION) return JNI_FALSE;
+    if (config->struct_size != sizeof(AeroLbmBenchmarkConfig)) return JNI_FALSE;
+    g_benchmark_cfg = *config;
+    sanitize_benchmark_config(g_benchmark_cfg);
+    return JNI_TRUE;
+}
+
+static jboolean native_benchmark_get_config_impl(AeroLbmBenchmarkConfig* out_config) {
+    if (!out_config) return JNI_FALSE;
+    *out_config = g_benchmark_cfg;
+    out_config->abi_version = AERO_LBM_BENCHMARK_ABI_VERSION;
+    out_config->struct_size = sizeof(AeroLbmBenchmarkConfig);
+    return JNI_TRUE;
+}
+
+static void native_benchmark_reset_config_impl() {
+    g_benchmark_cfg = make_default_benchmark_config();
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_init(int grid_size, int input_channels, int output_channels) {
+    return native_init_impl(grid_size, input_channels, output_channels) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_step(const float* packet, int grid_size, long long context_key, float* output_flow) {
+    return native_step_raw_impl(packet, grid_size, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz) {
+    const auto it = g_contexts.find(static_cast<jlong>(context_key));
+    if (it == g_contexts.end()) return 0;
+    const ContextState& ctx = it->second;
+    if (out_fx) *out_fx = ctx.last_force[0];
+    if (out_fy) *out_fy = ctx.last_force[1];
+    if (out_fz) *out_fz = ctx.last_force[2];
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT void aero_lbm_release_context(long long context_key) {
+    native_release_context_impl(static_cast<jlong>(context_key));
+}
+
+AERO_LBM_CAPI_EXPORT void aero_lbm_shutdown(void) {
+    native_shutdown_impl();
+}
+
+AERO_LBM_CAPI_EXPORT const char* aero_lbm_runtime_info(void) {
+    return g_cfg.runtime_info.empty() ? "uninitialized" : g_cfg.runtime_info.c_str();
+}
+
+AERO_LBM_CAPI_EXPORT const char* aero_lbm_timing_info(void) {
+    static std::string timing_text;
+    timing_text = timing_info_string();
+    return timing_text.c_str();
+}
+
+AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void) {
+    reset_timing_stats();
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_get_timing_snapshot(AeroLbmTimingSnapshot* out_snapshot) {
+    if (!out_snapshot) return 0;
+    const double inv = g_timing.ticks == 0 ? 0.0 : 1.0 / static_cast<double>(g_timing.ticks);
+    out_snapshot->ticks = g_timing.ticks;
+    out_snapshot->last_payload_copy_ms = g_timing.last.payload_copy_ms;
+    out_snapshot->last_solver_ms = g_timing.last.solver_ms;
+    out_snapshot->last_readback_ms = g_timing.last.readback_ms;
+    out_snapshot->last_total_ms = g_timing.last.total_ms;
+    out_snapshot->avg_payload_copy_ms = g_timing.payload_copy_ms_sum * inv;
+    out_snapshot->avg_solver_ms = g_timing.solver_ms_sum * inv;
+    out_snapshot->avg_readback_ms = g_timing.readback_ms_sum * inv;
+    out_snapshot->avg_total_ms = g_timing.total_ms_sum * inv;
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT void aero_lbm_benchmark_default_config(AeroLbmBenchmarkConfig* out_config) {
+    native_benchmark_default_config_impl(out_config);
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_benchmark_default_preset_config(int preset, AeroLbmBenchmarkConfig* out_config) {
+    return native_benchmark_default_preset_config_impl(preset, out_config) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_benchmark_set_config(const AeroLbmBenchmarkConfig* config) {
+    return native_benchmark_set_config_impl(config) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_benchmark_get_config(AeroLbmBenchmarkConfig* out_config) {
+    return native_benchmark_get_config_impl(out_config) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT void aero_lbm_benchmark_reset_config(void) {
+    native_benchmark_reset_config_impl();
+}
+
+AERO_LBM_CAPI_EXPORT const char* aero_lbm_benchmark_info(void) {
+    static std::string benchmark_text;
+    benchmark_text = benchmark_info_string(g_benchmark_cfg);
+    return benchmark_text.c_str();
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeInit(

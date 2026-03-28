@@ -10,6 +10,7 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -98,6 +99,7 @@ public final class AeroServerRuntime {
     private static final int FLOW_COUNT = GRID_SIZE * GRID_SIZE * GRID_SIZE * RESPONSE_CHANNELS;
 
     private static final int WINDOW_REFRESH_TICKS = 20;
+    private static final int WINDOW_SAMPLE_RESYNC_TICKS = 200;
     private static final int FLOW_SYNC_INTERVAL_TICKS = 2;
     private static final int CHUNK_SIZE = 16;
     private static final int WINDOW_SECTION_COUNT = GRID_SIZE / CHUNK_SIZE;
@@ -487,6 +489,13 @@ public final class AeroServerRuntime {
                 steppedThisTick = true;
                 maxSpeedThisTick = Math.max(maxSpeedThisTick, completed.maxSpeed());
                 lastSolverError = "";
+            }
+
+            if (!window.busy.get() && shouldResampleWindowSamples(window)) {
+                boolean geometryChanged = refreshSampleFields(world, key.origin(), window, false);
+                if (geometryChanged) {
+                    markWindowBackendDirty(window);
+                }
             }
 
             if (window.sections != null) {
@@ -915,6 +924,10 @@ public final class AeroServerRuntime {
                 }
             }
         }
+    }
+
+    private boolean shouldResampleWindowSamples(WindowState window) {
+        return tickCounter - window.lastSampleRefreshTick >= WINDOW_SAMPLE_RESYNC_TICKS;
     }
 
     private boolean captureTemperatureStateFromNative(WindowState window) {
@@ -1855,6 +1868,18 @@ public final class AeroServerRuntime {
 
     private WindowSection sampleWindowSection(ServerWorld world, BlockPos origin) {
         WindowSection section = new WindowSection();
+        sampleSectionFields(world, origin, section.obstacle, section.air, section.thermal);
+        return section;
+    }
+
+    private void sampleSectionFields(
+        ServerWorld world,
+        BlockPos origin,
+        float[] obstacleOut,
+        float[] airOut,
+        float[] thermalOut
+    ) {
+        Arrays.fill(thermalOut, 0.0f);
         BlockPos.Mutable cursor = new BlockPos.Mutable();
         for (int x = 0; x < CHUNK_SIZE; x++) {
             for (int y = 0; y < CHUNK_SIZE; y++) {
@@ -1863,8 +1888,8 @@ public final class AeroServerRuntime {
                     cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
                     BlockState state = world.getBlockState(cursor);
                     boolean solid = isSolidObstacle(world, cursor, state);
-                    section.obstacle[cell] = solid ? 1.0f : 0.0f;
-                    section.air[cell] = state.isAir() ? 1.0f : 0.0f;
+                    obstacleOut[cell] = solid ? 1.0f : 0.0f;
+                    airOut[cell] = state.isAir() ? 1.0f : 0.0f;
                 }
             }
         }
@@ -1881,21 +1906,74 @@ public final class AeroServerRuntime {
                     BlockState state = world.getBlockState(cursor);
                     boolean solid = isSolidObstacle(world, cursor, state);
                     if (solid) {
-                        emitSolidBlockThermalSource(section.thermal, world, cursor, state, x, y, z, environment, neighborCursor);
+                        emitSolidBlockThermalSource(thermalOut, world, cursor, state, x, y, z, environment, neighborCursor);
                     } else {
                         float source = sampleEmitterThermalSource(state) + sampleFluidThermalSource(world, cursor, state, environment);
-                        addSectionThermalSource(section.thermal, x, y, z, source);
+                        addSectionThermalSource(thermalOut, x, y, z, source);
                     }
                 }
             }
         }
-        return section;
     }
 
-    private void refreshSampleFields(ServerWorld world, BlockPos origin, WindowState window, boolean forceFullResample) {
+    private boolean refreshSectionSampleFields(
+        ServerWorld world,
+        BlockPos origin,
+        WindowSection section,
+        float[] obstacleScratch,
+        float[] airScratch,
+        float[] thermalScratch
+    ) {
+        sampleSectionFields(world, origin, obstacleScratch, airScratch, thermalScratch);
+        boolean geometryChanged = false;
+        for (int i = 0; i < SECTION_CELL_COUNT; i++) {
+            if (section.obstacle[i] == obstacleScratch[i]) {
+                continue;
+            }
+            geometryChanged = true;
+            int stateIdx = i * RESPONSE_CHANNELS;
+            section.state[stateIdx] = 0.0f;
+            section.state[stateIdx + 1] = 0.0f;
+            section.state[stateIdx + 2] = 0.0f;
+            section.state[stateIdx + 3] = 0.0f;
+            section.temperatureState[i] = 0.0f;
+        }
+        System.arraycopy(obstacleScratch, 0, section.obstacle, 0, SECTION_CELL_COUNT);
+        System.arraycopy(airScratch, 0, section.air, 0, SECTION_CELL_COUNT);
+        System.arraycopy(thermalScratch, 0, section.thermal, 0, SECTION_CELL_COUNT);
+        return geometryChanged;
+    }
+
+    private boolean refreshSampleFields(ServerWorld world, BlockPos origin, WindowState window, boolean forceFullResample) {
         window.ambientThermalBias = sampleAmbientThermalBias(world);
         if (!forceFullResample && window.sections != null) {
-            return;
+            boolean geometryChanged = false;
+            float[] obstacleScratch = new float[SECTION_CELL_COUNT];
+            float[] airScratch = new float[SECTION_CELL_COUNT];
+            float[] thermalScratch = new float[SECTION_CELL_COUNT];
+            for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+                for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                    for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                        WindowSection section = window.sectionAt(sx, sy, sz);
+                        BlockPos sectionPos = sectionOrigin(origin, sx, sy, sz);
+                        if (section == null) {
+                            window.setSection(sx, sy, sz, sampleWindowSection(world, sectionPos));
+                            geometryChanged = true;
+                            continue;
+                        }
+                        geometryChanged |= refreshSectionSampleFields(
+                            world,
+                            sectionPos,
+                            section,
+                            obstacleScratch,
+                            airScratch,
+                            thermalScratch
+                        );
+                    }
+                }
+            }
+            window.lastSampleRefreshTick = tickCounter;
+            return geometryChanged;
         }
 
         window.ensureSectionsInitialized();
@@ -1907,6 +1985,8 @@ public final class AeroServerRuntime {
             }
         }
         clearWindowStateChannels(window);
+        window.lastSampleRefreshTick = tickCounter;
+        return false;
     }
 
     private float[] runSolverStep(SolveSnapshot snapshot, PreparedPayload payload) throws IOException {
@@ -2465,6 +2545,7 @@ public final class AeroServerRuntime {
         private float[] solveField;
         private float[] temperatureTransferBuffer;
         private float ambientThermalBias = 0.0f;
+        private int lastSampleRefreshTick;
         private List<FanSource> fans = List.of();
         private volatile boolean detached;
         private volatile boolean backendResetPending;
