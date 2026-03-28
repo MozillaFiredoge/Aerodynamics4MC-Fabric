@@ -177,6 +177,14 @@ constexpr int kThermalUpdateStride = 2;
 constexpr float kBoussinesqBeta = 0.12f;
 constexpr float kBoussinesqForceMax = 0.02f;
 
+constexpr float kCylinderBenchmarkLength = 2.2f;
+constexpr float kCylinderBenchmarkHeight = 0.41f;
+constexpr float kCylinderBenchmarkDiameter = 0.1f;
+constexpr float kCylinderBenchmarkCenterX = 0.2f;
+constexpr float kCylinderBenchmarkCenterY = 0.2f;
+constexpr float kCylinderBenchmarkUmean = 0.08f;
+constexpr float kCylinderBenchmarkUmax = 1.5f * kCylinderBenchmarkUmean;
+
 inline float clampf(float v, float lo, float hi);
 inline float finite_or(float v, float fallback);
 
@@ -189,6 +197,45 @@ constexpr std::uint32_t kBenchmarkKnownFlags =
     | AERO_LBM_BENCHMARK_FLAG_DISABLE_SGS
     | AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE
     | AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY;
+
+struct CylinderBenchmarkGeometry {
+    float y_min;
+    float y_max;
+    float height;
+    float center_x;
+    float center_y;
+    float radius;
+    float diameter;
+};
+
+inline CylinderBenchmarkGeometry cylinder_benchmark_geometry(int n) {
+    const float length_cells = static_cast<float>(std::max(1, n - 1));
+    float channel_height = std::max(8.0f, kCylinderBenchmarkHeight / kCylinderBenchmarkLength * length_cells);
+    float diameter = std::max(2.5f, kCylinderBenchmarkDiameter / kCylinderBenchmarkLength * length_cells);
+    const float radius = 0.5f * diameter;
+    channel_height = std::max(channel_height, 2.0f * radius + 6.0f);
+    channel_height = std::min(channel_height, length_cells - 2.0f);
+    const float y_min = 0.5f * (length_cells - channel_height);
+    const float y_max = y_min + channel_height;
+    const float center_x = kCylinderBenchmarkCenterX / kCylinderBenchmarkLength * length_cells;
+    const float center_y = y_min + kCylinderBenchmarkCenterY / kCylinderBenchmarkHeight * channel_height;
+    return {y_min, y_max, channel_height, center_x, center_y, radius, 2.0f * radius};
+}
+
+inline float cylinder_benchmark_inlet_ux(int n, int y, float u_max) {
+    const CylinderBenchmarkGeometry geom = cylinder_benchmark_geometry(n);
+    const float denom = std::max(geom.y_max - geom.y_min, 1.0e-6f);
+    const float s = (static_cast<float>(y) - geom.y_min) / denom;
+    if (s < 0.0f || s > 1.0f) return 0.0f;
+    return 4.0f * u_max * s * (1.0f - s);
+}
+
+inline bool cylinder_benchmark_solid_cell(int n, int x, int y) {
+    const CylinderBenchmarkGeometry geom = cylinder_benchmark_geometry(n);
+    const float dx = static_cast<float>(x) - geom.center_x;
+    const float dy = static_cast<float>(y) - geom.center_y;
+    return dx * dx + dy * dy <= geom.radius * geom.radius;
+}
 
 inline AeroLbmBoundaryFaceConfig make_face_config(int hydro_kind, int thermal_kind) {
     AeroLbmBoundaryFaceConfig face{};
@@ -338,7 +385,8 @@ void apply_benchmark_preset_defaults(AeroLbmBenchmarkConfig& cfg, int preset) {
                 | AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY;
             set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_SYMMETRY, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
             cfg.x_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
-            cfg.x_min.velocity[0] = 0.08f;
+            cfg.initial_velocity[0] = kCylinderBenchmarkUmean;
+            cfg.x_min.velocity[0] = kCylinderBenchmarkUmax;
             cfg.x_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_CONVECTIVE_OUTFLOW, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
             cfg.z_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
             cfg.z_max = make_face_config(AERO_LBM_HYDRO_BOUNDARY_PERIODIC, AERO_LBM_THERMAL_BOUNDARY_PERIODIC);
@@ -639,6 +687,20 @@ inline float effective_fan_beta() {
 
 inline float benchmark_reference_speed() {
     if (!benchmark_mode_active()) return 0.0f;
+    if (g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
+        const float initial_speed = std::sqrt(
+            g_benchmark_cfg.initial_velocity[0] * g_benchmark_cfg.initial_velocity[0]
+            + g_benchmark_cfg.initial_velocity[1] * g_benchmark_cfg.initial_velocity[1]
+            + g_benchmark_cfg.initial_velocity[2] * g_benchmark_cfg.initial_velocity[2]
+        );
+        if (initial_speed > 1.0e-8f) return initial_speed;
+        const float face_speed = std::sqrt(
+            g_benchmark_cfg.x_min.velocity[0] * g_benchmark_cfg.x_min.velocity[0]
+            + g_benchmark_cfg.x_min.velocity[1] * g_benchmark_cfg.x_min.velocity[1]
+            + g_benchmark_cfg.x_min.velocity[2] * g_benchmark_cfg.x_min.velocity[2]
+        );
+        return (2.0f / 3.0f) * face_speed;
+    }
     float speed = std::sqrt(
         g_benchmark_cfg.initial_velocity[0] * g_benchmark_cfg.initial_velocity[0]
         + g_benchmark_cfg.initial_velocity[1] * g_benchmark_cfg.initial_velocity[1]
@@ -1015,7 +1077,16 @@ inline float boundary_convective_value(
 }
 
 inline float boundary_equilibrium_value(
-    const ContextState& ctx, std::size_t cell, int q, const AeroLbmBoundaryFaceConfig& face
+    const ContextState& ctx,
+    std::size_t cell,
+    int x,
+    int y,
+    int z,
+    int q,
+    int sx,
+    int sy,
+    int sz,
+    const AeroLbmBoundaryFaceConfig& face
 ) {
     float rho = 1.0f + clampf(ctx.ref_pressure[cell], kPressureMin, kPressureMax);
     float ux = 0.0f;
@@ -1027,6 +1098,11 @@ inline float boundary_equilibrium_value(
             ux = face.velocity[0];
             uy = face.velocity[1];
             uz = face.velocity[2];
+            if (g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D && sx < 0) {
+                ux = cylinder_benchmark_inlet_ux(ctx.n, y, face.velocity[0]);
+                uy = 0.0f;
+                uz = 0.0f;
+            }
             break;
         case AERO_LBM_HYDRO_BOUNDARY_PRESSURE_DIRICHLET:
             rho = 1.0f + clampf(face.pressure, kPressureMin, kPressureMax);
@@ -1064,7 +1140,7 @@ inline float benchmark_hydrodynamic_boundary_value(
         case AERO_LBM_HYDRO_BOUNDARY_MOVING_WALL:
         case AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET:
         case AERO_LBM_HYDRO_BOUNDARY_PRESSURE_DIRICHLET:
-            return boundary_equilibrium_value(ctx, cell, q, *face);
+            return boundary_equilibrium_value(ctx, cell, x, y, z, q, sx, sy, sz, *face);
         case AERO_LBM_HYDRO_BOUNDARY_SYMMETRY: {
             const int ix = std::clamp(sx, 0, ctx.n - 1);
             const int iy = std::clamp(sy, 0, ctx.n - 1);
@@ -1581,6 +1657,7 @@ void compute_benchmark_force(ContextState& ctx) {
                     if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.n || ny >= ctx.n || nz >= ctx.n) continue;
                     const std::size_t neighbor = cell_index(nx, ny, nz, ctx.n);
                     if (!ctx.obstacle[neighbor]) continue;
+                    if (!cylinder_benchmark_solid_cell(ctx.n, nx, ny)) continue;
                     const float fq = ctx.f_post[dist_index(cell, q, ctx.cells)];
                     fx += 2.0 * static_cast<double>(fq) * static_cast<double>(kCx[q]);
                     fy += 2.0 * static_cast<double>(fq) * static_cast<double>(kCy[q]);
@@ -1621,6 +1698,7 @@ void compute_benchmark_force_from_distributions(ContextState& ctx, const float* 
                     if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.n || ny >= ctx.n || nz >= ctx.n) continue;
                     const std::size_t neighbor = cell_index(nx, ny, nz, ctx.n);
                     if (!ctx.obstacle[neighbor]) continue;
+                    if (!cylinder_benchmark_solid_cell(ctx.n, nx, ny)) continue;
                     const float fq = dist_data[dist_index(cell, q, ctx.cells)];
                     fx += 2.0 * static_cast<double>(fq) * static_cast<double>(kCx[q]);
                     fy += 2.0 * static_cast<double>(fq) * static_cast<double>(kCy[q]);
@@ -1792,9 +1870,14 @@ __constant float BOUSSINESQ_FORCE_MAX = 0.02f;
 #define BENCH_DISABLE_INTERNAL_THERMAL_SOURCE (1 << 6)
 #define BENCH_DISABLE_BUOYANCY (1 << 7)
 
+#define BENCH_PRESET_CYLINDER_CROSSFLOW_2D 4
+
 #define PERIODIC_AXIS_X 1
 #define PERIODIC_AXIS_Y 2
 #define PERIODIC_AXIS_Z 4
+
+#define CYLINDER_BENCHMARK_LENGTH 2.2f
+#define CYLINDER_BENCHMARK_HEIGHT 0.41f
 
 inline float clampf(float v, float lo, float hi) { return fmin(hi, fmax(lo, v)); }
 inline int clampi(int v, int lo, int hi) { return min(hi, max(lo, v)); }
@@ -1820,6 +1903,20 @@ inline int wrap_axis_if_periodic(int coord, int n, int axis_bit, int periodic_ma
     coord %= n;
     if (coord < 0) coord += n;
     return coord;
+}
+
+inline float cylinder_benchmark_inlet_ux(int n, int y, float u_max) {
+    float length_cells = (float)max(1, n - 1);
+    float channel_height = fmax(8.0f, CYLINDER_BENCHMARK_HEIGHT / CYLINDER_BENCHMARK_LENGTH * length_cells);
+    float diameter = fmax(2.5f, 0.1f / CYLINDER_BENCHMARK_LENGTH * length_cells);
+    float radius = 0.5f * diameter;
+    channel_height = fmax(channel_height, 2.0f * radius + 6.0f);
+    channel_height = fmin(channel_height, length_cells - 2.0f);
+    float y_min = 0.5f * (length_cells - channel_height);
+    float y_max = y_min + channel_height;
+    float s = ((float)y - y_min) / fmax(y_max - y_min, 1.0e-6f);
+    if (s < 0.0f || s > 1.0f) return 0.0f;
+    return 4.0f * u_max * s * (1.0f - s);
 }
 
 inline int face_kind_for_oob(
@@ -1902,7 +1999,16 @@ inline float boundary_convective_value(
     return f1 + BOUNDARY_CONVECTIVE_BETA * (f1 - f2);
 }
 
-inline float boundary_equilibrium_value(int q, float4 face_data, float ref_pressure, int use_face_pressure) {
+inline float boundary_equilibrium_value(
+    int q,
+    float4 face_data,
+    float ref_pressure,
+    int use_face_pressure,
+    int benchmark_preset,
+    int n,
+    int y,
+    int sx
+) {
     float rho = 1.0f + clampf(ref_pressure, P_MIN, P_MAX);
     float ux = face_data.x;
     float uy = face_data.y;
@@ -1910,6 +2016,11 @@ inline float boundary_equilibrium_value(int q, float4 face_data, float ref_press
     float pressure = face_data.w;
     if (use_face_pressure != 0) {
         rho = 1.0f + clampf(pressure, P_MIN, P_MAX);
+    }
+    if (use_face_pressure == 0 && benchmark_preset == BENCH_PRESET_CYLINDER_CROSSFLOW_2D && sx < 0) {
+        ux = cylinder_benchmark_inlet_ux(n, y, face_data.x);
+        uy = 0.0f;
+        uz = 0.0f;
     }
     rho = clampf(rho, RHO_MIN, RHO_MAX);
     float speed2 = ux * ux + uy * uy + uz * uz;
@@ -1948,7 +2059,8 @@ inline float benchmark_boundary_value(
     float4 y_min_data,
     float4 y_max_data,
     float4 z_min_data,
-    float4 z_max_data
+    float4 z_max_data,
+    int benchmark_preset
 ) {
     int kind = face_kind_for_oob(sx, sy, sz, n, x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind);
     float4 face_data = face_data_for_oob(sx, sy, sz, n, x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data);
@@ -1957,10 +2069,10 @@ inline float benchmark_boundary_value(
             return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
         case 3:
         case 4:
-            return boundary_equilibrium_value(q, face_data, payload[cell * in_ch + 8], 0);
+            return boundary_equilibrium_value(q, face_data, payload[cell * in_ch + 8], 0, benchmark_preset, n, y, sx);
         case 5: {
             float4 pressure_face = (float4)(0.0f, 0.0f, 0.0f, face_data.w);
-            return boundary_equilibrium_value(q, pressure_face, payload[cell * in_ch + 8], 1);
+            return boundary_equilibrium_value(q, pressure_face, payload[cell * in_ch + 8], 1, benchmark_preset, n, y, sx);
         }
         case 7: {
             int ix = clampi(sx, 0, n - 1);
@@ -2094,6 +2206,7 @@ kernel void stream_collide_step(
     float tau_shear_eff, float tau_normal_eff,
     int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
     float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
+    int benchmark_preset,
     __global float* f_write,
     __global float* temp_write
 ) {
@@ -2126,7 +2239,7 @@ kernel void stream_collide_step(
             f_local[q] = benchmark_boundary_value(
                 f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags,
                 x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind,
-                x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data
+                x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data, benchmark_preset
             );
         } else {
             int src = (sx * n + sy) * n + sz;
@@ -2691,6 +2804,7 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     const int tick_i32 = static_cast<int>(ctx.step_counter & 0x7FFFFFFF);
     const int benchmark_flags = opencl_benchmark_flags();
     const int hydro_periodic_mask = opencl_hydrodynamic_periodic_mask();
+    const int benchmark_preset = benchmark_mode_active() ? g_benchmark_cfg.preset : 0;
     const auto face_kinds = opencl_hydrodynamic_face_kinds();
     const auto face_data = opencl_hydrodynamic_face_data();
     const auto tau_pair = opencl_effective_tau_pair();
@@ -2724,8 +2838,9 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(OpenClFaceData), face_data[3].data());
     err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(OpenClFaceData), face_data[4].data());
     err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(OpenClFaceData), face_data[5].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(cl_mem), &write_buf);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(cl_mem), &temp_write);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(int), &benchmark_preset);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(cl_mem), &write_buf);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(cl_mem), &temp_write);
     if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32)) return false;
 
     err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
