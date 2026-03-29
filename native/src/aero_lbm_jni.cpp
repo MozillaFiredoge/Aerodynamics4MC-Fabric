@@ -395,6 +395,7 @@ void apply_benchmark_preset_defaults(AeroLbmBenchmarkConfig& cfg, int preset) {
         case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D:
             cfg.rayleigh_number = 1.0e5f;
             cfg.prandtl_number = 0.71f;
+            cfg.flags |= AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE;
             set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_ADIABATIC);
             cfg.x_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET);
             cfg.x_min.temperature = 0.5f;
@@ -691,6 +692,10 @@ inline float effective_fan_beta() {
 
 inline float benchmark_reference_speed() {
     if (!benchmark_mode_active()) return 0.0f;
+    if (g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_2D
+        || g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D) {
+        return clampf(finite_or(g_benchmark_cfg.mach_number, 0.05f), 1.0e-4f, 0.30f) * std::sqrt(kCs2);
+    }
     if (g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
         const float initial_speed = std::sqrt(
             g_benchmark_cfg.initial_velocity[0] * g_benchmark_cfg.initial_velocity[0]
@@ -726,8 +731,42 @@ inline float benchmark_reference_speed() {
     return speed;
 }
 
+inline bool heated_cavity_benchmark_active() {
+    return benchmark_mode_active()
+        && (g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_2D
+            || g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D);
+}
+
+inline float benchmark_temperature_span() {
+    if (!benchmark_mode_active()) return 1.0f;
+    const AeroLbmBoundaryFaceConfig faces[6] = {
+        g_benchmark_cfg.x_min, g_benchmark_cfg.x_max,
+        g_benchmark_cfg.y_min, g_benchmark_cfg.y_max,
+        g_benchmark_cfg.z_min, g_benchmark_cfg.z_max,
+    };
+    float t_min = 1.0e9f;
+    float t_max = -1.0e9f;
+    bool any_dirichlet = false;
+    for (const AeroLbmBoundaryFaceConfig& face : faces) {
+        if (face.thermal_kind != AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET) continue;
+        any_dirichlet = true;
+        t_min = std::min(t_min, face.temperature);
+        t_max = std::max(t_max, face.temperature);
+    }
+    if (!any_dirichlet) return 1.0f;
+    return std::max(1.0e-6f, t_max - t_min);
+}
+
 inline float effective_benchmark_tau_shear() {
     if (!benchmark_mode_active()) return kTauShear;
+    if (heated_cavity_benchmark_active()) {
+        const float ra = std::max(1.0e-6f, finite_or(g_benchmark_cfg.rayleigh_number, 1.0e5f));
+        const float pr = std::max(1.0e-6f, finite_or(g_benchmark_cfg.prandtl_number, 0.71f));
+        const float ref_speed = benchmark_reference_speed();
+        const float ref_length = std::max(1.0e-6f, finite_or(g_benchmark_cfg.reference_length, 1.0f));
+        const float nu = ref_speed * ref_length * std::sqrt(pr / ra);
+        return clampf(0.5f + 3.0f * nu, kTauShearMin, kTauShearMax);
+    }
     const float re = finite_or(g_benchmark_cfg.reynolds_number, 0.0f);
     const float ref_speed = benchmark_reference_speed();
     const float ref_length = std::max(1.0e-6f, finite_or(g_benchmark_cfg.reference_length, 1.0f));
@@ -739,6 +778,26 @@ inline float effective_benchmark_tau_shear() {
 inline float effective_benchmark_tau_normal(float tau_shear_eff) {
     if (!benchmark_mode_active()) return clampf(kTauNormal, kTauNormalMin, kTauNormalMax);
     return clampf(tau_shear_eff, kTauNormalMin, kTauNormalMax);
+}
+
+inline float effective_thermal_diffusivity() {
+    if (!heated_cavity_benchmark_active()) return kThermalDiffusivity;
+    const float pr = std::max(1.0e-6f, finite_or(g_benchmark_cfg.prandtl_number, 0.71f));
+    const float tau_shear_eff = effective_benchmark_tau_shear();
+    const float nu = std::max(1.0e-6f, (tau_shear_eff - 0.5f) / 3.0f);
+    return nu / pr;
+}
+
+inline float effective_thermal_cooling() {
+    return heated_cavity_benchmark_active() ? 0.0f : kThermalCooling;
+}
+
+inline float effective_boussinesq_beta() {
+    if (!heated_cavity_benchmark_active()) return kBoussinesqBeta;
+    const float ref_speed = benchmark_reference_speed();
+    const float ref_length = std::max(1.0e-6f, finite_or(g_benchmark_cfg.reference_length, 1.0f));
+    const float delta_t = benchmark_temperature_span();
+    return (ref_speed * ref_speed) / std::max(1.0e-6f, ref_length * delta_t);
 }
 
 inline int opencl_benchmark_flags() {
@@ -847,6 +906,14 @@ inline std::array<float, 2> opencl_effective_tau_pair() {
     const float tau_shear = effective_benchmark_tau_shear();
     const float tau_normal = effective_benchmark_tau_normal(tau_shear);
     return {tau_shear, tau_normal};
+}
+
+inline std::array<float, 3> opencl_effective_thermal_transport() {
+    return {
+        effective_thermal_diffusivity(),
+        effective_thermal_cooling(),
+        effective_boussinesq_beta(),
+    };
 }
 
 double elapsed_ms(const Clock::time_point& begin, const Clock::time_point& end) {
@@ -1394,6 +1461,8 @@ inline float sample_temperature_trilinear(
 
 void update_temperature_field(ContextState& ctx) {
     if (!kEnableBoussinesq) return;
+    const float thermal_diffusivity = effective_thermal_diffusivity();
+    const float thermal_cooling = effective_thermal_cooling();
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         if (ctx.obstacle[cell]) {
             ctx.temperature_next[cell] = 0.0f;
@@ -1422,9 +1491,9 @@ void update_temperature_field(ContextState& ctx) {
         const float laplacian = t_sum - 6.0f * t_center;
         const float source = thermal_source_term(ctx, cell);
         const float t_next = advected
-                             + kThermalDiffusivity * laplacian
+                             + thermal_diffusivity * laplacian
                              + source
-                             - kThermalCooling * advected;
+                             - thermal_cooling * advected;
         ctx.temperature_next[cell] = clampf(t_next, kThermalMin, kThermalMax);
     }
     ctx.temperature.swap(ctx.temperature_next);
@@ -1437,6 +1506,7 @@ inline bool should_update_temperature(std::uint64_t step_counter) {
 }
 
 void collide(ContextState& ctx) {
+    const float boussinesq_beta = effective_boussinesq_beta();
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         if (ctx.obstacle[cell]) {
             ctx.rho[cell] = 1.0f;
@@ -1516,7 +1586,7 @@ void collide(ContextState& ctx) {
 
         if (effective_enable_buoyancy()) {
             const float buoyancy = clampf(
-                kBoussinesqBeta * ctx.temperature[cell],
+                boussinesq_beta * ctx.temperature[cell],
                 -kBoussinesqForceMax,
                 kBoussinesqForceMax
             );
@@ -2293,6 +2363,7 @@ kernel void stream_collide_step(
     __global const float* temp_read,
     int in_ch, int nx, int ny, int nz, int cells, int tick, int benchmark_flags, int hydro_periodic_mask, int thermal_periodic_mask,
     float tau_shear_eff, float tau_normal_eff,
+    float thermal_diffusivity_eff, float thermal_cooling_eff, float boussinesq_beta_eff,
     int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
     float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
     int tx_min_kind, int tx_max_kind, int ty_min_kind, int ty_max_kind, int tz_min_kind, int tz_max_kind,
@@ -2415,7 +2486,7 @@ kernel void stream_collide_step(
             thermal_source = fan * clampf(fan_norm * THERMAL_SOURCE_SCALE, 0.0f, THERMAL_SOURCE_MAX);
         }
         temp_next = clampf(
-            temp_advected + THERMAL_DIFFUSIVITY * laplacian_t + thermal_source - THERMAL_COOLING * temp_advected,
+            temp_advected + thermal_diffusivity_eff * laplacian_t + thermal_source - thermal_cooling_eff * temp_advected,
             THERMAL_MIN,
             THERMAL_MAX
         );
@@ -2454,7 +2525,7 @@ kernel void stream_collide_step(
     }
 
     if (BOUSSINESQ_ENABLED && (benchmark_flags & BENCH_DISABLE_BUOYANCY) == 0) {
-        float buoyancy = clampf(BOUSSINESQ_BETA * temp_next, -BOUSSINESQ_FORCE_MAX, BOUSSINESQ_FORCE_MAX);
+        float buoyancy = clampf(boussinesq_beta_eff * temp_next, -BOUSSINESQ_FORCE_MAX, BOUSSINESQ_FORCE_MAX);
         fy += rho_safe * buoyancy;
     }
 
@@ -2915,6 +2986,7 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     const auto thermal_face_kinds = opencl_thermal_face_kinds();
     const auto thermal_face_data = opencl_thermal_face_data();
     const auto tau_pair = opencl_effective_tau_pair();
+    const auto thermal_transport = opencl_effective_thermal_transport();
     
     // Ping-Pong 双重缓冲交换
     cl_mem read_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
@@ -2936,33 +3008,36 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     err |= clSetKernelArg(g_opencl.k_stream_collide, 11, sizeof(int), &thermal_periodic_mask);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 12, sizeof(float), &tau_pair[0]);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 13, sizeof(float), &tau_pair[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(int), &hydro_face_kinds[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(int), &hydro_face_kinds[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(int), &hydro_face_kinds[2]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(int), &hydro_face_kinds[3]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(int), &hydro_face_kinds[4]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(int), &hydro_face_kinds[5]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(OpenClFaceData), hydro_face_data[0].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(OpenClFaceData), hydro_face_data[1].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(OpenClFaceData), hydro_face_data[2].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(OpenClFaceData), hydro_face_data[3].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(OpenClFaceData), hydro_face_data[4].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(OpenClFaceData), hydro_face_data[5].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 26, sizeof(int), &thermal_face_kinds[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 27, sizeof(int), &thermal_face_kinds[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 28, sizeof(int), &thermal_face_kinds[2]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 29, sizeof(int), &thermal_face_kinds[3]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 30, sizeof(int), &thermal_face_kinds[4]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 31, sizeof(int), &thermal_face_kinds[5]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 32, sizeof(OpenClFaceData), thermal_face_data[0].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 33, sizeof(OpenClFaceData), thermal_face_data[1].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 34, sizeof(OpenClFaceData), thermal_face_data[2].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 35, sizeof(OpenClFaceData), thermal_face_data[3].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 36, sizeof(OpenClFaceData), thermal_face_data[4].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 37, sizeof(OpenClFaceData), thermal_face_data[5].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 38, sizeof(int), &benchmark_preset);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 39, sizeof(cl_mem), &write_buf);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 40, sizeof(cl_mem), &temp_write);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(float), &thermal_transport[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(float), &thermal_transport[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(float), &thermal_transport[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(int), &hydro_face_kinds[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(int), &hydro_face_kinds[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(int), &hydro_face_kinds[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(int), &hydro_face_kinds[3]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(int), &hydro_face_kinds[4]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(int), &hydro_face_kinds[5]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(OpenClFaceData), hydro_face_data[0].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(OpenClFaceData), hydro_face_data[1].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(OpenClFaceData), hydro_face_data[2].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 26, sizeof(OpenClFaceData), hydro_face_data[3].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 27, sizeof(OpenClFaceData), hydro_face_data[4].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 28, sizeof(OpenClFaceData), hydro_face_data[5].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 29, sizeof(int), &thermal_face_kinds[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 30, sizeof(int), &thermal_face_kinds[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 31, sizeof(int), &thermal_face_kinds[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 32, sizeof(int), &thermal_face_kinds[3]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 33, sizeof(int), &thermal_face_kinds[4]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 34, sizeof(int), &thermal_face_kinds[5]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 35, sizeof(OpenClFaceData), thermal_face_data[0].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 36, sizeof(OpenClFaceData), thermal_face_data[1].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 37, sizeof(OpenClFaceData), thermal_face_data[2].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 38, sizeof(OpenClFaceData), thermal_face_data[3].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 39, sizeof(OpenClFaceData), thermal_face_data[4].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 40, sizeof(OpenClFaceData), thermal_face_data[5].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 41, sizeof(int), &benchmark_preset);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 42, sizeof(cl_mem), &write_buf);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 43, sizeof(cl_mem), &temp_write);
     if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32)) return false;
 
     err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
