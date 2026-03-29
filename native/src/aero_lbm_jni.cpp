@@ -395,6 +395,7 @@ void apply_benchmark_preset_defaults(AeroLbmBenchmarkConfig& cfg, int preset) {
         case AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D:
             cfg.rayleigh_number = 1.0e5f;
             cfg.prandtl_number = 0.71f;
+            cfg.mach_number = 0.15f;
             cfg.flags |= AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE;
             set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_ADIABATIC);
             cfg.x_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET);
