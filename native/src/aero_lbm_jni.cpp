@@ -382,7 +382,7 @@ void apply_benchmark_preset_defaults(AeroLbmBenchmarkConfig& cfg, int preset) {
             cfg.flags |=
                 AERO_LBM_BENCHMARK_FLAG_DISABLE_INTERNAL_THERMAL_SOURCE
                 | AERO_LBM_BENCHMARK_FLAG_DISABLE_BUOYANCY;
-            set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_SYMMETRY, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+            set_all_faces(cfg, AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
             cfg.x_min = make_face_config(AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
             cfg.initial_velocity[0] = kCylinderBenchmarkUmean;
             cfg.x_min.velocity[0] = kCylinderBenchmarkUmax;
