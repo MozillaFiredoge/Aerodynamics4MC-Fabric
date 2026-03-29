@@ -208,30 +208,29 @@ struct CylinderBenchmarkGeometry {
     float diameter;
 };
 
-inline CylinderBenchmarkGeometry cylinder_benchmark_geometry(int n) {
-    const float length_cells = static_cast<float>(std::max(1, n - 1));
-    float channel_height = std::max(8.0f, kCylinderBenchmarkHeight / kCylinderBenchmarkLength * length_cells);
+inline CylinderBenchmarkGeometry cylinder_benchmark_geometry(int nx, int ny) {
+    const float length_cells = static_cast<float>(std::max(1, nx - 1));
+    const float channel_height = static_cast<float>(std::max(1, ny - 1));
     float diameter = std::max(2.5f, kCylinderBenchmarkDiameter / kCylinderBenchmarkLength * length_cells);
+    diameter = std::min(diameter, std::max(2.5f, channel_height - 4.0f));
     const float radius = 0.5f * diameter;
-    channel_height = std::max(channel_height, 2.0f * radius + 6.0f);
-    channel_height = std::min(channel_height, length_cells - 2.0f);
-    const float y_min = 0.5f * (length_cells - channel_height);
+    const float y_min = 0.0f;
     const float y_max = y_min + channel_height;
     const float center_x = kCylinderBenchmarkCenterX / kCylinderBenchmarkLength * length_cells;
     const float center_y = y_min + kCylinderBenchmarkCenterY / kCylinderBenchmarkHeight * channel_height;
     return {y_min, y_max, channel_height, center_x, center_y, radius, 2.0f * radius};
 }
 
-inline float cylinder_benchmark_inlet_ux(int n, int y, float u_max) {
-    const CylinderBenchmarkGeometry geom = cylinder_benchmark_geometry(n);
+inline float cylinder_benchmark_inlet_ux(int nx, int ny, int y, float u_max) {
+    const CylinderBenchmarkGeometry geom = cylinder_benchmark_geometry(nx, ny);
     const float denom = std::max(geom.y_max - geom.y_min, 1.0e-6f);
     const float s = (static_cast<float>(y) - geom.y_min) / denom;
     if (s < 0.0f || s > 1.0f) return 0.0f;
     return 4.0f * u_max * s * (1.0f - s);
 }
 
-inline bool cylinder_benchmark_solid_cell(int n, int x, int y) {
-    const CylinderBenchmarkGeometry geom = cylinder_benchmark_geometry(n);
+inline bool cylinder_benchmark_solid_cell(int nx, int ny, int x, int y) {
+    const CylinderBenchmarkGeometry geom = cylinder_benchmark_geometry(nx, ny);
     const float dx = static_cast<float>(x) - geom.center_x;
     const float dy = static_cast<float>(y) - geom.center_y;
     return dx * dx + dy * dy <= geom.radius * geom.radius;
@@ -499,6 +498,9 @@ std::string benchmark_info_string(const AeroLbmBenchmarkConfig& cfg) {
 
 struct Config {
     int grid_size = 0;
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
     int input_channels = 0;
     int output_channels = 0;
     bool initialized = false;
@@ -507,7 +509,9 @@ struct Config {
 };
 
 struct ContextState {
-    int n = 0;
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
     std::size_t cells = 0;
     bool cpu_initialized = false;
 
@@ -599,59 +603,59 @@ inline const AeroLbmBoundaryFaceConfig& boundary_face_config(int face_index) {
     }
 }
 
-inline bool wrap_axis_periodic(int& coord, int n, int min_face, int max_face, bool thermal) {
-    if (coord >= 0 && coord < n) return false;
+inline bool wrap_axis_periodic(int& coord, int dim, int min_face, int max_face, bool thermal) {
+    if (coord >= 0 && coord < dim) return false;
     const int face = coord < 0 ? min_face : max_face;
     const AeroLbmBoundaryFaceConfig& cfg = boundary_face_config(face);
     const int kind = thermal ? cfg.thermal_kind : cfg.hydrodynamic_kind;
     const int periodic_kind = thermal ? static_cast<int>(AERO_LBM_THERMAL_BOUNDARY_PERIODIC)
                                       : static_cast<int>(AERO_LBM_HYDRO_BOUNDARY_PERIODIC);
     if (kind != periodic_kind) return false;
-    coord %= n;
-    if (coord < 0) coord += n;
+    coord %= dim;
+    if (coord < 0) coord += dim;
     return true;
 }
 
-inline const AeroLbmBoundaryFaceConfig* hydrodynamic_face_for_oob(int x, int y, int z, int n) {
+inline const AeroLbmBoundaryFaceConfig* hydrodynamic_face_for_oob(int x, int y, int z, int nx, int ny, int nz) {
     if (x < 0) return &boundary_face_config(kFaceXMin);
-    if (x >= n) return &boundary_face_config(kFaceXMax);
+    if (x >= nx) return &boundary_face_config(kFaceXMax);
     if (y < 0) return &boundary_face_config(kFaceYMin);
-    if (y >= n) return &boundary_face_config(kFaceYMax);
+    if (y >= ny) return &boundary_face_config(kFaceYMax);
     if (z < 0) return &boundary_face_config(kFaceZMin);
-    if (z >= n) return &boundary_face_config(kFaceZMax);
+    if (z >= nz) return &boundary_face_config(kFaceZMax);
     return nullptr;
 }
 
-inline const AeroLbmBoundaryFaceConfig* thermal_face_for_oob(int x, int y, int z, int n) {
+inline const AeroLbmBoundaryFaceConfig* thermal_face_for_oob(int x, int y, int z, int nx, int ny, int nz) {
     if (x < 0) return &boundary_face_config(kFaceXMin);
-    if (x >= n) return &boundary_face_config(kFaceXMax);
+    if (x >= nx) return &boundary_face_config(kFaceXMax);
     if (y < 0) return &boundary_face_config(kFaceYMin);
-    if (y >= n) return &boundary_face_config(kFaceYMax);
+    if (y >= ny) return &boundary_face_config(kFaceYMax);
     if (z < 0) return &boundary_face_config(kFaceZMin);
-    if (z >= n) return &boundary_face_config(kFaceZMax);
+    if (z >= nz) return &boundary_face_config(kFaceZMax);
     return nullptr;
 }
 
-inline bool remap_hydrodynamic_coords(int& x, int& y, int& z, int n) {
+inline bool remap_hydrodynamic_coords(int& x, int& y, int& z, int nx, int ny, int nz) {
     bool changed = false;
-    changed |= wrap_axis_periodic(x, n, kFaceXMin, kFaceXMax, false);
-    changed |= wrap_axis_periodic(y, n, kFaceYMin, kFaceYMax, false);
-    changed |= wrap_axis_periodic(z, n, kFaceZMin, kFaceZMax, false);
+    changed |= wrap_axis_periodic(x, nx, kFaceXMin, kFaceXMax, false);
+    changed |= wrap_axis_periodic(y, ny, kFaceYMin, kFaceYMax, false);
+    changed |= wrap_axis_periodic(z, nz, kFaceZMin, kFaceZMax, false);
     return changed;
 }
 
-inline bool remap_thermal_coords(int& x, int& y, int& z, int n) {
+inline bool remap_thermal_coords(int& x, int& y, int& z, int nx, int ny, int nz) {
     bool changed = false;
-    changed |= wrap_axis_periodic(x, n, kFaceXMin, kFaceXMax, true);
-    changed |= wrap_axis_periodic(y, n, kFaceYMin, kFaceYMax, true);
-    changed |= wrap_axis_periodic(z, n, kFaceZMin, kFaceZMax, true);
+    changed |= wrap_axis_periodic(x, nx, kFaceXMin, kFaceXMax, true);
+    changed |= wrap_axis_periodic(y, ny, kFaceYMin, kFaceYMax, true);
+    changed |= wrap_axis_periodic(z, nz, kFaceZMin, kFaceZMax, true);
     return changed;
 }
 
-inline float effective_sponge_alpha(int n, int x, int y, int z) {
+inline float effective_sponge_alpha(int nx, int ny, int nz, int x, int y, int z) {
     if (benchmark_flag_enabled(AERO_LBM_BENCHMARK_FLAG_DISABLE_SPONGE)) return 0.0f;
     if (kSpongeLayers <= 0) return 0.0f;
-    const int d = std::min({x, y, z, n - 1 - x, n - 1 - y, n - 1 - z});
+    const int d = std::min({x, y, z, nx - 1 - x, ny - 1 - y, nz - 1 - z});
     if (d >= kSpongeLayers) return 0.0f;
     const float eta = static_cast<float>(kSpongeLayers - d) / static_cast<float>(kSpongeLayers);
     return clampf(kSpongeStrength * eta * eta, 0.0f, 0.95f);
@@ -835,8 +839,8 @@ std::string timing_info_string() {
     return oss.str();
 }
 
-inline std::size_t cell_index(int x, int y, int z, int n) {
-    return (static_cast<std::size_t>(x) * n + y) * n + z;
+inline std::size_t cell_index(int x, int y, int z, int nx, int ny, int nz) {
+    return (static_cast<std::size_t>(x) * ny + y) * nz + z;
 }
 
 // 极为关键的一步：CPU 侧同样采用 SoA (Structure of Arrays) 布局！
@@ -862,18 +866,19 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     return kW[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
 }
 
-inline void decode_cell(std::size_t cell, int n, int& x, int& y, int& z) {
-    const int yz = n * n;
+inline void decode_cell(std::size_t cell, int nx, int ny, int nz, int& x, int& y, int& z) {
+    (void)nx;
+    const int yz = ny * nz;
     x = static_cast<int>(cell / static_cast<std::size_t>(yz));
     const int rem = static_cast<int>(cell - static_cast<std::size_t>(x) * yz);
-    y = rem / n;
-    z = rem - y * n;
+    y = rem / nz;
+    z = rem - y * nz;
 }
 
 inline bool solid_or_oob(const ContextState& ctx, int x, int y, int z) {
-    remap_hydrodynamic_coords(x, y, z, ctx.n);
-    if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) return true;
-    return ctx.obstacle[cell_index(x, y, z, ctx.n)] != 0;
+    remap_hydrodynamic_coords(x, y, z, ctx.nx, ctx.ny, ctx.nz);
+    if (x < 0 || y < 0 || z < 0 || x >= ctx.nx || y >= ctx.ny || z >= ctx.nz) return true;
+    return ctx.obstacle[cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz)] != 0;
 }
 
 inline float hash_signed_noise(std::uint64_t cell, std::uint64_t tick) {
@@ -1043,9 +1048,9 @@ inline float obstacle_bounce_value(
     const int s2x = x - 2 * kCx[q];
     const int s2y = y - 2 * kCy[q];
     const int s2z = z - 2 * kCz[q];
-    if (s2x < 0 || s2y < 0 || s2z < 0 || s2x >= ctx.n || s2y >= ctx.n || s2z >= ctx.n) return bounced;
+    if (s2x < 0 || s2y < 0 || s2z < 0 || s2x >= ctx.nx || s2y >= ctx.ny || s2z >= ctx.nz) return bounced;
 
-    const std::size_t src2 = cell_index(s2x, s2y, s2z, ctx.n);
+    const std::size_t src2 = cell_index(s2x, s2y, s2z, ctx.nx, ctx.ny, ctx.nz);
     if (ctx.obstacle[src2]) return bounced;
 
     const float upstream = ctx.f_post[dist_index(src2, q, ctx.cells)];
@@ -1055,21 +1060,21 @@ inline float obstacle_bounce_value(
 inline float boundary_convective_value(
     const ContextState& ctx, std::size_t cell, int x, int y, int z, int q, int sx, int sy, int sz
 ) {
-    const int dx = (sx < 0 || sx >= ctx.n) ? kCx[q] : 0;
-    const int dy = (sy < 0 || sy >= ctx.n) ? kCy[q] : 0;
-    const int dz = (sz < 0 || sz >= ctx.n) ? kCz[q] : 0;
+    const int dx = (sx < 0 || sx >= ctx.nx) ? kCx[q] : 0;
+    const int dy = (sy < 0 || sy >= ctx.ny) ? kCy[q] : 0;
+    const int dz = (sz < 0 || sz >= ctx.nz) ? kCz[q] : 0;
 
-    const int i1x = std::clamp(x + dx, 0, ctx.n - 1);
-    const int i1y = std::clamp(y + dy, 0, ctx.n - 1);
-    const int i1z = std::clamp(z + dz, 0, ctx.n - 1);
-    const std::size_t src1 = cell_index(i1x, i1y, i1z, ctx.n);
+    const int i1x = std::clamp(x + dx, 0, ctx.nx - 1);
+    const int i1y = std::clamp(y + dy, 0, ctx.ny - 1);
+    const int i1z = std::clamp(z + dz, 0, ctx.nz - 1);
+    const std::size_t src1 = cell_index(i1x, i1y, i1z, ctx.nx, ctx.ny, ctx.nz);
     if (ctx.obstacle[src1]) return obstacle_bounce_value(ctx, cell, x, y, z, q);
 
     const float f1 = ctx.f_post[dist_index(src1, q, ctx.cells)];
-    const int i2x = std::clamp(x + 2 * dx, 0, ctx.n - 1);
-    const int i2y = std::clamp(y + 2 * dy, 0, ctx.n - 1);
-    const int i2z = std::clamp(z + 2 * dz, 0, ctx.n - 1);
-    const std::size_t src2 = cell_index(i2x, i2y, i2z, ctx.n);
+    const int i2x = std::clamp(x + 2 * dx, 0, ctx.nx - 1);
+    const int i2y = std::clamp(y + 2 * dy, 0, ctx.ny - 1);
+    const int i2z = std::clamp(z + 2 * dz, 0, ctx.nz - 1);
+    const std::size_t src2 = cell_index(i2x, i2y, i2z, ctx.nx, ctx.ny, ctx.nz);
     if (ctx.obstacle[src2]) return f1;
 
     const float f2 = ctx.f_post[dist_index(src2, q, ctx.cells)];
@@ -1099,7 +1104,7 @@ inline float boundary_equilibrium_value(
             uy = face.velocity[1];
             uz = face.velocity[2];
             if (g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D && sx < 0) {
-                ux = cylinder_benchmark_inlet_ux(ctx.n, y, face.velocity[0]);
+                ux = cylinder_benchmark_inlet_ux(ctx.nx, ctx.ny, y, face.velocity[0]);
                 uy = 0.0f;
                 uz = 0.0f;
             }
@@ -1132,7 +1137,7 @@ inline float benchmark_hydrodynamic_boundary_value(
     int sy,
     int sz
 ) {
-    const AeroLbmBoundaryFaceConfig* face = hydrodynamic_face_for_oob(sx, sy, sz, ctx.n);
+    const AeroLbmBoundaryFaceConfig* face = hydrodynamic_face_for_oob(sx, sy, sz, ctx.nx, ctx.ny, ctx.nz);
     const int kind = face ? face->hydrodynamic_kind : AERO_LBM_HYDRO_BOUNDARY_INHERIT_GAME;
     switch (kind) {
         case AERO_LBM_HYDRO_BOUNDARY_BOUNCE_BACK:
@@ -1142,10 +1147,10 @@ inline float benchmark_hydrodynamic_boundary_value(
         case AERO_LBM_HYDRO_BOUNDARY_PRESSURE_DIRICHLET:
             return boundary_equilibrium_value(ctx, cell, x, y, z, q, sx, sy, sz, *face);
         case AERO_LBM_HYDRO_BOUNDARY_SYMMETRY: {
-            const int ix = std::clamp(sx, 0, ctx.n - 1);
-            const int iy = std::clamp(sy, 0, ctx.n - 1);
-            const int iz = std::clamp(sz, 0, ctx.n - 1);
-            const std::size_t src = cell_index(ix, iy, iz, ctx.n);
+            const int ix = std::clamp(sx, 0, ctx.nx - 1);
+            const int iy = std::clamp(sy, 0, ctx.ny - 1);
+            const int iz = std::clamp(sz, 0, ctx.nz - 1);
+            const std::size_t src = cell_index(ix, iy, iz, ctx.nx, ctx.ny, ctx.nz);
             return ctx.obstacle[src] ? obstacle_bounce_value(ctx, cell, x, y, z, q) : ctx.f_post[dist_index(src, q, ctx.cells)];
         }
         case AERO_LBM_HYDRO_BOUNDARY_CONVECTIVE_OUTFLOW:
@@ -1162,9 +1167,11 @@ inline float benchmark_hydrodynamic_boundary_value(
     return boundary_convective_value(ctx, cell, x, y, z, q, sx, sy, sz);
 }
 
-void allocate_cpu_context(ContextState& ctx, int n) {
-    ctx.n = n;
-    ctx.cells = static_cast<std::size_t>(n) * n * n;
+void allocate_cpu_context(ContextState& ctx, int nx, int ny, int nz) {
+    ctx.nx = nx;
+    ctx.ny = ny;
+    ctx.nz = nz;
+    ctx.cells = static_cast<std::size_t>(nx) * ny * nz;
     ctx.cpu_initialized = false;
 
     ctx.f.assign(ctx.cells * kQ, 0.0f);
@@ -1286,9 +1293,9 @@ inline float thermal_source_term(const ContextState& ctx, std::size_t cell) {
 }
 
 inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int z, float self_value) {
-    remap_thermal_coords(x, y, z, ctx.n);
-    if (x < 0 || y < 0 || z < 0 || x >= ctx.n || y >= ctx.n || z >= ctx.n) {
-        const AeroLbmBoundaryFaceConfig* face = thermal_face_for_oob(x, y, z, ctx.n);
+    remap_thermal_coords(x, y, z, ctx.nx, ctx.ny, ctx.nz);
+    if (x < 0 || y < 0 || z < 0 || x >= ctx.nx || y >= ctx.ny || z >= ctx.nz) {
+        const AeroLbmBoundaryFaceConfig* face = thermal_face_for_oob(x, y, z, ctx.nx, ctx.ny, ctx.nz);
         const int kind = face ? face->thermal_kind : AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME;
         switch (kind) {
             case AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET:
@@ -1302,7 +1309,7 @@ inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int
                 return self_value;
         }
     }
-    const std::size_t cell = cell_index(x, y, z, ctx.n);
+    const std::size_t cell = cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz);
     if (ctx.obstacle[cell]) return self_value;
     return ctx.temperature[cell];
 }
@@ -1310,17 +1317,16 @@ inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int
 inline float sample_temperature_trilinear(
     const ContextState& ctx, float x, float y, float z, float fallback
 ) {
-    const float max_coord = static_cast<float>(ctx.n - 1);
-    x = clampf(x, 0.0f, max_coord);
-    y = clampf(y, 0.0f, max_coord);
-    z = clampf(z, 0.0f, max_coord);
+    x = clampf(x, 0.0f, static_cast<float>(ctx.nx - 1));
+    y = clampf(y, 0.0f, static_cast<float>(ctx.ny - 1));
+    z = clampf(z, 0.0f, static_cast<float>(ctx.nz - 1));
 
     const int x0 = static_cast<int>(std::floor(x));
     const int y0 = static_cast<int>(std::floor(y));
     const int z0 = static_cast<int>(std::floor(z));
-    const int x1 = std::min(ctx.n - 1, x0 + 1);
-    const int y1 = std::min(ctx.n - 1, y0 + 1);
-    const int z1 = std::min(ctx.n - 1, z0 + 1);
+    const int x1 = std::min(ctx.nx - 1, x0 + 1);
+    const int y1 = std::min(ctx.ny - 1, y0 + 1);
+    const int z1 = std::min(ctx.nz - 1, z0 + 1);
 
     const float fx = x - static_cast<float>(x0);
     const float fy = y - static_cast<float>(y0);
@@ -1353,7 +1359,7 @@ void update_temperature_field(ContextState& ctx) {
         }
 
         int x = 0, y = 0, z = 0;
-        decode_cell(cell, ctx.n, x, y, z);
+        decode_cell(cell, ctx.nx, ctx.ny, ctx.nz, x, y, z);
 
         const float t_center = ctx.temperature[cell];
         const float advected = sample_temperature_trilinear(
@@ -1580,8 +1586,8 @@ void collide(ContextState& ctx) {
         }
 
         int cx = 0, cy = 0, cz = 0;
-        decode_cell(cell, ctx.n, cx, cy, cz);
-        const float alpha = effective_sponge_alpha(ctx.n, cx, cy, cz);
+        decode_cell(cell, ctx.nx, ctx.ny, ctx.nz, cx, cy, cz);
+        const float alpha = effective_sponge_alpha(ctx.nx, ctx.ny, ctx.nz, cx, cy, cz);
         if (alpha > 0.0f) {
             const float keep = 1.0f - alpha;
             for (int q = 0; q < kQ; ++q) {
@@ -1594,11 +1600,10 @@ void collide(ContextState& ctx) {
 }
 
 void stream_and_bounce(ContextState& ctx) {
-    const int n = ctx.n;
-    for (int x = 0; x < n; ++x) {
-        for (int y = 0; y < n; ++y) {
-            for (int z = 0; z < n; ++z) {
-                const std::size_t cell = cell_index(x, y, z, n);
+    for (int x = 0; x < ctx.nx; ++x) {
+        for (int y = 0; y < ctx.ny; ++y) {
+            for (int z = 0; z < ctx.nz; ++z) {
+                const std::size_t cell = cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz);
                 std::array<float, kQ> f_local{};
                 if (ctx.obstacle[cell]) {
                     for (int q = 0; q < kQ; ++q) {
@@ -1609,13 +1614,13 @@ void stream_and_bounce(ContextState& ctx) {
                         int sx = x - kCx[q];
                         int sy = y - kCy[q];
                         int sz = z - kCz[q];
-                        remap_hydrodynamic_coords(sx, sy, sz, n);
-                        if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
+                        remap_hydrodynamic_coords(sx, sy, sz, ctx.nx, ctx.ny, ctx.nz);
+                        if (sx < 0 || sy < 0 || sz < 0 || sx >= ctx.nx || sy >= ctx.ny || sz >= ctx.nz) {
                             f_local[q] = benchmark_hydrodynamic_boundary_value(ctx, cell, x, y, z, q, sx, sy, sz);
                             continue;
                         }
 
-                        const std::size_t src = cell_index(sx, sy, sz, n);
+                        const std::size_t src = cell_index(sx, sy, sz, ctx.nx, ctx.ny, ctx.nz);
                         if (ctx.obstacle[src]) {
                             f_local[q] = obstacle_bounce_value(ctx, cell, x, y, z, q);
                         } else {
@@ -1644,20 +1649,20 @@ void compute_benchmark_force(ContextState& ctx) {
     double fx = 0.0;
     double fy = 0.0;
     double fz = 0.0;
-    for (int x = 0; x < ctx.n; ++x) {
-        for (int y = 0; y < ctx.n; ++y) {
-            for (int z = 0; z < ctx.n; ++z) {
-                const std::size_t cell = cell_index(x, y, z, ctx.n);
+    for (int x = 0; x < ctx.nx; ++x) {
+        for (int y = 0; y < ctx.ny; ++y) {
+            for (int z = 0; z < ctx.nz; ++z) {
+                const std::size_t cell = cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz);
                 if (ctx.obstacle[cell]) continue;
                 for (int q = 1; q < kQ; ++q) {
                     if (kCz[q] != 0) continue;
                     const int nx = x + kCx[q];
                     const int ny = y + kCy[q];
                     const int nz = z + kCz[q];
-                    if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.n || ny >= ctx.n || nz >= ctx.n) continue;
-                    const std::size_t neighbor = cell_index(nx, ny, nz, ctx.n);
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.nx || ny >= ctx.ny || nz >= ctx.nz) continue;
+                    const std::size_t neighbor = cell_index(nx, ny, nz, ctx.nx, ctx.ny, ctx.nz);
                     if (!ctx.obstacle[neighbor]) continue;
-                    if (!cylinder_benchmark_solid_cell(ctx.n, nx, ny)) continue;
+                    if (!cylinder_benchmark_solid_cell(ctx.nx, ctx.ny, nx, ny)) continue;
                     const float fq = ctx.f_post[dist_index(cell, q, ctx.cells)];
                     fx += 2.0 * static_cast<double>(fq) * static_cast<double>(kCx[q]);
                     fy += 2.0 * static_cast<double>(fq) * static_cast<double>(kCy[q]);
@@ -1667,7 +1672,7 @@ void compute_benchmark_force(ContextState& ctx) {
         }
     }
 
-    const double inv_depth = ctx.n > 0 ? (1.0 / static_cast<double>(ctx.n)) : 1.0;
+    const double inv_depth = ctx.nz > 0 ? (1.0 / static_cast<double>(ctx.nz)) : 1.0;
     ctx.last_force[0] = static_cast<float>(fx * inv_depth);
     ctx.last_force[1] = static_cast<float>(fy * inv_depth);
     ctx.last_force[2] = static_cast<float>(fz * inv_depth);
@@ -1685,20 +1690,20 @@ void compute_benchmark_force_from_distributions(ContextState& ctx, const float* 
     double fx = 0.0;
     double fy = 0.0;
     double fz = 0.0;
-    for (int x = 0; x < ctx.n; ++x) {
-        for (int y = 0; y < ctx.n; ++y) {
-            for (int z = 0; z < ctx.n; ++z) {
-                const std::size_t cell = cell_index(x, y, z, ctx.n);
+    for (int x = 0; x < ctx.nx; ++x) {
+        for (int y = 0; y < ctx.ny; ++y) {
+            for (int z = 0; z < ctx.nz; ++z) {
+                const std::size_t cell = cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz);
                 if (ctx.obstacle[cell]) continue;
                 for (int q = 1; q < kQ; ++q) {
                     if (kCz[q] != 0) continue;
                     const int nx = x + kCx[q];
                     const int ny = y + kCy[q];
                     const int nz = z + kCz[q];
-                    if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.n || ny >= ctx.n || nz >= ctx.n) continue;
-                    const std::size_t neighbor = cell_index(nx, ny, nz, ctx.n);
+                    if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.nx || ny >= ctx.ny || nz >= ctx.nz) continue;
+                    const std::size_t neighbor = cell_index(nx, ny, nz, ctx.nx, ctx.ny, ctx.nz);
                     if (!ctx.obstacle[neighbor]) continue;
-                    if (!cylinder_benchmark_solid_cell(ctx.n, nx, ny)) continue;
+                    if (!cylinder_benchmark_solid_cell(ctx.nx, ctx.ny, nx, ny)) continue;
                     const float fq = dist_data[dist_index(cell, q, ctx.cells)];
                     fx += 2.0 * static_cast<double>(fq) * static_cast<double>(kCx[q]);
                     fy += 2.0 * static_cast<double>(fq) * static_cast<double>(kCy[q]);
@@ -1708,7 +1713,7 @@ void compute_benchmark_force_from_distributions(ContextState& ctx, const float* 
         }
     }
 
-    const double inv_depth = ctx.n > 0 ? (1.0 / static_cast<double>(ctx.n)) : 1.0;
+    const double inv_depth = ctx.nz > 0 ? (1.0 / static_cast<double>(ctx.nz)) : 1.0;
     ctx.last_force[0] = static_cast<float>(fx * inv_depth);
     ctx.last_force[1] = static_cast<float>(fy * inv_depth);
     ctx.last_force[2] = static_cast<float>(fz * inv_depth);
@@ -1894,58 +1899,52 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
 
 inline float obstacle_bounce_value(
     __global const float* f_read, __global const float* payload,
-    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp, int benchmark_flags
+    int in_ch, int nx, int ny, int nz, int cells, int cell, int x, int y, int z, int q, int opp, int benchmark_flags
 );
 
-inline int wrap_axis_if_periodic(int coord, int n, int axis_bit, int periodic_mask) {
-    if (coord >= 0 && coord < n) return coord;
+inline int wrap_axis_if_periodic(int coord, int dim, int axis_bit, int periodic_mask) {
+    if (coord >= 0 && coord < dim) return coord;
     if ((periodic_mask & axis_bit) == 0) return coord;
-    coord %= n;
-    if (coord < 0) coord += n;
+    coord %= dim;
+    if (coord < 0) coord += dim;
     return coord;
 }
 
-inline float cylinder_benchmark_inlet_ux(int n, int y, float u_max) {
-    float length_cells = (float)max(1, n - 1);
-    float channel_height = fmax(8.0f, CYLINDER_BENCHMARK_HEIGHT / CYLINDER_BENCHMARK_LENGTH * length_cells);
-    float diameter = fmax(2.5f, 0.1f / CYLINDER_BENCHMARK_LENGTH * length_cells);
-    float radius = 0.5f * diameter;
-    channel_height = fmax(channel_height, 2.0f * radius + 6.0f);
-    channel_height = fmin(channel_height, length_cells - 2.0f);
-    float y_min = 0.5f * (length_cells - channel_height);
-    float y_max = y_min + channel_height;
-    float s = ((float)y - y_min) / fmax(y_max - y_min, 1.0e-6f);
+inline float cylinder_benchmark_inlet_ux(int nx, int ny, int y, float u_max) {
+    float height_cells = (float)max(1, ny - 1);
+    (void)nx;
+    float s = (float)y / fmax(height_cells, 1.0e-6f);
     if (s < 0.0f || s > 1.0f) return 0.0f;
     return 4.0f * u_max * s * (1.0f - s);
 }
 
 inline int face_kind_for_oob(
-    int sx, int sy, int sz, int n,
+    int sx, int sy, int sz, int nx, int ny, int nz,
     int x_min_kind, int x_max_kind,
     int y_min_kind, int y_max_kind,
     int z_min_kind, int z_max_kind
 ) {
     if (sx < 0) return x_min_kind;
-    if (sx >= n) return x_max_kind;
+    if (sx >= nx) return x_max_kind;
     if (sy < 0) return y_min_kind;
-    if (sy >= n) return y_max_kind;
+    if (sy >= ny) return y_max_kind;
     if (sz < 0) return z_min_kind;
-    if (sz >= n) return z_max_kind;
+    if (sz >= nz) return z_max_kind;
     return 0;
 }
 
 inline float4 face_data_for_oob(
-    int sx, int sy, int sz, int n,
+    int sx, int sy, int sz, int nx, int ny, int nz,
     float4 x_min_data, float4 x_max_data,
     float4 y_min_data, float4 y_max_data,
     float4 z_min_data, float4 z_max_data
 ) {
     if (sx < 0) return x_min_data;
-    if (sx >= n) return x_max_data;
+    if (sx >= nx) return x_max_data;
     if (sy < 0) return y_min_data;
-    if (sy >= n) return y_max_data;
+    if (sy >= ny) return y_max_data;
     if (sz < 0) return z_min_data;
-    if (sz >= n) return z_max_data;
+    if (sz >= nz) return z_max_data;
     return (float4)(0.0f, 0.0f, 0.0f, 0.0f);
 }
 
@@ -1964,9 +1963,9 @@ inline float signed_noise(uint cell, uint tick) {
     return 2.0f * u - 1.0f;
 }
 
-inline float sponge_alpha(int n, int x, int y, int z) {
+inline float sponge_alpha(int nx, int ny, int nz, int x, int y, int z) {
     if (SPONGE_LAYERS <= 0) return 0.0f;
-    int d = min(min(min(x, y), min(z, n - 1 - z)), min(n - 1 - x, n - 1 - y));
+    int d = min(min(min(x, y), min(z, nz - 1 - z)), min(nx - 1 - x, ny - 1 - y));
     if (d >= SPONGE_LAYERS) return 0.0f;
     float eta = (float)(SPONGE_LAYERS - d) / (float)SPONGE_LAYERS;
     return clampf(SPONGE_STRENGTH * eta * eta, 0.0f, 0.95f);
@@ -1974,25 +1973,25 @@ inline float sponge_alpha(int n, int x, int y, int z) {
 
 inline float boundary_convective_value(
     __global const float* f_read, __global const float* payload,
-    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int sx, int sy, int sz, int benchmark_flags
+    int in_ch, int nx, int ny, int nz, int cells, int cell, int x, int y, int z, int q, int sx, int sy, int sz, int benchmark_flags
 ) {
-    int dx = (sx < 0 || sx >= n) ? CX[q] : 0;
-    int dy = (sy < 0 || sy >= n) ? CY[q] : 0;
-    int dz = (sz < 0 || sz >= n) ? CZ[q] : 0;
+    int dx = (sx < 0 || sx >= nx) ? CX[q] : 0;
+    int dy = (sy < 0 || sy >= ny) ? CY[q] : 0;
+    int dz = (sz < 0 || sz >= nz) ? CZ[q] : 0;
 
-    int i1x = clampi(x + dx, 0, n - 1);
-    int i1y = clampi(y + dy, 0, n - 1);
-    int i1z = clampi(z + dz, 0, n - 1);
-    int src1 = (i1x * n + i1y) * n + i1z;
+    int i1x = clampi(x + dx, 0, nx - 1);
+    int i1y = clampi(y + dy, 0, ny - 1);
+    int i1z = clampi(z + dz, 0, nz - 1);
+    int src1 = (i1x * ny + i1y) * nz + i1z;
     if (payload[src1 * in_ch + 0] > 0.5f) {
-        return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
+        return obstacle_bounce_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
     }
 
     float f1 = f_read[q * cells + src1];
-    int i2x = clampi(x + 2 * dx, 0, n - 1);
-    int i2y = clampi(y + 2 * dy, 0, n - 1);
-    int i2z = clampi(z + 2 * dz, 0, n - 1);
-    int src2 = (i2x * n + i2y) * n + i2z;
+    int i2x = clampi(x + 2 * dx, 0, nx - 1);
+    int i2y = clampi(y + 2 * dy, 0, ny - 1);
+    int i2z = clampi(z + 2 * dz, 0, nz - 1);
+    int src2 = (i2x * ny + i2y) * nz + i2z;
     if (payload[src2 * in_ch + 0] > 0.5f) return f1;
 
     float f2 = f_read[q * cells + src2];
@@ -2005,7 +2004,8 @@ inline float boundary_equilibrium_value(
     float ref_pressure,
     int use_face_pressure,
     int benchmark_preset,
-    int n,
+    int nx,
+    int ny,
     int y,
     int sx
 ) {
@@ -2018,7 +2018,7 @@ inline float boundary_equilibrium_value(
         rho = 1.0f + clampf(pressure, P_MIN, P_MAX);
     }
     if (use_face_pressure == 0 && benchmark_preset == BENCH_PRESET_CYLINDER_CROSSFLOW_2D && sx < 0) {
-        ux = cylinder_benchmark_inlet_ux(n, y, face_data.x);
+        ux = cylinder_benchmark_inlet_ux(nx, ny, y, face_data.x);
         uy = 0.0f;
         uz = 0.0f;
     }
@@ -2037,7 +2037,9 @@ inline float benchmark_boundary_value(
     __global const float* f_read,
     __global const float* payload,
     int in_ch,
-    int n,
+    int nx,
+    int ny,
+    int nz,
     int cells,
     int cell,
     int x,
@@ -2062,36 +2064,36 @@ inline float benchmark_boundary_value(
     float4 z_max_data,
     int benchmark_preset
 ) {
-    int kind = face_kind_for_oob(sx, sy, sz, n, x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind);
-    float4 face_data = face_data_for_oob(sx, sy, sz, n, x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data);
+    int kind = face_kind_for_oob(sx, sy, sz, nx, ny, nz, x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind);
+    float4 face_data = face_data_for_oob(sx, sy, sz, nx, ny, nz, x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data);
     switch (kind) {
         case 2:
-            return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
+            return obstacle_bounce_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
         case 3:
         case 4:
-            return boundary_equilibrium_value(q, face_data, payload[cell * in_ch + 8], 0, benchmark_preset, n, y, sx);
+            return boundary_equilibrium_value(q, face_data, payload[cell * in_ch + 8], 0, benchmark_preset, nx, ny, y, sx);
         case 5: {
             float4 pressure_face = (float4)(0.0f, 0.0f, 0.0f, face_data.w);
-            return boundary_equilibrium_value(q, pressure_face, payload[cell * in_ch + 8], 1, benchmark_preset, n, y, sx);
+            return boundary_equilibrium_value(q, pressure_face, payload[cell * in_ch + 8], 1, benchmark_preset, nx, ny, y, sx);
         }
         case 7: {
-            int ix = clampi(sx, 0, n - 1);
-            int iy = clampi(sy, 0, n - 1);
-            int iz = clampi(sz, 0, n - 1);
-            int src = (ix * n + iy) * n + iz;
+            int ix = clampi(sx, 0, nx - 1);
+            int iy = clampi(sy, 0, ny - 1);
+            int iz = clampi(sz, 0, nz - 1);
+            int src = (ix * ny + iy) * nz + iz;
             if (payload[src * in_ch + 0] > 0.5f) {
-                return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
+                return obstacle_bounce_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
             }
             return f_read[q * cells + src];
         }
         case 6:
-            return boundary_convective_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags);
+            return boundary_convective_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags);
         case 0:
         default:
             if ((benchmark_flags & BENCH_DISABLE_CONVECTIVE_OUTFLOW) != 0) {
-                return obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
+                return obstacle_bounce_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, OPP[q], benchmark_flags);
             }
-            return boundary_convective_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags);
+            return boundary_convective_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags);
     }
 }
 
@@ -2099,14 +2101,16 @@ inline float temperature_or_self(
     __global const float* temp,
     __global const float* payload,
     int in_ch,
-    int n,
+    int nx,
+    int ny,
+    int nz,
     int x,
     int y,
     int z,
     float self_value
 ) {
-    if (x < 0 || y < 0 || z < 0 || x >= n || y >= n || z >= n) return self_value;
-    int cell = (x * n + y) * n + z;
+    if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return self_value;
+    int cell = (x * ny + y) * nz + z;
     if (payload[cell * in_ch + 0] > 0.5f) return self_value;
     return temp[cell];
 }
@@ -2115,36 +2119,37 @@ inline float sample_temperature_trilinear(
     __global const float* temp,
     __global const float* payload,
     int in_ch,
-    int n,
+    int nx,
+    int ny,
+    int nz,
     float px,
     float py,
     float pz,
     float fallback
 ) {
-    float max_coord = (float)(n - 1);
-    px = clampf(px, 0.0f, max_coord);
-    py = clampf(py, 0.0f, max_coord);
-    pz = clampf(pz, 0.0f, max_coord);
+    px = clampf(px, 0.0f, (float)(nx - 1));
+    py = clampf(py, 0.0f, (float)(ny - 1));
+    pz = clampf(pz, 0.0f, (float)(nz - 1));
 
     int x0 = (int)floor(px);
     int y0 = (int)floor(py);
     int z0 = (int)floor(pz);
-    int x1 = min(n - 1, x0 + 1);
-    int y1 = min(n - 1, y0 + 1);
-    int z1 = min(n - 1, z0 + 1);
+    int x1 = min(nx - 1, x0 + 1);
+    int y1 = min(ny - 1, y0 + 1);
+    int z1 = min(nz - 1, z0 + 1);
 
     float fx = px - (float)x0;
     float fy = py - (float)y0;
     float fz = pz - (float)z0;
 
-    float c000 = temperature_or_self(temp, payload, in_ch, n, x0, y0, z0, fallback);
-    float c100 = temperature_or_self(temp, payload, in_ch, n, x1, y0, z0, fallback);
-    float c010 = temperature_or_self(temp, payload, in_ch, n, x0, y1, z0, fallback);
-    float c110 = temperature_or_self(temp, payload, in_ch, n, x1, y1, z0, fallback);
-    float c001 = temperature_or_self(temp, payload, in_ch, n, x0, y0, z1, fallback);
-    float c101 = temperature_or_self(temp, payload, in_ch, n, x1, y0, z1, fallback);
-    float c011 = temperature_or_self(temp, payload, in_ch, n, x0, y1, z1, fallback);
-    float c111 = temperature_or_self(temp, payload, in_ch, n, x1, y1, z1, fallback);
+    float c000 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x0, y0, z0, fallback);
+    float c100 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x1, y0, z0, fallback);
+    float c010 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x0, y1, z0, fallback);
+    float c110 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x1, y1, z0, fallback);
+    float c001 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x0, y0, z1, fallback);
+    float c101 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x1, y0, z1, fallback);
+    float c011 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x0, y1, z1, fallback);
+    float c111 = temperature_or_self(temp, payload, in_ch, nx, ny, nz, x1, y1, z1, fallback);
 
     float c00 = c000 + (c100 - c000) * fx;
     float c10 = c010 + (c110 - c010) * fx;
@@ -2157,7 +2162,7 @@ inline float sample_temperature_trilinear(
 
 inline float obstacle_bounce_value(
     __global const float* f_read, __global const float* payload,
-    int in_ch, int n, int cells, int cell, int x, int y, int z, int q, int opp, int benchmark_flags
+    int in_ch, int nx, int ny, int nz, int cells, int cell, int x, int y, int z, int q, int opp, int benchmark_flags
 ) {
     float bounced = f_read[opp * cells + cell];
     float blend = (benchmark_flags & BENCH_DISABLE_OBSTACLE_BOUNCE_BLEND) ? 0.0f : OBSTACLE_BOUNCE_BLEND;
@@ -2166,9 +2171,9 @@ inline float obstacle_bounce_value(
     int s2x = x - 2 * CX[q];
     int s2y = y - 2 * CY[q];
     int s2z = z - 2 * CZ[q];
-    if (s2x < 0 || s2y < 0 || s2z < 0 || s2x >= n || s2y >= n || s2z >= n) return bounced;
+    if (s2x < 0 || s2y < 0 || s2z < 0 || s2x >= nx || s2y >= ny || s2z >= nz) return bounced;
 
-    int src2 = (s2x * n + s2y) * n + s2z;
+    int src2 = (s2x * ny + s2y) * nz + s2z;
     if (payload[src2 * in_ch + 0] > 0.5f) return bounced;
 
     float upstream = f_read[q * cells + src2];
@@ -2202,7 +2207,7 @@ kernel void stream_collide_step(
     __global const float* f_read,
     __global const float* payload,
     __global const float* temp_read,
-    int in_ch, int n, int cells, int tick, int benchmark_flags, int hydro_periodic_mask,
+    int in_ch, int nx, int ny, int nz, int cells, int tick, int benchmark_flags, int hydro_periodic_mask,
     float tau_shear_eff, float tau_normal_eff,
     int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
     float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
@@ -2213,11 +2218,11 @@ kernel void stream_collide_step(
     int cell = (int)get_global_id(0);
     if (cell >= cells) return;
 
-    int yz = n * n;
+    int yz = ny * nz;
     int x = cell / yz;
     int rem = cell - x * yz;
-    int y = rem / n;
-    int z = rem - y * n;
+    int y = rem / nz;
+    int z = rem - y * nz;
     
     int base = cell * in_ch;
     int is_solid = payload[base + 0] > 0.5f;
@@ -2232,19 +2237,19 @@ kernel void stream_collide_step(
         }
 
         int sx = x - CX[q], sy = y - CY[q], sz = z - CZ[q];
-        sx = wrap_axis_if_periodic(sx, n, PERIODIC_AXIS_X, hydro_periodic_mask);
-        sy = wrap_axis_if_periodic(sy, n, PERIODIC_AXIS_Y, hydro_periodic_mask);
-        sz = wrap_axis_if_periodic(sz, n, PERIODIC_AXIS_Z, hydro_periodic_mask);
-        if (sx < 0 || sy < 0 || sz < 0 || sx >= n || sy >= n || sz >= n) {
+        sx = wrap_axis_if_periodic(sx, nx, PERIODIC_AXIS_X, hydro_periodic_mask);
+        sy = wrap_axis_if_periodic(sy, ny, PERIODIC_AXIS_Y, hydro_periodic_mask);
+        sz = wrap_axis_if_periodic(sz, nz, PERIODIC_AXIS_Z, hydro_periodic_mask);
+        if (sx < 0 || sy < 0 || sz < 0 || sx >= nx || sy >= ny || sz >= nz) {
             f_local[q] = benchmark_boundary_value(
-                f_read, payload, in_ch, n, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags,
+                f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags,
                 x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind,
                 x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data, benchmark_preset
             );
         } else {
-            int src = (sx * n + sy) * n + sz;
+            int src = (sx * ny + sy) * nz + sz;
             if (payload[src * in_ch + 0] > 0.5f) {
-                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, n, cells, cell, x, y, z, q, opp, benchmark_flags);
+                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, opp, benchmark_flags);
             } else {
                 f_local[q] = f_read[q * cells + src];
             }
@@ -2286,7 +2291,9 @@ kernel void stream_collide_step(
             temp_read,
             payload,
             in_ch,
-            n,
+            nx,
+            ny,
+            nz,
             (float)x - ux,
             (float)y - uy,
             (float)z - uz,
@@ -2296,28 +2303,28 @@ kernel void stream_collide_step(
         float typ = temp_center, tym = temp_center;
         float tzp = temp_center, tzm = temp_center;
 
-        if (x + 1 < n) {
-            int nb = ((x + 1) * n + y) * n + z;
+        if (x + 1 < nx) {
+            int nb = ((x + 1) * ny + y) * nz + z;
             if (payload[nb * in_ch + 0] < 0.5f) txp = temp_read[nb];
         }
         if (x - 1 >= 0) {
-            int nb = ((x - 1) * n + y) * n + z;
+            int nb = ((x - 1) * ny + y) * nz + z;
             if (payload[nb * in_ch + 0] < 0.5f) txm = temp_read[nb];
         }
-        if (y + 1 < n) {
-            int nb = (x * n + (y + 1)) * n + z;
+        if (y + 1 < ny) {
+            int nb = (x * ny + (y + 1)) * nz + z;
             if (payload[nb * in_ch + 0] < 0.5f) typ = temp_read[nb];
         }
         if (y - 1 >= 0) {
-            int nb = (x * n + (y - 1)) * n + z;
+            int nb = (x * ny + (y - 1)) * nz + z;
             if (payload[nb * in_ch + 0] < 0.5f) tym = temp_read[nb];
         }
-        if (z + 1 < n) {
-            int nb = (x * n + y) * n + (z + 1);
+        if (z + 1 < nz) {
+            int nb = (x * ny + y) * nz + (z + 1);
             if (payload[nb * in_ch + 0] < 0.5f) tzp = temp_read[nb];
         }
         if (z - 1 >= 0) {
-            int nb = (x * n + y) * n + (z - 1);
+            int nb = (x * ny + y) * nz + (z - 1);
             if (payload[nb * in_ch + 0] < 0.5f) tzm = temp_read[nb];
         }
 
@@ -2554,7 +2561,7 @@ R"CLC(
     float ux_plus = ux + 0.5f * dux;
     float uy_plus = uy + 0.5f * duy;
     float uz_plus = uz + 0.5f * duz;
-    float alpha_sponge = (benchmark_flags & BENCH_DISABLE_SPONGE) ? 0.0f : sponge_alpha(n, x, y, z);
+    float alpha_sponge = (benchmark_flags & BENCH_DISABLE_SPONGE) ? 0.0f : sponge_alpha(nx, ny, nz, x, y, z);
     float keep_sponge = 1.0f - alpha_sponge;
 
     for (int q = 0; q < KQ; ++q) {
@@ -2819,28 +2826,30 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     err |= clSetKernelArg(g_opencl.k_stream_collide, 1, sizeof(cl_mem), &ctx.d_payload);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 2, sizeof(cl_mem), &temp_read);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 3, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &ctx.n);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(int), &tick_i32);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(int), &benchmark_flags);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(int), &hydro_periodic_mask);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 9, sizeof(float), &tau_pair[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 10, sizeof(float), &tau_pair[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 11, sizeof(int), &face_kinds[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 12, sizeof(int), &face_kinds[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 13, sizeof(int), &face_kinds[2]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(int), &face_kinds[3]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(int), &face_kinds[4]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(int), &face_kinds[5]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(OpenClFaceData), face_data[0].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(OpenClFaceData), face_data[1].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(OpenClFaceData), face_data[2].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(OpenClFaceData), face_data[3].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(OpenClFaceData), face_data[4].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(OpenClFaceData), face_data[5].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(int), &benchmark_preset);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(cl_mem), &write_buf);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(cl_mem), &temp_write);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &ctx.nx);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &ctx.ny);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(int), &ctx.nz);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(int), &tick_i32);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 9, sizeof(int), &benchmark_flags);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 10, sizeof(int), &hydro_periodic_mask);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 11, sizeof(float), &tau_pair[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 12, sizeof(float), &tau_pair[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 13, sizeof(int), &face_kinds[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(int), &face_kinds[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(int), &face_kinds[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(int), &face_kinds[3]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(int), &face_kinds[4]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(int), &face_kinds[5]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(OpenClFaceData), face_data[0].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(OpenClFaceData), face_data[1].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(OpenClFaceData), face_data[2].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(OpenClFaceData), face_data[3].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(OpenClFaceData), face_data[4].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(OpenClFaceData), face_data[5].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(int), &benchmark_preset);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 26, sizeof(cl_mem), &write_buf);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 27, sizeof(cl_mem), &temp_write);
     if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32)) return false;
 
     err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
@@ -2954,9 +2963,13 @@ bool should_force_cpu_backend() {
 #endif
 }
 
-void ensure_context_shape(ContextState& ctx, int n, std::size_t cells) {
-    if (ctx.n == n && ctx.cells == cells) return;
-    clear_context(ctx); ctx.n = n; ctx.cells = cells;
+void ensure_context_shape(ContextState& ctx, int nx, int ny, int nz, std::size_t cells) {
+    if (ctx.nx == nx && ctx.ny == ny && ctx.nz == nz && ctx.cells == cells) return;
+    clear_context(ctx);
+    ctx.nx = nx;
+    ctx.ny = ny;
+    ctx.nz = nz;
+    ctx.cells = cells;
 }
 
 void ensure_context_temperature_storage(ContextState& ctx) {
@@ -2977,7 +2990,7 @@ void assign_temperature_state(ContextState& ctx, const float* temperature_state)
 }
 
 void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
-    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     ingest_payload(ctx, packet, g_cfg.input_channels);
     if (!ctx.cpu_initialized) initialize_distributions(ctx);
     if (should_update_temperature(ctx.step_counter)) {
@@ -3008,10 +3021,23 @@ bool run_solver_step(ContextState& ctx, const float* packet, float* out, StepTim
 
 extern "C" {
 
-static jboolean native_init_impl(jint grid_size, jint input_channels, jint output_channels) {
-    if (grid_size <= 0 || input_channels < 9 || output_channels < 4) { reset_runtime_state(); return JNI_FALSE; }
+static std::size_t configured_cells() {
+    return static_cast<std::size_t>(g_cfg.nx) * g_cfg.ny * g_cfg.nz;
+}
+
+static jboolean native_init_dims_impl(jint nx, jint ny, jint nz, jint input_channels, jint output_channels) {
+    if (nx <= 0 || ny <= 0 || nz <= 0 || input_channels < 9 || output_channels < 4) {
+        reset_runtime_state();
+        return JNI_FALSE;
+    }
     clear_all_contexts(); reset_timing_stats();
-    g_cfg.grid_size = grid_size; g_cfg.input_channels = input_channels; g_cfg.output_channels = output_channels; g_cfg.initialized = true;
+    g_cfg.grid_size = (nx == ny && ny == nz) ? nx : 0;
+    g_cfg.nx = nx;
+    g_cfg.ny = ny;
+    g_cfg.nz = nz;
+    g_cfg.input_channels = input_channels;
+    g_cfg.output_channels = output_channels;
+    g_cfg.initialized = true;
 
     if (should_force_cpu_backend()) {
         g_cfg.opencl_enabled = false;
@@ -3027,6 +3053,28 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
     return JNI_TRUE;
 }
 
+static jboolean native_init_impl(jint grid_size, jint input_channels, jint output_channels) {
+    return native_init_dims_impl(grid_size, grid_size, grid_size, input_channels, output_channels);
+}
+
+static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jint nz, jlong context_key, float* output_flow) {
+    auto tick_begin = Clock::now();
+    StepTiming timing;
+
+    if (!g_cfg.initialized || !packet || !output_flow) return false;
+    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+
+    ContextState& ctx = g_contexts[context_key];
+    ensure_context_shape(ctx, nx, ny, nz, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
+
+    const bool ok = run_solver_step(ctx, packet, output_flow, timing);
+    timing.total_ms = elapsed_ms(tick_begin, Clock::now());
+    record_timing(timing);
+    return ok;
+}
+
 static jboolean native_step_impl(
     JNIEnv* env, jclass, jbyteArray payload, jint grid_size, jlong context_key, jfloatArray output_flow
 ) {
@@ -3034,7 +3082,7 @@ static jboolean native_step_impl(
     StepTiming timing;
 
     if (!g_cfg.initialized || !payload || !output_flow || grid_size != g_cfg.grid_size) return JNI_FALSE;
-    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+    const std::size_t cells = configured_cells();
     const std::size_t payload_bytes = cells * g_cfg.input_channels * sizeof(float);
     if (env->GetArrayLength(payload) != static_cast<jsize>(payload_bytes)) return JNI_FALSE;
 
@@ -3050,9 +3098,9 @@ static jboolean native_step_impl(
     if (!out) return JNI_FALSE;
 
     ContextState& ctx = g_contexts[context_key];
-    ensure_context_shape(ctx, grid_size, cells);
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     // Ensure CPU-side buffers exist and reuse packet buffer to avoid per-step allocations
-    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     if (ctx.packet.size() != cells * (std::size_t)g_cfg.input_channels) {
         ctx.packet.assign(cells * (std::size_t)g_cfg.input_channels, 0.0f);
     }
@@ -3080,7 +3128,7 @@ static jboolean native_step_direct_impl(
     StepTiming timing;
 
     if (!g_cfg.initialized || !payload_buffer || !output_flow || grid_size != g_cfg.grid_size) return JNI_FALSE;
-    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+    const std::size_t cells = configured_cells();
     const std::size_t payload_bytes = cells * g_cfg.input_channels * sizeof(float);
 
     void* payload_raw = env->GetDirectBufferAddress(payload_buffer);
@@ -3092,8 +3140,8 @@ static jboolean native_step_direct_impl(
     if (!out) return JNI_FALSE;
 
     ContextState& ctx = g_contexts[context_key];
-    ensure_context_shape(ctx, grid_size, cells);
-    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
 
     const float* packet = reinterpret_cast<const float*>(payload_raw);
     bool ok = run_solver_step(ctx, packet, out, timing);
@@ -3105,33 +3153,20 @@ static jboolean native_step_direct_impl(
 }
 
 static bool native_step_raw_impl(const float* packet, jint grid_size, jlong context_key, float* output_flow) {
-    auto tick_begin = Clock::now();
-    StepTiming timing;
-
-    if (!g_cfg.initialized || !packet || !output_flow || grid_size != g_cfg.grid_size) return false;
-    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
-
-    ContextState& ctx = g_contexts[context_key];
-    ensure_context_shape(ctx, grid_size, cells);
-    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
-
-    const bool ok = run_solver_step(ctx, packet, output_flow, timing);
-    timing.total_ms = elapsed_ms(tick_begin, Clock::now());
-    record_timing(timing);
-    return ok;
+    return native_step_raw_dims_impl(packet, grid_size, grid_size, grid_size, context_key, output_flow);
 }
 
 static jboolean native_get_temperature_state_impl(
     JNIEnv* env, jclass, jint grid_size, jlong context_key, jfloatArray temperature_state
 ) {
     if (!g_cfg.initialized || !temperature_state || grid_size != g_cfg.grid_size) return JNI_FALSE;
-    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+    const std::size_t cells = configured_cells();
     if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
 
     auto it = g_contexts.find(context_key);
     if (it == g_contexts.end()) return JNI_FALSE;
     ContextState& ctx = it->second;
-    ensure_context_shape(ctx, grid_size, cells);
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_temperature_from_gpu(ctx)) return JNI_FALSE;
     if (ctx.temperature.size() != cells) return JNI_FALSE;
 
@@ -3143,12 +3178,12 @@ static jboolean native_set_temperature_state_impl(
     JNIEnv* env, jclass, jint grid_size, jlong context_key, jfloatArray temperature_state
 ) {
     if (!g_cfg.initialized || !temperature_state || grid_size != g_cfg.grid_size) return JNI_FALSE;
-    const std::size_t cells = static_cast<std::size_t>(grid_size) * grid_size * grid_size;
+    const std::size_t cells = configured_cells();
     if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
 
     ContextState& ctx = g_contexts[context_key];
-    ensure_context_shape(ctx, grid_size, cells);
-    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.n);
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     jfloat* temperature_ptr = env->GetFloatArrayElements(temperature_state, nullptr);
     if (!temperature_ptr) return JNI_FALSE;
     assign_temperature_state(ctx, temperature_ptr);
@@ -3211,6 +3246,14 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_init(int grid_size, int input_channels, int ou
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_step(const float* packet, int grid_size, long long context_key, float* output_flow) {
     return native_step_raw_impl(packet, grid_size, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_channels, int output_channels) {
+    return native_init_dims_impl(nx, ny, nz, input_channels, output_channels) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny, int nz, long long context_key, float* output_flow) {
+    return native_step_raw_dims_impl(packet, nx, ny, nz, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz) {

@@ -109,6 +109,8 @@ typedef struct AeroLbmTimingSnapshot {
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_init(int grid_size, int input_channels, int output_channels);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step(const float* packet, int grid_size, long long context_key, float* output_flow);
+AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_channels, int output_channels);
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny, int nz, long long context_key, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz);
 AERO_LBM_CAPI_EXPORT void aero_lbm_release_context(long long context_key);
 AERO_LBM_CAPI_EXPORT void aero_lbm_shutdown(void);
