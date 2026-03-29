@@ -2139,6 +2139,8 @@ inline float benchmark_boundary_value(
     }
 }
 
+)CLC"
+R"CLC(
 inline float temperature_or_self(
     __global const float* temp,
     __global const float* payload,
