@@ -27,6 +27,7 @@
 namespace {
 
 constexpr int kQ = 27;
+constexpr int kThermalQ = 7;
 constexpr std::array<int, 3> kVel1D = {-1, 0, 1};
 constexpr std::array<float, 3> kW1D = {1.0f / 6.0f, 2.0f / 3.0f, 1.0f / 6.0f};
 constexpr std::array<std::array<float, 3>, 3> kMomentInv1D = {{
@@ -116,6 +117,13 @@ constexpr std::array<int, kQ> kCz = make_cz();
 constexpr std::array<int, kQ> kOpp = make_opp();
 constexpr std::array<float, kQ> kW = make_w();
 
+constexpr std::array<int, kThermalQ> kThermalCx = {0, 1, -1, 0, 0, 0, 0};
+constexpr std::array<int, kThermalQ> kThermalCy = {0, 0, 0, 1, -1, 0, 0};
+constexpr std::array<int, kThermalQ> kThermalCz = {0, 0, 0, 0, 0, 1, -1};
+constexpr std::array<int, kThermalQ> kThermalOpp = {0, 2, 1, 4, 3, 6, 5};
+constexpr std::array<float, kThermalQ> kThermalW = {0.25f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f};
+constexpr float kThermalCs2 = 0.25f;
+
 constexpr int kChannelObstacle = 0;
 constexpr int kChannelFanMask = 1;
 constexpr int kChannelFanVx = 2;
@@ -171,8 +179,8 @@ constexpr float kThermalDiffusivity = 0.035f;
 constexpr float kThermalCooling = 0.020f;
 constexpr float kThermalSourceScale = 0.0012f;
 constexpr float kThermalSourceMax = 0.006f;
-constexpr float kThermalMin = -0.20f;
-constexpr float kThermalMax = 0.20f;
+constexpr float kThermalMin = -1.00f;
+constexpr float kThermalMax = 1.00f;
 constexpr int kThermalUpdateStride = 2;
 constexpr float kBoussinesqBeta = 0.12f;
 constexpr float kBoussinesqForceMax = 0.02f;
@@ -538,6 +546,9 @@ struct ContextState {
     std::vector<uint8_t> obstacle;
     std::vector<float> temperature;
     std::vector<float> temperature_next;
+    std::vector<float> temperature_scratch;
+    std::vector<float> thermal_f;
+    std::vector<float> thermal_f_post;
     float last_force[3] = {0.0f, 0.0f, 0.0f};
     std::uint64_t step_counter = 0;
 
@@ -550,6 +561,9 @@ struct ContextState {
     cl_mem d_output = nullptr;
     cl_mem d_temp = nullptr;
     cl_mem d_temp_next = nullptr;
+    cl_mem d_temp_scratch = nullptr;
+    cl_mem d_thermal_f = nullptr;
+    cl_mem d_thermal_f_post = nullptr;
 #endif
 };
 
@@ -738,6 +752,16 @@ inline bool heated_cavity_benchmark_active() {
             || g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_DIFFERENTIALLY_HEATED_CAVITY_3D);
 }
 
+inline bool thermal_bfecc_benchmark_active() {
+    return heated_cavity_benchmark_active();
+}
+
+inline bool thermal_ddf_benchmark_active() {
+    // Benchmark-mode thermal transport stays scalar to avoid the extra bandwidth
+    // cost of a second distribution set; heated cavities use BFECC instead.
+    return false;
+}
+
 inline float benchmark_temperature_span() {
     if (!benchmark_mode_active()) return 1.0f;
     const AeroLbmBoundaryFaceConfig faces[6] = {
@@ -756,6 +780,16 @@ inline float benchmark_temperature_span() {
     }
     if (!any_dirichlet) return 1.0f;
     return std::max(1.0e-6f, t_max - t_min);
+}
+
+inline int effective_thermal_update_stride() {
+    if (!kEnableBoussinesq) return 1;
+    if (benchmark_mode_active()) return 1;
+    return std::max(1, kThermalUpdateStride);
+}
+
+inline float effective_thermal_dt() {
+    return static_cast<float>(effective_thermal_update_stride());
 }
 
 inline float effective_benchmark_tau_shear() {
@@ -787,6 +821,18 @@ inline float effective_thermal_diffusivity() {
     const float tau_shear_eff = effective_benchmark_tau_shear();
     const float nu = std::max(1.0e-6f, (tau_shear_eff - 0.5f) / 3.0f);
     return nu / pr;
+}
+
+inline float effective_thermal_tau() {
+    const float alpha = std::max(1.0e-6f, effective_thermal_diffusivity());
+    return clampf(0.5f + alpha / kThermalCs2, 0.5005f, 3.0f);
+}
+
+inline float thermal_feq(int q, float temperature, float ux, float uy, float uz) {
+    const float cu = static_cast<float>(kThermalCx[q]) * ux
+                   + static_cast<float>(kThermalCy[q]) * uy
+                   + static_cast<float>(kThermalCz[q]) * uz;
+    return kThermalW[q] * temperature * (1.0f + cu / kThermalCs2);
 }
 
 inline float effective_thermal_cooling() {
@@ -917,6 +963,10 @@ inline std::array<float, 3> opencl_effective_thermal_transport() {
     };
 }
 
+inline int opencl_effective_thermal_update_stride() {
+    return effective_thermal_update_stride();
+}
+
 double elapsed_ms(const Clock::time_point& begin, const Clock::time_point& end) {
     return std::chrono::duration<double, std::milli>(end - begin).count();
 }
@@ -955,6 +1005,10 @@ inline std::size_t cell_index(int x, int y, int z, int nx, int ny, int nz) {
 
 // 极为关键的一步：CPU 侧同样采用 SoA (Structure of Arrays) 布局！
 inline std::size_t dist_index(std::size_t cell, int q, std::size_t cells) {
+    return static_cast<std::size_t>(q) * cells + cell;
+}
+
+inline std::size_t thermal_dist_index(std::size_t cell, int q, std::size_t cells) {
     return static_cast<std::size_t>(q) * cells + cell;
 }
 
@@ -1305,9 +1359,41 @@ void allocate_cpu_context(ContextState& ctx, int nx, int ny, int nz) {
     ctx.obstacle.assign(ctx.cells, 0);
     ctx.temperature.assign(ctx.cells, 0.0f);
     ctx.temperature_next.assign(ctx.cells, 0.0f);
+    ctx.temperature_scratch.assign(ctx.cells, 0.0f);
+    ctx.thermal_f.clear();
+    ctx.thermal_f_post.clear();
     ctx.last_force[0] = 0.0f;
     ctx.last_force[1] = 0.0f;
     ctx.last_force[2] = 0.0f;
+}
+
+void ensure_context_thermal_ddf_storage(ContextState& ctx) {
+    if (!thermal_ddf_benchmark_active()) return;
+    const std::size_t thermal_cells = ctx.cells * kThermalQ;
+    if (ctx.thermal_f.size() != thermal_cells) {
+        ctx.thermal_f.assign(thermal_cells, 0.0f);
+    }
+    if (ctx.thermal_f_post.size() != thermal_cells) {
+        ctx.thermal_f_post.assign(thermal_cells, 0.0f);
+    }
+}
+
+void ensure_context_temperature_storage(ContextState& ctx);
+
+void rebuild_thermal_distributions_from_temperature(ContextState& ctx) {
+    if (!thermal_ddf_benchmark_active()) return;
+    ensure_context_thermal_ddf_storage(ctx);
+    for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+        const float temperature = ctx.obstacle[cell] ? 0.0f : clampf(ctx.temperature[cell], kThermalMin, kThermalMax);
+        const float ux = ctx.obstacle[cell] ? 0.0f : ctx.ux[cell];
+        const float uy = ctx.obstacle[cell] ? 0.0f : ctx.uy[cell];
+        const float uz = ctx.obstacle[cell] ? 0.0f : ctx.uz[cell];
+        for (int q = 0; q < kThermalQ; ++q) {
+            const float geq = thermal_feq(q, temperature, ux, uy, uz);
+            ctx.thermal_f[thermal_dist_index(cell, q, ctx.cells)] = geq;
+            ctx.thermal_f_post[thermal_dist_index(cell, q, ctx.cells)] = geq;
+        }
+    }
 }
 
 void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
@@ -1383,6 +1469,7 @@ void initialize_distributions(ContextState& ctx) {
         ctx.temperature[cell] = clampf(ctx.temperature[cell], kThermalMin, kThermalMax);
         ctx.temperature_next[cell] = ctx.temperature[cell];
     }
+    rebuild_thermal_distributions_from_temperature(ctx);
     ctx.cpu_initialized = true;
 }
 
@@ -1402,7 +1489,14 @@ inline float thermal_source_term(const ContextState& ctx, std::size_t cell) {
     return ctx.fan_mask[cell] * capped;
 }
 
-inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int z, float self_value) {
+inline float thermal_field_neighbor_or_self(
+    const ContextState& ctx,
+    const std::vector<float>& field,
+    int x,
+    int y,
+    int z,
+    float self_value
+) {
     remap_thermal_coords(x, y, z, ctx.nx, ctx.ny, ctx.nz);
     if (x < 0 || y < 0 || z < 0 || x >= ctx.nx || y >= ctx.ny || z >= ctx.nz) {
         const AeroLbmBoundaryFaceConfig* face = thermal_face_for_oob(x, y, z, ctx.nx, ctx.ny, ctx.nz);
@@ -1421,35 +1515,118 @@ inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int
     }
     const std::size_t cell = cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz);
     if (ctx.obstacle[cell]) return self_value;
-    return ctx.temperature[cell];
+    return field[cell];
 }
 
-inline float sample_temperature_trilinear(
-    const ContextState& ctx, float x, float y, float z, float fallback
-) {
-    x = clampf(x, 0.0f, static_cast<float>(ctx.nx - 1));
-    y = clampf(y, 0.0f, static_cast<float>(ctx.ny - 1));
-    z = clampf(z, 0.0f, static_cast<float>(ctx.nz - 1));
+inline float thermal_neighbor_or_self(const ContextState& ctx, int x, int y, int z, float self_value) {
+    return thermal_field_neighbor_or_self(ctx, ctx.temperature, x, y, z, self_value);
+}
 
+inline float thermal_boundary_distribution(
+    const ContextState& ctx,
+    const std::vector<float>& thermal_read,
+    std::size_t cell,
+    int q,
+    float self_temperature
+) {
+    const float outgoing = thermal_read[thermal_dist_index(cell, kThermalOpp[q], ctx.cells)];
+    return outgoing;
+}
+
+inline float thermal_streamed_value(
+    const ContextState& ctx,
+    const std::vector<float>& thermal_read,
+    std::size_t cell,
+    int x,
+    int y,
+    int z,
+    int q,
+    float self_temperature
+) {
+    int sx = x - kThermalCx[q];
+    int sy = y - kThermalCy[q];
+    int sz = z - kThermalCz[q];
+    remap_thermal_coords(sx, sy, sz, ctx.nx, ctx.ny, ctx.nz);
+    if (sx < 0 || sy < 0 || sz < 0 || sx >= ctx.nx || sy >= ctx.ny || sz >= ctx.nz) {
+        const AeroLbmBoundaryFaceConfig* face = thermal_face_for_oob(sx, sy, sz, ctx.nx, ctx.ny, ctx.nz);
+        const int kind = face ? face->thermal_kind : AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME;
+        switch (kind) {
+            case AERO_LBM_THERMAL_BOUNDARY_TEMPERATURE_DIRICHLET: {
+                const float wall_t = clampf(face->temperature, kThermalMin, kThermalMax);
+                return -thermal_read[thermal_dist_index(cell, kThermalOpp[q], ctx.cells)] + 2.0f * kThermalW[q] * wall_t;
+            }
+            case AERO_LBM_THERMAL_BOUNDARY_HEAT_FLUX_NEUMANN: {
+                const float wall_t = clampf(self_temperature + face->heat_flux, kThermalMin, kThermalMax);
+                return -thermal_read[thermal_dist_index(cell, kThermalOpp[q], ctx.cells)] + 2.0f * kThermalW[q] * wall_t;
+            }
+            case AERO_LBM_THERMAL_BOUNDARY_DISABLED:
+            case AERO_LBM_THERMAL_BOUNDARY_ADIABATIC:
+            case AERO_LBM_THERMAL_BOUNDARY_INHERIT_GAME:
+            default:
+                return thermal_boundary_distribution(ctx, thermal_read, cell, q, self_temperature);
+        }
+    }
+    const std::size_t src = cell_index(sx, sy, sz, ctx.nx, ctx.ny, ctx.nz);
+    if (ctx.obstacle[src]) {
+        return thermal_boundary_distribution(ctx, thermal_read, cell, q, self_temperature);
+    }
+    return thermal_read[thermal_dist_index(src, q, ctx.cells)];
+}
+
+inline void local_temperature_bounds(
+    const ContextState& ctx,
+    const std::vector<float>& field,
+    int x,
+    int y,
+    int z,
+    float& out_min,
+    float& out_max
+) {
+    const std::size_t cell = cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz);
+    const float center = field[cell];
+    out_min = center;
+    out_max = center;
+    const float neighbors[6] = {
+        thermal_field_neighbor_or_self(ctx, field, x + 1, y, z, center),
+        thermal_field_neighbor_or_self(ctx, field, x - 1, y, z, center),
+        thermal_field_neighbor_or_self(ctx, field, x, y + 1, z, center),
+        thermal_field_neighbor_or_self(ctx, field, x, y - 1, z, center),
+        thermal_field_neighbor_or_self(ctx, field, x, y, z + 1, center),
+        thermal_field_neighbor_or_self(ctx, field, x, y, z - 1, center),
+    };
+    for (float value : neighbors) {
+        out_min = std::min(out_min, value);
+        out_max = std::max(out_max, value);
+    }
+}
+
+inline float sample_temperature_trilinear_field(
+    const ContextState& ctx,
+    const std::vector<float>& field,
+    float x,
+    float y,
+    float z,
+    float fallback
+) {
     const int x0 = static_cast<int>(std::floor(x));
     const int y0 = static_cast<int>(std::floor(y));
     const int z0 = static_cast<int>(std::floor(z));
-    const int x1 = std::min(ctx.nx - 1, x0 + 1);
-    const int y1 = std::min(ctx.ny - 1, y0 + 1);
-    const int z1 = std::min(ctx.nz - 1, z0 + 1);
+    const int x1 = x0 + 1;
+    const int y1 = y0 + 1;
+    const int z1 = z0 + 1;
 
     const float fx = x - static_cast<float>(x0);
     const float fy = y - static_cast<float>(y0);
     const float fz = z - static_cast<float>(z0);
 
-    const float c000 = thermal_neighbor_or_self(ctx, x0, y0, z0, fallback);
-    const float c100 = thermal_neighbor_or_self(ctx, x1, y0, z0, fallback);
-    const float c010 = thermal_neighbor_or_self(ctx, x0, y1, z0, fallback);
-    const float c110 = thermal_neighbor_or_self(ctx, x1, y1, z0, fallback);
-    const float c001 = thermal_neighbor_or_self(ctx, x0, y0, z1, fallback);
-    const float c101 = thermal_neighbor_or_self(ctx, x1, y0, z1, fallback);
-    const float c011 = thermal_neighbor_or_self(ctx, x0, y1, z1, fallback);
-    const float c111 = thermal_neighbor_or_self(ctx, x1, y1, z1, fallback);
+    const float c000 = thermal_field_neighbor_or_self(ctx, field, x0, y0, z0, fallback);
+    const float c100 = thermal_field_neighbor_or_self(ctx, field, x1, y0, z0, fallback);
+    const float c010 = thermal_field_neighbor_or_self(ctx, field, x0, y1, z0, fallback);
+    const float c110 = thermal_field_neighbor_or_self(ctx, field, x1, y1, z0, fallback);
+    const float c001 = thermal_field_neighbor_or_self(ctx, field, x0, y0, z1, fallback);
+    const float c101 = thermal_field_neighbor_or_self(ctx, field, x1, y0, z1, fallback);
+    const float c011 = thermal_field_neighbor_or_self(ctx, field, x0, y1, z1, fallback);
+    const float c111 = thermal_field_neighbor_or_self(ctx, field, x1, y1, z1, fallback);
 
     const float c00 = c000 + (c100 - c000) * fx;
     const float c10 = c010 + (c110 - c010) * fx;
@@ -1460,10 +1637,104 @@ inline float sample_temperature_trilinear(
     return c0 + (c1 - c0) * fz;
 }
 
+inline float sample_temperature_trilinear(
+    const ContextState& ctx, float x, float y, float z, float fallback
+) {
+    return sample_temperature_trilinear_field(ctx, ctx.temperature, x, y, z, fallback);
+}
+
 void update_temperature_field(ContextState& ctx) {
+    if (thermal_bfecc_benchmark_active()) {
+        // BFECC reduces the excessive dissipation of first-order semi-Lagrangian
+        // advection without introducing a full thermal DDF in benchmark mode.
+        ensure_context_temperature_storage(ctx);
+        const float thermal_diffusivity = effective_thermal_diffusivity();
+        const float thermal_cooling = effective_thermal_cooling();
+        const float thermal_dt = effective_thermal_dt();
+
+        for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+            if (ctx.obstacle[cell]) {
+                ctx.temperature_scratch[cell] = 0.0f;
+                continue;
+            }
+            int x = 0, y = 0, z = 0;
+            decode_cell(cell, ctx.nx, ctx.ny, ctx.nz, x, y, z);
+            const float t_center = ctx.temperature[cell];
+            ctx.temperature_scratch[cell] = sample_temperature_trilinear_field(
+                ctx,
+                ctx.temperature,
+                static_cast<float>(x) - thermal_dt * ctx.ux[cell],
+                static_cast<float>(y) - thermal_dt * ctx.uy[cell],
+                static_cast<float>(z) - thermal_dt * ctx.uz[cell],
+                t_center
+            );
+        }
+
+        for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+            if (ctx.obstacle[cell]) {
+                ctx.temperature_next[cell] = 0.0f;
+                continue;
+            }
+            int x = 0, y = 0, z = 0;
+            decode_cell(cell, ctx.nx, ctx.ny, ctx.nz, x, y, z);
+            const float t_center = ctx.temperature[cell];
+            const float backward = sample_temperature_trilinear_field(
+                ctx,
+                ctx.temperature_scratch,
+                static_cast<float>(x) + thermal_dt * ctx.ux[cell],
+                static_cast<float>(y) + thermal_dt * ctx.uy[cell],
+                static_cast<float>(z) + thermal_dt * ctx.uz[cell],
+                ctx.temperature_scratch[cell]
+            );
+            ctx.temperature_next[cell] = clampf(t_center + 0.5f * (t_center - backward), kThermalMin, kThermalMax);
+        }
+
+        for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+            if (ctx.obstacle[cell]) {
+                ctx.temperature_scratch[cell] = 0.0f;
+                continue;
+            }
+            int x = 0, y = 0, z = 0;
+            decode_cell(cell, ctx.nx, ctx.ny, ctx.nz, x, y, z);
+            const float t_center = ctx.temperature[cell];
+            float advected = sample_temperature_trilinear_field(
+                ctx,
+                ctx.temperature_next,
+                static_cast<float>(x) - thermal_dt * ctx.ux[cell],
+                static_cast<float>(y) - thermal_dt * ctx.uy[cell],
+                static_cast<float>(z) - thermal_dt * ctx.uz[cell],
+                ctx.temperature_next[cell]
+            );
+            float local_min = 0.0f;
+            float local_max = 0.0f;
+            local_temperature_bounds(ctx, ctx.temperature, x, y, z, local_min, local_max);
+            advected = clampf(advected, local_min, local_max);
+
+            const float t_sum =
+                thermal_neighbor_or_self(ctx, x + 1, y, z, t_center)
+                + thermal_neighbor_or_self(ctx, x - 1, y, z, t_center)
+                + thermal_neighbor_or_self(ctx, x, y + 1, z, t_center)
+                + thermal_neighbor_or_self(ctx, x, y - 1, z, t_center)
+                + thermal_neighbor_or_self(ctx, x, y, z + 1, t_center)
+                + thermal_neighbor_or_self(ctx, x, y, z - 1, t_center);
+            const float laplacian = t_sum - 6.0f * t_center;
+            const float source = thermal_source_term(ctx, cell);
+            ctx.temperature_scratch[cell] = clampf(
+                advected + thermal_dt * (thermal_diffusivity * laplacian + source - thermal_cooling * advected),
+                kThermalMin,
+                kThermalMax
+            );
+        }
+
+        ctx.temperature.swap(ctx.temperature_scratch);
+        std::copy(ctx.temperature.begin(), ctx.temperature.end(), ctx.temperature_next.begin());
+        return;
+    }
+
     if (!kEnableBoussinesq) return;
     const float thermal_diffusivity = effective_thermal_diffusivity();
     const float thermal_cooling = effective_thermal_cooling();
+    const float thermal_dt = effective_thermal_dt();
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         if (ctx.obstacle[cell]) {
             ctx.temperature_next[cell] = 0.0f;
@@ -1476,9 +1747,9 @@ void update_temperature_field(ContextState& ctx) {
         const float t_center = ctx.temperature[cell];
         const float advected = sample_temperature_trilinear(
             ctx,
-            static_cast<float>(x) - ctx.ux[cell],
-            static_cast<float>(y) - ctx.uy[cell],
-            static_cast<float>(z) - ctx.uz[cell],
+            static_cast<float>(x) - thermal_dt * ctx.ux[cell],
+            static_cast<float>(y) - thermal_dt * ctx.uy[cell],
+            static_cast<float>(z) - thermal_dt * ctx.uz[cell],
             t_center
         );
         const float t_sum =
@@ -1492,9 +1763,7 @@ void update_temperature_field(ContextState& ctx) {
         const float laplacian = t_sum - 6.0f * t_center;
         const float source = thermal_source_term(ctx, cell);
         const float t_next = advected
-                             + thermal_diffusivity * laplacian
-                             + source
-                             - thermal_cooling * advected;
+                             + thermal_dt * (thermal_diffusivity * laplacian + source - thermal_cooling * advected);
         ctx.temperature_next[cell] = clampf(t_next, kThermalMin, kThermalMax);
     }
     ctx.temperature.swap(ctx.temperature_next);
@@ -1502,8 +1771,9 @@ void update_temperature_field(ContextState& ctx) {
 
 inline bool should_update_temperature(std::uint64_t step_counter) {
     if (!kEnableBoussinesq) return false;
-    if (kThermalUpdateStride <= 1) return true;
-    return (step_counter % static_cast<std::uint64_t>(kThermalUpdateStride)) == 0;
+    const int stride = effective_thermal_update_stride();
+    if (stride <= 1) return true;
+    return (step_counter % static_cast<std::uint64_t>(stride)) == 0;
 }
 
 void collide(ContextState& ctx) {
@@ -1633,10 +1903,12 @@ void collide(ContextState& ctx) {
         compute_raw_moments(f_local, raw);
         compute_central_moments(raw, ux, uy, uz, central_pre);
 
-        float tau_shear_local = effective_benchmark_tau_shear();
-        float tau_normal_local = effective_benchmark_tau_normal(tau_shear_local);
+        const float tau_shear_base = effective_benchmark_tau_shear();
+        const float tau_normal_base = effective_benchmark_tau_normal(tau_shear_base);
+        float tau_shear_local = tau_shear_base;
+        float tau_normal_local = tau_normal_base;
         if (effective_enable_sgs()) {
-            const float nu0 = std::max(1e-6f, (kTauShear - 0.5f) / 3.0f);
+            const float nu0 = std::max(1e-6f, (tau_shear_base - 0.5f) / 3.0f);
             const float neq_xx = central_pre[2][0][0] - rho_safe * kCs2;
             const float neq_yy = central_pre[0][2][0] - rho_safe * kCs2;
             const float neq_zz = central_pre[0][0][2] - rho_safe * kCs2;
@@ -1651,7 +1923,7 @@ void collide(ContextState& ctx) {
             nu_t = std::min(nu_t, kSgsNutToNu0Max * nu0);
             tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), kTauShearMin, kTauShearMax);
             tau_normal_local = clampf(
-                kTauNormal + (tau_shear_local - kTauShear) * kSgsBulkCoupling,
+                tau_normal_base + (tau_shear_local - tau_shear_base) * kSgsBulkCoupling,
                 kTauNormalMin,
                 kTauNormalMax
             );
@@ -1892,6 +2164,9 @@ struct OpenClRuntime {
     cl_command_queue queue = nullptr;
     cl_program program = nullptr;
     cl_kernel k_init = nullptr;
+    cl_kernel k_thermal_bfecc_forward = nullptr;
+    cl_kernel k_thermal_bfecc_correct = nullptr;
+    cl_kernel k_thermal_bfecc_finalize = nullptr;
     cl_kernel k_stream_collide = nullptr;
     cl_kernel k_output = nullptr;
 };
@@ -1934,6 +2209,12 @@ __constant float W[KQ] = {
     0.018518519f, 0.074074074f, 0.018518519f,
     0.004629630f, 0.018518519f, 0.004629630f
 };
+__constant int TQ = 7;
+__constant int TCX[7] = {0, 1, -1, 0, 0, 0, 0};
+__constant int TCY[7] = {0, 0, 0, 1, -1, 0, 0};
+__constant int TCZ[7] = {0, 0, 0, 0, 0, 1, -1};
+__constant int TOPP[7] = {0, 2, 1, 4, 3, 6, 5};
+__constant float TW[7] = {0.25f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f};
 __constant float TINV[3][3] = {
     {0.0f, -0.5f, 0.5f},
     {1.0f, 0.0f, -1.0f},
@@ -1973,9 +2254,10 @@ __constant float THERMAL_DIFFUSIVITY = 0.035f;
 __constant float THERMAL_COOLING = 0.020f;
 __constant float THERMAL_SOURCE_SCALE = 0.0012f;
 __constant float THERMAL_SOURCE_MAX = 0.006f;
-__constant float THERMAL_MIN = -0.20f;
-__constant float THERMAL_MAX = 0.20f;
+__constant float THERMAL_MIN = -1.00f;
+__constant float THERMAL_MAX = 1.00f;
 __constant int THERMAL_UPDATE_STRIDE = 2;
+__constant float THERMAL_CS2 = 0.25f;
 __constant float BOUSSINESQ_BETA = 0.12f;
 __constant float BOUSSINESQ_FORCE_MAX = 0.02f;
 
@@ -1989,6 +2271,8 @@ __constant float BOUSSINESQ_FORCE_MAX = 0.02f;
 #define BENCH_DISABLE_BUOYANCY (1 << 7)
 
 #define BENCH_PRESET_CYLINDER_CROSSFLOW_2D 4
+#define BENCH_PRESET_HEATED_CAVITY_2D 5
+#define BENCH_PRESET_HEATED_CAVITY_3D 6
 
 #define PERIODIC_AXIS_X 1
 #define PERIODIC_AXIS_Y 2
@@ -2315,6 +2599,87 @@ inline float sample_temperature_trilinear(
     return c0 + (c1 - c0) * fz;
 }
 
+inline int thermal_ddf_benchmark_enabled(int benchmark_preset) {
+    return 0;
+}
+
+inline int thermal_bfecc_benchmark_enabled(int benchmark_preset) {
+    return benchmark_preset == BENCH_PRESET_HEATED_CAVITY_2D || benchmark_preset == BENCH_PRESET_HEATED_CAVITY_3D;
+}
+
+inline float thermal_feq_opencl(int q, float temperature, float ux, float uy, float uz) {
+    float cu = (float)TCX[q] * ux + (float)TCY[q] * uy + (float)TCZ[q] * uz;
+    return TW[q] * temperature * (1.0f + cu / THERMAL_CS2);
+}
+
+inline float thermal_boundary_distribution_opencl(
+    __global const float* thermal_f_read,
+    int cells,
+    int cell,
+    int q
+) {
+    return thermal_f_read[TOPP[q] * cells + cell];
+}
+
+inline float thermal_streamed_value_opencl(
+    __global const float* thermal_f_read,
+    __global const float* payload,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int cells,
+    int thermal_periodic_mask,
+    int tx_min_kind,
+    int tx_max_kind,
+    int ty_min_kind,
+    int ty_max_kind,
+    int tz_min_kind,
+    int tz_max_kind,
+    float4 tx_min_data,
+    float4 tx_max_data,
+    float4 ty_min_data,
+    float4 ty_max_data,
+    float4 tz_min_data,
+    float4 tz_max_data,
+    int cell,
+    int x,
+    int y,
+    int z,
+    int q,
+    float self_temperature
+) {
+    int sx = x - TCX[q];
+    int sy = y - TCY[q];
+    int sz = z - TCZ[q];
+    sx = wrap_axis_if_periodic(sx, nx, PERIODIC_AXIS_X, thermal_periodic_mask);
+    sy = wrap_axis_if_periodic(sy, ny, PERIODIC_AXIS_Y, thermal_periodic_mask);
+    sz = wrap_axis_if_periodic(sz, nz, PERIODIC_AXIS_Z, thermal_periodic_mask);
+    if (sx < 0 || sy < 0 || sz < 0 || sx >= nx || sy >= ny || sz >= nz) {
+        int face_kind = face_kind_for_oob(
+            sx, sy, sz, nx, ny, nz,
+            tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind
+        );
+        float4 face_data = face_data_for_oob(
+            sx, sy, sz, nx, ny, nz,
+            tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data
+        );
+        if (face_kind == 4) {
+            return -thermal_f_read[TOPP[q] * cells + cell] + 2.0f * TW[q] * clampf(face_data.x, THERMAL_MIN, THERMAL_MAX);
+        }
+        if (face_kind == 5) {
+            float wall_t = clampf(self_temperature + face_data.y, THERMAL_MIN, THERMAL_MAX);
+            return -thermal_f_read[TOPP[q] * cells + cell] + 2.0f * TW[q] * wall_t;
+        }
+        return thermal_boundary_distribution_opencl(thermal_f_read, cells, cell, q);
+    }
+    int src = (sx * ny + sy) * nz + sz;
+    if (payload[src * in_ch + 0] > 0.5f) {
+        return thermal_boundary_distribution_opencl(thermal_f_read, cells, cell, q);
+    }
+    return thermal_f_read[q * cells + src];
+}
+
 inline float obstacle_bounce_value(
     __global const float* f_read, __global const float* payload,
     int in_ch, int nx, int ny, int nz, int cells, int cell, int x, int y, int z, int q, int opp, int benchmark_flags
@@ -2358,20 +2723,251 @@ kernel void init_distributions(
 
 )CLC"
 R"CLC(
+kernel void thermal_bfecc_forward(
+    __global const float* payload,
+    __global const float* temp_read,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int cells,
+    int thermal_periodic_mask,
+    int tx_min_kind,
+    int tx_max_kind,
+    int ty_min_kind,
+    int ty_max_kind,
+    int tz_min_kind,
+    int tz_max_kind,
+    float4 tx_min_data,
+    float4 tx_max_data,
+    float4 ty_min_data,
+    float4 ty_max_data,
+    float4 tz_min_data,
+    float4 tz_max_data,
+    float thermal_dt,
+    __global float* temp_forward
+) {
+    int cell = (int)get_global_id(0);
+    if (cell >= cells) return;
+    int base = cell * in_ch;
+    if (payload[base + 0] > 0.5f) {
+        temp_forward[cell] = 0.0f;
+        return;
+    }
+    int yz = ny * nz;
+    int x = cell / yz;
+    int rem = cell - x * yz;
+    int y = rem / nz;
+    int z = rem - y * nz;
+    float ux = payload[base + 5];
+    float uy = payload[base + 6];
+    float uz = payload[base + 7];
+    temp_forward[cell] = sample_temperature_trilinear(
+        temp_read,
+        payload,
+        in_ch,
+        nx,
+        ny,
+        nz,
+        thermal_periodic_mask,
+        tx_min_kind,
+        tx_max_kind,
+        ty_min_kind,
+        ty_max_kind,
+        tz_min_kind,
+        tz_max_kind,
+        tx_min_data,
+        tx_max_data,
+        ty_min_data,
+        ty_max_data,
+        tz_min_data,
+        tz_max_data,
+        (float)x - thermal_dt * ux,
+        (float)y - thermal_dt * uy,
+        (float)z - thermal_dt * uz,
+        temp_read[cell]
+    );
+}
+
+kernel void thermal_bfecc_correct(
+    __global const float* payload,
+    __global const float* temp_read,
+    __global const float* temp_forward,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int cells,
+    int thermal_periodic_mask,
+    int tx_min_kind,
+    int tx_max_kind,
+    int ty_min_kind,
+    int ty_max_kind,
+    int tz_min_kind,
+    int tz_max_kind,
+    float4 tx_min_data,
+    float4 tx_max_data,
+    float4 ty_min_data,
+    float4 ty_max_data,
+    float4 tz_min_data,
+    float4 tz_max_data,
+    float thermal_dt,
+    __global float* temp_corrected
+) {
+    int cell = (int)get_global_id(0);
+    if (cell >= cells) return;
+    int base = cell * in_ch;
+    if (payload[base + 0] > 0.5f) {
+        temp_corrected[cell] = 0.0f;
+        return;
+    }
+    int yz = ny * nz;
+    int x = cell / yz;
+    int rem = cell - x * yz;
+    int y = rem / nz;
+    int z = rem - y * nz;
+    float ux = payload[base + 5];
+    float uy = payload[base + 6];
+    float uz = payload[base + 7];
+    float t_center = temp_read[cell];
+    float backward = sample_temperature_trilinear(
+        temp_forward,
+        payload,
+        in_ch,
+        nx,
+        ny,
+        nz,
+        thermal_periodic_mask,
+        tx_min_kind,
+        tx_max_kind,
+        ty_min_kind,
+        ty_max_kind,
+        tz_min_kind,
+        tz_max_kind,
+        tx_min_data,
+        tx_max_data,
+        ty_min_data,
+        ty_max_data,
+        tz_min_data,
+        tz_max_data,
+        (float)x + thermal_dt * ux,
+        (float)y + thermal_dt * uy,
+        (float)z + thermal_dt * uz,
+        temp_forward[cell]
+    );
+    temp_corrected[cell] = clampf(t_center + 0.5f * (t_center - backward), THERMAL_MIN, THERMAL_MAX);
+}
+
+kernel void thermal_bfecc_finalize(
+    __global const float* payload,
+    __global const float* temp_read,
+    __global const float* temp_corrected,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int cells,
+    int thermal_periodic_mask,
+    int tx_min_kind,
+    int tx_max_kind,
+    int ty_min_kind,
+    int ty_max_kind,
+    int tz_min_kind,
+    int tz_max_kind,
+    float4 tx_min_data,
+    float4 tx_max_data,
+    float4 ty_min_data,
+    float4 ty_max_data,
+    float4 tz_min_data,
+    float4 tz_max_data,
+    float thermal_dt,
+    float thermal_diffusivity_eff,
+    float thermal_cooling_eff,
+    int benchmark_flags,
+    __global float* temp_out
+) {
+    int cell = (int)get_global_id(0);
+    if (cell >= cells) return;
+    int base = cell * in_ch;
+    if (payload[base + 0] > 0.5f) {
+        temp_out[cell] = 0.0f;
+        return;
+    }
+    int yz = ny * nz;
+    int x = cell / yz;
+    int rem = cell - x * yz;
+    int y = rem / nz;
+    int z = rem - y * nz;
+    float ux = payload[base + 5];
+    float uy = payload[base + 6];
+    float uz = payload[base + 7];
+    float t_center = temp_read[cell];
+    float advected = sample_temperature_trilinear(
+        temp_corrected,
+        payload,
+        in_ch,
+        nx,
+        ny,
+        nz,
+        thermal_periodic_mask,
+        tx_min_kind,
+        tx_max_kind,
+        ty_min_kind,
+        ty_max_kind,
+        tz_min_kind,
+        tz_max_kind,
+        tx_min_data,
+        tx_max_data,
+        ty_min_data,
+        ty_max_data,
+        tz_min_data,
+        tz_max_data,
+        (float)x - thermal_dt * ux,
+        (float)y - thermal_dt * uy,
+        (float)z - thermal_dt * uz,
+        temp_corrected[cell]
+    );
+    float txp0 = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x + 1, y, z, t_center);
+    float txm0 = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x - 1, y, z, t_center);
+    float typ0 = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y + 1, z, t_center);
+    float tym0 = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y - 1, z, t_center);
+    float tzp0 = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z + 1, t_center);
+    float tzm0 = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z - 1, t_center);
+    float local_min = fmin(fmin(fmin(txp0, txm0), fmin(typ0, tym0)), fmin(fmin(tzp0, tzm0), t_center));
+    float local_max = fmax(fmax(fmax(txp0, txm0), fmax(typ0, tym0)), fmax(fmax(tzp0, tzm0), t_center));
+    advected = clampf(advected, local_min, local_max);
+    float laplacian_t = (txp0 + txm0 + typ0 + tym0 + tzp0 + tzm0) - 6.0f * t_center;
+    float thermal_source = 0.0f;
+    if ((benchmark_flags & BENCH_DISABLE_INTERNAL_THERMAL_SOURCE) != 0) {
+        thermal_source = 0.0f;
+    } else if (in_ch > 9) {
+        thermal_source = clampf(payload[base + 9], -THERMAL_SOURCE_MAX, THERMAL_SOURCE_MAX);
+    }
+    temp_out[cell] = clampf(
+        advected + thermal_dt * (thermal_diffusivity_eff * laplacian_t + thermal_source - thermal_cooling_eff * advected),
+        THERMAL_MIN,
+        THERMAL_MAX
+    );
+}
+
+)CLC"
+R"CLC(
 kernel void stream_collide_step(
     __global const float* f_read,
     __global const float* payload,
     __global const float* temp_read,
+    __global const float* thermal_f_read,
     int in_ch, int nx, int ny, int nz, int cells, int tick, int benchmark_flags, int hydro_periodic_mask, int thermal_periodic_mask,
     float tau_shear_eff, float tau_normal_eff,
-    float thermal_diffusivity_eff, float thermal_cooling_eff, float boussinesq_beta_eff,
+    float thermal_diffusivity_eff, float thermal_cooling_eff, float boussinesq_beta_eff, int thermal_update_stride_eff,
     int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
     float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
     int tx_min_kind, int tx_max_kind, int ty_min_kind, int ty_max_kind, int tz_min_kind, int tz_max_kind,
     float4 tx_min_data, float4 tx_max_data, float4 ty_min_data, float4 ty_max_data, float4 tz_min_data, float4 tz_max_data,
     int benchmark_preset,
     __global float* f_write,
-    __global float* temp_write
+    __global float* temp_write,
+    __global float* thermal_f_write
 ) {
     int cell = (int)get_global_id(0);
     if (cell >= cells) return;
@@ -2381,6 +2977,8 @@ kernel void stream_collide_step(
     int rem = cell - x * yz;
     int y = rem / nz;
     int z = rem - y * nz;
+    int use_thermal_ddf = thermal_ddf_benchmark_enabled(benchmark_preset);
+    int use_thermal_bfecc = thermal_bfecc_benchmark_enabled(benchmark_preset);
     
     int base = cell * in_ch;
     int is_solid = payload[base + 0] > 0.5f;
@@ -2417,6 +3015,11 @@ kernel void stream_collide_step(
     if (is_solid) {
         temp_write[cell] = 0.0f;
         for (int q = 0; q < KQ; ++q) f_write[q * cells + cell] = f_local[q];
+        if (use_thermal_ddf) {
+            for (int tq = 0; tq < 7; ++tq) {
+                thermal_f_write[tq * cells + cell] = thermal_feq_opencl(tq, 0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
         return;
     }
 
@@ -2442,55 +3045,108 @@ kernel void stream_collide_step(
 
     float temp_center = temp_read[cell];
     float temp_next = temp_center;
+    int thermal_stride = max(1, thermal_update_stride_eff);
+    float thermal_dt = (float)thermal_stride;
     int update_temperature = BOUSSINESQ_ENABLED
-        && (THERMAL_UPDATE_STRIDE <= 1 || (tick % THERMAL_UPDATE_STRIDE) == 0);
+        && !use_thermal_bfecc
+        && (thermal_stride <= 1 || (tick % thermal_stride) == 0);
     if (update_temperature) {
-        float temp_advected = sample_temperature_trilinear(
-            temp_read,
-            payload,
-            in_ch,
-            nx,
-            ny,
-            nz,
-            thermal_periodic_mask,
-            tx_min_kind,
-            tx_max_kind,
-            ty_min_kind,
-            ty_max_kind,
-            tz_min_kind,
-            tz_max_kind,
-            tx_min_data,
-            tx_max_data,
-            ty_min_data,
-            ty_max_data,
-            tz_min_data,
-            tz_max_data,
-            (float)x - ux,
-            (float)y - uy,
-            (float)z - uz,
-            temp_center
-        );
-        float txp = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x + 1, y, z, temp_center);
-        float txm = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x - 1, y, z, temp_center);
-        float typ = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y + 1, z, temp_center);
-        float tym = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y - 1, z, temp_center);
-        float tzp = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z + 1, temp_center);
-        float tzm = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z - 1, temp_center);
+        if (use_thermal_ddf) {
+            float tau_t = clampf(0.5f + thermal_diffusivity_eff / THERMAL_CS2, 0.5005f, 3.0f);
+            float omega_t = 1.0f / tau_t;
+            float g_local[7];
+            float temp_macro = 0.0f;
+            for (int tq = 0; tq < 7; ++tq) {
+                g_local[tq] = thermal_streamed_value_opencl(
+                    thermal_f_read,
+                    payload,
+                    in_ch,
+                    nx,
+                    ny,
+                    nz,
+                    cells,
+                    thermal_periodic_mask,
+                    tx_min_kind,
+                    tx_max_kind,
+                    ty_min_kind,
+                    ty_max_kind,
+                    tz_min_kind,
+                    tz_max_kind,
+                    tx_min_data,
+                    tx_max_data,
+                    ty_min_data,
+                    ty_max_data,
+                    tz_min_data,
+                    tz_max_data,
+                    cell,
+                    x,
+                    y,
+                    z,
+                    tq,
+                    temp_center
+                );
+                temp_macro += g_local[tq];
+            }
+            temp_next = clampf(temp_macro, THERMAL_MIN, THERMAL_MAX);
+            for (int tq = 0; tq < 7; ++tq) {
+                float geq_t = thermal_feq_opencl(tq, temp_next, ux, uy, uz);
+                thermal_f_write[tq * cells + cell] = g_local[tq] - omega_t * (g_local[tq] - geq_t);
+            }
+        } else {
+            float temp_advected = sample_temperature_trilinear(
+                temp_read,
+                payload,
+                in_ch,
+                nx,
+                ny,
+                nz,
+                thermal_periodic_mask,
+                tx_min_kind,
+                tx_max_kind,
+                ty_min_kind,
+                ty_max_kind,
+                tz_min_kind,
+                tz_max_kind,
+                tx_min_data,
+                tx_max_data,
+                ty_min_data,
+                ty_max_data,
+                tz_min_data,
+                tz_max_data,
+                (float)x - thermal_dt * ux,
+                (float)y - thermal_dt * uy,
+                (float)z - thermal_dt * uz,
+                temp_center
+            );
+            float txp = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x + 1, y, z, temp_center);
+            float txm = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x - 1, y, z, temp_center);
+            float typ = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y + 1, z, temp_center);
+            float tym = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y - 1, z, temp_center);
+            float tzp = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z + 1, temp_center);
+            float tzm = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z - 1, temp_center);
 
-        float laplacian_t = (txp + txm + typ + tym + tzp + tzm) - 6.0f * temp_center;
-        float thermal_source = 0.0f;
-        if ((benchmark_flags & BENCH_DISABLE_INTERNAL_THERMAL_SOURCE) != 0) {
-            thermal_source = 0.0f;
-        } else if (in_ch > 9) {
-            thermal_source = clampf(payload[base + 9], -THERMAL_SOURCE_MAX, THERMAL_SOURCE_MAX);
-        } else if (fan > 0.0f && fan_norm > 1e-8f) {
-            thermal_source = fan * clampf(fan_norm * THERMAL_SOURCE_SCALE, 0.0f, THERMAL_SOURCE_MAX);
+            float laplacian_t = (txp + txm + typ + tym + tzp + tzm) - 6.0f * temp_center;
+            float thermal_source = 0.0f;
+            if ((benchmark_flags & BENCH_DISABLE_INTERNAL_THERMAL_SOURCE) != 0) {
+                thermal_source = 0.0f;
+            } else if (in_ch > 9) {
+                thermal_source = clampf(payload[base + 9], -THERMAL_SOURCE_MAX, THERMAL_SOURCE_MAX);
+            } else if (fan > 0.0f && fan_norm > 1e-8f) {
+                thermal_source = fan * clampf(fan_norm * THERMAL_SOURCE_SCALE, 0.0f, THERMAL_SOURCE_MAX);
+            }
+            temp_next = clampf(
+                temp_advected + thermal_dt * (thermal_diffusivity_eff * laplacian_t + thermal_source - thermal_cooling_eff * temp_advected),
+                THERMAL_MIN,
+                THERMAL_MAX
+            );
+            for (int tq = 0; tq < 7; ++tq) {
+                thermal_f_write[tq * cells + cell] = thermal_feq_opencl(tq, temp_next, ux, uy, uz);
+            }
         }
-        temp_next = clampf(
-            temp_advected + thermal_diffusivity_eff * laplacian_t + thermal_source - thermal_cooling_eff * temp_advected,
-            THERMAL_MIN,
-            THERMAL_MAX
-        );
+    } else if (use_thermal_ddf) {
+        for (int tq = 0; tq < 7; ++tq) {
+            thermal_f_write[tq * cells + cell] = thermal_f_read[tq * cells + cell];
+        }
     }
     temp_write[cell] = temp_next;
 
@@ -2592,10 +3248,12 @@ kernel void stream_collide_step(
 
 )CLC"
 R"CLC(
-    float tau_shear_local = tau_shear_eff;
-    float tau_normal_local = clampf(tau_normal_eff, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
+    float tau_shear_base = tau_shear_eff;
+    float tau_normal_base = clampf(tau_normal_eff, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
+    float tau_shear_local = tau_shear_base;
+    float tau_normal_local = tau_normal_base;
     if (SGS_ENABLED && (benchmark_flags & BENCH_DISABLE_SGS) == 0) {
-        float nu0 = fmax(1e-6f, (TAU_SHEAR - 0.5f) / 3.0f);
+        float nu0 = fmax(1e-6f, (tau_shear_base - 0.5f) / 3.0f);
         float neq_xx = central_pre[MI(2, 0, 0)] - rho_safe * CS2;
         float neq_yy = central_pre[MI(0, 2, 0)] - rho_safe * CS2;
         float neq_zz = central_pre[MI(0, 0, 2)] - rho_safe * CS2;
@@ -2610,7 +3268,7 @@ R"CLC(
         nu_t = fmin(nu_t, SGS_NUT_TO_NU0_MAX * nu0);
         tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), TAU_SHEAR_MIN, TAU_SHEAR_MAX);
         tau_normal_local = clampf(
-            TAU_NORMAL + (tau_shear_local - TAU_SHEAR) * SGS_BULK_COUPLING,
+            tau_normal_base + (tau_shear_local - tau_shear_base) * SGS_BULK_COUPLING,
             TAU_NORMAL_MIN,
             TAU_NORMAL_MAX
         );
@@ -2817,6 +3475,9 @@ std::string read_program_build_log(cl_program program, cl_device_id device) {
 }
 
 void release_opencl_runtime() {
+    if (g_opencl.k_thermal_bfecc_finalize) clReleaseKernel(g_opencl.k_thermal_bfecc_finalize);
+    if (g_opencl.k_thermal_bfecc_correct) clReleaseKernel(g_opencl.k_thermal_bfecc_correct);
+    if (g_opencl.k_thermal_bfecc_forward) clReleaseKernel(g_opencl.k_thermal_bfecc_forward);
     if (g_opencl.k_output) clReleaseKernel(g_opencl.k_output);
     if (g_opencl.k_stream_collide) clReleaseKernel(g_opencl.k_stream_collide);
     if (g_opencl.k_init) clReleaseKernel(g_opencl.k_init);
@@ -2827,13 +3488,16 @@ void release_opencl_runtime() {
 }
 
 void release_context_gpu_buffers(ContextState& ctx) {
+    if (ctx.d_thermal_f_post) clReleaseMemObject(ctx.d_thermal_f_post);
+    if (ctx.d_thermal_f) clReleaseMemObject(ctx.d_thermal_f);
+    if (ctx.d_temp_scratch) clReleaseMemObject(ctx.d_temp_scratch);
     if (ctx.d_temp_next) clReleaseMemObject(ctx.d_temp_next);
     if (ctx.d_temp) clReleaseMemObject(ctx.d_temp);
     if (ctx.d_output) clReleaseMemObject(ctx.d_output);
     if (ctx.d_f_post) clReleaseMemObject(ctx.d_f_post);
     if (ctx.d_f) clReleaseMemObject(ctx.d_f);
     if (ctx.d_payload) clReleaseMemObject(ctx.d_payload);
-    ctx.d_temp_next = ctx.d_temp = ctx.d_output = ctx.d_f_post = ctx.d_f = ctx.d_payload = nullptr;
+    ctx.d_thermal_f_post = ctx.d_thermal_f = ctx.d_temp_scratch = ctx.d_temp_next = ctx.d_temp = ctx.d_output = ctx.d_f_post = ctx.d_f = ctx.d_payload = nullptr;
     ctx.gpu_buffers_ready = ctx.gpu_initialized = false;
 }
 
@@ -2889,11 +3553,17 @@ bool initialize_opencl_runtime() {
     }
 
     cl_kernel k_init = clCreateKernel(program, "init_distributions", &err);
+    cl_kernel k_thermal_bfecc_forward = clCreateKernel(program, "thermal_bfecc_forward", &err);
+    cl_kernel k_thermal_bfecc_correct = clCreateKernel(program, "thermal_bfecc_correct", &err);
+    cl_kernel k_thermal_bfecc_finalize = clCreateKernel(program, "thermal_bfecc_finalize", &err);
     cl_kernel k_stream_collide = clCreateKernel(program, "stream_collide_step", &err);
     cl_kernel k_output = clCreateKernel(program, "output_macro", &err);
 
-    if (!k_init || !k_stream_collide || !k_output) {
+    if (!k_init || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize || !k_stream_collide || !k_output) {
         if (k_init) clReleaseKernel(k_init);
+        if (k_thermal_bfecc_forward) clReleaseKernel(k_thermal_bfecc_forward);
+        if (k_thermal_bfecc_correct) clReleaseKernel(k_thermal_bfecc_correct);
+        if (k_thermal_bfecc_finalize) clReleaseKernel(k_thermal_bfecc_finalize);
         if (k_stream_collide) clReleaseKernel(k_stream_collide);
         if (k_output) clReleaseKernel(k_output);
         clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
@@ -2901,7 +3571,12 @@ bool initialize_opencl_runtime() {
     }
 
     g_opencl.context = context; g_opencl.queue = queue; g_opencl.program = program;
-    g_opencl.k_init = k_init; g_opencl.k_stream_collide = k_stream_collide; g_opencl.k_output = k_output;
+    g_opencl.k_init = k_init;
+    g_opencl.k_thermal_bfecc_forward = k_thermal_bfecc_forward;
+    g_opencl.k_thermal_bfecc_correct = k_thermal_bfecc_correct;
+    g_opencl.k_thermal_bfecc_finalize = k_thermal_bfecc_finalize;
+    g_opencl.k_stream_collide = k_stream_collide;
+    g_opencl.k_output = k_output;
     g_opencl.platform = selected_platform; g_opencl.device = selected_device;
     g_opencl.available = true; g_opencl.device_name = read_device_name(selected_device);
     return true;
@@ -2913,6 +3588,7 @@ bool ensure_context_gpu_buffers(ContextState& ctx) {
 
     const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
     const std::size_t dist_bytes = ctx.cells * kQ * sizeof(float);
+    const std::size_t thermal_dist_bytes = ctx.cells * kThermalQ * sizeof(float);
     const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
     const std::size_t temp_bytes = ctx.cells * sizeof(float);
 
@@ -2923,8 +3599,14 @@ bool ensure_context_gpu_buffers(ContextState& ctx) {
     ctx.d_output = clCreateBuffer(g_opencl.context, CL_MEM_WRITE_ONLY, output_bytes, nullptr, &err);
     ctx.d_temp = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
     ctx.d_temp_next = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
+    ctx.d_temp_scratch = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
+    if (thermal_ddf_benchmark_active()) {
+        ctx.d_thermal_f = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, thermal_dist_bytes, nullptr, &err);
+        ctx.d_thermal_f_post = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, thermal_dist_bytes, nullptr, &err);
+    }
 
-    if (!ctx.d_payload || !ctx.d_f || !ctx.d_f_post || !ctx.d_output || !ctx.d_temp || !ctx.d_temp_next) {
+    if (!ctx.d_payload || !ctx.d_f || !ctx.d_f_post || !ctx.d_output || !ctx.d_temp || !ctx.d_temp_next || !ctx.d_temp_scratch
+        || (thermal_ddf_benchmark_active() && (!ctx.d_thermal_f || !ctx.d_thermal_f_post))) {
         release_context_gpu_buffers(ctx); return false;
     }
     ctx.gpu_buffers_ready = true; ctx.gpu_initialized = false;
@@ -2960,6 +3642,7 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     auto solver_begin = Clock::now();
     cl_int err = CL_SUCCESS;
     if (!ctx.gpu_initialized) {
+        rebuild_thermal_distributions_from_temperature(ctx);
         err |= clSetKernelArg(g_opencl.k_init, 0, sizeof(cl_mem), &ctx.d_payload);
         err |= clSetKernelArg(g_opencl.k_init, 1, sizeof(int), &g_cfg.input_channels);
         err |= clSetKernelArg(g_opencl.k_init, 2, sizeof(int), &cells_i32);
@@ -2973,6 +3656,15 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         }
         if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
             return false;
+        }
+        if (thermal_ddf_benchmark_active()) {
+            const std::size_t thermal_bytes = ctx.cells * kThermalQ * sizeof(float);
+            if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+                return false;
+            }
+            if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+                return false;
+            }
         }
         ctx.gpu_initialized = true;
     }
@@ -2988,57 +3680,155 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     const auto thermal_face_data = opencl_thermal_face_data();
     const auto tau_pair = opencl_effective_tau_pair();
     const auto thermal_transport = opencl_effective_thermal_transport();
+    const int thermal_update_stride = opencl_effective_thermal_update_stride();
     
     // Ping-Pong 双重缓冲交换
     cl_mem read_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
     cl_mem write_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f_post : ctx.d_f;
     cl_mem temp_read = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
     cl_mem temp_write = (ctx.step_counter % 2 == 0) ? ctx.d_temp_next : ctx.d_temp;
+    cl_mem thermal_read = thermal_ddf_benchmark_active()
+        ? ((ctx.step_counter % 2 == 0) ? ctx.d_thermal_f : ctx.d_thermal_f_post)
+        : temp_read;
+    cl_mem thermal_write = thermal_ddf_benchmark_active()
+        ? ((ctx.step_counter % 2 == 0) ? ctx.d_thermal_f_post : ctx.d_thermal_f)
+        : temp_write;
+    if (thermal_bfecc_benchmark_active()) {
+        const float thermal_dt = static_cast<float>(thermal_update_stride);
+
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 0, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 1, sizeof(cl_mem), &temp_read);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 2, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 3, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 4, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 5, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 6, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 7, sizeof(int), &thermal_periodic_mask);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 8, sizeof(int), &thermal_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 9, sizeof(int), &thermal_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 10, sizeof(int), &thermal_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 11, sizeof(int), &thermal_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 12, sizeof(int), &thermal_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 13, sizeof(int), &thermal_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 14, sizeof(OpenClFaceData), thermal_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 15, sizeof(OpenClFaceData), thermal_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 16, sizeof(OpenClFaceData), thermal_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 17, sizeof(OpenClFaceData), thermal_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 18, sizeof(OpenClFaceData), thermal_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 19, sizeof(OpenClFaceData), thermal_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 20, sizeof(float), &thermal_dt);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 21, sizeof(cl_mem), &ctx.d_temp_scratch);
+        if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_thermal_bfecc_forward, cells_i32)) return false;
+
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 0, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 1, sizeof(cl_mem), &temp_read);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 2, sizeof(cl_mem), &ctx.d_temp_scratch);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 3, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 4, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 5, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 6, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 7, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 8, sizeof(int), &thermal_periodic_mask);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 9, sizeof(int), &thermal_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 10, sizeof(int), &thermal_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 11, sizeof(int), &thermal_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 12, sizeof(int), &thermal_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 13, sizeof(int), &thermal_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 14, sizeof(int), &thermal_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 15, sizeof(OpenClFaceData), thermal_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 16, sizeof(OpenClFaceData), thermal_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 17, sizeof(OpenClFaceData), thermal_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 18, sizeof(OpenClFaceData), thermal_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 19, sizeof(OpenClFaceData), thermal_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 20, sizeof(OpenClFaceData), thermal_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 21, sizeof(float), &thermal_dt);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 22, sizeof(cl_mem), &temp_write);
+        if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_thermal_bfecc_correct, cells_i32)) return false;
+
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 0, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 1, sizeof(cl_mem), &temp_read);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 2, sizeof(cl_mem), &temp_write);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 3, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 4, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 5, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 6, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 7, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 8, sizeof(int), &thermal_periodic_mask);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 9, sizeof(int), &thermal_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 10, sizeof(int), &thermal_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 11, sizeof(int), &thermal_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 12, sizeof(int), &thermal_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 13, sizeof(int), &thermal_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 14, sizeof(int), &thermal_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 15, sizeof(OpenClFaceData), thermal_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 16, sizeof(OpenClFaceData), thermal_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 17, sizeof(OpenClFaceData), thermal_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 18, sizeof(OpenClFaceData), thermal_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 19, sizeof(OpenClFaceData), thermal_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 20, sizeof(OpenClFaceData), thermal_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 21, sizeof(float), &thermal_dt);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 22, sizeof(float), &thermal_transport[0]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 23, sizeof(float), &thermal_transport[1]);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 24, sizeof(int), &benchmark_flags);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 25, sizeof(cl_mem), &ctx.d_temp_scratch);
+        if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_thermal_bfecc_finalize, cells_i32)) return false;
+
+        if (clEnqueueCopyBuffer(g_opencl.queue, ctx.d_temp_scratch, temp_write, 0, 0, ctx.cells * sizeof(float), 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+        temp_read = temp_write;
+    }
 
     err |= clSetKernelArg(g_opencl.k_stream_collide, 0, sizeof(cl_mem), &read_buf);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 1, sizeof(cl_mem), &ctx.d_payload);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 2, sizeof(cl_mem), &temp_read);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 3, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &ctx.nx);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &ctx.ny);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(int), &ctx.nz);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(int), &tick_i32);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 9, sizeof(int), &benchmark_flags);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 10, sizeof(int), &hydro_periodic_mask);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 11, sizeof(int), &thermal_periodic_mask);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 12, sizeof(float), &tau_pair[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 13, sizeof(float), &tau_pair[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(float), &thermal_transport[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(float), &thermal_transport[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(float), &thermal_transport[2]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(int), &hydro_face_kinds[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(int), &hydro_face_kinds[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(int), &hydro_face_kinds[2]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(int), &hydro_face_kinds[3]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(int), &hydro_face_kinds[4]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(int), &hydro_face_kinds[5]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(OpenClFaceData), hydro_face_data[0].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(OpenClFaceData), hydro_face_data[1].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(OpenClFaceData), hydro_face_data[2].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 26, sizeof(OpenClFaceData), hydro_face_data[3].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 27, sizeof(OpenClFaceData), hydro_face_data[4].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 28, sizeof(OpenClFaceData), hydro_face_data[5].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 29, sizeof(int), &thermal_face_kinds[0]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 30, sizeof(int), &thermal_face_kinds[1]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 31, sizeof(int), &thermal_face_kinds[2]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 32, sizeof(int), &thermal_face_kinds[3]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 33, sizeof(int), &thermal_face_kinds[4]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 34, sizeof(int), &thermal_face_kinds[5]);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 35, sizeof(OpenClFaceData), thermal_face_data[0].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 36, sizeof(OpenClFaceData), thermal_face_data[1].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 37, sizeof(OpenClFaceData), thermal_face_data[2].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 38, sizeof(OpenClFaceData), thermal_face_data[3].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 39, sizeof(OpenClFaceData), thermal_face_data[4].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 40, sizeof(OpenClFaceData), thermal_face_data[5].data());
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 41, sizeof(int), &benchmark_preset);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 42, sizeof(cl_mem), &write_buf);
-    err |= clSetKernelArg(g_opencl.k_stream_collide, 43, sizeof(cl_mem), &temp_write);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 3, sizeof(cl_mem), &thermal_read);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &g_cfg.input_channels);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &ctx.nx);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(int), &ctx.ny);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(int), &ctx.nz);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 9, sizeof(int), &tick_i32);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 10, sizeof(int), &benchmark_flags);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 11, sizeof(int), &hydro_periodic_mask);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 12, sizeof(int), &thermal_periodic_mask);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 13, sizeof(float), &tau_pair[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(float), &tau_pair[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(float), &thermal_transport[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(float), &thermal_transport[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(float), &thermal_transport[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(int), &thermal_update_stride);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(int), &hydro_face_kinds[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(int), &hydro_face_kinds[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(int), &hydro_face_kinds[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(int), &hydro_face_kinds[3]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(int), &hydro_face_kinds[4]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(int), &hydro_face_kinds[5]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(OpenClFaceData), hydro_face_data[0].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 26, sizeof(OpenClFaceData), hydro_face_data[1].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 27, sizeof(OpenClFaceData), hydro_face_data[2].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 28, sizeof(OpenClFaceData), hydro_face_data[3].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 29, sizeof(OpenClFaceData), hydro_face_data[4].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 30, sizeof(OpenClFaceData), hydro_face_data[5].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 31, sizeof(int), &thermal_face_kinds[0]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 32, sizeof(int), &thermal_face_kinds[1]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 33, sizeof(int), &thermal_face_kinds[2]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 34, sizeof(int), &thermal_face_kinds[3]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 35, sizeof(int), &thermal_face_kinds[4]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 36, sizeof(int), &thermal_face_kinds[5]);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 37, sizeof(OpenClFaceData), thermal_face_data[0].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 38, sizeof(OpenClFaceData), thermal_face_data[1].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 39, sizeof(OpenClFaceData), thermal_face_data[2].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 40, sizeof(OpenClFaceData), thermal_face_data[3].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 41, sizeof(OpenClFaceData), thermal_face_data[4].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 42, sizeof(OpenClFaceData), thermal_face_data[5].data());
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 43, sizeof(int), &benchmark_preset);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 44, sizeof(cl_mem), &write_buf);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 45, sizeof(cl_mem), &temp_write);
+    err |= clSetKernelArg(g_opencl.k_stream_collide, 46, sizeof(cl_mem), &thermal_write);
     if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32)) return false;
 
     err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
@@ -3088,6 +3878,7 @@ bool sync_context_temperature_from_gpu(ContextState& ctx) {
         return false;
     }
     std::copy(ctx.temperature.begin(), ctx.temperature.end(), ctx.temperature_next.begin());
+    rebuild_thermal_distributions_from_temperature(ctx);
     return true;
 }
 
@@ -3101,6 +3892,7 @@ bool sync_context_temperature_to_gpu(ContextState& ctx) {
     if (ctx.temperature_next.size() != ctx.cells) {
         ctx.temperature_next.assign(ctx.cells, 0.0f);
     }
+    rebuild_thermal_distributions_from_temperature(ctx);
     const std::size_t temp_bytes = ctx.cells * sizeof(float);
     if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
         return false;
@@ -3108,6 +3900,17 @@ bool sync_context_temperature_to_gpu(ContextState& ctx) {
     if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
         return false;
     }
+#if defined(AERO_LBM_OPENCL)
+    if (thermal_ddf_benchmark_active()) {
+        const std::size_t thermal_bytes = ctx.cells * kThermalQ * sizeof(float);
+        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+            return false;
+        }
+    }
+#endif
     return true;
 }
 
@@ -3168,6 +3971,9 @@ void ensure_context_temperature_storage(ContextState& ctx) {
     if (ctx.temperature_next.size() != ctx.cells) {
         ctx.temperature_next.assign(ctx.cells, 0.0f);
     }
+    if (ctx.temperature_scratch.size() != ctx.cells) {
+        ctx.temperature_scratch.assign(ctx.cells, 0.0f);
+    }
 }
 
 void assign_temperature_state(ContextState& ctx, const float* temperature_state) {
@@ -3176,6 +3982,7 @@ void assign_temperature_state(ContextState& ctx, const float* temperature_state)
         ctx.temperature[i] = clampf(temperature_state[i], kThermalMin, kThermalMax);
     }
     std::copy(ctx.temperature.begin(), ctx.temperature.end(), ctx.temperature_next.begin());
+    rebuild_thermal_distributions_from_temperature(ctx);
 }
 
 void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
