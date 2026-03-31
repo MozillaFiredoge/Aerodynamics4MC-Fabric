@@ -3474,6 +3474,12 @@ std::string read_program_build_log(cl_program program, cl_device_id device) {
     return log;
 }
 
+std::string format_opencl_api_error(const char* api, cl_int err) {
+    std::ostringstream oss;
+    oss << api << " failed (" << static_cast<int>(err) << ")";
+    return oss.str();
+}
+
 void release_opencl_runtime() {
     if (g_opencl.k_thermal_bfecc_finalize) clReleaseKernel(g_opencl.k_thermal_bfecc_finalize);
     if (g_opencl.k_thermal_bfecc_correct) clReleaseKernel(g_opencl.k_thermal_bfecc_correct);
@@ -3592,34 +3598,76 @@ bool ensure_context_gpu_buffers(ContextState& ctx) {
     const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
     const std::size_t temp_bytes = ctx.cells * sizeof(float);
 
-    cl_int err = CL_SUCCESS;
-    ctx.d_payload = clCreateBuffer(g_opencl.context, CL_MEM_READ_ONLY, payload_bytes, nullptr, &err);
-    ctx.d_f = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, dist_bytes, nullptr, &err);
-    ctx.d_f_post = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, dist_bytes, nullptr, &err);
-    ctx.d_output = clCreateBuffer(g_opencl.context, CL_MEM_WRITE_ONLY, output_bytes, nullptr, &err);
-    ctx.d_temp = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
-    ctx.d_temp_next = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
-    ctx.d_temp_scratch = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, temp_bytes, nullptr, &err);
+    auto create_buffer = [&](cl_mem& target, cl_mem_flags flags, std::size_t bytes, const char* label) -> bool {
+        cl_int err = CL_SUCCESS;
+        target = clCreateBuffer(g_opencl.context, flags, bytes, nullptr, &err);
+        if (err != CL_SUCCESS || !target) {
+            g_opencl.error = format_opencl_api_error(label, err);
+            return false;
+        }
+        return true;
+    };
+
+    if (!create_buffer(ctx.d_payload, CL_MEM_READ_ONLY, payload_bytes, "clCreateBuffer(d_payload)")) {
+        release_context_gpu_buffers(ctx);
+        return false;
+    }
+    if (!create_buffer(ctx.d_f, CL_MEM_READ_WRITE, dist_bytes, "clCreateBuffer(d_f)")) {
+        release_context_gpu_buffers(ctx);
+        return false;
+    }
+    if (!create_buffer(ctx.d_f_post, CL_MEM_READ_WRITE, dist_bytes, "clCreateBuffer(d_f_post)")) {
+        release_context_gpu_buffers(ctx);
+        return false;
+    }
+    if (!create_buffer(ctx.d_output, CL_MEM_WRITE_ONLY, output_bytes, "clCreateBuffer(d_output)")) {
+        release_context_gpu_buffers(ctx);
+        return false;
+    }
+    if (!create_buffer(ctx.d_temp, CL_MEM_READ_WRITE, temp_bytes, "clCreateBuffer(d_temp)")) {
+        release_context_gpu_buffers(ctx);
+        return false;
+    }
+    if (!create_buffer(ctx.d_temp_next, CL_MEM_READ_WRITE, temp_bytes, "clCreateBuffer(d_temp_next)")) {
+        release_context_gpu_buffers(ctx);
+        return false;
+    }
+    if (!create_buffer(ctx.d_temp_scratch, CL_MEM_READ_WRITE, temp_bytes, "clCreateBuffer(d_temp_scratch)")) {
+        release_context_gpu_buffers(ctx);
+        return false;
+    }
     if (thermal_ddf_benchmark_active()) {
-        ctx.d_thermal_f = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, thermal_dist_bytes, nullptr, &err);
-        ctx.d_thermal_f_post = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, thermal_dist_bytes, nullptr, &err);
+        if (!create_buffer(ctx.d_thermal_f, CL_MEM_READ_WRITE, thermal_dist_bytes, "clCreateBuffer(d_thermal_f)")) {
+            release_context_gpu_buffers(ctx);
+            return false;
+        }
+        if (!create_buffer(ctx.d_thermal_f_post, CL_MEM_READ_WRITE, thermal_dist_bytes, "clCreateBuffer(d_thermal_f_post)")) {
+            release_context_gpu_buffers(ctx);
+            return false;
+        }
     }
 
     if (!ctx.d_payload || !ctx.d_f || !ctx.d_f_post || !ctx.d_output || !ctx.d_temp || !ctx.d_temp_next || !ctx.d_temp_scratch
         || (thermal_ddf_benchmark_active() && (!ctx.d_thermal_f || !ctx.d_thermal_f_post))) {
+        g_opencl.error = "ensure_context_gpu_buffers incomplete allocation";
         release_context_gpu_buffers(ctx); return false;
     }
     ctx.gpu_buffers_ready = true; ctx.gpu_initialized = false;
     return true;
 }
 
-bool enqueue_kernel_1d(cl_kernel kernel, int cells) {
+cl_int enqueue_kernel_1d(cl_kernel kernel, int cells) {
     const size_t global_size = static_cast<size_t>(cells);
-    return clEnqueueNDRangeKernel(g_opencl.queue, kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr) == CL_SUCCESS;
+    return clEnqueueNDRangeKernel(g_opencl.queue, kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
 }
 
 bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
     if (!ensure_context_gpu_buffers(ctx)) return false;
+
+    auto fail_cl = [&](const char* api, cl_int err) -> bool {
+        g_opencl.error = format_opencl_api_error(api, err);
+        return false;
+    };
 
     const int cells_i32 = static_cast<int>(ctx.cells);
     const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
@@ -3636,7 +3684,10 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     }
 
     auto upload_begin = Clock::now();
-    if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_payload, CL_TRUE, 0, payload_bytes, payload, 0, nullptr, nullptr) != CL_SUCCESS) return false;
+    {
+        cl_int upload_err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_payload, CL_TRUE, 0, payload_bytes, payload, 0, nullptr, nullptr);
+        if (upload_err != CL_SUCCESS) return fail_cl("clEnqueueWriteBuffer(d_payload)", upload_err);
+    }
     timing.payload_copy_ms += elapsed_ms(upload_begin, Clock::now());
 
     auto solver_begin = Clock::now();
@@ -3648,23 +3699,21 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_init, 2, sizeof(int), &cells_i32);
         err |= clSetKernelArg(g_opencl.k_init, 3, sizeof(cl_mem), &ctx.d_f);
         err |= clSetKernelArg(g_opencl.k_init, 4, sizeof(cl_mem), &ctx.d_f_post);
-        if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_init, cells_i32)) return false;
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_init)", err);
+        err = enqueue_kernel_1d(g_opencl.k_init, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_init)", err);
 
         const std::size_t temp_bytes = ctx.cells * sizeof(float);
-        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
-            return false;
-        }
-        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
-            return false;
-        }
+        err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueWriteBuffer(d_temp)", err);
+        err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueWriteBuffer(d_temp_next)", err);
         if (thermal_ddf_benchmark_active()) {
             const std::size_t thermal_bytes = ctx.cells * kThermalQ * sizeof(float);
-            if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
-                return false;
-            }
-            if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
-                return false;
-            }
+            err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr);
+            if (err != CL_SUCCESS) return fail_cl("clEnqueueWriteBuffer(d_thermal_f)", err);
+            err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr);
+            if (err != CL_SUCCESS) return fail_cl("clEnqueueWriteBuffer(d_thermal_f_post)", err);
         }
         ctx.gpu_initialized = true;
     }
@@ -3719,7 +3768,9 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 19, sizeof(OpenClFaceData), thermal_face_data[5].data());
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 20, sizeof(float), &thermal_dt);
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_forward, 21, sizeof(cl_mem), &ctx.d_temp_scratch);
-        if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_thermal_bfecc_forward, cells_i32)) return false;
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_thermal_bfecc_forward)", err);
+        err = enqueue_kernel_1d(g_opencl.k_thermal_bfecc_forward, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_thermal_bfecc_forward)", err);
 
         err = CL_SUCCESS;
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 0, sizeof(cl_mem), &ctx.d_payload);
@@ -3745,7 +3796,9 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 20, sizeof(OpenClFaceData), thermal_face_data[5].data());
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 21, sizeof(float), &thermal_dt);
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_correct, 22, sizeof(cl_mem), &temp_write);
-        if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_thermal_bfecc_correct, cells_i32)) return false;
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_thermal_bfecc_correct)", err);
+        err = enqueue_kernel_1d(g_opencl.k_thermal_bfecc_correct, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_thermal_bfecc_correct)", err);
 
         err = CL_SUCCESS;
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 0, sizeof(cl_mem), &ctx.d_payload);
@@ -3774,11 +3827,12 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 23, sizeof(float), &thermal_transport[1]);
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 24, sizeof(int), &benchmark_flags);
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 25, sizeof(cl_mem), &ctx.d_temp_scratch);
-        if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_thermal_bfecc_finalize, cells_i32)) return false;
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_thermal_bfecc_finalize)", err);
+        err = enqueue_kernel_1d(g_opencl.k_thermal_bfecc_finalize, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_thermal_bfecc_finalize)", err);
 
-        if (clEnqueueCopyBuffer(g_opencl.queue, ctx.d_temp_scratch, temp_write, 0, 0, ctx.cells * sizeof(float), 0, nullptr, nullptr) != CL_SUCCESS) {
-            return false;
-        }
+        err = clEnqueueCopyBuffer(g_opencl.queue, ctx.d_temp_scratch, temp_write, 0, 0, ctx.cells * sizeof(float), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueCopyBuffer(temp_scratch->temp_write)", err);
         temp_read = temp_write;
     }
 
@@ -3829,7 +3883,9 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     err |= clSetKernelArg(g_opencl.k_stream_collide, 44, sizeof(cl_mem), &write_buf);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 45, sizeof(cl_mem), &temp_write);
     err |= clSetKernelArg(g_opencl.k_stream_collide, 46, sizeof(cl_mem), &thermal_write);
-    if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32)) return false;
+    if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_stream_collide)", err);
+    err = enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32);
+    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_stream_collide)", err);
 
     err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
     err |= clSetKernelArg(g_opencl.k_output, 1, sizeof(cl_mem), &ctx.d_payload);
@@ -3837,21 +3893,24 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     err |= clSetKernelArg(g_opencl.k_output, 3, sizeof(int), &g_cfg.output_channels);
     err |= clSetKernelArg(g_opencl.k_output, 4, sizeof(int), &cells_i32);
     err |= clSetKernelArg(g_opencl.k_output, 5, sizeof(cl_mem), &ctx.d_output);
-    if (err != CL_SUCCESS || !enqueue_kernel_1d(g_opencl.k_output, cells_i32)) return false;
+    if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_output)", err);
+    err = enqueue_kernel_1d(g_opencl.k_output, cells_i32);
+    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_output)", err);
 
-    clFinish(g_opencl.queue);
+    err = clFinish(g_opencl.queue);
+    if (err != CL_SUCCESS) return fail_cl("clFinish(queue)", err);
     timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
 
     auto readback_begin = Clock::now();
-    if (clEnqueueReadBuffer(g_opencl.queue, ctx.d_output, CL_TRUE, 0, output_bytes, out, 0, nullptr, nullptr) != CL_SUCCESS) return false;
+    err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_output, CL_TRUE, 0, output_bytes, out, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) return fail_cl("clEnqueueReadBuffer(d_output)", err);
     if (benchmark_mode_active() && g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
         const std::size_t dist_bytes = ctx.cells * kQ * sizeof(float);
         if (ctx.f.size() != ctx.cells * kQ) {
             ctx.f.assign(ctx.cells * kQ, 0.0f);
         }
-        if (clEnqueueReadBuffer(g_opencl.queue, write_buf, CL_TRUE, 0, dist_bytes, ctx.f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
-            return false;
-        }
+        err = clEnqueueReadBuffer(g_opencl.queue, write_buf, CL_TRUE, 0, dist_bytes, ctx.f.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueReadBuffer(write_buf)", err);
         compute_benchmark_force_from_distributions(ctx, ctx.f.data());
     } else {
         ctx.last_force[0] = 0.0f;
@@ -3874,7 +3933,9 @@ bool sync_context_temperature_from_gpu(ContextState& ctx) {
     }
     cl_mem current_temp = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
     const std::size_t temp_bytes = ctx.cells * sizeof(float);
-    if (clEnqueueReadBuffer(g_opencl.queue, current_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+    cl_int err = clEnqueueReadBuffer(g_opencl.queue, current_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(current_temp)", err);
         return false;
     }
     std::copy(ctx.temperature.begin(), ctx.temperature.end(), ctx.temperature_next.begin());
@@ -3894,19 +3955,27 @@ bool sync_context_temperature_to_gpu(ContextState& ctx) {
     }
     rebuild_thermal_distributions_from_temperature(ctx);
     const std::size_t temp_bytes = ctx.cells * sizeof(float);
-    if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+    cl_int err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_temp)", err);
         return false;
     }
-    if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+    err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_temp_next)", err);
         return false;
     }
 #if defined(AERO_LBM_OPENCL)
     if (thermal_ddf_benchmark_active()) {
         const std::size_t thermal_bytes = ctx.cells * kThermalQ * sizeof(float);
-        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+        err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_thermal_f)", err);
             return false;
         }
-        if (clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+        err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_thermal_f_post)", err);
             return false;
         }
     }
@@ -4002,7 +4071,9 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
 bool run_solver_step(ContextState& ctx, const float* packet, float* out, StepTiming& timing) {
     bool ok = false;
     if (g_cfg.opencl_enabled && benchmark_opencl_supported()) {
-        if (!(ok = opencl_step(ctx, packet, out, timing))) disable_opencl_runtime("OpenCL fail");
+        if (!(ok = opencl_step(ctx, packet, out, timing))) {
+            disable_opencl_runtime(g_opencl.error.empty() ? "OpenCL fail" : g_opencl.error);
+        }
     }
     if (!ok) {
         auto solver_begin = Clock::now();
