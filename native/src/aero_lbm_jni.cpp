@@ -3083,6 +3083,8 @@ kernel void stream_collide_hydro_forced_step(
         uz *= scale;
     }
 
+)CLC"
+R"CLC(
     float raw[27];
     float central_pre[27];
     float central_post[27];
