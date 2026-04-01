@@ -2167,9 +2167,11 @@ struct OpenClRuntime {
     cl_kernel k_thermal_bfecc_forward = nullptr;
     cl_kernel k_thermal_bfecc_correct = nullptr;
     cl_kernel k_thermal_bfecc_finalize = nullptr;
+    cl_kernel k_thermal_scalar = nullptr;
     cl_kernel k_stream_collide = nullptr;
     cl_kernel k_stream_collide_tgv = nullptr;
     cl_kernel k_stream_collide_hydro_bench = nullptr;
+    cl_kernel k_stream_collide_hydro_forced = nullptr;
     cl_kernel k_output = nullptr;
 };
 
@@ -2952,7 +2954,417 @@ kernel void thermal_bfecc_finalize(
     );
 }
 
+kernel void thermal_scalar_step(
+    __global const float* payload,
+    __global const float* temp_read,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int cells,
+    int thermal_periodic_mask,
+    int tx_min_kind,
+    int tx_max_kind,
+    int ty_min_kind,
+    int ty_max_kind,
+    int tz_min_kind,
+    int tz_max_kind,
+    float4 tx_min_data,
+    float4 tx_max_data,
+    float4 ty_min_data,
+    float4 ty_max_data,
+    float4 tz_min_data,
+    float4 tz_max_data,
+    float thermal_dt,
+    float thermal_diffusivity_eff,
+    float thermal_cooling_eff,
+    int benchmark_flags,
+    __global float* temp_out
+) {
+    int cell = (int)get_global_id(0);
+    if (cell >= cells) return;
+    int base = cell * in_ch;
+    if (payload[base + 0] > 0.5f) {
+        temp_out[cell] = 0.0f;
+        return;
+    }
+    int yz = ny * nz;
+    int x = cell / yz;
+    int rem = cell - x * yz;
+    int y = rem / nz;
+    int z = rem - y * nz;
+    float ux = payload[base + 5];
+    float uy = payload[base + 6];
+    float uz = payload[base + 7];
+    float t_center = temp_read[cell];
+    float temp_advected = sample_temperature_trilinear(
+        temp_read,
+        payload,
+        in_ch,
+        nx,
+        ny,
+        nz,
+        thermal_periodic_mask,
+        tx_min_kind,
+        tx_max_kind,
+        ty_min_kind,
+        ty_max_kind,
+        tz_min_kind,
+        tz_max_kind,
+        tx_min_data,
+        tx_max_data,
+        ty_min_data,
+        ty_max_data,
+        tz_min_data,
+        tz_max_data,
+        (float)x - thermal_dt * ux,
+        (float)y - thermal_dt * uy,
+        (float)z - thermal_dt * uz,
+        t_center
+    );
+    float txp = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x + 1, y, z, t_center);
+    float txm = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x - 1, y, z, t_center);
+    float typ = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y + 1, z, t_center);
+    float tym = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y - 1, z, t_center);
+    float tzp = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z + 1, t_center);
+    float tzm = temperature_or_self(temp_read, payload, in_ch, nx, ny, nz, thermal_periodic_mask, tx_min_kind, tx_max_kind, ty_min_kind, ty_max_kind, tz_min_kind, tz_max_kind, tx_min_data, tx_max_data, ty_min_data, ty_max_data, tz_min_data, tz_max_data, x, y, z - 1, t_center);
+    float laplacian_t = (txp + txm + typ + tym + tzp + tzm) - 6.0f * t_center;
+    float thermal_source = 0.0f;
+    if ((benchmark_flags & BENCH_DISABLE_INTERNAL_THERMAL_SOURCE) != 0) {
+        thermal_source = 0.0f;
+    } else if (in_ch > 9) {
+        thermal_source = clampf(payload[base + 9], -THERMAL_SOURCE_MAX, THERMAL_SOURCE_MAX);
+    } else {
+        float fan = clampf(payload[base + 1], 0.0f, 1.0f);
+        float fan_ux = payload[base + 2];
+        float fan_uy = payload[base + 3];
+        float fan_uz = payload[base + 4];
+        float fan_norm = sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
+        if (fan > 0.0f && fan_norm > 1e-8f) {
+            thermal_source = fan * clampf(fan_norm * THERMAL_SOURCE_SCALE, 0.0f, THERMAL_SOURCE_MAX);
+        }
+    }
+    temp_out[cell] = clampf(
+        temp_advected + thermal_dt * (thermal_diffusivity_eff * laplacian_t + thermal_source - thermal_cooling_eff * temp_advected),
+        THERMAL_MIN,
+        THERMAL_MAX
+    );
+}
+
 )CLC"
+R"CLC(
+kernel void stream_collide_hydro_forced_step(
+    __global const float* f_read,
+    __global const float* payload,
+    __global const float* temp_read,
+    int in_ch, int nx, int ny, int nz, int cells, int tick, int benchmark_flags, int hydro_periodic_mask,
+    float tau_shear_eff, float tau_normal_eff, float boussinesq_beta_eff,
+    int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
+    float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
+    int benchmark_preset,
+    __global float* f_write
+) {
+    int cell = (int)get_global_id(0);
+    if (cell >= cells) return;
+
+    int yz = ny * nz;
+    int x = cell / yz;
+    int rem = cell - x * yz;
+    int y = rem / nz;
+    int z = rem - y * nz;
+    int base = cell * in_ch;
+    int is_solid = payload[base + 0] > 0.5f;
+
+    float f_local[KQ];
+    for (int q = 0; q < KQ; ++q) {
+        int opp = OPP[q];
+        if (is_solid) {
+            f_local[q] = f_read[opp * cells + cell];
+            continue;
+        }
+        int sx = x - CX[q];
+        int sy = y - CY[q];
+        int sz = z - CZ[q];
+        sx = wrap_axis_if_periodic(sx, nx, PERIODIC_AXIS_X, hydro_periodic_mask);
+        sy = wrap_axis_if_periodic(sy, ny, PERIODIC_AXIS_Y, hydro_periodic_mask);
+        sz = wrap_axis_if_periodic(sz, nz, PERIODIC_AXIS_Z, hydro_periodic_mask);
+        if (sx < 0 || sy < 0 || sz < 0 || sx >= nx || sy >= ny || sz >= nz) {
+            f_local[q] = benchmark_boundary_value(
+                f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, sx, sy, sz, benchmark_flags,
+                x_min_kind, x_max_kind, y_min_kind, y_max_kind, z_min_kind, z_max_kind,
+                x_min_data, x_max_data, y_min_data, y_max_data, z_min_data, z_max_data, benchmark_preset
+            );
+        } else {
+            int src = (sx * ny + sy) * nz + sz;
+            if (payload[src * in_ch + 0] > 0.5f) {
+                f_local[q] = obstacle_bounce_value(f_read, payload, in_ch, nx, ny, nz, cells, cell, x, y, z, q, opp, benchmark_flags);
+            } else {
+                f_local[q] = f_read[q * cells + src];
+            }
+        }
+    }
+
+    if (is_solid) {
+        for (int q = 0; q < KQ; ++q) f_write[q * cells + cell] = f_local[q];
+        return;
+    }
+
+    float rho = 0.0f, mx = 0.0f, my = 0.0f, mz = 0.0f;
+    for (int q = 0; q < KQ; ++q) {
+        float fq = f_local[q];
+        rho += fq;
+        mx += fq * (float)CX[q];
+        my += fq * (float)CY[q];
+        mz += fq * (float)CZ[q];
+    }
+
+    float rho_safe = fmax(1e-6f, rho);
+    float inv_rho = 1.0f / rho_safe;
+    float ux = mx * inv_rho;
+    float uy = my * inv_rho;
+    float uz = mz * inv_rho;
+    float speed_pre = sqrt(ux * ux + uy * uy + uz * uz);
+
+    float fan = (benchmark_flags & BENCH_DISABLE_FAN_FORCING) ? 0.0f : clampf(payload[base + 1], 0.0f, 1.0f);
+    float fan_ux = payload[base + 2];
+    float fan_uy = payload[base + 3];
+    float fan_uz = payload[base + 4];
+    float fan_norm = sqrt(fan_ux * fan_ux + fan_uy * fan_uy + fan_uz * fan_uz);
+    float temp_center = temp_read[cell];
+
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    if (fan > 0.0f && fan_norm > 1e-8f) {
+        float inv_norm = 1.0f / fan_norm;
+        float noise_amp = (benchmark_flags & BENCH_DISABLE_FAN_NOISE) ? 0.0f : FAN_NOISE_AMP;
+        float noise = 1.0f + noise_amp * signed_noise((uint)cell, (uint)tick);
+        float target_speed = clampf(
+            fan_norm * FAN_TARGET_SCALE * fmax(0.0f, noise),
+            0.0f,
+            FAN_TARGET_MAX
+        );
+        float fan_nx = fan_ux * inv_norm;
+        float fan_ny = fan_uy * inv_norm;
+        float fan_nz = fan_uz * inv_norm;
+        float u_para = ux * fan_nx + uy * fan_ny + uz * fan_nz;
+        float u_perp_x = ux - u_para * fan_nx;
+        float u_perp_y = uy - u_para * fan_ny;
+        float u_perp_z = uz - u_para * fan_nz;
+        float axial_push = fmax(0.0f, target_speed - u_para);
+        float speed_damp = 1.0f;
+        if (speed_pre > FAN_SPEED_SOFT_CAP) {
+            float r = (speed_pre - FAN_SPEED_SOFT_CAP) / fmax(1e-4f, FAN_SPEED_DAMP_WIDTH);
+            speed_damp = 1.0f / (1.0f + r * r);
+        }
+        float beta = fan * FAN_BETA * speed_damp;
+        fx = beta * rho_safe * (axial_push * fan_nx - FAN_PERP_DAMP * u_perp_x);
+        fy = beta * rho_safe * (axial_push * fan_ny - FAN_PERP_DAMP * u_perp_y);
+        fz = beta * rho_safe * (axial_push * fan_nz - FAN_PERP_DAMP * u_perp_z);
+    }
+
+    if (BOUSSINESQ_ENABLED && (benchmark_flags & BENCH_DISABLE_BUOYANCY) == 0) {
+        float buoyancy = clampf(boussinesq_beta_eff * temp_center, -BOUSSINESQ_FORCE_MAX, BOUSSINESQ_FORCE_MAX);
+        fy += rho_safe * buoyancy;
+    }
+
+    float dux = fx * inv_rho;
+    float duy = fy * inv_rho;
+    float duz = fz * inv_rho;
+    ux += 0.5f * dux;
+    uy += 0.5f * duy;
+    uz += 0.5f * duz;
+    ux = mix(ux, payload[base + 5], STATE_NUDGE);
+    uy = mix(uy, payload[base + 6], STATE_NUDGE);
+    uz = mix(uz, payload[base + 7], STATE_NUDGE);
+
+    float speed2 = ux * ux + uy * uy + uz * uz;
+    if (speed2 > MAX_SPEED * MAX_SPEED) {
+        float scale = MAX_SPEED * rsqrt(speed2);
+        ux *= scale;
+        uy *= scale;
+        uz *= scale;
+    }
+
+    float raw[27];
+    float central_pre[27];
+    float central_post[27];
+    float raw_post[27];
+    for (int i = 0; i < 27; ++i) {
+        raw[i] = 0.0f;
+        central_pre[i] = 0.0f;
+        central_post[i] = 0.0f;
+        raw_post[i] = 0.0f;
+    }
+
+    for (int q = 0; q < KQ; ++q) {
+        float fq = f_local[q];
+        float cx = (float)CX[q], cy = (float)CY[q], cz = (float)CZ[q];
+        float px[3] = {1.0f, cx, cx * cx};
+        float py[3] = {1.0f, cy, cy * cy};
+        float pz[3] = {1.0f, cz, cz * cz};
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 3; ++b) {
+                for (int c = 0; c < 3; ++c) {
+                    raw[MI(a, b, c)] += fq * px[a] * py[b] * pz[c];
+                }
+            }
+        }
+    }
+
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int p = 0; p <= a; ++p) {
+                    for (int qm = 0; qm <= b; ++qm) {
+                        for (int rm = 0; rm <= c; ++rm) {
+                            float sx = (a - p == 0) ? 1.0f : ((a - p == 1) ? -ux : ux * ux);
+                            float sy = (b - qm == 0) ? 1.0f : ((b - qm == 1) ? -uy : uy * uy);
+                            float sz = (c - rm == 0) ? 1.0f : ((c - rm == 1) ? -uz : uz * uz);
+                            float coeff = (float)(binom(a, p) * binom(b, qm) * binom(c, rm));
+                            sum += coeff * sx * sy * sz * raw[MI(p, qm, rm)];
+                        }
+                    }
+                }
+                central_pre[MI(a, b, c)] = sum;
+            }
+        }
+    }
+
+    float tau_shear_base = tau_shear_eff;
+    float tau_normal_base = clampf(tau_normal_eff, TAU_NORMAL_MIN, TAU_NORMAL_MAX);
+    float tau_shear_local = tau_shear_base;
+    float tau_normal_local = tau_normal_base;
+    if (SGS_ENABLED && (benchmark_flags & BENCH_DISABLE_SGS) == 0) {
+        float nu0 = fmax(1e-6f, (tau_shear_base - 0.5f) / 3.0f);
+        float neq_xx = central_pre[MI(2, 0, 0)] - rho_safe * CS2;
+        float neq_yy = central_pre[MI(0, 2, 0)] - rho_safe * CS2;
+        float neq_zz = central_pre[MI(0, 0, 2)] - rho_safe * CS2;
+        float neq_xy = central_pre[MI(1, 1, 0)];
+        float neq_xz = central_pre[MI(1, 0, 1)];
+        float neq_yz = central_pre[MI(0, 1, 1)];
+        float q_norm2 = neq_xx * neq_xx + neq_yy * neq_yy + neq_zz * neq_zz
+                        + 2.0f * (neq_xy * neq_xy + neq_xz * neq_xz + neq_yz * neq_yz);
+        float q_mag = sqrt(fmax(0.0f, q_norm2));
+        float s_mag = q_mag / fmax(1e-6f, 2.0f * rho_safe * nu0);
+        float nu_t = SGS_C2 * s_mag;
+        nu_t = fmin(nu_t, SGS_NUT_TO_NU0_MAX * nu0);
+        tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), TAU_SHEAR_MIN, TAU_SHEAR_MAX);
+        tau_normal_local = clampf(
+            tau_normal_base + (tau_shear_local - tau_shear_base) * SGS_BULK_COUPLING,
+            TAU_NORMAL_MIN,
+            TAU_NORMAL_MAX
+        );
+    }
+
+    float omega_diag = 1.0f / tau_normal_local;
+    float omega_offdiag = 1.0f / tau_shear_local;
+    float s_diag = clampf(omega_diag, 0.0f, 1.95f);
+    float s_offdiag = clampf(omega_offdiag, 0.0f, 1.95f);
+    float eq_second = rho_safe * CS2;
+
+    central_post[MI(0, 0, 0)] = rho_safe;
+    central_post[MI(2, 0, 0)] = central_pre[MI(2, 0, 0)] + s_diag * (eq_second - central_pre[MI(2, 0, 0)]);
+    central_post[MI(0, 2, 0)] = central_pre[MI(0, 2, 0)] + s_diag * (eq_second - central_pre[MI(0, 2, 0)]);
+    central_post[MI(0, 0, 2)] = central_pre[MI(0, 0, 2)] + s_diag * (eq_second - central_pre[MI(0, 0, 2)]);
+    central_post[MI(1, 1, 0)] = (1.0f - s_offdiag) * central_pre[MI(1, 1, 0)];
+    central_post[MI(1, 0, 1)] = (1.0f - s_offdiag) * central_pre[MI(1, 0, 1)];
+    central_post[MI(0, 1, 1)] = (1.0f - s_offdiag) * central_pre[MI(0, 1, 1)];
+
+    float c200 = central_post[MI(2, 0, 0)];
+    float c020 = central_post[MI(0, 2, 0)];
+    float c002 = central_post[MI(0, 0, 2)];
+    float c110 = central_post[MI(1, 1, 0)];
+    float c101 = central_post[MI(1, 0, 1)];
+    float c011 = central_post[MI(0, 1, 1)];
+    float inv_rho_safe = 1.0f / fmax(1e-6f, rho_safe);
+
+    central_post[MI(2, 2, 0)] = c200 * c020 * inv_rho_safe + 2.0f * c110 * c110 * inv_rho_safe;
+    central_post[MI(2, 0, 2)] = c200 * c002 * inv_rho_safe + 2.0f * c101 * c101 * inv_rho_safe;
+    central_post[MI(0, 2, 2)] = c020 * c002 * inv_rho_safe + 2.0f * c011 * c011 * inv_rho_safe;
+    central_post[MI(2, 1, 1)] = (c200 * c011 + 2.0f * c110 * c101) * inv_rho_safe;
+    central_post[MI(1, 2, 1)] = (c020 * c101 + 2.0f * c110 * c011) * inv_rho_safe;
+    central_post[MI(1, 1, 2)] = (c002 * c110 + 2.0f * c101 * c011) * inv_rho_safe;
+    central_post[MI(2, 2, 2)] = (c200 * c020 * c002
+                                + 2.0f * c110 * c110 * c002
+                                + 2.0f * c101 * c101 * c020
+                                + 2.0f * c011 * c011 * c200
+                                + 8.0f * c110 * c101 * c011) * inv_rho_safe * inv_rho_safe;
+
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int p = 0; p <= a; ++p) {
+                    for (int qm = 0; qm <= b; ++qm) {
+                        for (int rm = 0; rm <= c; ++rm) {
+                            float ux_pow = (a - p == 0) ? 1.0f : ((a - p == 1) ? ux : ux * ux);
+                            float uy_pow = (b - qm == 0) ? 1.0f : ((b - qm == 1) ? uy : uy * uy);
+                            float uz_pow = (c - rm == 0) ? 1.0f : ((c - rm == 1) ? uz : uz * uz);
+                            float coeff = (float)(binom(a, p) * binom(b, qm) * binom(c, rm));
+                            sum += coeff * ux_pow * uy_pow * uz_pow * central_post[MI(p, qm, rm)];
+                        }
+                    }
+                }
+                raw_post[MI(a, b, c)] = sum;
+            }
+        }
+    }
+
+    float f_post_local[KQ];
+    for (int ix = 0; ix < 3; ++ix) {
+        for (int iy = 0; iy < 3; ++iy) {
+            for (int iz = 0; iz < 3; ++iz) {
+                float sum = 0.0f;
+                for (int a = 0; a < 3; ++a) {
+                    for (int b = 0; b < 3; ++b) {
+                        for (int c = 0; c < 3; ++c) {
+                            sum += TINV[ix][a] * TINV[iy][b] * TINV[iz][c] * raw_post[MI(a, b, c)];
+                        }
+                    }
+                }
+                int q = (ix * 3 + iy) * 3 + iz;
+                f_post_local[q] = sum;
+            }
+        }
+    }
+
+    float rho_corr = 0.0f, mx_corr = 0.0f, my_corr = 0.0f, mz_corr = 0.0f;
+    for (int q = 0; q < KQ; ++q) {
+        float fq = f_post_local[q];
+        rho_corr += fq;
+        mx_corr += fq * (float)CX[q];
+        my_corr += fq * (float)CY[q];
+        mz_corr += fq * (float)CZ[q];
+    }
+    float inv_rho_corr = 1.0f / fmax(1e-6f, rho_corr);
+    float ux_corr = mx_corr * inv_rho_corr;
+    float uy_corr = my_corr * inv_rho_corr;
+    float uz_corr = mz_corr * inv_rho_corr;
+    for (int q = 0; q < KQ; ++q) {
+        f_post_local[q] += feq(q, rho_safe, ux, uy, uz) - feq(q, fmax(1e-6f, rho_corr), ux_corr, uy_corr, uz_corr);
+    }
+
+    float ux_minus = ux - 0.5f * dux;
+    float uy_minus = uy - 0.5f * duy;
+    float uz_minus = uz - 0.5f * duz;
+    float ux_plus = ux + 0.5f * dux;
+    float uy_plus = uy + 0.5f * duy;
+    float uz_plus = uz + 0.5f * duz;
+    float alpha_sponge = (benchmark_flags & BENCH_DISABLE_SPONGE) ? 0.0f : sponge_alpha(nx, ny, nz, x, y, z);
+    float keep_sponge = 1.0f - alpha_sponge;
+
+    for (int q = 0; q < KQ; ++q) {
+        float edm_source = feq(q, rho_safe, ux_plus, uy_plus, uz_plus) - feq(q, rho_safe, ux_minus, uy_minus, uz_minus);
+        float f_next = f_post_local[q] + edm_source;
+        if (alpha_sponge > 0.0f) {
+            float f_far = feq(q, 1.0f, 0.0f, 0.0f, 0.0f);
+            f_next = keep_sponge * f_next + alpha_sponge * f_far;
+        }
+        f_write[q * cells + cell] = f_next;
+    }
+}
+
+ )CLC"
 R"CLC(
 kernel void stream_collide_step(
     __global const float* f_read,
@@ -3965,7 +4377,9 @@ void release_opencl_runtime() {
     if (g_opencl.k_thermal_bfecc_finalize) clReleaseKernel(g_opencl.k_thermal_bfecc_finalize);
     if (g_opencl.k_thermal_bfecc_correct) clReleaseKernel(g_opencl.k_thermal_bfecc_correct);
     if (g_opencl.k_thermal_bfecc_forward) clReleaseKernel(g_opencl.k_thermal_bfecc_forward);
+    if (g_opencl.k_thermal_scalar) clReleaseKernel(g_opencl.k_thermal_scalar);
     if (g_opencl.k_output) clReleaseKernel(g_opencl.k_output);
+    if (g_opencl.k_stream_collide_hydro_forced) clReleaseKernel(g_opencl.k_stream_collide_hydro_forced);
     if (g_opencl.k_stream_collide_hydro_bench) clReleaseKernel(g_opencl.k_stream_collide_hydro_bench);
     if (g_opencl.k_stream_collide_tgv) clReleaseKernel(g_opencl.k_stream_collide_tgv);
     if (g_opencl.k_stream_collide) clReleaseKernel(g_opencl.k_stream_collide);
@@ -4045,19 +4459,24 @@ bool initialize_opencl_runtime() {
     cl_kernel k_thermal_bfecc_forward = clCreateKernel(program, "thermal_bfecc_forward", &err);
     cl_kernel k_thermal_bfecc_correct = clCreateKernel(program, "thermal_bfecc_correct", &err);
     cl_kernel k_thermal_bfecc_finalize = clCreateKernel(program, "thermal_bfecc_finalize", &err);
+    cl_kernel k_thermal_scalar = clCreateKernel(program, "thermal_scalar_step", &err);
     cl_kernel k_stream_collide = clCreateKernel(program, "stream_collide_step", &err);
     cl_kernel k_stream_collide_tgv = clCreateKernel(program, "stream_collide_tgv_step", &err);
     cl_kernel k_stream_collide_hydro_bench = clCreateKernel(program, "stream_collide_hydro_benchmark_step", &err);
+    cl_kernel k_stream_collide_hydro_forced = clCreateKernel(program, "stream_collide_hydro_forced_step", &err);
     cl_kernel k_output = clCreateKernel(program, "output_macro", &err);
 
-    if (!k_init || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize || !k_stream_collide || !k_stream_collide_tgv || !k_stream_collide_hydro_bench || !k_output) {
+    if (!k_init || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize || !k_thermal_scalar
+        || !k_stream_collide || !k_stream_collide_tgv || !k_stream_collide_hydro_bench || !k_stream_collide_hydro_forced || !k_output) {
         if (k_init) clReleaseKernel(k_init);
         if (k_thermal_bfecc_forward) clReleaseKernel(k_thermal_bfecc_forward);
         if (k_thermal_bfecc_correct) clReleaseKernel(k_thermal_bfecc_correct);
         if (k_thermal_bfecc_finalize) clReleaseKernel(k_thermal_bfecc_finalize);
+        if (k_thermal_scalar) clReleaseKernel(k_thermal_scalar);
         if (k_stream_collide) clReleaseKernel(k_stream_collide);
         if (k_stream_collide_tgv) clReleaseKernel(k_stream_collide_tgv);
         if (k_stream_collide_hydro_bench) clReleaseKernel(k_stream_collide_hydro_bench);
+        if (k_stream_collide_hydro_forced) clReleaseKernel(k_stream_collide_hydro_forced);
         if (k_output) clReleaseKernel(k_output);
         clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
         g_opencl.error = "Kernel creation failed"; return false;
@@ -4068,9 +4487,11 @@ bool initialize_opencl_runtime() {
     g_opencl.k_thermal_bfecc_forward = k_thermal_bfecc_forward;
     g_opencl.k_thermal_bfecc_correct = k_thermal_bfecc_correct;
     g_opencl.k_thermal_bfecc_finalize = k_thermal_bfecc_finalize;
+    g_opencl.k_thermal_scalar = k_thermal_scalar;
     g_opencl.k_stream_collide = k_stream_collide;
     g_opencl.k_stream_collide_tgv = k_stream_collide_tgv;
     g_opencl.k_stream_collide_hydro_bench = k_stream_collide_hydro_bench;
+    g_opencl.k_stream_collide_hydro_forced = k_stream_collide_hydro_forced;
     g_opencl.k_output = k_output;
     g_opencl.platform = selected_platform; g_opencl.device = selected_device;
     g_opencl.available = true; g_opencl.device_name = read_device_name(selected_device);
@@ -4224,7 +4645,12 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     const bool use_tgv_fastpath = benchmark_preset == AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D;
     const bool use_hydro_bench_fastpath =
         benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D
-        || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D;
+        || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D
+        || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D;
+    const bool use_scalar_thermal_kernel =
+        !use_tgv_fastpath
+        && !use_hydro_bench_fastpath
+        && !thermal_bfecc_benchmark_active();
     const auto hydro_face_kinds = opencl_hydrodynamic_face_kinds();
     const auto hydro_face_data = opencl_hydrodynamic_face_data();
     const auto thermal_face_kinds = opencl_thermal_face_kinds();
@@ -4238,12 +4664,6 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     cl_mem write_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f_post : ctx.d_f;
     cl_mem temp_read = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
     cl_mem temp_write = (ctx.step_counter % 2 == 0) ? ctx.d_temp_next : ctx.d_temp;
-    cl_mem thermal_read = thermal_ddf_benchmark_active()
-        ? ((ctx.step_counter % 2 == 0) ? ctx.d_thermal_f : ctx.d_thermal_f_post)
-        : temp_read;
-    cl_mem thermal_write = thermal_ddf_benchmark_active()
-        ? ((ctx.step_counter % 2 == 0) ? ctx.d_thermal_f_post : ctx.d_thermal_f)
-        : temp_write;
     if (thermal_bfecc_benchmark_active()) {
         const float thermal_dt = static_cast<float>(thermal_update_stride);
 
@@ -4337,6 +4757,39 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         if (err != CL_SUCCESS) return fail_cl("clEnqueueCopyBuffer(temp_scratch->temp_write)", err);
         if (!stage_fence("after_thermal_bfecc")) return false;
         temp_read = temp_write;
+    } else if (use_scalar_thermal_kernel) {
+        const float thermal_dt = static_cast<float>(thermal_update_stride);
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 0, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 1, sizeof(cl_mem), &temp_read);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 2, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 3, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 4, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 5, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 6, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 7, sizeof(int), &thermal_periodic_mask);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 8, sizeof(int), &thermal_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 9, sizeof(int), &thermal_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 10, sizeof(int), &thermal_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 11, sizeof(int), &thermal_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 12, sizeof(int), &thermal_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 13, sizeof(int), &thermal_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 14, sizeof(OpenClFaceData), thermal_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 15, sizeof(OpenClFaceData), thermal_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 16, sizeof(OpenClFaceData), thermal_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 17, sizeof(OpenClFaceData), thermal_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 18, sizeof(OpenClFaceData), thermal_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 19, sizeof(OpenClFaceData), thermal_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 20, sizeof(float), &thermal_dt);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 21, sizeof(float), &thermal_transport[0]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 22, sizeof(float), &thermal_transport[1]);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 23, sizeof(int), &benchmark_flags);
+        err |= clSetKernelArg(g_opencl.k_thermal_scalar, 24, sizeof(cl_mem), &temp_write);
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_thermal_scalar)", err);
+        err = enqueue_kernel_1d(g_opencl.k_thermal_scalar, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_thermal_scalar)", err);
+        if (!stage_fence("after_thermal_scalar")) return false;
+        temp_read = temp_write;
     }
 
     err = CL_SUCCESS;
@@ -4382,56 +4835,37 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err = enqueue_kernel_1d(g_opencl.k_stream_collide_hydro_bench, cells_i32);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_stream_collide_hydro_bench)", err);
     } else {
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 0, sizeof(cl_mem), &read_buf);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 1, sizeof(cl_mem), &ctx.d_payload);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 2, sizeof(cl_mem), &temp_read);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 3, sizeof(cl_mem), &thermal_read);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 4, sizeof(int), &g_cfg.input_channels);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 5, sizeof(int), &ctx.nx);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 6, sizeof(int), &ctx.ny);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 7, sizeof(int), &ctx.nz);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 8, sizeof(int), &cells_i32);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 9, sizeof(int), &tick_i32);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 10, sizeof(int), &benchmark_flags);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 11, sizeof(int), &hydro_periodic_mask);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 12, sizeof(int), &thermal_periodic_mask);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 13, sizeof(float), &tau_pair[0]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 14, sizeof(float), &tau_pair[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 15, sizeof(float), &thermal_transport[0]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 16, sizeof(float), &thermal_transport[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 17, sizeof(float), &thermal_transport[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 18, sizeof(int), &thermal_update_stride);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 19, sizeof(int), &hydro_face_kinds[0]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 20, sizeof(int), &hydro_face_kinds[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 21, sizeof(int), &hydro_face_kinds[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 22, sizeof(int), &hydro_face_kinds[3]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 23, sizeof(int), &hydro_face_kinds[4]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 24, sizeof(int), &hydro_face_kinds[5]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 25, sizeof(OpenClFaceData), hydro_face_data[0].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 26, sizeof(OpenClFaceData), hydro_face_data[1].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 27, sizeof(OpenClFaceData), hydro_face_data[2].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 28, sizeof(OpenClFaceData), hydro_face_data[3].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 29, sizeof(OpenClFaceData), hydro_face_data[4].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 30, sizeof(OpenClFaceData), hydro_face_data[5].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 31, sizeof(int), &thermal_face_kinds[0]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 32, sizeof(int), &thermal_face_kinds[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 33, sizeof(int), &thermal_face_kinds[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 34, sizeof(int), &thermal_face_kinds[3]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 35, sizeof(int), &thermal_face_kinds[4]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 36, sizeof(int), &thermal_face_kinds[5]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 37, sizeof(OpenClFaceData), thermal_face_data[0].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 38, sizeof(OpenClFaceData), thermal_face_data[1].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 39, sizeof(OpenClFaceData), thermal_face_data[2].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 40, sizeof(OpenClFaceData), thermal_face_data[3].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 41, sizeof(OpenClFaceData), thermal_face_data[4].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 42, sizeof(OpenClFaceData), thermal_face_data[5].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 43, sizeof(int), &benchmark_preset);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 44, sizeof(cl_mem), &write_buf);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 45, sizeof(cl_mem), &temp_write);
-        err |= clSetKernelArg(g_opencl.k_stream_collide, 46, sizeof(cl_mem), &thermal_write);
-        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_stream_collide)", err);
-        err = enqueue_kernel_1d(g_opencl.k_stream_collide, cells_i32);
-        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_stream_collide)", err);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 0, sizeof(cl_mem), &read_buf);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 1, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 2, sizeof(cl_mem), &temp_read);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 3, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 4, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 5, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 6, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 7, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 8, sizeof(int), &tick_i32);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 9, sizeof(int), &benchmark_flags);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 10, sizeof(int), &hydro_periodic_mask);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 11, sizeof(float), &tau_pair[0]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 12, sizeof(float), &tau_pair[1]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 13, sizeof(float), &thermal_transport[2]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 14, sizeof(int), &hydro_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 15, sizeof(int), &hydro_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 16, sizeof(int), &hydro_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 17, sizeof(int), &hydro_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 18, sizeof(int), &hydro_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 19, sizeof(int), &hydro_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 20, sizeof(OpenClFaceData), hydro_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 21, sizeof(OpenClFaceData), hydro_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 22, sizeof(OpenClFaceData), hydro_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 23, sizeof(OpenClFaceData), hydro_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 24, sizeof(OpenClFaceData), hydro_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 25, sizeof(OpenClFaceData), hydro_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 26, sizeof(int), &benchmark_preset);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 27, sizeof(cl_mem), &write_buf);
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_stream_collide_hydro_forced)", err);
+        err = enqueue_kernel_1d(g_opencl.k_stream_collide_hydro_forced, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_stream_collide_hydro_forced)", err);
     }
     if (!stage_fence("after_stream_collide")) return false;
 
