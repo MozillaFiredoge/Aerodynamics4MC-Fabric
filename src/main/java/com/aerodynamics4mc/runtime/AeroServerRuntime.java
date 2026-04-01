@@ -617,11 +617,15 @@ public final class AeroServerRuntime {
                     if (!slideWindowSections(world, window, slidingSourceKey.origin(), key.origin())) {
                         saveWindowStateToCache(world, slidingSourceKey.origin(), window);
                         reloadWindowFromWorldState(world, key.origin(), window);
+                        markWindowBackendDirty(window);
                     } else {
+                        boolean shiftedNative = shiftNativeWindowBackend(window, slidingSourceKey.origin(), key.origin());
                         clearWindowPressureForExposedFringe(window, sectionShift(slidingSourceKey.origin(), key.origin()));
                         stabilizeWindowEdges(window);
+                        if (!shiftedNative) {
+                            markWindowBackendDirty(window);
+                        }
                     }
-                    markWindowBackendDirty(window);
                 } else {
                     window = new WindowState(nextContextId++);
                     reloadWindowFromWorldState(world, key.origin(), window);
@@ -963,6 +967,25 @@ public final class AeroServerRuntime {
             window.clearTemperatureRestorePending();
         }
         return restored;
+    }
+
+    private boolean shiftNativeWindowBackend(WindowState window, BlockPos oldOrigin, BlockPos newOrigin) {
+        if (backendMode != BackendMode.NATIVE || window.busy.get() || window.backendResetPending()) {
+            return false;
+        }
+        if (!nativeBackend.isLoaded()) {
+            return false;
+        }
+        if (!nativeBackend.ensureInitialized(GRID_SIZE, CHANNELS, RESPONSE_CHANNELS)) {
+            return false;
+        }
+        int dx = newOrigin.getX() - oldOrigin.getX();
+        int dy = newOrigin.getY() - oldOrigin.getY();
+        int dz = newOrigin.getZ() - oldOrigin.getZ();
+        if (dx == 0 && dy == 0 && dz == 0) {
+            return true;
+        }
+        return nativeBackend.shiftContext(GRID_SIZE, window.nativeContextId, dx, dy, dz);
     }
 
     private void fillTemperatureBufferFromSections(WindowState window, float[] buffer) {

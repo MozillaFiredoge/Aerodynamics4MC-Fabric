@@ -4391,6 +4391,147 @@ bool sync_context_temperature_to_gpu(ContextState& ctx) {
     return true;
 }
 
+bool sync_context_state_from_gpu(ContextState& ctx) {
+    if (!ctx.gpu_buffers_ready || !ctx.gpu_initialized) {
+        return true;
+    }
+    if (ctx.f.size() != ctx.cells * kQ) {
+        ctx.f.assign(ctx.cells * kQ, 0.0f);
+    }
+    if (ctx.f_post.size() != ctx.cells * kQ) {
+        ctx.f_post.assign(ctx.cells * kQ, 0.0f);
+    }
+    ensure_context_temperature_storage(ctx);
+    cl_int err = clEnqueueReadBuffer(
+        g_opencl.queue,
+        ctx.d_f,
+        CL_TRUE,
+        0,
+        ctx.f.size() * sizeof(float),
+        ctx.f.data(),
+        0,
+        nullptr,
+        nullptr
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_f)", err);
+        return false;
+    }
+    err = clEnqueueReadBuffer(
+        g_opencl.queue,
+        ctx.d_f_post,
+        CL_TRUE,
+        0,
+        ctx.f_post.size() * sizeof(float),
+        ctx.f_post.data(),
+        0,
+        nullptr,
+        nullptr
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_f_post)", err);
+        return false;
+    }
+    const std::size_t temp_bytes = ctx.cells * sizeof(float);
+    err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_temp)", err);
+        return false;
+    }
+    err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature_next.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_temp_next)", err);
+        return false;
+    }
+    err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_temp_scratch, CL_TRUE, 0, temp_bytes, ctx.temperature_scratch.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_temp_scratch)", err);
+        return false;
+    }
+    if (thermal_ddf_benchmark_active()) {
+        ensure_context_thermal_ddf_storage(ctx);
+        const std::size_t thermal_bytes = ctx.cells * kThermalQ * sizeof(float);
+        err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_thermal_f)", err);
+            return false;
+        }
+        err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f_post.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_thermal_f_post)", err);
+            return false;
+        }
+    }
+    ctx.cpu_initialized = true;
+    return true;
+}
+
+bool sync_context_state_to_gpu(ContextState& ctx) {
+    if (!ctx.gpu_buffers_ready || !ctx.gpu_initialized) {
+        return true;
+    }
+    cl_int err = clEnqueueWriteBuffer(
+        g_opencl.queue,
+        ctx.d_f,
+        CL_TRUE,
+        0,
+        ctx.f.size() * sizeof(float),
+        ctx.f.data(),
+        0,
+        nullptr,
+        nullptr
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_f)", err);
+        return false;
+    }
+    err = clEnqueueWriteBuffer(
+        g_opencl.queue,
+        ctx.d_f_post,
+        CL_TRUE,
+        0,
+        ctx.f_post.size() * sizeof(float),
+        ctx.f_post.data(),
+        0,
+        nullptr,
+        nullptr
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_f_post)", err);
+        return false;
+    }
+    const std::size_t temp_bytes = ctx.cells * sizeof(float);
+    err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp, CL_TRUE, 0, temp_bytes, ctx.temperature.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_temp)", err);
+        return false;
+    }
+    err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_next, CL_TRUE, 0, temp_bytes, ctx.temperature_next.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_temp_next)", err);
+        return false;
+    }
+    err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_temp_scratch, CL_TRUE, 0, temp_bytes, ctx.temperature_scratch.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_temp_scratch)", err);
+        return false;
+    }
+    if (thermal_ddf_benchmark_active()) {
+        const std::size_t thermal_bytes = ctx.cells * kThermalQ * sizeof(float);
+        err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f, CL_TRUE, 0, thermal_bytes, ctx.thermal_f.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_thermal_f)", err);
+            return false;
+        }
+        err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_thermal_f_post, CL_TRUE, 0, thermal_bytes, ctx.thermal_f_post.data(), 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_thermal_f_post)", err);
+            return false;
+        }
+    }
+    return true;
+}
+
 #else
 struct OpenClRuntime { bool available = false; std::string error; std::string device_name; };
 OpenClRuntime g_opencl;
@@ -4400,6 +4541,8 @@ bool initialize_opencl_runtime() { g_opencl.error = "Disabled"; return false; }
 bool opencl_step(ContextState&, const float*, float*, StepTiming&) { return false; }
 bool sync_context_temperature_from_gpu(ContextState&) { return true; }
 bool sync_context_temperature_to_gpu(ContextState&) { return true; }
+bool sync_context_state_from_gpu(ContextState&) { return true; }
+bool sync_context_state_to_gpu(ContextState&) { return true; }
 #endif
 
 void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
@@ -4460,6 +4603,122 @@ void assign_temperature_state(ContextState& ctx, const float* temperature_state)
     }
     std::copy(ctx.temperature.begin(), ctx.temperature.end(), ctx.temperature_next.begin());
     rebuild_thermal_distributions_from_temperature(ctx);
+}
+
+template <typename T>
+void shift_scalar_field(std::vector<T>& field, int nx, int ny, int nz, int dx, int dy, int dz, T fill_value) {
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    std::vector<T> shifted(cells, fill_value);
+    if (field.size() != cells) {
+        field = std::move(shifted);
+        return;
+    }
+    for (int x = 0; x < nx; ++x) {
+        const int old_x = x + dx;
+        if (old_x < 0 || old_x >= nx) continue;
+        for (int y = 0; y < ny; ++y) {
+            const int old_y = y + dy;
+            if (old_y < 0 || old_y >= ny) continue;
+            for (int z = 0; z < nz; ++z) {
+                const int old_z = z + dz;
+                if (old_z < 0 || old_z >= nz) continue;
+                shifted[cell_index(x, y, z, nx, ny, nz)] = field[cell_index(old_x, old_y, old_z, nx, ny, nz)];
+            }
+        }
+    }
+    field = std::move(shifted);
+}
+
+template <std::size_t Q>
+void shift_population_field(
+    std::vector<float>& field,
+    int nx,
+    int ny,
+    int nz,
+    int dx,
+    int dy,
+    int dz,
+    const std::array<float, Q>& fringe_equilibrium
+) {
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    std::vector<float> shifted(cells * Q, 0.0f);
+    if (field.size() != cells * Q) {
+        for (std::size_t cell = 0; cell < cells; ++cell) {
+            for (std::size_t q = 0; q < Q; ++q) {
+                shifted[q * cells + cell] = fringe_equilibrium[q];
+            }
+        }
+        field = std::move(shifted);
+        return;
+    }
+    for (int x = 0; x < nx; ++x) {
+        const int old_x = x + dx;
+        for (int y = 0; y < ny; ++y) {
+            const int old_y = y + dy;
+            for (int z = 0; z < nz; ++z) {
+                const int old_z = z + dz;
+                const std::size_t new_cell = cell_index(x, y, z, nx, ny, nz);
+                if (old_x >= 0 && old_x < nx && old_y >= 0 && old_y < ny && old_z >= 0 && old_z < nz) {
+                    const std::size_t old_cell = cell_index(old_x, old_y, old_z, nx, ny, nz);
+                    for (std::size_t q = 0; q < Q; ++q) {
+                        shifted[q * cells + new_cell] = field[q * cells + old_cell];
+                    }
+                } else {
+                    for (std::size_t q = 0; q < Q; ++q) {
+                        shifted[q * cells + new_cell] = fringe_equilibrium[q];
+                    }
+                }
+            }
+        }
+    }
+    field = std::move(shifted);
+}
+
+bool shift_context_cpu_state(ContextState& ctx, int dx, int dy, int dz) {
+    if (ctx.cells == 0) return true;
+    if (dx == 0 && dy == 0 && dz == 0) return true;
+    if (std::abs(dx) >= ctx.nx || std::abs(dy) >= ctx.ny || std::abs(dz) >= ctx.nz) return false;
+
+    std::array<float, kQ> hydro_eq{};
+    for (int q = 0; q < kQ; ++q) {
+        hydro_eq[q] = feq(q, 1.0f, 0.0f, 0.0f, 0.0f);
+    }
+    shift_population_field(ctx.f, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, hydro_eq);
+    shift_population_field(ctx.f_post, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, hydro_eq);
+
+    if (ctx.rho.size() == ctx.cells) shift_scalar_field(ctx.rho, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 1.0f);
+    if (ctx.ux.size() == ctx.cells) shift_scalar_field(ctx.ux, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.uy.size() == ctx.cells) shift_scalar_field(ctx.uy, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.uz.size() == ctx.cells) shift_scalar_field(ctx.uz, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+
+    if (ctx.ref_ux.size() == ctx.cells) shift_scalar_field(ctx.ref_ux, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.ref_uy.size() == ctx.cells) shift_scalar_field(ctx.ref_uy, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.ref_uz.size() == ctx.cells) shift_scalar_field(ctx.ref_uz, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.ref_pressure.size() == ctx.cells) shift_scalar_field(ctx.ref_pressure, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+
+    if (ctx.fan_mask.size() == ctx.cells) shift_scalar_field(ctx.fan_mask, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.fan_ux.size() == ctx.cells) shift_scalar_field(ctx.fan_ux, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.fan_uy.size() == ctx.cells) shift_scalar_field(ctx.fan_uy, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.fan_uz.size() == ctx.cells) shift_scalar_field(ctx.fan_uz, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.thermal_source.size() == ctx.cells) shift_scalar_field(ctx.thermal_source, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.obstacle.size() == ctx.cells) shift_scalar_field<uint8_t>(ctx.obstacle, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, static_cast<uint8_t>(0));
+    if (ctx.temperature.size() == ctx.cells) shift_scalar_field(ctx.temperature, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.temperature_next.size() == ctx.cells) shift_scalar_field(ctx.temperature_next, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.temperature_scratch.size() == ctx.cells) shift_scalar_field(ctx.temperature_scratch, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+
+    if (ctx.thermal_f.size() == ctx.cells * kThermalQ && ctx.thermal_f_post.size() == ctx.cells * kThermalQ) {
+        std::array<float, kThermalQ> thermal_eq{};
+        for (int q = 0; q < kThermalQ; ++q) {
+            thermal_eq[q] = thermal_feq(q, 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        shift_population_field(ctx.thermal_f, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, thermal_eq);
+        shift_population_field(ctx.thermal_f_post, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, thermal_eq);
+    }
+
+    ctx.last_force[0] = 0.0f;
+    ctx.last_force[1] = 0.0f;
+    ctx.last_force[2] = 0.0f;
+    return true;
 }
 
 void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
@@ -4681,6 +4940,21 @@ static jboolean native_set_temperature_state_impl(
     return JNI_TRUE;
 }
 
+static jboolean native_shift_context_impl(jint grid_size, jlong context_key, jint dx, jint dy, jint dz) {
+    if (!g_cfg.initialized || grid_size != g_cfg.grid_size) return JNI_FALSE;
+    auto it = g_contexts.find(context_key);
+    if (it == g_contexts.end()) return JNI_FALSE;
+    ContextState& ctx = it->second;
+    const std::size_t cells = configured_cells();
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (ctx.cells == 0) return JNI_TRUE;
+    if (std::abs(dx) >= ctx.nx || std::abs(dy) >= ctx.ny || std::abs(dz) >= ctx.nz) return JNI_FALSE;
+    if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return JNI_FALSE;
+    if (!shift_context_cpu_state(ctx, dx, dy, dz)) return JNI_FALSE;
+    if (g_cfg.opencl_enabled && !sync_context_state_to_gpu(ctx)) return JNI_FALSE;
+    return JNI_TRUE;
+}
+
 static void native_release_context_impl(jlong context_key) {
     auto it = g_contexts.find(context_key);
     if (it != g_contexts.end()) { clear_context(it->second); g_contexts.erase(it); }
@@ -4743,6 +5017,10 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_ch
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny, int nz, long long context_key, float* output_flow) {
     return native_step_raw_dims_impl(packet, nx, ny, nz, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_shift_context(int grid_size, long long context_key, int dx, int dy, int dz) {
+    return native_shift_context_impl(grid_size, static_cast<jlong>(context_key), dx, dy, dz) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature) {
@@ -4860,6 +5138,17 @@ JNIEXPORT void JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeRel
 }
 JNIEXPORT void JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeReleaseContext(JNIEnv*, jclass, jlong context_key) {
     native_release_context_impl(context_key);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeShiftContext(
+    JNIEnv*, jclass, jint grid_size, jlong context_key, jint dx, jint dy, jint dz
+) {
+    return native_shift_context_impl(grid_size, context_key, dx, dy, dz);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeShiftContext(
+    JNIEnv*, jclass, jint grid_size, jlong context_key, jint dx, jint dy, jint dz
+) {
+    return native_shift_context_impl(grid_size, context_key, dx, dy, dz);
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeGetTemperatureState(

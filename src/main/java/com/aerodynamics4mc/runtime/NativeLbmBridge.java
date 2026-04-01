@@ -101,6 +101,16 @@ public final class NativeLbmBridge {
         nativeReleaseContext(contextKey);
     }
 
+    public synchronized boolean shiftContext(int grid, long contextKey, int dx, int dy, int dz) {
+        if (!initialized || !LOADED) {
+            return false;
+        }
+        if (grid != gridSize) {
+            return false;
+        }
+        return nativeShiftContext(grid, contextKey, dx, dy, dz);
+    }
+
     public synchronized String runtimeInfo() {
         if (!LOADED) {
             return "not_loaded";
@@ -147,6 +157,8 @@ public final class NativeLbmBridge {
     private static native boolean nativeStepDirect(ByteBuffer payload, int gridSize, long contextKey, float[] outputFlow);
 
     private static native void nativeReleaseContext(long contextKey);
+
+    private static native boolean nativeShiftContext(int gridSize, long contextKey, int dx, int dy, int dz);
 
     private static native void nativeShutdown();
 
