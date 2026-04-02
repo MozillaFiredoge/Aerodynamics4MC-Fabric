@@ -23,6 +23,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
@@ -146,8 +147,6 @@ public final class AeroServerRuntime {
     private static final int REGION_HALO_CELLS = CHUNK_SIZE;
     private static final int REGION_CORE_SIZE = GRID_SIZE - REGION_HALO_CELLS * 2;
     private static final int REGION_LATTICE_STRIDE = REGION_CORE_SIZE;
-    private static final int REGION_ACTIVE_RADIUS = 1;
-    private static final int REGION_ACTIVE_RADIUS_Y = 1;
     private static final int WINDOW_STICKY_MARGIN_SECTIONS = 2;
     private static final int WINDOW_STICKY_MARGIN_BLOCKS = WINDOW_STICKY_MARGIN_SECTIONS * CHUNK_SIZE;
 
@@ -161,6 +160,7 @@ public final class AeroServerRuntime {
     private final Map<WindowKey, WindowState> windows = new HashMap<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
     private final ActiveWindowWorldCache worldCache = new ActiveWindowWorldCache();
+    private final Object simulationStateLock = new Object();
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT, runnable -> {
         Thread thread = new Thread(runnable, "aero-server-solver");
         thread.setDaemon(true);
@@ -168,6 +168,8 @@ public final class AeroServerRuntime {
     });
     private final AtomicInteger activeSolveTasks = new AtomicInteger(0);
     private final AtomicLong runtimeGeneration = new AtomicLong(0L);
+    private final AtomicLong publishedFrameCounter = new AtomicLong(0L);
+    private final AtomicReference<PublishedFrame> publishedFrame = new AtomicReference<>(null);
 
     private boolean streamingEnabled = false;
     private boolean debugEnabled = false;
@@ -180,6 +182,7 @@ public final class AeroServerRuntime {
     private int clientMasterDetectedWindows = 0;
     private int tickCounter = 0;
     private long simulationTicks = 0L;
+    private long lastObservedPublishedFrameId = 0L;
     private int secondWindowTotalTicks = 0;
     private int secondWindowSimulationTicks = 0;
     private float simulationTicksPerSecond = 0.0f;
@@ -188,6 +191,7 @@ public final class AeroServerRuntime {
     private int streamlineSampleStride = DEFAULT_STREAMLINE_STRIDE;
     private BackendMode backendMode = BackendMode.NATIVE;
     private long nextContextId = 1L;
+    private SimulationCoordinator simulationCoordinator;
 
     private AeroServerRuntime() {
     }
@@ -215,6 +219,7 @@ public final class AeroServerRuntime {
                 .executes(ctx -> {
                     streamingEnabled = true;
                     lastSolverError = "";
+                    ensureSimulationCoordinatorRunning();
                     feedback(ctx.getSource(), "Streaming enabled");
                     broadcastState(ctx.getSource().getServer());
                     return 1;
@@ -441,133 +446,104 @@ public final class AeroServerRuntime {
             return;
         }
         tickCounter++;
+        ensureSimulationCoordinatorRunning();
 
         boolean clientMasterActive = isClientMasterActive(server);
         if (clientMasterActive) {
-            if (tickCounter == 1 || tickCounter % WINDOW_REFRESH_TICKS == 0) {
-                clientMasterDetectedWindows = scanFanSources(server).size();
-            }
-            if (!windows.isEmpty()) {
-                for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
-                    WindowState window = entry.getValue();
-                    ServerWorld world = server.getWorld(entry.getKey().worldKey());
-                    deactivateWindow(world, entry.getKey().origin(), window);
+            synchronized (simulationStateLock) {
+                if (tickCounter == 1 || tickCounter % WINDOW_REFRESH_TICKS == 0) {
+                    clientMasterDetectedWindows = scanFanSources(server).size();
                 }
-                windows.clear();
-                worldCache.saveAll();
+                if (!windows.isEmpty()) {
+                    for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+                        WindowState window = entry.getValue();
+                        ServerWorld world = server.getWorld(entry.getKey().worldKey());
+                        deactivateWindow(world, entry.getKey().origin(), window);
+                    }
+                    windows.clear();
+                    worldCache.saveAll();
+                }
             }
+            publishedFrame.set(null);
             lastMaxFlowSpeed = 0.0f;
-            updateSimulationRate(false);
+            updateSimulationRate(0);
             return;
         }
 
-        boolean windowOriginShifted = hasWindowOriginShifted(server);
-        if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0 || windowOriginShifted) {
-            refreshWindows(server, tickCounter == 1);
-        }
-        clientMasterDetectedWindows = windows.size();
+        synchronized (simulationStateLock) {
+            boolean windowOriginShifted = hasWindowOriginShifted(server);
+            if (windows.isEmpty() || tickCounter % WINDOW_REFRESH_TICKS == 0 || windowOriginShifted) {
+                refreshWindows(server, tickCounter == 1);
+            }
 
-        if (windows.isEmpty()) {
-            updateSimulationRate(false);
+            Iterator<Map.Entry<WindowKey, WindowState>> it = windows.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<WindowKey, WindowState> entry = it.next();
+                WindowKey key = entry.getKey();
+                WindowState window = entry.getValue();
+                ServerWorld world = server.getWorld(key.worldKey());
+                if (world == null) {
+                    deactivateWindow(null, key.origin(), window);
+                    it.remove();
+                    continue;
+                }
+                if (!window.busy.get() && shouldResampleWindowSamples(window)) {
+                    boolean geometryChanged = refreshSampleFields(world, key.origin(), window, false);
+                    if (geometryChanged) {
+                        markWindowBackendDirty(window);
+                    }
+                }
+            }
+            clientMasterDetectedWindows = windows.size();
+        }
+
+        PublishedFrame frame = publishedFrame.get();
+        if (frame == null || frame.regions().isEmpty()) {
+            updateSimulationRate(0);
             lastMaxFlowSpeed = 0.0f;
             return;
         }
 
         boolean shouldSyncFlow = debugEnabled && (tickCounter % FLOW_SYNC_INTERVAL_TICKS == 0);
-        boolean steppedThisTick = false;
-        float maxSpeedThisTick = 0.0f;
-        List<Map.Entry<WindowKey, WindowState>> activeWindows = new ArrayList<>(windows.size());
-        Iterator<Map.Entry<WindowKey, WindowState>> it = windows.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<WindowKey, WindowState> entry = it.next();
-            WindowKey key = entry.getKey();
-            WindowState window = entry.getValue();
-            ServerWorld world = server.getWorld(key.worldKey());
-            if (world == null) {
-                deactivateWindow(null, key.origin(), window);
-                it.remove();
-                continue;
-            }
-
-            SolveResult completed = consumeCompletedSolveResult(window, key.origin());
-            if (completed != null) {
-                applyStateFieldFromResponse(window, completed.flow());
-                window.markSeamSyncPending();
-                steppedThisTick = true;
-                maxSpeedThisTick = Math.max(maxSpeedThisTick, completed.maxSpeed());
-                lastSolverError = "";
-            }
-
-            if (!window.busy.get() && shouldResampleWindowSamples(window)) {
-                boolean geometryChanged = refreshSampleFields(world, key.origin(), window, false);
-                if (geometryChanged) {
-                    markWindowBackendDirty(window);
-                }
-            }
-            activeWindows.add(entry);
+        applyPublishedForces(server, frame, FORCE_STRENGTH, clientMasterActive);
+        if (shouldSyncFlow) {
+            syncPublishedFlowToPlayers(server, frame, streamlineSampleStride);
         }
-
-        synchronizeRegionSeams(activeWindows);
-
-        for (Map.Entry<WindowKey, WindowState> entry : activeWindows) {
-            WindowKey key = entry.getKey();
-            WindowState window = entry.getValue();
-            ServerWorld world = server.getWorld(key.worldKey());
-            if (world == null) {
-                continue;
-            }
-            if (window.sections != null) {
-                applyForces(world, key.origin(), window, FORCE_STRENGTH, clientMasterActive);
-                if (shouldSyncFlow) {
-                    syncFlowToPlayers(world, key.origin(), window, streamlineSampleStride);
-                }
-            }
-
-            if (!window.busy.get() && window.backendResetPending()) {
-                resetWindowBackend(window);
-            }
-            if (window.busy.compareAndSet(false, true)) {
-                SolveSnapshot snapshot = createSolveSnapshot(
-                    window,
-                    key.origin(),
-                    backendMode,
-                    maxWindSpeed,
-                    runtimeGeneration.get()
-                );
-                activeSolveTasks.incrementAndGet();
-                solverExecutor.execute(() -> runSolveTask(snapshot));
-            }
+        long frameId = frame.frameId();
+        int publishedSteps = 0;
+        if (frameId > lastObservedPublishedFrameId) {
+            long delta = frameId - lastObservedPublishedFrameId;
+            simulationTicks += delta;
+            publishedSteps = (int) Math.min(Integer.MAX_VALUE, delta);
+            lastObservedPublishedFrameId = frameId;
+            lastMaxFlowSpeed = frame.maxSpeed();
         }
-        if (steppedThisTick) {
-            simulationTicks++;
-        }
-        if (steppedThisTick) {
-            lastMaxFlowSpeed = maxSpeedThisTick;
-        }
-        updateSimulationRate(steppedThisTick);
+        updateSimulationRate(publishedSteps);
     }
 
     private void switchBackend(BackendMode mode) {
         if (backendMode == mode) {
             return;
         }
-        if (mode == BackendMode.SOCKET) {
-            for (WindowState window : windows.values()) {
-                if (!window.busy.get()) {
-                    nativeBackend.releaseContext(window.nativeContextId);
+        synchronized (simulationStateLock) {
+            if (mode == BackendMode.SOCKET) {
+                for (WindowState window : windows.values()) {
+                    if (!window.busy.get()) {
+                        nativeBackend.releaseContext(window.nativeContextId);
+                    }
+                }
+            } else {
+                for (WindowState window : windows.values()) {
+                    if (!window.busy.get()) {
+                        closeSocket(window);
+                    }
                 }
             }
-        } else {
-            for (WindowState window : windows.values()) {
-                if (!window.busy.get()) {
-                    closeSocket(window);
+            backendMode = mode;
+            if (mode == BackendMode.NATIVE) {
+                for (WindowState window : windows.values()) {
+                    window.markTemperatureRestorePending();
                 }
-            }
-        }
-        backendMode = mode;
-        if (mode == BackendMode.NATIVE) {
-            for (WindowState window : windows.values()) {
-                window.markTemperatureRestorePending();
             }
         }
     }
@@ -575,22 +551,27 @@ public final class AeroServerRuntime {
     private void stopStreaming(MinecraftServer server) {
         runtimeGeneration.incrementAndGet();
         streamingEnabled = false;
+        stopSimulationCoordinator();
         tickCounter = 0;
         simulationTicks = 0L;
+        lastObservedPublishedFrameId = 0L;
         secondWindowTotalTicks = 0;
         secondWindowSimulationTicks = 0;
         simulationTicksPerSecond = 0.0f;
         lastMaxFlowSpeed = 0.0f;
-        for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
-            WindowState window = entry.getValue();
-            if (server != null) {
-                ServerWorld world = server.getWorld(entry.getKey().worldKey());
-                deactivateWindow(world, entry.getKey().origin(), window);
-            } else {
-                deactivateWindow(null, entry.getKey().origin(), window);
+        synchronized (simulationStateLock) {
+            for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+                WindowState window = entry.getValue();
+                if (server != null) {
+                    ServerWorld world = server.getWorld(entry.getKey().worldKey());
+                    deactivateWindow(world, entry.getKey().origin(), window);
+                } else {
+                    deactivateWindow(null, entry.getKey().origin(), window);
+                }
             }
+            windows.clear();
         }
-        windows.clear();
+        publishedFrame.set(null);
         waitForSolverIdle();
         clientMasterDetectedWindows = 0;
         if (server != null) {
@@ -802,27 +783,13 @@ public final class AeroServerRuntime {
             if (window.sections == null || window.busy.get()) {
                 continue;
             }
-            for (int dx = -1; dx <= 1; dx++) {
-                for (int dy = -1; dy <= 1; dy++) {
-                    for (int dz = -1; dz <= 1; dz++) {
-                        if (!isPositiveNeighborOffset(dx, dy, dz)) {
-                            continue;
-                        }
-                        synchronizePositiveNeighbor(activeByKey, key, window, dx, dy, dz);
-                    }
-                }
-            }
+            synchronizePositiveNeighbor(activeByKey, key, window, 1, 0, 0);
+            synchronizePositiveNeighbor(activeByKey, key, window, 0, 1, 0);
+            synchronizePositiveNeighbor(activeByKey, key, window, 0, 0, 1);
         }
         for (WindowState window : pendingWindows) {
             window.clearSeamSyncPending();
         }
-    }
-
-    private boolean isPositiveNeighborOffset(int dx, int dy, int dz) {
-        if (dx == 0 && dy == 0 && dz == 0) {
-            return false;
-        }
-        return dx > 0 || (dx == 0 && dy > 0) || (dx == 0 && dy == 0 && dz > 0);
     }
 
     private void synchronizePositiveNeighbor(
@@ -1356,18 +1323,13 @@ public final class AeroServerRuntime {
             RegistryKey<World> worldKey = world.getRegistryKey();
             for (ServerPlayerEntity player : world.getPlayers()) {
                 BlockPos baseCore = coreOriginForPosition(player.getBlockPos());
-                for (int dx = -REGION_ACTIVE_RADIUS; dx <= REGION_ACTIVE_RADIUS; dx++) {
-                    for (int dy = -REGION_ACTIVE_RADIUS_Y; dy <= REGION_ACTIVE_RADIUS_Y; dy++) {
-                        for (int dz = -REGION_ACTIVE_RADIUS; dz <= REGION_ACTIVE_RADIUS; dz++) {
-                            BlockPos coreOrigin = new BlockPos(
-                                baseCore.getX() + dx * REGION_LATTICE_STRIDE,
-                                baseCore.getY() + dy * REGION_LATTICE_STRIDE,
-                                baseCore.getZ() + dz * REGION_LATTICE_STRIDE
-                            );
-                            keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(coreOrigin)));
-                        }
-                    }
-                }
+                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore)));
+                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(REGION_LATTICE_STRIDE, 0, 0))));
+                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(-REGION_LATTICE_STRIDE, 0, 0))));
+                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))));
+                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))));
+                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, 0, REGION_LATTICE_STRIDE))));
+                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, 0, -REGION_LATTICE_STRIDE))));
             }
         }
         return keys;
@@ -2513,10 +2475,10 @@ public final class AeroServerRuntime {
         return (requested == 1 || requested == 2 || requested == 4 || requested == 8) ? requested : DEFAULT_STREAMLINE_STRIDE;
     }
 
-    private void updateSimulationRate(boolean steppedThisTick) {
+    private void updateSimulationRate(int steppedTicks) {
         secondWindowTotalTicks++;
-        if (steppedThisTick) {
-            secondWindowSimulationTicks++;
+        if (steppedTicks > 0) {
+            secondWindowSimulationTicks += steppedTicks;
         }
         if (secondWindowTotalTicks >= TICKS_PER_SECOND) {
             simulationTicksPerSecond = (secondWindowSimulationTicks * (float) TICKS_PER_SECOND) / secondWindowTotalTicks;
@@ -2554,17 +2516,14 @@ public final class AeroServerRuntime {
         if (server != null && isClientMasterActive(server)) {
             return;
         }
-
+        PublishedFrame frame = publishedFrame.get();
+        if (frame == null) {
+            return;
+        }
         int stride = sanitizeStride(streamlineSampleStride);
-
-        for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+        for (Map.Entry<WindowKey, PublishedRegion> entry : frame.regions().entrySet()) {
             WindowKey key = entry.getKey();
-            WindowState window = entry.getValue();
-            if (window.sections == null) {
-                continue;
-            }
-
-            float[] sampled = sampleFlow(window, stride);
+            float[] sampled = sampleFlow(entry.getValue(), stride);
             Identifier dimId = key.worldKey().getValue();
             ServerPlayNetworking.send(player, new AeroFlowPayload(dimId, key.origin(), stride, sampled));
         }
@@ -2683,6 +2642,281 @@ public final class AeroServerRuntime {
         }
     }
 
+    private void ensureSimulationCoordinatorRunning() {
+        synchronized (simulationStateLock) {
+            if (simulationCoordinator != null && simulationCoordinator.running()) {
+                return;
+            }
+            simulationCoordinator = new SimulationCoordinator();
+            simulationCoordinator.start();
+        }
+    }
+
+    private void stopSimulationCoordinator() {
+        SimulationCoordinator coordinator;
+        synchronized (simulationStateLock) {
+            coordinator = simulationCoordinator;
+            simulationCoordinator = null;
+        }
+        if (coordinator != null) {
+            coordinator.shutdown();
+        }
+    }
+
+    private List<ActiveWindow> snapshotActiveWindowsForCoordinator() {
+        synchronized (simulationStateLock) {
+            if (windows.isEmpty()) {
+                return List.of();
+            }
+            List<ActiveWindow> snapshot = new ArrayList<>(windows.size());
+            for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
+                WindowState window = entry.getValue();
+                if (window.sections == null || window.detached()) {
+                    continue;
+                }
+                snapshot.add(new ActiveWindow(entry.getKey(), window));
+            }
+            return snapshot;
+        }
+    }
+
+    private float applyCompletedResults(List<ActiveWindow> activeWindows) {
+        float maxSpeedThisCycle = 0.0f;
+        for (ActiveWindow active : activeWindows) {
+            SolveResult completed = consumeCompletedSolveResult(active.window(), active.key().origin());
+            if (completed == null) {
+                continue;
+            }
+            applyStateFieldFromResponse(active.window(), completed.flow());
+            active.window().markSeamSyncPending();
+            maxSpeedThisCycle = Math.max(maxSpeedThisCycle, completed.maxSpeed());
+            lastSolverError = "";
+        }
+        return maxSpeedThisCycle;
+    }
+
+    private void resetPendingBackends(List<ActiveWindow> activeWindows) {
+        for (ActiveWindow active : activeWindows) {
+            WindowState window = active.window();
+            if (!window.busy.get() && window.backendResetPending()) {
+                resetWindowBackend(window);
+            }
+        }
+    }
+
+    private List<SolveSnapshot> scheduleSolveCycle(List<ActiveWindow> activeWindows) {
+        List<SolveSnapshot> scheduled = new ArrayList<>(activeWindows.size());
+        for (ActiveWindow active : activeWindows) {
+            WindowState window = active.window();
+            if (!window.busy.compareAndSet(false, true)) {
+                continue;
+            }
+            SolveSnapshot snapshot = createSolveSnapshot(
+                window,
+                active.key().origin(),
+                backendMode,
+                maxWindSpeed,
+                runtimeGeneration.get()
+            );
+            activeSolveTasks.incrementAndGet();
+            solverExecutor.execute(() -> runSolveTask(snapshot));
+            scheduled.add(snapshot);
+        }
+        return scheduled;
+    }
+
+    private void waitForScheduledSnapshots(List<SolveSnapshot> scheduled) {
+        while (true) {
+            boolean anyBusy = false;
+            for (SolveSnapshot snapshot : scheduled) {
+                if (snapshot.window().busy.get()) {
+                    anyBusy = true;
+                    break;
+                }
+            }
+            if (!anyBusy) {
+                return;
+            }
+            try {
+                Thread.sleep(1L);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    private boolean activeSetStillMatches(List<ActiveWindow> snapshot) {
+        synchronized (simulationStateLock) {
+            if (windows.size() != snapshot.size()) {
+                return false;
+            }
+            for (ActiveWindow active : snapshot) {
+                if (windows.get(active.key()) != active.window() || active.window().detached()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    private void publishFrame(List<ActiveWindow> activeWindows, float maxSpeedThisCycle) {
+        Map<WindowKey, PublishedRegion> regions = new HashMap<>(activeWindows.size());
+        for (ActiveWindow active : activeWindows) {
+            WindowSection[] sections = active.window().sections;
+            if (sections == null) {
+                continue;
+            }
+            PublishedSection[] snapshotSections = new PublishedSection[WINDOW_SECTION_VOLUME];
+            for (int i = 0; i < WINDOW_SECTION_VOLUME; i++) {
+                WindowSection section = sections[i];
+                if (section == null) {
+                    continue;
+                }
+                PublishedSection publishedSection = new PublishedSection();
+                System.arraycopy(section.state, 0, publishedSection.state, 0, publishedSection.state.length);
+                snapshotSections[i] = publishedSection;
+            }
+            regions.put(active.key(), new PublishedRegion(active.key().origin(), snapshotSections));
+        }
+        if (regions.isEmpty()) {
+            return;
+        }
+        long frameId = publishedFrameCounter.incrementAndGet();
+        publishedFrame.set(new PublishedFrame(frameId, maxSpeedThisCycle, Map.copyOf(regions)));
+    }
+
+    private void applyPublishedForces(
+        MinecraftServer server,
+        PublishedFrame frame,
+        double strength,
+        boolean clientMasterActive
+    ) {
+        for (Map.Entry<WindowKey, PublishedRegion> entry : frame.regions().entrySet()) {
+            WindowKey key = entry.getKey();
+            ServerWorld world = server.getWorld(key.worldKey());
+            if (world == null) {
+                continue;
+            }
+            applyForces(world, entry.getValue(), strength, clientMasterActive);
+        }
+    }
+
+    private void applyForces(ServerWorld world, PublishedRegion region, double strength, boolean clientMasterActive) {
+        Box box = coreBounds(region.origin());
+        for (Entity entity : world.getEntitiesByClass(Entity.class, box, e -> e.isAlive() && !e.isSpectator())) {
+            boolean isPlayer = entity instanceof ServerPlayerEntity;
+            if (clientMasterActive && isPlayer) {
+                continue;
+            }
+            Vec3d center = entity.getBoundingBox().getCenter();
+            Vec3d velocity = sampleVelocity(region, region.origin(), center);
+            double forceScale = isPlayer ? PLAYER_FORCE_STRENGTH : strength;
+            Vec3d delta = velocity.multiply(forceScale);
+            if (delta.lengthSquared() < 1e-10) {
+                continue;
+            }
+            entity.addVelocity(delta.x, delta.y, delta.z);
+        }
+    }
+
+    private void syncPublishedFlowToPlayers(MinecraftServer server, PublishedFrame frame, int stride) {
+        int sampleStride = sanitizeStride(stride);
+        for (Map.Entry<WindowKey, PublishedRegion> entry : frame.regions().entrySet()) {
+            WindowKey key = entry.getKey();
+            ServerWorld world = server.getWorld(key.worldKey());
+            if (world == null) {
+                continue;
+            }
+            float[] sampled = sampleFlow(entry.getValue(), sampleStride);
+            AeroFlowPayload payload = new AeroFlowPayload(world.getRegistryKey().getValue(), key.origin(), sampleStride, sampled);
+            for (ServerPlayerEntity player : world.getPlayers()) {
+                ServerPlayNetworking.send(player, payload);
+            }
+        }
+    }
+
+    private Vec3d sampleVelocity(PublishedRegion region, BlockPos origin, Vec3d worldPos) {
+        double localX = worldPos.x - origin.getX();
+        double localY = worldPos.y - origin.getY();
+        double localZ = worldPos.z - origin.getZ();
+
+        if (localX < 0 || localY < 0 || localZ < 0 || localX >= GRID_SIZE - 1 || localY >= GRID_SIZE - 1 || localZ >= GRID_SIZE - 1) {
+            return Vec3d.ZERO;
+        }
+
+        int x0 = (int) Math.floor(localX);
+        int y0 = (int) Math.floor(localY);
+        int z0 = (int) Math.floor(localZ);
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        int z1 = z0 + 1;
+
+        float fx = (float) (localX - x0);
+        float fy = (float) (localY - y0);
+        float fz = (float) (localZ - z0);
+
+        Vec3d c000 = velocityAt(region, x0, y0, z0);
+        Vec3d c100 = velocityAt(region, x1, y0, z0);
+        Vec3d c010 = velocityAt(region, x0, y1, z0);
+        Vec3d c110 = velocityAt(region, x1, y1, z0);
+        Vec3d c001 = velocityAt(region, x0, y0, z1);
+        Vec3d c101 = velocityAt(region, x1, y0, z1);
+        Vec3d c011 = velocityAt(region, x0, y1, z1);
+        Vec3d c111 = velocityAt(region, x1, y1, z1);
+
+        Vec3d c00 = lerp(c000, c100, fx);
+        Vec3d c10 = lerp(c010, c110, fx);
+        Vec3d c01 = lerp(c001, c101, fx);
+        Vec3d c11 = lerp(c011, c111, fx);
+
+        Vec3d c0 = lerp(c00, c10, fy);
+        Vec3d c1 = lerp(c01, c11, fy);
+        return lerp(c0, c1, fz);
+    }
+
+    private Vec3d velocityAt(PublishedRegion region, int x, int y, int z) {
+        int cx = MathHelper.clamp(x, 0, GRID_SIZE - 1);
+        int cy = MathHelper.clamp(y, 0, GRID_SIZE - 1);
+        int cz = MathHelper.clamp(z, 0, GRID_SIZE - 1);
+        PublishedSection section = region.sectionAt(cx / CHUNK_SIZE, cy / CHUNK_SIZE, cz / CHUNK_SIZE);
+        if (section == null) {
+            return Vec3d.ZERO;
+        }
+        int localIndex = localSectionCellIndex(cx % CHUNK_SIZE, cy % CHUNK_SIZE, cz % CHUNK_SIZE) * RESPONSE_CHANNELS;
+        return new Vec3d(section.state[localIndex], section.state[localIndex + 1], section.state[localIndex + 2]);
+    }
+
+    private float[] sampleFlow(PublishedRegion region, int stride) {
+        int n = (GRID_SIZE + stride - 1) / stride;
+        float[] sampled = new float[n * n * n * RESPONSE_CHANNELS];
+        int dst = 0;
+        for (int x = 0; x < n; x++) {
+            int sx = Math.min(GRID_SIZE - 1, x * stride);
+            for (int y = 0; y < n; y++) {
+                int sy = Math.min(GRID_SIZE - 1, y * stride);
+                for (int z = 0; z < n; z++) {
+                    int sz = Math.min(GRID_SIZE - 1, z * stride);
+                    PublishedSection section = region.sectionAt(sx / CHUNK_SIZE, sy / CHUNK_SIZE, sz / CHUNK_SIZE);
+                    if (section == null) {
+                        sampled[dst] = 0.0f;
+                        sampled[dst + 1] = 0.0f;
+                        sampled[dst + 2] = 0.0f;
+                        sampled[dst + 3] = 0.0f;
+                    } else {
+                        int src = localSectionCellIndex(sx % CHUNK_SIZE, sy % CHUNK_SIZE, sz % CHUNK_SIZE) * RESPONSE_CHANNELS;
+                        sampled[dst] = section.state[src];
+                        sampled[dst + 1] = section.state[src + 1];
+                        sampled[dst + 2] = section.state[src + 2];
+                        sampled[dst + 3] = section.state[src + 3];
+                    }
+                    dst += RESPONSE_CHANNELS;
+                }
+            }
+        }
+        return sampled;
+    }
+
     private void releaseWindow(WindowState window) {
         if (!window.markReleased()) {
             return;
@@ -2724,6 +2958,9 @@ public final class AeroServerRuntime {
     }
 
     private record WindowKey(RegistryKey<World> worldKey, BlockPos origin) {
+    }
+
+    private record ActiveWindow(WindowKey key, WindowState window) {
     }
 
     private record SectionShift(int dx, int dy, int dz) {
@@ -2778,6 +3015,31 @@ public final class AeroServerRuntime {
     }
 
     private record SolveSanitizeResult(float maxSpeed, int invalidComponents) {
+    }
+
+    private record PublishedFrame(long frameId, float maxSpeed, Map<WindowKey, PublishedRegion> regions) {
+    }
+
+    private static final class PublishedRegion {
+        private final BlockPos origin;
+        private final PublishedSection[] sections;
+
+        private PublishedRegion(BlockPos origin, PublishedSection[] sections) {
+            this.origin = origin;
+            this.sections = sections;
+        }
+
+        private BlockPos origin() {
+            return origin;
+        }
+
+        private PublishedSection sectionAt(int sx, int sy, int sz) {
+            return sections[((sx * WINDOW_SECTION_COUNT + sy) * WINDOW_SECTION_COUNT + sz)];
+        }
+    }
+
+    private static final class PublishedSection {
+        private final float[] state = new float[SECTION_CELL_COUNT * RESPONSE_CHANNELS];
     }
 
     private static final class WindowState {
@@ -2930,5 +3192,109 @@ public final class AeroServerRuntime {
         private final float[] thermal = new float[SECTION_CELL_COUNT];
         private final float[] temperatureState = new float[SECTION_CELL_COUNT];
         private final float[] state = new float[SECTION_CELL_COUNT * RESPONSE_CHANNELS];
+    }
+
+    private final class SimulationCoordinator implements Runnable {
+        private final AtomicBoolean running = new AtomicBoolean(true);
+        private final Thread thread = new Thread(this, "aero-sim-coordinator");
+
+        private SimulationCoordinator() {
+            thread.setDaemon(true);
+        }
+
+        private void start() {
+            thread.start();
+        }
+
+        private boolean running() {
+            return running.get();
+        }
+
+        private void shutdown() {
+            running.set(false);
+            thread.interrupt();
+            try {
+                thread.join();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Override
+        public void run() {
+            while (running.get()) {
+                if (!streamingEnabled) {
+                    publishedFrame.set(null);
+                    sleepQuietly(5L);
+                    continue;
+                }
+
+                List<ActiveWindow> activeWindows = snapshotActiveWindowsForCoordinator();
+                if (activeWindows.isEmpty()) {
+                    publishedFrame.set(null);
+                    sleepQuietly(2L);
+                    continue;
+                }
+
+                synchronized (simulationStateLock) {
+                    applyCompletedResults(activeWindows);
+                    synchronizeRegionSeams(toWindowEntries(activeWindows));
+                    resetPendingBackends(activeWindows);
+                }
+
+                if (hasBusyWindow(activeWindows)) {
+                    sleepQuietly(1L);
+                    continue;
+                }
+
+                List<SolveSnapshot> scheduled;
+                synchronized (simulationStateLock) {
+                    scheduled = scheduleSolveCycle(activeWindows);
+                }
+                if (scheduled.isEmpty()) {
+                    sleepQuietly(1L);
+                    continue;
+                }
+
+                waitForScheduledSnapshots(scheduled);
+                if (!running.get()) {
+                    return;
+                }
+
+                synchronized (simulationStateLock) {
+                    float maxSpeedThisCycle = applyCompletedResults(activeWindows);
+                    synchronizeRegionSeams(toWindowEntries(activeWindows));
+                    resetPendingBackends(activeWindows);
+                    if (activeSetStillMatches(activeWindows)) {
+                        publishFrame(activeWindows, maxSpeedThisCycle);
+                    }
+                }
+            }
+        }
+
+        private boolean hasBusyWindow(List<ActiveWindow> activeWindows) {
+            for (ActiveWindow active : activeWindows) {
+                if (active.window().busy.get()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void sleepQuietly(long millis) {
+            try {
+                Thread.sleep(millis);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        private List<Map.Entry<WindowKey, WindowState>> toWindowEntries(List<ActiveWindow> activeWindows) {
+            List<Map.Entry<WindowKey, WindowState>> entries = new ArrayList<>(activeWindows.size());
+            for (ActiveWindow active : activeWindows) {
+                entries.add(Map.entry(active.key(), active.window()));
+            }
+            return entries;
+        }
     }
 }
