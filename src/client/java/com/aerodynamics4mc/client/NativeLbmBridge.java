@@ -128,6 +128,23 @@ public final class NativeLbmBridge {
         return nativeShiftContext(grid, contextKey, dx, dy, dz);
     }
 
+    public synchronized boolean exchangeHalo(
+        int grid,
+        long firstContextKey,
+        long secondContextKey,
+        int offsetX,
+        int offsetY,
+        int offsetZ
+    ) {
+        if (!initialized || !LOADED) {
+            return false;
+        }
+        if (grid != gridSize) {
+            return false;
+        }
+        return nativeExchangeHalo(grid, firstContextKey, secondContextKey, offsetX, offsetY, offsetZ);
+    }
+
     public synchronized String runtimeInfo() {
         if (!LOADED) {
             return "not_loaded";
@@ -176,6 +193,15 @@ public final class NativeLbmBridge {
     private static native void nativeReleaseContext(long contextKey);
 
     private static native boolean nativeShiftContext(int gridSize, long contextKey, int dx, int dy, int dz);
+
+    private static native boolean nativeExchangeHalo(
+        int gridSize,
+        long firstContextKey,
+        long secondContextKey,
+        int offsetX,
+        int offsetY,
+        int offsetZ
+    );
 
     private static native void nativeShutdown();
 

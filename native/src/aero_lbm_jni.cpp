@@ -170,7 +170,7 @@ constexpr float kFanNoiseAmp = 0.02f;
 constexpr float kFanSpeedSoftCap = 0.30f;
 constexpr float kFanSpeedDampWidth = 0.06f;
 constexpr float kFanPerpDamp = 1.0f;
-constexpr float kStateNudge = 0.0f;
+constexpr float kRuntimeStateNudge = 0.08f;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
 // Boussinesq approximation with an internal thermal scalar field.
@@ -602,6 +602,36 @@ enum BoundaryFaceIndex {
 inline bool benchmark_mode_active() {
     return g_benchmark_cfg.enabled != 0;
 }
+
+inline float effective_state_nudge() {
+    return benchmark_mode_active() ? 0.0f : kRuntimeStateNudge;
+}
+
+bool halo_exchange_slab_bounds(
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int nx,
+    int ny,
+    int nz,
+    int halo,
+    int core,
+    int* neg_src_x0,
+    int* neg_src_y0,
+    int* neg_src_z0,
+    int* pos_dst_x0,
+    int* pos_dst_y0,
+    int* pos_dst_z0,
+    int* pos_src_x0,
+    int* pos_src_y0,
+    int* pos_src_z0,
+    int* neg_dst_x0,
+    int* neg_dst_y0,
+    int* neg_dst_z0,
+    int* size_x,
+    int* size_y,
+    int* size_z
+);
 
 inline bool benchmark_flag_enabled(std::uint32_t flag) {
     return benchmark_mode_active() && (g_benchmark_cfg.flags & flag) != 0;
@@ -1873,9 +1903,10 @@ void collide(ContextState& ctx) {
         uy += 0.5f * duy;
         uz += 0.5f * duz;
 
-        ux = (1.0f - kStateNudge) * ux + kStateNudge * ctx.ref_ux[cell];
-        uy = (1.0f - kStateNudge) * uy + kStateNudge * ctx.ref_uy[cell];
-        uz = (1.0f - kStateNudge) * uz + kStateNudge * ctx.ref_uz[cell];
+        const float state_nudge = effective_state_nudge();
+        ux = (1.0f - state_nudge) * ux + state_nudge * ctx.ref_ux[cell];
+        uy = (1.0f - state_nudge) * uy + state_nudge * ctx.ref_uy[cell];
+        uz = (1.0f - state_nudge) * uz + state_nudge * ctx.ref_uz[cell];
         if (!finitef(ux) || !finitef(uy) || !finitef(uz)) {
             reseed_cell_from_reference(ctx, cell);
             continue;
@@ -2244,7 +2275,6 @@ __constant float FAN_NOISE_AMP = 0.02f;
 __constant float FAN_SPEED_SOFT_CAP = 0.30f;
 __constant float FAN_SPEED_DAMP_WIDTH = 0.06f;
 __constant float FAN_PERP_DAMP = 1.0f;
-__constant float STATE_NUDGE = 0.0f;
 __constant float MAX_SPEED = 0.34641016f;
 __constant float RHO_MIN = 0.97f;
 __constant float RHO_MAX = 1.03f;
@@ -2957,7 +2987,7 @@ kernel void stream_collide_hydro_forced_step(
     __global const float* payload,
     __global const float* temp_read,
     int in_ch, int nx, int ny, int nz, int cells, int tick, int benchmark_flags, int hydro_periodic_mask,
-    float tau_shear_eff, float tau_normal_eff, float boussinesq_beta_eff,
+    float tau_shear_eff, float tau_normal_eff, float boussinesq_beta_eff, float state_nudge,
     int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
     float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
     int benchmark_preset,
@@ -3071,9 +3101,9 @@ kernel void stream_collide_hydro_forced_step(
     ux += 0.5f * dux;
     uy += 0.5f * duy;
     uz += 0.5f * duz;
-    ux = mix(ux, payload[base + 5], STATE_NUDGE);
-    uy = mix(uy, payload[base + 6], STATE_NUDGE);
-    uz = mix(uz, payload[base + 7], STATE_NUDGE);
+    ux = mix(ux, payload[base + 5], state_nudge);
+    uy = mix(uy, payload[base + 6], state_nudge);
+    uz = mix(uz, payload[base + 7], state_nudge);
 
     float speed2 = ux * ux + uy * uy + uz * uz;
     if (speed2 > MAX_SPEED * MAX_SPEED) {
@@ -4274,23 +4304,25 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 8, sizeof(int), &tick_i32);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 9, sizeof(int), &benchmark_flags);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 10, sizeof(int), &hydro_periodic_mask);
+        const float state_nudge = effective_state_nudge();
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 11, sizeof(float), &tau_pair[0]);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 12, sizeof(float), &tau_pair[1]);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 13, sizeof(float), &thermal_transport[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 14, sizeof(int), &hydro_face_kinds[0]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 15, sizeof(int), &hydro_face_kinds[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 16, sizeof(int), &hydro_face_kinds[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 17, sizeof(int), &hydro_face_kinds[3]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 18, sizeof(int), &hydro_face_kinds[4]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 19, sizeof(int), &hydro_face_kinds[5]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 20, sizeof(OpenClFaceData), hydro_face_data[0].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 21, sizeof(OpenClFaceData), hydro_face_data[1].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 22, sizeof(OpenClFaceData), hydro_face_data[2].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 23, sizeof(OpenClFaceData), hydro_face_data[3].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 24, sizeof(OpenClFaceData), hydro_face_data[4].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 25, sizeof(OpenClFaceData), hydro_face_data[5].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 26, sizeof(int), &benchmark_preset);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 27, sizeof(cl_mem), &write_buf);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 14, sizeof(float), &state_nudge);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 15, sizeof(int), &hydro_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 16, sizeof(int), &hydro_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 17, sizeof(int), &hydro_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 18, sizeof(int), &hydro_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 19, sizeof(int), &hydro_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 20, sizeof(int), &hydro_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 21, sizeof(OpenClFaceData), hydro_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 22, sizeof(OpenClFaceData), hydro_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 23, sizeof(OpenClFaceData), hydro_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 24, sizeof(OpenClFaceData), hydro_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 25, sizeof(OpenClFaceData), hydro_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 26, sizeof(OpenClFaceData), hydro_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 27, sizeof(int), &benchmark_preset);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 28, sizeof(cl_mem), &write_buf);
         if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_stream_collide_hydro_forced)", err);
         err = enqueue_kernel_1d(g_opencl.k_stream_collide_hydro_forced, cells_i32);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_stream_collide_hydro_forced)", err);
@@ -4532,6 +4564,198 @@ bool sync_context_state_to_gpu(ContextState& ctx) {
     return true;
 }
 
+bool copy_buffer_face_slab(
+    cl_mem src,
+    std::size_t src_base_bytes,
+    cl_mem dst,
+    std::size_t dst_base_bytes,
+    int nx,
+    int ny,
+    int nz,
+    int src_x0,
+    int src_y0,
+    int src_z0,
+    int dst_x0,
+    int dst_y0,
+    int dst_z0,
+    int size_x,
+    int size_y,
+    int size_z,
+    const char* label
+) {
+    const std::size_t element_bytes = sizeof(float);
+    const std::size_t row_pitch = static_cast<std::size_t>(nz) * element_bytes;
+    const std::size_t slice_pitch = static_cast<std::size_t>(ny) * nz * element_bytes;
+    const std::size_t src_origin[3] = {
+        src_base_bytes + static_cast<std::size_t>(src_z0) * element_bytes,
+        static_cast<std::size_t>(src_y0),
+        static_cast<std::size_t>(src_x0)
+    };
+    const std::size_t dst_origin[3] = {
+        dst_base_bytes + static_cast<std::size_t>(dst_z0) * element_bytes,
+        static_cast<std::size_t>(dst_y0),
+        static_cast<std::size_t>(dst_x0)
+    };
+    const std::size_t region[3] = {
+        static_cast<std::size_t>(size_z) * element_bytes,
+        static_cast<std::size_t>(size_y),
+        static_cast<std::size_t>(size_x)
+    };
+    const cl_int err = clEnqueueCopyBufferRect(
+        g_opencl.queue,
+        src,
+        dst,
+        src_origin,
+        dst_origin,
+        region,
+        row_pitch,
+        slice_pitch,
+        row_pitch,
+        slice_pitch,
+        0,
+        nullptr,
+        nullptr
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error(label, err);
+        return false;
+    }
+    return true;
+}
+
+bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int offset_x, int offset_y, int offset_z) {
+    if (!first.gpu_buffers_ready || !second.gpu_buffers_ready
+        || !first.gpu_initialized || !second.gpu_initialized) {
+        return true;
+    }
+    if (first.nx != second.nx || first.ny != second.ny || first.nz != second.nz) return false;
+    const int nx = first.nx;
+    const int ny = first.ny;
+    const int nz = first.nz;
+    if (nx != ny || ny != nz) return false;
+    const int halo = std::max(1, nx / 4);
+    const int core = nx - halo * 2;
+    if (core <= 0) return false;
+
+    int neg_src_x0 = 0;
+    int neg_src_y0 = 0;
+    int neg_src_z0 = 0;
+    int pos_dst_x0 = 0;
+    int pos_dst_y0 = 0;
+    int pos_dst_z0 = 0;
+    int pos_src_x0 = 0;
+    int pos_src_y0 = 0;
+    int pos_src_z0 = 0;
+    int neg_dst_x0 = 0;
+    int neg_dst_y0 = 0;
+    int neg_dst_z0 = 0;
+    int size_x = 0;
+    int size_y = 0;
+    int size_z = 0;
+    if (!halo_exchange_slab_bounds(
+        offset_x,
+        offset_y,
+        offset_z,
+        nx,
+        ny,
+        nz,
+        halo,
+        core,
+        &neg_src_x0,
+        &neg_src_y0,
+        &neg_src_z0,
+        &pos_dst_x0,
+        &pos_dst_y0,
+        &pos_dst_z0,
+        &pos_src_x0,
+        &pos_src_y0,
+        &pos_src_z0,
+        &neg_dst_x0,
+        &neg_dst_y0,
+        &neg_dst_z0,
+        &size_x,
+        &size_y,
+        &size_z
+    )) {
+        return false;
+    }
+
+    const std::size_t plane_bytes = first.cells * sizeof(float);
+    cl_mem first_current = (first.step_counter % 2 == 0) ? first.d_f : first.d_f_post;
+    cl_mem second_current = (second.step_counter % 2 == 0) ? second.d_f : second.d_f_post;
+    for (int q = 0; q < kQ; ++q) {
+        const std::size_t base = static_cast<std::size_t>(q) * plane_bytes;
+        if (!copy_buffer_face_slab(
+            first_current, base,
+            second_current, base,
+            nx, ny, nz,
+            neg_src_x0, neg_src_y0, neg_src_z0,
+            pos_dst_x0, pos_dst_y0, pos_dst_z0,
+            size_x, size_y, size_z,
+            "clEnqueueCopyBufferRect(halo_f_first_to_second)"
+        )) {
+            return false;
+        }
+        if (!copy_buffer_face_slab(
+            second_current, base,
+            first_current, base,
+            nx, ny, nz,
+            pos_src_x0, pos_src_y0, pos_src_z0,
+            neg_dst_x0, neg_dst_y0, neg_dst_z0,
+            size_x, size_y, size_z,
+            "clEnqueueCopyBufferRect(halo_f_second_to_first)"
+        )) {
+            return false;
+        }
+    }
+
+    cl_mem first_temp_current = (first.step_counter % 2 == 0) ? first.d_temp : first.d_temp_next;
+    cl_mem second_temp_current = (second.step_counter % 2 == 0) ? second.d_temp : second.d_temp_next;
+    if (!copy_buffer_face_slab(
+        first_temp_current,
+        0,
+        second_temp_current,
+        0,
+        nx,
+        ny,
+        nz,
+        neg_src_x0,
+        neg_src_y0,
+        neg_src_z0,
+        pos_dst_x0,
+        pos_dst_y0,
+        pos_dst_z0,
+        size_x,
+        size_y,
+        size_z,
+        "clEnqueueCopyBufferRect(halo_temp_first_to_second)"
+    )) {
+        return false;
+    }
+    if (!copy_buffer_face_slab(
+        second_temp_current,
+        0,
+        first_temp_current,
+        0,
+        nx,
+        ny,
+        nz,
+        pos_src_x0,
+        pos_src_y0,
+        pos_src_z0,
+        neg_dst_x0,
+        neg_dst_y0,
+        neg_dst_z0,
+        size_x,
+        size_y,
+        size_z,
+        "clEnqueueCopyBufferRect(halo_temp_second_to_first)"
+    )) {
+        return false;
+    }
+    return true;
+}
+
 #else
 struct OpenClRuntime { bool available = false; std::string error; std::string device_name; };
 OpenClRuntime g_opencl;
@@ -4543,6 +4767,7 @@ bool sync_context_temperature_from_gpu(ContextState&) { return true; }
 bool sync_context_temperature_to_gpu(ContextState&) { return true; }
 bool sync_context_state_from_gpu(ContextState&) { return true; }
 bool sync_context_state_to_gpu(ContextState&) { return true; }
+bool exchange_context_halo_gpu(ContextState&, ContextState&, int, int, int) { return true; }
 #endif
 
 void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
@@ -4672,6 +4897,266 @@ void shift_population_field(
         }
     }
     field = std::move(shifted);
+}
+
+template <typename T>
+void copy_scalar_slab(
+    const std::vector<T>& src,
+    std::vector<T>& dst,
+    int nx,
+    int ny,
+    int nz,
+    int src_x0,
+    int src_y0,
+    int src_z0,
+    int dst_x0,
+    int dst_y0,
+    int dst_z0,
+    int size_x,
+    int size_y,
+    int size_z
+) {
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    if (src.size() != cells || dst.size() != cells) {
+        return;
+    }
+    for (int x = 0; x < size_x; ++x) {
+        for (int y = 0; y < size_y; ++y) {
+            for (int z = 0; z < size_z; ++z) {
+                const std::size_t src_cell = cell_index(src_x0 + x, src_y0 + y, src_z0 + z, nx, ny, nz);
+                const std::size_t dst_cell = cell_index(dst_x0 + x, dst_y0 + y, dst_z0 + z, nx, ny, nz);
+                dst[dst_cell] = src[src_cell];
+            }
+        }
+    }
+}
+
+template <std::size_t Q>
+void copy_population_slab(
+    const std::vector<float>& src,
+    std::vector<float>& dst,
+    int nx,
+    int ny,
+    int nz,
+    int src_x0,
+    int src_y0,
+    int src_z0,
+    int dst_x0,
+    int dst_y0,
+    int dst_z0,
+    int size_x,
+    int size_y,
+    int size_z
+) {
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    if (src.size() != cells * Q || dst.size() != cells * Q) {
+        return;
+    }
+    for (int x = 0; x < size_x; ++x) {
+        for (int y = 0; y < size_y; ++y) {
+            for (int z = 0; z < size_z; ++z) {
+                const std::size_t src_cell = cell_index(src_x0 + x, src_y0 + y, src_z0 + z, nx, ny, nz);
+                const std::size_t dst_cell = cell_index(dst_x0 + x, dst_y0 + y, dst_z0 + z, nx, ny, nz);
+                for (std::size_t q = 0; q < Q; ++q) {
+                    dst[q * cells + dst_cell] = src[q * cells + src_cell];
+                }
+            }
+        }
+    }
+}
+
+bool halo_exchange_slab_bounds(
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int nx,
+    int ny,
+    int nz,
+    int halo,
+    int core,
+    int* neg_src_x0,
+    int* neg_src_y0,
+    int* neg_src_z0,
+    int* pos_dst_x0,
+    int* pos_dst_y0,
+    int* pos_dst_z0,
+    int* pos_src_x0,
+    int* pos_src_y0,
+    int* pos_src_z0,
+    int* neg_dst_x0,
+    int* neg_dst_y0,
+    int* neg_dst_z0,
+    int* size_x,
+    int* size_y,
+    int* size_z
+) {
+    if (!neg_src_x0 || !neg_src_y0 || !neg_src_z0
+        || !pos_dst_x0 || !pos_dst_y0 || !pos_dst_z0
+        || !pos_src_x0 || !pos_src_y0 || !pos_src_z0
+        || !neg_dst_x0 || !neg_dst_y0 || !neg_dst_z0
+        || !size_x || !size_y || !size_z) {
+        return false;
+    }
+    auto fill_axis = [&](int offset, int extent, int* first_src, int* second_dst, int* second_src, int* first_dst, int* axis_size) {
+        switch (offset) {
+            case -1:
+                *first_src = halo;
+                *second_dst = extent - halo;
+                *second_src = core;
+                *first_dst = 0;
+                *axis_size = halo;
+                return true;
+            case 0:
+                *first_src = halo;
+                *second_dst = halo;
+                *second_src = halo;
+                *first_dst = halo;
+                *axis_size = core;
+                return true;
+            case 1:
+                *first_src = core;
+                *second_dst = 0;
+                *second_src = halo;
+                *first_dst = extent - halo;
+                *axis_size = halo;
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    return fill_axis(offset_x, nx, neg_src_x0, pos_dst_x0, pos_src_x0, neg_dst_x0, size_x)
+        && fill_axis(offset_y, ny, neg_src_y0, pos_dst_y0, pos_src_y0, neg_dst_y0, size_y)
+        && fill_axis(offset_z, nz, neg_src_z0, pos_dst_z0, pos_src_z0, neg_dst_z0, size_z);
+}
+
+bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int offset_x, int offset_y, int offset_z) {
+    if (first.cells == 0 || second.cells == 0) return true;
+    if (first.nx != second.nx || first.ny != second.ny || first.nz != second.nz) return false;
+    const int nx = first.nx;
+    const int ny = first.ny;
+    const int nz = first.nz;
+    if (nx != ny || ny != nz) return false;
+    const int halo = std::max(1, nx / 4);
+    const int core = nx - halo * 2;
+    if (core <= 0) return false;
+
+    int neg_src_x0 = 0;
+    int neg_src_y0 = 0;
+    int neg_src_z0 = 0;
+    int pos_dst_x0 = 0;
+    int pos_dst_y0 = 0;
+    int pos_dst_z0 = 0;
+    int pos_src_x0 = 0;
+    int pos_src_y0 = 0;
+    int pos_src_z0 = 0;
+    int neg_dst_x0 = 0;
+    int neg_dst_y0 = 0;
+    int neg_dst_z0 = 0;
+    int size_x = 0;
+    int size_y = 0;
+    int size_z = 0;
+    if (!halo_exchange_slab_bounds(
+        offset_x,
+        offset_y,
+        offset_z,
+        nx,
+        ny,
+        nz,
+        halo,
+        core,
+        &neg_src_x0,
+        &neg_src_y0,
+        &neg_src_z0,
+        &pos_dst_x0,
+        &pos_dst_y0,
+        &pos_dst_z0,
+        &pos_src_x0,
+        &pos_src_y0,
+        &pos_src_z0,
+        &neg_dst_x0,
+        &neg_dst_y0,
+        &neg_dst_z0,
+        &size_x,
+        &size_y,
+        &size_z
+    )) {
+        return false;
+    }
+
+    copy_population_slab<kQ>(
+        first.f,
+        second.f,
+        nx,
+        ny,
+        nz,
+        neg_src_x0,
+        neg_src_y0,
+        neg_src_z0,
+        pos_dst_x0,
+        pos_dst_y0,
+        pos_dst_z0,
+        size_x,
+        size_y,
+        size_z
+    );
+    copy_population_slab<kQ>(
+        second.f,
+        first.f,
+        nx,
+        ny,
+        nz,
+        pos_src_x0,
+        pos_src_y0,
+        pos_src_z0,
+        neg_dst_x0,
+        neg_dst_y0,
+        neg_dst_z0,
+        size_x,
+        size_y,
+        size_z
+    );
+    if (first.temperature.size() == first.cells && second.temperature.size() == second.cells) {
+        copy_scalar_slab(
+            first.temperature,
+            second.temperature,
+            nx,
+            ny,
+            nz,
+            neg_src_x0,
+            neg_src_y0,
+            neg_src_z0,
+            pos_dst_x0,
+            pos_dst_y0,
+            pos_dst_z0,
+            size_x,
+            size_y,
+            size_z
+        );
+        copy_scalar_slab(
+            second.temperature,
+            first.temperature,
+            nx,
+            ny,
+            nz,
+            pos_src_x0,
+            pos_src_y0,
+            pos_src_z0,
+            neg_dst_x0,
+            neg_dst_y0,
+            neg_dst_z0,
+            size_x,
+            size_y,
+            size_z
+        );
+        if (first.temperature_next.size() == first.cells) {
+            std::copy(first.temperature.begin(), first.temperature.end(), first.temperature_next.begin());
+        }
+        if (second.temperature_next.size() == second.cells) {
+            std::copy(second.temperature.begin(), second.temperature.end(), second.temperature_next.begin());
+        }
+    }
+    return true;
 }
 
 bool shift_context_cpu_state(ContextState& ctx, int dx, int dy, int dz) {
@@ -4955,6 +5440,36 @@ static jboolean native_shift_context_impl(jint grid_size, jlong context_key, jin
     return JNI_TRUE;
 }
 
+static jboolean native_exchange_halo_impl(
+    jint grid_size,
+    jlong first_context_key,
+    jlong second_context_key,
+    jint offset_x,
+    jint offset_y,
+    jint offset_z
+) {
+    if (!g_cfg.initialized || grid_size != g_cfg.grid_size) return JNI_FALSE;
+    if (offset_x < -1 || offset_x > 1 || offset_y < -1 || offset_y > 1 || offset_z < -1 || offset_z > 1) {
+        return JNI_FALSE;
+    }
+    if (offset_x == 0 && offset_y == 0 && offset_z == 0) {
+        return JNI_FALSE;
+    }
+    auto first_it = g_contexts.find(first_context_key);
+    auto second_it = g_contexts.find(second_context_key);
+    if (first_it == g_contexts.end() || second_it == g_contexts.end()) return JNI_FALSE;
+    ContextState& first = first_it->second;
+    ContextState& second = second_it->second;
+    const std::size_t cells = configured_cells();
+    ensure_context_shape(first, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(second, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (first.cells == 0 || second.cells == 0) return JNI_TRUE;
+    if (g_cfg.opencl_enabled) {
+        return exchange_context_halo_gpu(first, second, offset_x, offset_y, offset_z) ? JNI_TRUE : JNI_FALSE;
+    }
+    return exchange_context_halo_cpu(first, second, offset_x, offset_y, offset_z) ? JNI_TRUE : JNI_FALSE;
+}
+
 static void native_release_context_impl(jlong context_key) {
     auto it = g_contexts.find(context_key);
     if (it != g_contexts.end()) { clear_context(it->second); g_contexts.erase(it); }
@@ -5021,6 +5536,24 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny,
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_shift_context(int grid_size, long long context_key, int dx, int dy, int dz) {
     return native_shift_context_impl(grid_size, static_cast<jlong>(context_key), dx, dy, dz) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
+    int grid_size,
+    long long first_context_key,
+    long long second_context_key,
+    int offset_x,
+    int offset_y,
+    int offset_z
+) {
+    return native_exchange_halo_impl(
+        grid_size,
+        static_cast<jlong>(first_context_key),
+        static_cast<jlong>(second_context_key),
+        offset_x,
+        offset_y,
+        offset_z
+    ) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature) {
@@ -5149,6 +5682,17 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nati
     JNIEnv*, jclass, jint grid_size, jlong context_key, jint dx, jint dy, jint dz
 ) {
     return native_shift_context_impl(grid_size, context_key, dx, dy, dz);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeExchangeHalo(
+    JNIEnv*, jclass, jint grid_size, jlong first_context_key, jlong second_context_key, jint offset_x, jint offset_y, jint offset_z
+) {
+    return native_exchange_halo_impl(grid_size, first_context_key, second_context_key, offset_x, offset_y, offset_z);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeExchangeHalo(
+    JNIEnv*, jclass, jint grid_size, jlong first_context_key, jlong second_context_key, jint offset_x, jint offset_y, jint offset_z
+) {
+    return native_exchange_halo_impl(grid_size, first_context_key, second_context_key, offset_x, offset_y, offset_z);
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeGetTemperatureState(

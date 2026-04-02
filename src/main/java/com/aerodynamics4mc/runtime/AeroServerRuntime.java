@@ -65,7 +65,7 @@ import net.minecraft.world.chunk.WorldChunk;
 
 public final class AeroServerRuntime {
     private static final String LOG_PREFIX = "[aerodynamics4mc] ";
-    private static final int GRID_SIZE = 128;
+    private static final int GRID_SIZE = 64;
     private static final int TICKS_PER_SECOND = 20;
     private static final float DOMAIN_SIZE_METERS = 4.0f;
     private static final float SOLVER_STEP_SECONDS = 1.0f / TICKS_PER_SECOND;
@@ -143,6 +143,11 @@ public final class AeroServerRuntime {
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
     private static final float WINDOW_EDGE_STABILIZATION_MIN_KEEP = 0.15f;
+    private static final int REGION_HALO_CELLS = CHUNK_SIZE;
+    private static final int REGION_CORE_SIZE = GRID_SIZE - REGION_HALO_CELLS * 2;
+    private static final int REGION_LATTICE_STRIDE = REGION_CORE_SIZE;
+    private static final int REGION_ACTIVE_RADIUS = 1;
+    private static final int REGION_ACTIVE_RADIUS_Y = 1;
     private static final int WINDOW_STICKY_MARGIN_SECTIONS = 2;
     private static final int WINDOW_STICKY_MARGIN_BLOCKS = WINDOW_STICKY_MARGIN_SECTIONS * CHUNK_SIZE;
 
@@ -471,6 +476,7 @@ public final class AeroServerRuntime {
         boolean shouldSyncFlow = debugEnabled && (tickCounter % FLOW_SYNC_INTERVAL_TICKS == 0);
         boolean steppedThisTick = false;
         float maxSpeedThisTick = 0.0f;
+        List<Map.Entry<WindowKey, WindowState>> activeWindows = new ArrayList<>(windows.size());
         Iterator<Map.Entry<WindowKey, WindowState>> it = windows.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<WindowKey, WindowState> entry = it.next();
@@ -497,7 +503,18 @@ public final class AeroServerRuntime {
                     markWindowBackendDirty(window);
                 }
             }
+            activeWindows.add(entry);
+        }
 
+        synchronizeRegionSeams(activeWindows);
+
+        for (Map.Entry<WindowKey, WindowState> entry : activeWindows) {
+            WindowKey key = entry.getKey();
+            WindowState window = entry.getValue();
+            ServerWorld world = server.getWorld(key.worldKey());
+            if (world == null) {
+                continue;
+            }
             if (window.sections != null) {
                 applyForces(world, key.origin(), window, FORCE_STRENGTH, clientMasterActive);
                 if (shouldSyncFlow) {
@@ -608,28 +625,8 @@ public final class AeroServerRuntime {
             if (window != null) {
                 consumed.add(key);
             } else {
-                WindowKey slidingSourceKey = forceResample ? null : findSlidingSourceWindowKey(key, consumed);
-                if (slidingSourceKey != null) {
-                    window = windows.get(slidingSourceKey);
-                    consumed.add(slidingSourceKey);
-                    applyPendingSolveResult(window, slidingSourceKey.origin());
-                    captureTemperatureStateFromNative(window);
-                    if (!slideWindowSections(world, window, slidingSourceKey.origin(), key.origin())) {
-                        saveWindowStateToCache(world, slidingSourceKey.origin(), window);
-                        reloadWindowFromWorldState(world, key.origin(), window);
-                        markWindowBackendDirty(window);
-                    } else {
-                        boolean shiftedNative = shiftNativeWindowBackend(window, slidingSourceKey.origin(), key.origin());
-                        clearWindowPressureForExposedFringe(window, sectionShift(slidingSourceKey.origin(), key.origin()));
-                        stabilizeWindowEdges(window);
-                        if (!shiftedNative) {
-                            markWindowBackendDirty(window);
-                        }
-                    }
-                } else {
-                    window = new WindowState(nextContextId++);
-                    reloadWindowFromWorldState(world, key.origin(), window);
-                }
+                window = new WindowState(nextContextId++);
+                reloadWindowFromWorldState(world, key.origin(), window);
             }
 
             if (forceResample) {
@@ -780,13 +777,197 @@ public final class AeroServerRuntime {
     }
 
     private boolean hasWindowOriginShifted(MinecraftServer server) {
-        Set<WindowKey> expected = new HashSet<>();
-        for (ServerWorld world : server.getWorlds()) {
-            for (ServerPlayerEntity player : world.getPlayers()) {
-                expected.add(new WindowKey(world.getRegistryKey(), anchoredWindowOrigin(world.getRegistryKey(), player.getBlockPos())));
+        return !activeRegionKeys(server).equals(windows.keySet());
+    }
+
+    private void synchronizeRegionSeams(List<Map.Entry<WindowKey, WindowState>> activeWindows) {
+        if (activeWindows.isEmpty()) {
+            return;
+        }
+        Map<WindowKey, WindowState> activeByKey = new HashMap<>(activeWindows.size());
+        for (Map.Entry<WindowKey, WindowState> entry : activeWindows) {
+            activeByKey.put(entry.getKey(), entry.getValue());
+        }
+        for (Map.Entry<WindowKey, WindowState> entry : activeWindows) {
+            WindowKey key = entry.getKey();
+            WindowState window = entry.getValue();
+            if (window.sections == null || window.busy.get()) {
+                continue;
+            }
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (!isPositiveNeighborOffset(dx, dy, dz)) {
+                            continue;
+                        }
+                        synchronizePositiveNeighbor(activeByKey, key, window, dx, dy, dz);
+                    }
+                }
             }
         }
-        return !expected.equals(windows.keySet());
+    }
+
+    private boolean isPositiveNeighborOffset(int dx, int dy, int dz) {
+        if (dx == 0 && dy == 0 && dz == 0) {
+            return false;
+        }
+        return dx > 0 || (dx == 0 && dy > 0) || (dx == 0 && dy == 0 && dz > 0);
+    }
+
+    private void synchronizePositiveNeighbor(
+        Map<WindowKey, WindowState> activeByKey,
+        WindowKey key,
+        WindowState window,
+        int dx,
+        int dy,
+        int dz
+    ) {
+        BlockPos neighborOrigin = key.origin().add(
+            dx * REGION_LATTICE_STRIDE,
+            dy * REGION_LATTICE_STRIDE,
+            dz * REGION_LATTICE_STRIDE
+        );
+        WindowKey neighborKey = new WindowKey(key.worldKey(), neighborOrigin);
+        WindowState neighbor = activeByKey.get(neighborKey);
+        if (neighbor == null
+            || neighbor.sections == null
+            || neighbor.busy.get()
+            || window.backendResetPending()
+            || neighbor.backendResetPending()) {
+            return;
+        }
+        synchronizeNeighborHalo(window, neighbor, dx, dy, dz);
+    }
+
+    private void synchronizeNeighborHalo(WindowState first, WindowState second, int offsetX, int offsetY, int offsetZ) {
+        boolean nativeHaloSynced = false;
+        if (backendMode == BackendMode.NATIVE
+            && nativeBackend.isLoaded()
+            && nativeBackend.ensureInitialized(GRID_SIZE, CHANNELS, RESPONSE_CHANNELS)) {
+            nativeHaloSynced = nativeBackend.exchangeHalo(
+                GRID_SIZE,
+                first.nativeContextId,
+                second.nativeContextId,
+                offsetX,
+                offsetY,
+                offsetZ
+            );
+            if (!nativeHaloSynced && lastSolverError.isEmpty()) {
+                lastSolverError = "Native halo exchange failed for offset "
+                    + offsetX + "," + offsetY + "," + offsetZ;
+            }
+        }
+        copyNeighborHaloPrism(first, second, offsetX, offsetY, offsetZ);
+        copyNeighborHaloPrism(second, first, -offsetX, -offsetY, -offsetZ);
+        if (!nativeHaloSynced) {
+            first.markTemperatureRestorePending();
+            second.markTemperatureRestorePending();
+        }
+    }
+
+    private void copyNeighborHaloPrism(WindowState srcWindow, WindowState dstWindow, int offsetX, int offsetY, int offsetZ) {
+        int[] srcStart = new int[3];
+        int[] dstStart = new int[3];
+        int[] size = new int[3];
+        if (!fillNeighborHaloBounds(offsetX, offsetY, offsetZ, srcStart, dstStart, size)) {
+            return;
+        }
+        copySlab(
+            srcWindow,
+            dstWindow,
+            srcStart[0],
+            srcStart[1],
+            srcStart[2],
+            dstStart[0],
+            dstStart[1],
+            dstStart[2],
+            size[0],
+            size[1],
+            size[2]
+        );
+    }
+
+    private boolean fillNeighborHaloBounds(
+        int offsetX,
+        int offsetY,
+        int offsetZ,
+        int[] srcStart,
+        int[] dstStart,
+        int[] size
+    ) {
+        if (srcStart.length < 3 || dstStart.length < 3 || size.length < 3) {
+            return false;
+        }
+        return fillNeighborAxisBounds(offsetX, srcStart, dstStart, size, 0)
+            && fillNeighborAxisBounds(offsetY, srcStart, dstStart, size, 1)
+            && fillNeighborAxisBounds(offsetZ, srcStart, dstStart, size, 2);
+    }
+
+    private boolean fillNeighborAxisBounds(int offset, int[] srcStart, int[] dstStart, int[] size, int axis) {
+        switch (offset) {
+            case -1 -> {
+                srcStart[axis] = REGION_HALO_CELLS;
+                dstStart[axis] = GRID_SIZE - REGION_HALO_CELLS;
+                size[axis] = REGION_HALO_CELLS;
+                return true;
+            }
+            case 0 -> {
+                srcStart[axis] = REGION_HALO_CELLS;
+                dstStart[axis] = REGION_HALO_CELLS;
+                size[axis] = REGION_CORE_SIZE;
+                return true;
+            }
+            case 1 -> {
+                srcStart[axis] = REGION_CORE_SIZE;
+                dstStart[axis] = 0;
+                size[axis] = REGION_HALO_CELLS;
+                return true;
+            }
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    private void copySlab(
+        WindowState srcWindow,
+        WindowState dstWindow,
+        int srcX0,
+        int srcY0,
+        int srcZ0,
+        int dstX0,
+        int dstY0,
+        int dstZ0,
+        int sizeX,
+        int sizeY,
+        int sizeZ
+    ) {
+        for (int x = 0; x < sizeX; x++) {
+            int srcX = srcX0 + x;
+            int dstX = dstX0 + x;
+            for (int y = 0; y < sizeY; y++) {
+                int srcY = srcY0 + y;
+                int dstY = dstY0 + y;
+                for (int z = 0; z < sizeZ; z++) {
+                    int srcZ = srcZ0 + z;
+                    int dstZ = dstZ0 + z;
+                    WindowSection srcSection = srcWindow.sectionAt(srcX / CHUNK_SIZE, srcY / CHUNK_SIZE, srcZ / CHUNK_SIZE);
+                    WindowSection dstSection = dstWindow.sectionAt(dstX / CHUNK_SIZE, dstY / CHUNK_SIZE, dstZ / CHUNK_SIZE);
+                    if (srcSection == null || dstSection == null) {
+                        continue;
+                    }
+                    int srcLocal = localSectionCellIndex(srcX % CHUNK_SIZE, srcY % CHUNK_SIZE, srcZ % CHUNK_SIZE);
+                    int dstLocal = localSectionCellIndex(dstX % CHUNK_SIZE, dstY % CHUNK_SIZE, dstZ % CHUNK_SIZE);
+                    int srcState = srcLocal * RESPONSE_CHANNELS;
+                    int dstState = dstLocal * RESPONSE_CHANNELS;
+                    dstSection.state[dstState] = srcSection.state[srcState];
+                    dstSection.state[dstState + 1] = srcSection.state[srcState + 1];
+                    dstSection.state[dstState + 2] = srcSection.state[srcState + 2];
+                    dstSection.state[dstState + 3] = srcSection.state[srcState + 3];
+                    dstSection.temperatureState[dstLocal] = srcSection.temperatureState[srcLocal];
+                }
+            }
+        }
     }
 
     private boolean loadWindowStateFromCache(ServerWorld world, BlockPos origin, WindowState window) {
@@ -824,8 +1005,6 @@ public final class AeroServerRuntime {
     private void reloadWindowFromWorldState(ServerWorld world, BlockPos origin, WindowState window) {
         refreshSampleFields(world, origin, window, true);
         loadWindowStateFromCache(world, origin, window);
-        clearWindowPressure(window);
-        stabilizeWindowEdges(window);
         window.markTemperatureRestorePending();
     }
 
@@ -1108,12 +1287,8 @@ public final class AeroServerRuntime {
 
     private Map<WindowKey, List<FanSource>> scanFanSources(MinecraftServer server) {
         Map<WindowKey, List<FanSource>> fansByWindow = new HashMap<>();
-        for (ServerWorld world : server.getWorlds()) {
-            for (ServerPlayerEntity player : world.getPlayers()) {
-                BlockPos origin = anchoredWindowOrigin(world.getRegistryKey(), player.getBlockPos());
-                WindowKey key = new WindowKey(world.getRegistryKey(), origin);
-                fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
-            }
+        for (WindowKey key : activeRegionKeys(server)) {
+            fansByWindow.computeIfAbsent(key, ignored -> new ArrayList<>());
         }
 
         if (fansByWindow.isEmpty()) {
@@ -1163,6 +1338,29 @@ public final class AeroServerRuntime {
         return fansByWindow;
     }
 
+    private Set<WindowKey> activeRegionKeys(MinecraftServer server) {
+        Set<WindowKey> keys = new HashSet<>();
+        for (ServerWorld world : server.getWorlds()) {
+            RegistryKey<World> worldKey = world.getRegistryKey();
+            for (ServerPlayerEntity player : world.getPlayers()) {
+                BlockPos baseCore = coreOriginForPosition(player.getBlockPos());
+                for (int dx = -REGION_ACTIVE_RADIUS; dx <= REGION_ACTIVE_RADIUS; dx++) {
+                    for (int dy = -REGION_ACTIVE_RADIUS_Y; dy <= REGION_ACTIVE_RADIUS_Y; dy++) {
+                        for (int dz = -REGION_ACTIVE_RADIUS; dz <= REGION_ACTIVE_RADIUS; dz++) {
+                            BlockPos coreOrigin = new BlockPos(
+                                baseCore.getX() + dx * REGION_LATTICE_STRIDE,
+                                baseCore.getY() + dy * REGION_LATTICE_STRIDE,
+                                baseCore.getZ() + dz * REGION_LATTICE_STRIDE
+                            );
+                            keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(coreOrigin)));
+                        }
+                    }
+                }
+            }
+        }
+        return keys;
+    }
+
     private void addFanToContainingWindows(
         Map<WindowKey, List<FanSource>> fansByWindow,
         RegistryKey<World> worldKey,
@@ -1191,6 +1389,28 @@ public final class AeroServerRuntime {
         return pos.getX() >= minX && pos.getX() < maxX
             && pos.getY() >= minY && pos.getY() < maxY
             && pos.getZ() >= minZ && pos.getZ() < maxZ;
+    }
+
+    private BlockPos coreOriginForPosition(BlockPos pos) {
+        int x = Math.floorDiv(pos.getX(), REGION_LATTICE_STRIDE) * REGION_LATTICE_STRIDE;
+        int y = Math.floorDiv(pos.getY(), REGION_LATTICE_STRIDE) * REGION_LATTICE_STRIDE;
+        int z = Math.floorDiv(pos.getZ(), REGION_LATTICE_STRIDE) * REGION_LATTICE_STRIDE;
+        return new BlockPos(x, y, z);
+    }
+
+    private BlockPos windowOriginFromCoreOrigin(BlockPos coreOrigin) {
+        return coreOrigin.add(-REGION_HALO_CELLS, -REGION_HALO_CELLS, -REGION_HALO_CELLS);
+    }
+
+    private Box coreBounds(BlockPos origin) {
+        return new Box(
+            origin.getX() + REGION_HALO_CELLS,
+            origin.getY() + REGION_HALO_CELLS,
+            origin.getZ() + REGION_HALO_CELLS,
+            origin.getX() + REGION_HALO_CELLS + REGION_CORE_SIZE,
+            origin.getY() + REGION_HALO_CELLS + REGION_CORE_SIZE,
+            origin.getZ() + REGION_HALO_CELLS + REGION_CORE_SIZE
+        );
     }
 
     private BlockPos centerWindowOnPlayer(BlockPos pos) {
@@ -2141,14 +2361,7 @@ public final class AeroServerRuntime {
     }
 
     private void applyForces(ServerWorld world, BlockPos origin, WindowState window, double strength, boolean clientMasterActive) {
-        Box box = new Box(
-            origin.getX(),
-            origin.getY(),
-            origin.getZ(),
-            origin.getX() + GRID_SIZE,
-            origin.getY() + GRID_SIZE,
-            origin.getZ() + GRID_SIZE
-        );
+        Box box = coreBounds(origin);
 
         for (Entity entity : world.getEntitiesByClass(Entity.class, box, e -> e.isAlive() && !e.isSpectator())) {
             boolean isPlayer = entity instanceof ServerPlayerEntity;

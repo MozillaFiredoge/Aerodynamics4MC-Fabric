@@ -112,6 +112,14 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_step(const float* packet, int grid_size, long 
 AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_channels, int output_channels);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny, int nz, long long context_key, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_shift_context(int grid_size, long long context_key, int dx, int dy, int dz);
+AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
+    int grid_size,
+    long long first_context_key,
+    long long second_context_key,
+    int offset_x,
+    int offset_y,
+    int offset_z
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz);
 AERO_LBM_CAPI_EXPORT void aero_lbm_release_context(long long context_key);
