@@ -19,13 +19,15 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 
 public class AeroClientMod implements ClientModInitializer {
-    private static final int GRID_SIZE = 128;
+    private static final int GRID_SIZE = 64;
     private static final float DEFAULT_MAX_INFLOW_SPEED = 8.0f;
     private static final int DEFAULT_BACKEND_MODE = 1;
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final double PLAYER_PREDICTION_FORCE_STRENGTH = 0.02;
     private static final double PARTICLE_FORCE_STRENGTH = 0.02;
     private static final int REMOTE_WINDOW_STALE_TICKS = 20;
+    private static final int REGION_HALO_CELLS = GRID_SIZE / 4;
+    private static final int REGION_CORE_SIZE = GRID_SIZE - REGION_HALO_CELLS * 2;
 
     private final Map<WindowKey, WindowView> remoteWindows = new HashMap<>();
     private final ClientFluidRuntime clientFluidRuntime = new ClientFluidRuntime(GRID_SIZE);
@@ -96,11 +98,10 @@ public class AeroClientMod implements ClientModInitializer {
         }
 
         Identifier currentDimension = client.world.getRegistryKey().getValue();
-        for (Map.Entry<WindowKey, WindowView> entry : remoteWindows.entrySet()) {
-            if (!entry.getKey().dimensionId().equals(currentDimension)) {
-                continue;
-            }
-            FlowRenderer renderer = entry.getValue().renderer();
+        Vec3d center = client.player != null ? client.player.getBoundingBox().getCenter() : client.gameRenderer.getCamera().getCameraPos();
+        WindowView view = findWindowView(currentDimension, center);
+        if (view != null) {
+            FlowRenderer renderer = view.renderer();
             renderer.setMaxInflowSpeed(maxWindSpeed);
             renderer.setStreamlineSampleStride(streamlineSampleStride);
             renderer.setRenderVelocityVectors(renderVelocityVectors);
@@ -194,7 +195,7 @@ public class AeroClientMod implements ClientModInitializer {
             if (!key.dimensionId().equals(dimensionId)) {
                 continue;
             }
-            if (isInsideWindow(key.origin(), worldPos)) {
+            if (isInsideCore(key.origin(), worldPos)) {
                 WindowView view = entry.getValue();
                 view.origin = key.origin();
                 return view;
@@ -203,10 +204,10 @@ public class AeroClientMod implements ClientModInitializer {
         return null;
     }
 
-    private boolean isInsideWindow(BlockPos origin, Vec3d worldPos) {
-        return worldPos.x >= origin.getX() && worldPos.x < origin.getX() + GRID_SIZE
-            && worldPos.y >= origin.getY() && worldPos.y < origin.getY() + GRID_SIZE
-            && worldPos.z >= origin.getZ() && worldPos.z < origin.getZ() + GRID_SIZE;
+    private boolean isInsideCore(BlockPos origin, Vec3d worldPos) {
+        return worldPos.x >= origin.getX() + REGION_HALO_CELLS && worldPos.x < origin.getX() + REGION_HALO_CELLS + REGION_CORE_SIZE
+            && worldPos.y >= origin.getY() + REGION_HALO_CELLS && worldPos.y < origin.getY() + REGION_HALO_CELLS + REGION_CORE_SIZE
+            && worldPos.z >= origin.getZ() + REGION_HALO_CELLS && worldPos.z < origin.getZ() + REGION_HALO_CELLS + REGION_CORE_SIZE;
     }
 
     private void clearState() {

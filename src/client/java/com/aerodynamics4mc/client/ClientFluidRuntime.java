@@ -76,6 +76,7 @@ final class ClientFluidRuntime {
     private static final int FAN_SCAN_RADIUS = 48;
     private static final int CHUNK_SIZE = 16;
     private static final int SOLVER_WORKER_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+    private static final int REGION_HALO_RATIO = 4;
 
     private static final int DEFAULT_STREAMLINE_STRIDE = 4;
     private static final float NATIVE_VELOCITY_SCALE = 30.0f;
@@ -268,7 +269,9 @@ final class ClientFluidRuntime {
             return;
         }
 
-        for (WindowState window : windows.values()) {
+        Vec3d center = client.player != null ? client.player.getBoundingBox().getCenter() : client.gameRenderer.getCamera().getCameraPos();
+        WindowState window = findWindowContaining(center);
+        if (window != null) {
             window.renderer.setMaxInflowSpeed(maxWindSpeed);
             window.renderer.setStreamlineSampleStride(streamlineSampleStride);
             window.renderer.setRenderVelocityVectors(renderVelocityVectors);
@@ -372,11 +375,19 @@ final class ClientFluidRuntime {
 
     private WindowState findWindowContaining(Vec3d worldPos) {
         for (Map.Entry<WindowKey, WindowState> entry : windows.entrySet()) {
-            if (isInsideWindow(worldPos, entry.getKey().origin(), 0)) {
+            if (isInsideCore(worldPos, entry.getKey().origin())) {
                 return entry.getValue();
             }
         }
         return null;
+    }
+
+    private boolean isInsideCore(Vec3d pos, BlockPos origin) {
+        int halo = gridSize / REGION_HALO_RATIO;
+        int core = gridSize - halo * 2;
+        return pos.x >= origin.getX() + halo && pos.x < origin.getX() + halo + core
+            && pos.y >= origin.getY() + halo && pos.y < origin.getY() + halo + core
+            && pos.z >= origin.getZ() + halo && pos.z < origin.getZ() + halo + core;
     }
 
     private boolean shouldResampleWindowSamples(WindowState window) {

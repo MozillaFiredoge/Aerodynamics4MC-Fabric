@@ -98,7 +98,7 @@ public final class AeroServerRuntime {
     private static final int RESPONSE_CHANNELS = 4;
     private static final int FLOW_COUNT = GRID_SIZE * GRID_SIZE * GRID_SIZE * RESPONSE_CHANNELS;
 
-    private static final int WINDOW_REFRESH_TICKS = 20;
+    private static final int WINDOW_REFRESH_TICKS = 100;
     private static final int WINDOW_SAMPLE_RESYNC_TICKS = 200;
     private static final int FLOW_SYNC_INTERVAL_TICKS = 2;
     private static final int CHUNK_SIZE = 16;
@@ -492,6 +492,7 @@ public final class AeroServerRuntime {
             SolveResult completed = consumeCompletedSolveResult(window, key.origin());
             if (completed != null) {
                 applyStateFieldFromResponse(window, completed.flow());
+                window.markSeamSyncPending();
                 steppedThisTick = true;
                 maxSpeedThisTick = Math.max(maxSpeedThisTick, completed.maxSpeed());
                 lastSolverError = "";
@@ -785,8 +786,15 @@ public final class AeroServerRuntime {
             return;
         }
         Map<WindowKey, WindowState> activeByKey = new HashMap<>(activeWindows.size());
+        List<WindowState> pendingWindows = new ArrayList<>();
         for (Map.Entry<WindowKey, WindowState> entry : activeWindows) {
             activeByKey.put(entry.getKey(), entry.getValue());
+            if (entry.getValue().seamSyncPending()) {
+                pendingWindows.add(entry.getValue());
+            }
+        }
+        if (pendingWindows.isEmpty()) {
+            return;
         }
         for (Map.Entry<WindowKey, WindowState> entry : activeWindows) {
             WindowKey key = entry.getKey();
@@ -804,6 +812,9 @@ public final class AeroServerRuntime {
                     }
                 }
             }
+        }
+        for (WindowState window : pendingWindows) {
+            window.clearSeamSyncPending();
         }
     }
 
@@ -857,9 +868,9 @@ public final class AeroServerRuntime {
                     + offsetX + "," + offsetY + "," + offsetZ;
             }
         }
-        copyNeighborHaloPrism(first, second, offsetX, offsetY, offsetZ);
-        copyNeighborHaloPrism(second, first, -offsetX, -offsetY, -offsetZ);
         if (!nativeHaloSynced) {
+            copyNeighborHaloPrism(first, second, offsetX, offsetY, offsetZ);
+            copyNeighborHaloPrism(second, first, -offsetX, -offsetY, -offsetZ);
             first.markTemperatureRestorePending();
             second.markTemperatureRestorePending();
         }
@@ -1006,6 +1017,7 @@ public final class AeroServerRuntime {
         refreshSampleFields(world, origin, window, true);
         loadWindowStateFromCache(world, origin, window);
         window.markTemperatureRestorePending();
+        window.markSeamSyncPending();
     }
 
     private void saveWindowStateToCache(ServerWorld world, BlockPos origin, WindowState window) {
@@ -2358,6 +2370,7 @@ public final class AeroServerRuntime {
                 }
             }
         }
+        window.markSeamSyncPending();
     }
 
     private void applyForces(ServerWorld world, BlockPos origin, WindowState window, double strength, boolean clientMasterActive) {
@@ -2786,6 +2799,7 @@ public final class AeroServerRuntime {
         private volatile boolean detached;
         private volatile boolean backendResetPending;
         private volatile boolean temperatureRestorePending = true;
+        private volatile boolean seamSyncPending = true;
 
         private WindowState(long nativeContextId) {
             this.nativeContextId = nativeContextId;
@@ -2891,6 +2905,18 @@ public final class AeroServerRuntime {
 
         private void clearTemperatureRestorePending() {
             temperatureRestorePending = false;
+        }
+
+        private void markSeamSyncPending() {
+            seamSyncPending = true;
+        }
+
+        private void clearSeamSyncPending() {
+            seamSyncPending = false;
+        }
+
+        private boolean seamSyncPending() {
+            return seamSyncPending;
         }
 
         private boolean markReleased() {

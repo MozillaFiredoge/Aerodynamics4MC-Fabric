@@ -18,6 +18,8 @@ public class FlowRenderer {
     private static final int MIN_VECTOR_FIELD_STRIDE = 2;
 
     private final int gridSize;
+    private final int coreStart;
+    private final int coreEnd;
     private float maxInflowSpeed;
 
     private float[] flowField;
@@ -31,6 +33,8 @@ public class FlowRenderer {
 
     public FlowRenderer(int gridSize, float maxInflowSpeed) {
         this.gridSize = gridSize;
+        this.coreStart = gridSize / 4;
+        this.coreEnd = gridSize - coreStart;
         this.maxInflowSpeed = Math.max(MIN_SPEED, maxInflowSpeed);
         this.sampleStride = 4;
         this.streamlineSampleStride = 4;
@@ -139,9 +143,9 @@ public class FlowRenderer {
         var entry = matrices.peek();
         Matrix4f matrix = entry.getPositionMatrix();
 
-        for (int x = 0; x < gridSize; x += stride) {
-            for (int y = 0; y < gridSize; y += stride) {
-                for (int z = 0; z < gridSize; z += stride) {
+        for (int x = coreStart; x < coreEnd; x += stride) {
+            for (int y = coreStart; y < coreEnd; y += stride) {
+                for (int z = coreStart; z < coreEnd; z += stride) {
                     Vec3d vel = sampleVelocityLocal(x + 0.5, y + 0.5, z + 0.5);
                     float speed = (float) vel.length();
                     float speedNorm = MathHelper.clamp(speed / maxInflowSpeed, 0.0f, 1.0f);
@@ -191,8 +195,8 @@ public class FlowRenderer {
             phase = (int) (client.world.getTime() % interleave);
         }
 
-        for (int y = 0; y < gridSize; y += seedStride) {
-            for (int z = 0; z < gridSize; z += seedStride) {
+        for (int y = coreStart; y < coreEnd; y += seedStride) {
+            for (int z = coreStart; z < coreEnd; z += seedStride) {
                 if (interleave > 1) {
                     int seedY = y / seedStride;
                     int seedZ = z / seedStride;
@@ -201,7 +205,7 @@ public class FlowRenderer {
                         continue;
                     }
                 }
-                Vec3d pos = new Vec3d(0.5, y + 0.5, z + 0.5);
+                Vec3d pos = new Vec3d(coreStart + 0.5, y + 0.5, z + 0.5);
 
                 for (int step = 0; step < maxSteps; step++) {
                     Vec3d vel = sampleVelocityLocal(pos.x, pos.y, pos.z);
@@ -219,9 +223,9 @@ public class FlowRenderer {
                     float advectStep = stepSize * MathHelper.clamp(speedNorm * 8.0f, 0.2f, 1.25f);
                     Vec3d nextPos = pos.add(dir.multiply(advectStep));
 
-                    if (nextPos.x < 0 || nextPos.x >= gridSize
-                        || nextPos.y < 0 || nextPos.y >= gridSize
-                        || nextPos.z < 0 || nextPos.z >= gridSize) {
+                    if (nextPos.x < coreStart || nextPos.x >= coreEnd
+                        || nextPos.y < coreStart || nextPos.y >= coreEnd
+                        || nextPos.z < coreStart || nextPos.z >= coreEnd) {
                         break;
                     }
 
@@ -269,7 +273,8 @@ public class FlowRenderer {
     }
 
     private Vec3d sampleVelocityLocal(double localX, double localY, double localZ) {
-        if (localX < 0 || localY < 0 || localZ < 0 || localX > gridSize - 1 || localY > gridSize - 1 || localZ > gridSize - 1) {
+        if (localX < coreStart || localY < coreStart || localZ < coreStart
+            || localX > coreEnd - 1 || localY > coreEnd - 1 || localZ > coreEnd - 1) {
             return Vec3d.ZERO;
         }
 
@@ -317,7 +322,8 @@ public class FlowRenderer {
     }
 
     private float samplePressureLocal(double localX, double localY, double localZ) {
-        if (localX < 0 || localY < 0 || localZ < 0 || localX > gridSize - 1 || localY > gridSize - 1 || localZ > gridSize - 1) {
+        if (localX < coreStart || localY < coreStart || localZ < coreStart
+            || localX > coreEnd - 1 || localY > coreEnd - 1 || localZ > coreEnd - 1) {
             return 0.0f;
         }
 
