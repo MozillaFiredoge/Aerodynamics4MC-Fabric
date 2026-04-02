@@ -68,9 +68,15 @@ public final class AeroServerRuntime {
     private static final String LOG_PREFIX = "[aerodynamics4mc] ";
     private static final int GRID_SIZE = 64;
     private static final int TICKS_PER_SECOND = 20;
-    private static final float DOMAIN_SIZE_METERS = 4.0f;
+    private static final float BLOCK_SIZE_METERS = 1.0f;
+    private static final float DOMAIN_SIZE_METERS = GRID_SIZE * BLOCK_SIZE_METERS;
     private static final float SOLVER_STEP_SECONDS = 1.0f / TICKS_PER_SECOND;
-    private static final float CELL_SIZE_METERS = DOMAIN_SIZE_METERS / GRID_SIZE;
+    private static final float CELL_SIZE_METERS = BLOCK_SIZE_METERS;
+    private static final float CELL_FACE_AREA_SQUARE_METERS = CELL_SIZE_METERS * CELL_SIZE_METERS;
+    private static final float CELL_VOLUME_CUBIC_METERS = CELL_FACE_AREA_SQUARE_METERS * CELL_SIZE_METERS;
+    private static final float AIR_DENSITY_KG_PER_CUBIC_METER = 1.225f;
+    private static final float AIR_SPECIFIC_HEAT_J_PER_KG_K = 1005.0f;
+    private static final float RUNTIME_TEMPERATURE_SCALE_KELVIN = 20.0f;
     private static final int CHANNELS = 10;
     private static final int CH_OBSTACLE = 0;
     private static final int CH_FAN_MASK = 1;
@@ -83,7 +89,11 @@ public final class AeroServerRuntime {
     private static final int CH_STATE_P = 8;
     private static final int CH_THERMAL_SOURCE = 9;
 
-    private static final float INFLOW_SPEED = 8.0f;
+    private static final float MAX_SAFE_LATTICE_SPEED = 0.28f;
+    private static final float NATIVE_VELOCITY_SCALE = CELL_SIZE_METERS / SOLVER_STEP_SECONDS;
+    private static final float MAX_RUNTIME_WIND_SPEED = MAX_SAFE_LATTICE_SPEED * NATIVE_VELOCITY_SCALE;
+    private static final float DEFAULT_FAN_INFLOW_SPEED = 4.0f;
+    private static final float INFLOW_SPEED = Math.min(DEFAULT_FAN_INFLOW_SPEED, MAX_RUNTIME_WIND_SPEED);
     private static final int FAN_RADIUS = 1;
     private static final int DUCT_SCAN_MAX = 20;
     private static final int DUCT_RING_RADIUS = 1;
@@ -102,6 +112,7 @@ public final class AeroServerRuntime {
     private static final int WINDOW_REFRESH_TICKS = 100;
     private static final int WINDOW_SAMPLE_RESYNC_TICKS = 200;
     private static final int FLOW_SYNC_INTERVAL_TICKS = 2;
+    private static final int MAX_SIMULATION_STEP_BACKLOG = 2;
     private static final int CHUNK_SIZE = 16;
     private static final int WINDOW_SECTION_COUNT = GRID_SIZE / CHUNK_SIZE;
     private static final int WINDOW_SECTION_VOLUME = WINDOW_SECTION_COUNT * WINDOW_SECTION_COUNT * WINDOW_SECTION_COUNT;
@@ -114,32 +125,31 @@ public final class AeroServerRuntime {
     private static final int MIN_STREAMLINE_STRIDE = 1;
     private static final int MAX_STREAMLINE_STRIDE = 8;
 
-    private static final float NATIVE_VELOCITY_SCALE = 30.0f;
     private static final float NATIVE_THERMAL_SOURCE_MAX = 0.006f;
     private static final float STATE_PRESSURE_MIN = -0.03f;
     private static final float STATE_PRESSURE_MAX = 0.03f;
-    private static final float THERMAL_SOURCE_LAVA = NATIVE_THERMAL_SOURCE_MAX;
-    private static final float THERMAL_SOURCE_MAGMA = 0.0046f;
-    private static final float THERMAL_SOURCE_CAMPFIRE = 0.0044f;
-    private static final float THERMAL_SOURCE_SOUL_CAMPFIRE = 0.0036f;
-    private static final float THERMAL_SOURCE_FIRE = 0.0048f;
-    private static final float THERMAL_SOURCE_SOUL_FIRE = 0.0038f;
-    private static final float THERMAL_SOURCE_TORCH = 0.0024f;
-    private static final float THERMAL_SOURCE_SOUL_TORCH = 0.0018f;
-    private static final float THERMAL_SOURCE_LANTERN = 0.0016f;
-    private static final float THERMAL_SOURCE_SOUL_LANTERN = 0.0012f;
+    private static final float THERMAL_SOURCE_LAVA = temperatureSourceFromPowerWatts(3200.0f);
+    private static final float THERMAL_SOURCE_MAGMA = temperatureSourceFromPowerWatts(1200.0f);
+    private static final float THERMAL_SOURCE_CAMPFIRE = temperatureSourceFromPowerWatts(1800.0f);
+    private static final float THERMAL_SOURCE_SOUL_CAMPFIRE = temperatureSourceFromPowerWatts(1200.0f);
+    private static final float THERMAL_SOURCE_FIRE = temperatureSourceFromPowerWatts(2200.0f);
+    private static final float THERMAL_SOURCE_SOUL_FIRE = temperatureSourceFromPowerWatts(1500.0f);
+    private static final float THERMAL_SOURCE_TORCH = temperatureSourceFromPowerWatts(80.0f);
+    private static final float THERMAL_SOURCE_SOUL_TORCH = temperatureSourceFromPowerWatts(50.0f);
+    private static final float THERMAL_SOURCE_LANTERN = temperatureSourceFromPowerWatts(60.0f);
+    private static final float THERMAL_SOURCE_SOUL_LANTERN = temperatureSourceFromPowerWatts(40.0f);
     private static final float THERMAL_SOURCE_SOLID_FACE_COUPLING = 0.90f;
-    private static final float THERMAL_SOURCE_SOLAR_DIRECT = 0.00155f;
-    private static final float THERMAL_SOURCE_SOLAR_DIFFUSE = 0.00045f;
-    private static final float THERMAL_SOURCE_SKY_COOLING_DAY = 0.00018f;
-    private static final float THERMAL_SOURCE_SKY_COOLING_NIGHT = 0.00110f;
-    private static final float THERMAL_SOURCE_PRECIP_COOLING = 0.00090f;
-    private static final float THERMAL_SOURCE_OPEN_WATER_BASE_COOLING = 0.00035f;
+    private static final float THERMAL_SOURCE_SOLAR_DIRECT = temperatureSourceFromSurfaceFlux(850.0f);
+    private static final float THERMAL_SOURCE_SOLAR_DIFFUSE = temperatureSourceFromSurfaceFlux(140.0f);
+    private static final float THERMAL_SOURCE_SKY_COOLING_DAY = temperatureSourceFromSurfaceFlux(90.0f);
+    private static final float THERMAL_SOURCE_SKY_COOLING_NIGHT = temperatureSourceFromSurfaceFlux(420.0f);
+    private static final float THERMAL_SOURCE_PRECIP_COOLING = temperatureSourceFromSurfaceFlux(260.0f);
+    private static final float THERMAL_SOURCE_OPEN_WATER_BASE_COOLING = temperatureSourceFromSurfaceFlux(110.0f);
     private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK = 0.000010f;
     private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_MAX = 0.0012f;
-    private static final float THERMAL_SOURCE_BIOME_COUPLING = 0.00040f;
-    private static final float THERMAL_SOURCE_SNOW_BASE_COOLING = 0.00045f;
-    private static final float THERMAL_SOURCE_VEGETATION_BASE_COOLING = 0.00012f;
+    private static final float THERMAL_SOURCE_BIOME_COUPLING = temperatureSourceFromSurfaceFlux(160.0f);
+    private static final float THERMAL_SOURCE_SNOW_BASE_COOLING = temperatureSourceFromSurfaceFlux(220.0f);
+    private static final float THERMAL_SOURCE_VEGETATION_BASE_COOLING = temperatureSourceFromSurfaceFlux(70.0f);
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
@@ -167,6 +177,7 @@ public final class AeroServerRuntime {
         return thread;
     });
     private final AtomicInteger activeSolveTasks = new AtomicInteger(0);
+    private final AtomicInteger simulationStepBudget = new AtomicInteger(0);
     private final AtomicLong runtimeGeneration = new AtomicLong(0L);
     private final AtomicLong publishedFrameCounter = new AtomicLong(0L);
     private final AtomicReference<PublishedFrame> publishedFrame = new AtomicReference<>(null);
@@ -232,10 +243,14 @@ public final class AeroServerRuntime {
                         return 1;
                     }))
             .then(CommandManager.literal("maxspeed")
-                .then(CommandManager.argument("value", FloatArgumentType.floatArg(0.0f, 64.0f))
-                    .suggests((context, builder) -> CommandSource.suggestMatching(List.of("4", "8", "12", "16"), builder))
+                .then(CommandManager.argument("value", FloatArgumentType.floatArg(0.0f, MAX_RUNTIME_WIND_SPEED))
+                    .suggests((context, builder) -> CommandSource.suggestMatching(List.of("1", "2", "4", "5"), builder))
                     .executes(ctx -> {
-                        maxWindSpeed = FloatArgumentType.getFloat(ctx, "value");
+                        maxWindSpeed = MathHelper.clamp(
+                            FloatArgumentType.getFloat(ctx, "value"),
+                            0.0f,
+                            MAX_RUNTIME_WIND_SPEED
+                        );
                         feedback(ctx.getSource(), "Max wind speed set to " + format2(maxWindSpeed));
                         broadcastState(ctx.getSource().getServer());
                         return 1;
@@ -259,10 +274,14 @@ public final class AeroServerRuntime {
                         return 1;
                     }))
                 .then(CommandManager.literal("speed")
-                    .then(CommandManager.argument("value", FloatArgumentType.floatArg(0.0f, 64.0f))
-                        .suggests((context, builder) -> CommandSource.suggestMatching(List.of("1", "2", "4", "8", "12"), builder))
+                    .then(CommandManager.argument("value", FloatArgumentType.floatArg(0.0f, MAX_RUNTIME_WIND_SPEED))
+                        .suggests((context, builder) -> CommandSource.suggestMatching(List.of("1", "2", "4", "5"), builder))
                         .executes(ctx -> {
-                            tunnelSpeed = FloatArgumentType.getFloat(ctx, "value");
+                            tunnelSpeed = MathHelper.clamp(
+                                FloatArgumentType.getFloat(ctx, "value"),
+                                0.0f,
+                                MAX_RUNTIME_WIND_SPEED
+                            );
                             feedback(ctx.getSource(), "Tunnel speed set to " + format2(tunnelSpeed));
                             return 1;
                         })))
@@ -450,6 +469,7 @@ public final class AeroServerRuntime {
 
         boolean clientMasterActive = isClientMasterActive(server);
         if (clientMasterActive) {
+            simulationStepBudget.set(0);
             synchronized (simulationStateLock) {
                 if (tickCounter == 1 || tickCounter % WINDOW_REFRESH_TICKS == 0) {
                     clientMasterDetectedWindows = scanFanSources(server).size();
@@ -496,6 +516,7 @@ public final class AeroServerRuntime {
             }
             clientMasterDetectedWindows = windows.size();
         }
+        grantSimulationStepBudget();
 
         PublishedFrame frame = publishedFrame.get();
         if (frame == null || frame.regions().isEmpty()) {
@@ -553,6 +574,7 @@ public final class AeroServerRuntime {
         streamingEnabled = false;
         stopSimulationCoordinator();
         tickCounter = 0;
+        simulationStepBudget.set(0);
         simulationTicks = 0L;
         lastObservedPublishedFrameId = 0L;
         secondWindowTotalTicks = 0;
@@ -1323,13 +1345,12 @@ public final class AeroServerRuntime {
             RegistryKey<World> worldKey = world.getRegistryKey();
             for (ServerPlayerEntity player : world.getPlayers()) {
                 BlockPos baseCore = coreOriginForPosition(player.getBlockPos());
-                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore)));
-                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(REGION_LATTICE_STRIDE, 0, 0))));
-                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(-REGION_LATTICE_STRIDE, 0, 0))));
-                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))));
-                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))));
-                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, 0, REGION_LATTICE_STRIDE))));
-                keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore.add(0, 0, -REGION_LATTICE_STRIDE))));
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        BlockPos regionCore = baseCore.add(dx * REGION_LATTICE_STRIDE, 0, dz * REGION_LATTICE_STRIDE);
+                        keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(regionCore)));
+                    }
+                }
             }
         }
         return keys;
@@ -1471,6 +1492,28 @@ public final class AeroServerRuntime {
         return x >= 0 && y >= 0 && z >= 0 && x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE;
     }
 
+    private static float temperatureSourceFromPowerWatts(float thermalPowerWatts) {
+        float scalar = thermalPowerWatts * SOLVER_STEP_SECONDS
+            / (AIR_DENSITY_KG_PER_CUBIC_METER * AIR_SPECIFIC_HEAT_J_PER_KG_K
+                * CELL_VOLUME_CUBIC_METERS * RUNTIME_TEMPERATURE_SCALE_KELVIN);
+        return MathHelper.clamp(scalar, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
+    }
+
+    private static float temperatureSourceFromSurfaceFlux(float heatFluxWattsPerSquareMeter) {
+        float scalar = heatFluxWattsPerSquareMeter * CELL_FACE_AREA_SQUARE_METERS * SOLVER_STEP_SECONDS
+            / (AIR_DENSITY_KG_PER_CUBIC_METER * AIR_SPECIFIC_HEAT_J_PER_KG_K
+                * CELL_VOLUME_CUBIC_METERS * RUNTIME_TEMPERATURE_SCALE_KELVIN);
+        return MathHelper.clamp(scalar, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
+    }
+
+    private float runtimeFanSpeedMetersPerSecond() {
+        return MathHelper.clamp(Math.min(INFLOW_SPEED, maxWindSpeed), 0.0f, MAX_RUNTIME_WIND_SPEED);
+    }
+
+    private float runtimeTunnelSpeedMetersPerSecond() {
+        return MathHelper.clamp(tunnelSpeed, 0.0f, MAX_RUNTIME_WIND_SPEED);
+    }
+
     private void applyFanAtVoxel(WindowState window, int x, int y, int z, float fanVx, float fanVy, float fanVz) {
         if (!inBounds(x, y, z)) {
             return;
@@ -1491,9 +1534,10 @@ public final class AeroServerRuntime {
         int cy = inflowPos.getY() - minY;
         int cz = inflowPos.getZ() - minZ;
 
-        float fanVx = fan.facing().getOffsetX() * INFLOW_SPEED;
-        float fanVy = fan.facing().getOffsetY() * INFLOW_SPEED;
-        float fanVz = fan.facing().getOffsetZ() * INFLOW_SPEED;
+        float inflowSpeed = runtimeFanSpeedMetersPerSecond();
+        float fanVx = fan.facing().getOffsetX() * inflowSpeed;
+        float fanVy = fan.facing().getOffsetY() * inflowSpeed;
+        float fanVz = fan.facing().getOffsetZ() * inflowSpeed;
 
         int radius2 = FAN_RADIUS * FAN_RADIUS;
         switch (fan.facing().getAxis()) {
@@ -1557,9 +1601,10 @@ public final class AeroServerRuntime {
             default -> 1.55f;
         };
 
-        float baseVx = dx * INFLOW_SPEED;
-        float baseVy = dy * INFLOW_SPEED;
-        float baseVz = dz * INFLOW_SPEED;
+        float inflowSpeed = runtimeFanSpeedMetersPerSecond();
+        float baseVx = dx * inflowSpeed;
+        float baseVy = dy * inflowSpeed;
+        float baseVz = dz * inflowSpeed;
         int range = switch (level) {
             case 1 -> 8;
             case 2 -> 14;
@@ -1680,10 +1725,11 @@ public final class AeroServerRuntime {
         }
 
         int layers = Math.max(1, Math.min(TUNNEL_INFLOW_LAYERS, GRID_SIZE));
+        float tunnelVelocity = runtimeTunnelSpeedMetersPerSecond();
         for (int x = 0; x < layers; x++) {
             for (int y = 0; y < GRID_SIZE; y++) {
                 for (int z = 0; z < GRID_SIZE; z++) {
-                    applyFanAtVoxel(window, x, y, z, tunnelSpeed, 0.0f, 0.0f);
+                    applyFanAtVoxel(window, x, y, z, tunnelVelocity, 0.0f, 0.0f);
                 }
             }
         }
@@ -2487,6 +2533,18 @@ public final class AeroServerRuntime {
         }
     }
 
+    private void grantSimulationStepBudget() {
+        while (true) {
+            int current = simulationStepBudget.get();
+            if (current >= MAX_SIMULATION_STEP_BACKLOG) {
+                return;
+            }
+            if (simulationStepBudget.compareAndSet(current, current + 1)) {
+                return;
+            }
+        }
+    }
+
     private void sendStateToPlayer(ServerPlayerEntity player, MinecraftServer server) {
         ServerPlayNetworking.send(
             player,
@@ -3246,12 +3304,17 @@ public final class AeroServerRuntime {
                     sleepQuietly(1L);
                     continue;
                 }
+                if (!acquireSimulationStepBudget()) {
+                    sleepQuietly(1L);
+                    continue;
+                }
 
                 List<SolveSnapshot> scheduled;
                 synchronized (simulationStateLock) {
                     scheduled = scheduleSolveCycle(activeWindows);
                 }
                 if (scheduled.isEmpty()) {
+                    simulationStepBudget.incrementAndGet();
                     sleepQuietly(1L);
                     continue;
                 }
@@ -3279,6 +3342,18 @@ public final class AeroServerRuntime {
                 }
             }
             return false;
+        }
+
+        private boolean acquireSimulationStepBudget() {
+            while (true) {
+                int current = simulationStepBudget.get();
+                if (current <= 0) {
+                    return false;
+                }
+                if (simulationStepBudget.compareAndSet(current, current - 1)) {
+                    return true;
+                }
+            }
         }
 
         private void sleepQuietly(long millis) {
