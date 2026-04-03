@@ -143,11 +143,18 @@ constexpr float kRuntimeSecondsPerStep = 1.0f / 20.0f;
 constexpr float kRuntimeMetersPerCell = 1.0f;
 constexpr float kRuntimeVelocityScale = kRuntimeMetersPerCell / kRuntimeSecondsPerStep;
 constexpr float kRuntimeAirKinematicViscosityMetersSqPerSecond = 1.50e-5f;
+constexpr float kRuntimeAirPrandtl = 0.71f;
+constexpr float kRuntimeTurbulentPrandtl = 0.85f;
+constexpr float kRuntimeAirThermalDiffusivityMetersSqPerSecond =
+    kRuntimeAirKinematicViscosityMetersSqPerSecond / kRuntimeAirPrandtl;
 constexpr float kRuntimeTemperatureScaleKelvin = 20.0f;
 constexpr float kRuntimeAirThermalExpansionPerKelvin = 1.0f / 300.0f;
 constexpr float kRuntimeGravityMetersPerSecondSq = 9.81f;
 constexpr float kRuntimeMolecularNu0 =
     kRuntimeAirKinematicViscosityMetersSqPerSecond
+    * (kRuntimeSecondsPerStep / (kRuntimeMetersPerCell * kRuntimeMetersPerCell));
+constexpr float kRuntimeMolecularAlpha0 =
+    kRuntimeAirThermalDiffusivityMetersSqPerSecond
     * (kRuntimeSecondsPerStep / (kRuntimeMetersPerCell * kRuntimeMetersPerCell));
 
 constexpr float kRhoMin = 0.97f;
@@ -190,7 +197,7 @@ constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 // Boussinesq approximation with an internal thermal scalar field.
 constexpr bool kEnableBoussinesq = true;
 constexpr float kThermalDiffusivity = 0.035f;
-constexpr float kThermalCooling = 0.020f;
+constexpr float kThermalCooling = 0.0f;
 constexpr float kThermalSourceScale = 0.0012f;
 constexpr float kThermalSourceMax = 0.006f;
 constexpr float kThermalMin = -1.00f;
@@ -860,6 +867,10 @@ inline float runtime_molecular_nu0() {
     return clamp_shear_nu(kRuntimeMolecularNu0);
 }
 
+inline float runtime_molecular_alpha0() {
+    return std::max(1.0e-8f, kRuntimeMolecularAlpha0);
+}
+
 inline float effective_base_nu_shear() {
     if (!benchmark_mode_active()) return runtime_molecular_nu0();
     if (heated_cavity_benchmark_active()) {
@@ -892,6 +903,7 @@ inline float effective_benchmark_tau_normal(float tau_shear_eff) {
 }
 
 inline float effective_thermal_diffusivity() {
+    if (!benchmark_mode_active()) return runtime_molecular_alpha0();
     if (!heated_cavity_benchmark_active()) return kThermalDiffusivity;
     const float pr = std::max(1.0e-6f, finite_or(g_benchmark_cfg.prandtl_number, 0.71f));
     return effective_base_nu_shear() / pr;
@@ -910,7 +922,7 @@ inline float thermal_feq(int q, float temperature, float ux, float uy, float uz)
 }
 
 inline float effective_thermal_cooling() {
-    return heated_cavity_benchmark_active() ? 0.0f : kThermalCooling;
+    return 0.0f;
 }
 
 inline float effective_boussinesq_beta() {
@@ -1721,12 +1733,106 @@ inline float sample_temperature_trilinear(
     return sample_temperature_trilinear_field(ctx, ctx.temperature, x, y, z, fallback);
 }
 
+inline float velocity_component_or_self(
+    const ContextState& ctx,
+    int x,
+    int y,
+    int z,
+    int component,
+    float fallback
+) {
+    if (x < 0 || y < 0 || z < 0 || x >= ctx.nx || y >= ctx.ny || z >= ctx.nz) return fallback;
+    const std::size_t neighbor = cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz);
+    if (ctx.obstacle[neighbor]) return fallback;
+    switch (component) {
+        case 0: return ctx.ux[neighbor];
+        case 1: return ctx.uy[neighbor];
+        case 2: return ctx.uz[neighbor];
+        default: return fallback;
+    }
+}
+
+inline float runtime_local_turbulent_nu(
+    const ContextState& ctx,
+    int x,
+    int y,
+    int z,
+    float ux_center,
+    float uy_center,
+    float uz_center
+) {
+    if (benchmark_mode_active() || !effective_enable_sgs()) return 0.0f;
+
+    const float ux_px = velocity_component_or_self(ctx, x + 1, y, z, 0, ux_center);
+    const float ux_mx = velocity_component_or_self(ctx, x - 1, y, z, 0, ux_center);
+    const float ux_py = velocity_component_or_self(ctx, x, y + 1, z, 0, ux_center);
+    const float ux_my = velocity_component_or_self(ctx, x, y - 1, z, 0, ux_center);
+    const float ux_pz = velocity_component_or_self(ctx, x, y, z + 1, 0, ux_center);
+    const float ux_mz = velocity_component_or_self(ctx, x, y, z - 1, 0, ux_center);
+
+    const float uy_px = velocity_component_or_self(ctx, x + 1, y, z, 1, uy_center);
+    const float uy_mx = velocity_component_or_self(ctx, x - 1, y, z, 1, uy_center);
+    const float uy_py = velocity_component_or_self(ctx, x, y + 1, z, 1, uy_center);
+    const float uy_my = velocity_component_or_self(ctx, x, y - 1, z, 1, uy_center);
+    const float uy_pz = velocity_component_or_self(ctx, x, y, z + 1, 1, uy_center);
+    const float uy_mz = velocity_component_or_self(ctx, x, y, z - 1, 1, uy_center);
+
+    const float uz_px = velocity_component_or_self(ctx, x + 1, y, z, 2, uz_center);
+    const float uz_mx = velocity_component_or_self(ctx, x - 1, y, z, 2, uz_center);
+    const float uz_py = velocity_component_or_self(ctx, x, y + 1, z, 2, uz_center);
+    const float uz_my = velocity_component_or_self(ctx, x, y - 1, z, 2, uz_center);
+    const float uz_pz = velocity_component_or_self(ctx, x, y, z + 1, 2, uz_center);
+    const float uz_mz = velocity_component_or_self(ctx, x, y, z - 1, 2, uz_center);
+
+    const float dux_dx = 0.5f * (ux_px - ux_mx);
+    const float dux_dy = 0.5f * (ux_py - ux_my);
+    const float dux_dz = 0.5f * (ux_pz - ux_mz);
+    const float duy_dx = 0.5f * (uy_px - uy_mx);
+    const float duy_dy = 0.5f * (uy_py - uy_my);
+    const float duy_dz = 0.5f * (uy_pz - uy_mz);
+    const float duz_dx = 0.5f * (uz_px - uz_mx);
+    const float duz_dy = 0.5f * (uz_py - uz_my);
+    const float duz_dz = 0.5f * (uz_pz - uz_mz);
+
+    const float s_xx = dux_dx;
+    const float s_yy = duy_dy;
+    const float s_zz = duz_dz;
+    const float s_xy = 0.5f * (dux_dy + duy_dx);
+    const float s_xz = 0.5f * (dux_dz + duz_dx);
+    const float s_yz = 0.5f * (duy_dz + duz_dy);
+    const float s_mag = std::sqrt(std::max(
+        0.0f,
+        2.0f * (s_xx * s_xx + s_yy * s_yy + s_zz * s_zz)
+        + 4.0f * (s_xy * s_xy + s_xz * s_xz + s_yz * s_yz)
+    ));
+
+    const float nu0 = runtime_molecular_nu0();
+    float nu_t = kSgsC2 * s_mag;
+    nu_t = std::min(nu_t, kSgsNutToNu0Max * nu0);
+    return std::max(0.0f, nu_t);
+}
+
+inline float effective_local_thermal_diffusivity(
+    const ContextState& ctx,
+    int x,
+    int y,
+    int z,
+    float ux_center,
+    float uy_center,
+    float uz_center
+) {
+    if (benchmark_mode_active()) return effective_thermal_diffusivity();
+    const float alpha_mol = runtime_molecular_alpha0();
+    const float nu_t = runtime_local_turbulent_nu(ctx, x, y, z, ux_center, uy_center, uz_center);
+    const float alpha_t = nu_t / std::max(1.0e-6f, kRuntimeTurbulentPrandtl);
+    return alpha_mol + alpha_t;
+}
+
 void update_temperature_field(ContextState& ctx) {
     if (thermal_bfecc_active()) {
         // BFECC reduces the excessive dissipation of first-order semi-Lagrangian
         // advection without introducing a full thermal DDF in benchmark mode.
         ensure_context_temperature_storage(ctx);
-        const float thermal_diffusivity = effective_thermal_diffusivity();
         const float thermal_cooling = effective_thermal_cooling();
         const float thermal_dt = effective_thermal_dt();
 
@@ -1788,6 +1894,15 @@ void update_temperature_field(ContextState& ctx) {
             local_temperature_bounds(ctx, ctx.temperature, x, y, z, local_min, local_max);
             advected = clampf(advected, local_min, local_max);
 
+            const float thermal_diffusivity = effective_local_thermal_diffusivity(
+                ctx,
+                x,
+                y,
+                z,
+                ctx.ux[cell],
+                ctx.uy[cell],
+                ctx.uz[cell]
+            );
             const float t_sum =
                 thermal_neighbor_or_self(ctx, x + 1, y, z, t_center)
                 + thermal_neighbor_or_self(ctx, x - 1, y, z, t_center)
@@ -1810,7 +1925,6 @@ void update_temperature_field(ContextState& ctx) {
     }
 
     if (!kEnableBoussinesq) return;
-    const float thermal_diffusivity = effective_thermal_diffusivity();
     const float thermal_cooling = effective_thermal_cooling();
     const float thermal_dt = effective_thermal_dt();
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
@@ -1840,6 +1954,15 @@ void update_temperature_field(ContextState& ctx) {
 
         const float laplacian = t_sum - 6.0f * t_center;
         const float source = thermal_source_term(ctx, cell);
+        const float thermal_diffusivity = effective_local_thermal_diffusivity(
+            ctx,
+            x,
+            y,
+            z,
+            ctx.ux[cell],
+            ctx.uy[cell],
+            ctx.uz[cell]
+        );
         const float t_next = advected
                              + thermal_dt * (thermal_diffusivity * laplacian + source - thermal_cooling * advected);
         ctx.temperature_next[cell] = clampf(t_next, kThermalMin, kThermalMax);
@@ -2303,6 +2426,8 @@ __constant float TINV[3][3] = {
 };
 
 __constant float RUNTIME_MOLECULAR_NU0 = 7.500000e-7f;
+__constant float RUNTIME_MOLECULAR_ALPHA0 = 1.056338e-6f;
+__constant float RUNTIME_TURBULENT_PRANDTL = 8.500000e-1f;
 __constant float NU_SHEAR_MIN = 1.0e-8f;
 __constant float NU_SHEAR_MAX = 1.500000e-1f;
 __constant float NU_NORMAL_MIN = 1.0e-8f;
@@ -2688,6 +2813,103 @@ inline float sample_temperature_trilinear(
     return c0 + (c1 - c0) * fz;
 }
 
+inline float velocity_component_or_self(
+    __global const float* payload,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int x,
+    int y,
+    int z,
+    int channel,
+    float fallback
+) {
+    if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return fallback;
+    int cell = (x * ny + y) * nz + z;
+    int base = cell * in_ch;
+    if (payload[base + 0] > 0.5f) return fallback;
+    return payload[base + channel];
+}
+
+inline float runtime_local_turbulent_nu(
+    __global const float* payload,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int x,
+    int y,
+    int z,
+    float ux_center,
+    float uy_center,
+    float uz_center
+) {
+    float ux_px = velocity_component_or_self(payload, in_ch, nx, ny, nz, x + 1, y, z, 5, ux_center);
+    float ux_mx = velocity_component_or_self(payload, in_ch, nx, ny, nz, x - 1, y, z, 5, ux_center);
+    float ux_py = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y + 1, z, 5, ux_center);
+    float ux_my = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y - 1, z, 5, ux_center);
+    float ux_pz = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y, z + 1, 5, ux_center);
+    float ux_mz = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y, z - 1, 5, ux_center);
+
+    float uy_px = velocity_component_or_self(payload, in_ch, nx, ny, nz, x + 1, y, z, 6, uy_center);
+    float uy_mx = velocity_component_or_self(payload, in_ch, nx, ny, nz, x - 1, y, z, 6, uy_center);
+    float uy_py = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y + 1, z, 6, uy_center);
+    float uy_my = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y - 1, z, 6, uy_center);
+    float uy_pz = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y, z + 1, 6, uy_center);
+    float uy_mz = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y, z - 1, 6, uy_center);
+
+    float uz_px = velocity_component_or_self(payload, in_ch, nx, ny, nz, x + 1, y, z, 7, uz_center);
+    float uz_mx = velocity_component_or_self(payload, in_ch, nx, ny, nz, x - 1, y, z, 7, uz_center);
+    float uz_py = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y + 1, z, 7, uz_center);
+    float uz_my = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y - 1, z, 7, uz_center);
+    float uz_pz = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y, z + 1, 7, uz_center);
+    float uz_mz = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y, z - 1, 7, uz_center);
+
+    float dux_dx = 0.5f * (ux_px - ux_mx);
+    float dux_dy = 0.5f * (ux_py - ux_my);
+    float dux_dz = 0.5f * (ux_pz - ux_mz);
+    float duy_dx = 0.5f * (uy_px - uy_mx);
+    float duy_dy = 0.5f * (uy_py - uy_my);
+    float duy_dz = 0.5f * (uy_pz - uy_mz);
+    float duz_dx = 0.5f * (uz_px - uz_mx);
+    float duz_dy = 0.5f * (uz_py - uz_my);
+    float duz_dz = 0.5f * (uz_pz - uz_mz);
+
+    float s_xx = dux_dx;
+    float s_yy = duy_dy;
+    float s_zz = duz_dz;
+    float s_xy = 0.5f * (dux_dy + duy_dx);
+    float s_xz = 0.5f * (dux_dz + duz_dx);
+    float s_yz = 0.5f * (duy_dz + duz_dy);
+    float s_mag = sqrt(fmax(
+        0.0f,
+        2.0f * (s_xx * s_xx + s_yy * s_yy + s_zz * s_zz)
+        + 4.0f * (s_xy * s_xy + s_xz * s_xz + s_yz * s_yz)
+    ));
+
+    float nu_t = SGS_C2 * s_mag;
+    nu_t = fmin(nu_t, SGS_NUT_TO_NU0_MAX * RUNTIME_MOLECULAR_NU0);
+    return fmax(0.0f, nu_t);
+}
+
+inline float runtime_local_thermal_diffusivity(
+    __global const float* payload,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int x,
+    int y,
+    int z,
+    float ux_center,
+    float uy_center,
+    float uz_center
+) {
+    float nu_t = runtime_local_turbulent_nu(payload, in_ch, nx, ny, nz, x, y, z, ux_center, uy_center, uz_center);
+    return RUNTIME_MOLECULAR_ALPHA0 + nu_t / fmax(1.0e-6f, RUNTIME_TURBULENT_PRANDTL);
+}
+
 inline int thermal_ddf_benchmark_enabled(int benchmark_preset) {
     return 0;
 }
@@ -2973,6 +3195,7 @@ kernel void thermal_bfecc_finalize(
     float thermal_diffusivity_eff,
     float thermal_cooling_eff,
     int benchmark_flags,
+    int runtime_local_thermal_model,
     __global float* temp_out
 ) {
     int cell = (int)get_global_id(0);
@@ -3025,6 +3248,10 @@ kernel void thermal_bfecc_finalize(
     float local_min = fmin(fmin(fmin(txp0, txm0), fmin(typ0, tym0)), fmin(fmin(tzp0, tzm0), t_center));
     float local_max = fmax(fmax(fmax(txp0, txm0), fmax(typ0, tym0)), fmax(fmax(tzp0, tzm0), t_center));
     advected = clampf(advected, local_min, local_max);
+    float thermal_diffusivity_local = thermal_diffusivity_eff;
+    if (runtime_local_thermal_model != 0) {
+        thermal_diffusivity_local = runtime_local_thermal_diffusivity(payload, in_ch, nx, ny, nz, x, y, z, ux, uy, uz);
+    }
     float laplacian_t = (txp0 + txm0 + typ0 + tym0 + tzp0 + tzm0) - 6.0f * t_center;
     float thermal_source = 0.0f;
     if ((benchmark_flags & BENCH_DISABLE_INTERNAL_THERMAL_SOURCE) != 0) {
@@ -3033,7 +3260,7 @@ kernel void thermal_bfecc_finalize(
         thermal_source = clampf(payload[base + 9], -THERMAL_SOURCE_MAX, THERMAL_SOURCE_MAX);
     }
     temp_out[cell] = clampf(
-        advected + thermal_dt * (thermal_diffusivity_eff * laplacian_t + thermal_source - thermal_cooling_eff * advected),
+        advected + thermal_dt * (thermal_diffusivity_local * laplacian_t + thermal_source - thermal_cooling_eff * advected),
         THERMAL_MIN,
         THERMAL_MAX
     );
@@ -4208,6 +4435,7 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     const float base_nu_shear = opencl_effective_base_nu_shear();
     const auto thermal_transport = opencl_effective_thermal_transport();
     const int thermal_update_stride = opencl_effective_thermal_update_stride();
+    const int runtime_local_thermal_model = benchmark_mode_active() ? 0 : 1;
     
     // Ping-Pong 双重缓冲交换
     cl_mem read_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
@@ -4298,7 +4526,8 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 22, sizeof(float), &thermal_transport[0]);
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 23, sizeof(float), &thermal_transport[1]);
         err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 24, sizeof(int), &benchmark_flags);
-        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 25, sizeof(cl_mem), &ctx.d_temp_scratch);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 25, sizeof(int), &runtime_local_thermal_model);
+        err |= clSetKernelArg(g_opencl.k_thermal_bfecc_finalize, 26, sizeof(cl_mem), &ctx.d_temp_scratch);
         if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_thermal_bfecc_finalize)", err);
         err = enqueue_kernel_1d(g_opencl.k_thermal_bfecc_finalize, cells_i32);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_thermal_bfecc_finalize)", err);

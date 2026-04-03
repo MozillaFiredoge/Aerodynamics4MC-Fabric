@@ -128,28 +128,35 @@ public final class AeroServerRuntime {
     private static final float NATIVE_THERMAL_SOURCE_MAX = 0.006f;
     private static final float STATE_PRESSURE_MIN = -0.03f;
     private static final float STATE_PRESSURE_MAX = 0.03f;
-    private static final float THERMAL_SOURCE_LAVA = temperatureSourceFromPowerWatts(3200.0f);
-    private static final float THERMAL_SOURCE_MAGMA = temperatureSourceFromPowerWatts(1200.0f);
-    private static final float THERMAL_SOURCE_CAMPFIRE = temperatureSourceFromPowerWatts(1800.0f);
-    private static final float THERMAL_SOURCE_SOUL_CAMPFIRE = temperatureSourceFromPowerWatts(1200.0f);
-    private static final float THERMAL_SOURCE_FIRE = temperatureSourceFromPowerWatts(2200.0f);
-    private static final float THERMAL_SOURCE_SOUL_FIRE = temperatureSourceFromPowerWatts(1500.0f);
-    private static final float THERMAL_SOURCE_TORCH = temperatureSourceFromPowerWatts(80.0f);
-    private static final float THERMAL_SOURCE_SOUL_TORCH = temperatureSourceFromPowerWatts(50.0f);
-    private static final float THERMAL_SOURCE_LANTERN = temperatureSourceFromPowerWatts(60.0f);
-    private static final float THERMAL_SOURCE_SOUL_LANTERN = temperatureSourceFromPowerWatts(40.0f);
-    private static final float THERMAL_SOURCE_SOLID_FACE_COUPLING = 0.90f;
-    private static final float THERMAL_SOURCE_SOLAR_DIRECT = temperatureSourceFromSurfaceFlux(850.0f);
-    private static final float THERMAL_SOURCE_SOLAR_DIFFUSE = temperatureSourceFromSurfaceFlux(140.0f);
-    private static final float THERMAL_SOURCE_SKY_COOLING_DAY = temperatureSourceFromSurfaceFlux(90.0f);
-    private static final float THERMAL_SOURCE_SKY_COOLING_NIGHT = temperatureSourceFromSurfaceFlux(420.0f);
-    private static final float THERMAL_SOURCE_PRECIP_COOLING = temperatureSourceFromSurfaceFlux(260.0f);
-    private static final float THERMAL_SOURCE_OPEN_WATER_BASE_COOLING = temperatureSourceFromSurfaceFlux(110.0f);
-    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK = 0.000010f;
-    private static final float THERMAL_SOURCE_ALTITUDE_LAPSE_MAX = 0.0012f;
-    private static final float THERMAL_SOURCE_BIOME_COUPLING = temperatureSourceFromSurfaceFlux(160.0f);
-    private static final float THERMAL_SOURCE_SNOW_BASE_COOLING = temperatureSourceFromSurfaceFlux(220.0f);
-    private static final float THERMAL_SOURCE_VEGETATION_BASE_COOLING = temperatureSourceFromSurfaceFlux(70.0f);
+    private static final float THERMAL_SURFACE_INIT_MIN_K = 220.0f;
+    private static final float THERMAL_SURFACE_MAX_K = 1800.0f;
+    private static final float THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K = 288.15f;
+    private static final float THERMAL_BIOME_TEMPERATURE_SCALE_K = 12.0f;
+    private static final float THERMAL_ALTITUDE_LAPSE_RATE_K_PER_BLOCK = 0.0065f;
+    private static final float THERMAL_DEEP_GROUND_OFFSET_K = 1.5f;
+    private static final float THERMAL_SKY_TEMP_DROP_DAY_K = 10.0f;
+    private static final float THERMAL_SKY_TEMP_DROP_NIGHT_K = 24.0f;
+    private static final float THERMAL_PRECIP_TEMP_DROP_K = 4.0f;
+    private static final float THERMAL_STEFAN_BOLTZMANN = 5.6703744e-8f;
+    private static final float THERMAL_SOLAR_DIRECT_FLUX_W_M2 = 850.0f;
+    private static final float THERMAL_SOLAR_DIFFUSE_FLUX_W_M2 = 140.0f;
+    private static final float THERMAL_EMITTER_POWER_LAVA_W = 3200.0f;
+    private static final float THERMAL_EMITTER_POWER_MAGMA_W = 1200.0f;
+    private static final float THERMAL_EMITTER_POWER_CAMPFIRE_W = 1800.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_CAMPFIRE_W = 1200.0f;
+    private static final float THERMAL_EMITTER_POWER_FIRE_W = 2200.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_FIRE_W = 1500.0f;
+    private static final float THERMAL_EMITTER_POWER_TORCH_W = 80.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_TORCH_W = 50.0f;
+    private static final float THERMAL_EMITTER_POWER_LANTERN_W = 60.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_LANTERN_W = 40.0f;
+    private static final byte SURFACE_KIND_NONE = 0;
+    private static final byte SURFACE_KIND_ROCK = 1;
+    private static final byte SURFACE_KIND_SOIL = 2;
+    private static final byte SURFACE_KIND_VEGETATION = 3;
+    private static final byte SURFACE_KIND_SNOW_ICE = 4;
+    private static final byte SURFACE_KIND_WATER = 5;
+    private static final byte SURFACE_KIND_MOLTEN = 6;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
@@ -965,6 +972,8 @@ public final class AeroServerRuntime {
                     dstSection.state[dstState + 2] = srcSection.state[srcState + 2];
                     dstSection.state[dstState + 3] = srcSection.state[srcState + 3];
                     dstSection.temperatureState[dstLocal] = srcSection.temperatureState[srcLocal];
+                    dstSection.surfaceTemperature[dstLocal] = srcSection.surfaceTemperature[srcLocal];
+                    dstSection.surfaceKind[dstLocal] = srcSection.surfaceKind[srcLocal];
                 }
             }
         }
@@ -1053,6 +1062,8 @@ public final class AeroServerRuntime {
                 section.state[idx + 2] = 0.0f;
                 section.state[idx + 3] = 0.0f;
                 section.temperatureState[i] = 0.0f;
+                section.surfaceTemperature[i] = 0.0f;
+                section.surfaceKind[i] = SURFACE_KIND_NONE;
             }
         }
         window.clearCompletedSolveResult();
@@ -1853,99 +1864,86 @@ public final class AeroServerRuntime {
     }
 
     private float sampleAmbientThermalBias(ServerWorld world) {
-        ThermalEnvironment environment = sampleThermalEnvironment(
-            world,
-            new BlockPos(0, world.getSeaLevel(), 0)
-        );
-        return MathHelper.clamp(environment.biomeBias() * 0.10f, -0.00008f, 0.00008f);
+        return 0.0f;
     }
 
-    private float sampleEmitterThermalSource(BlockState state) {
-        float source = 0.0f;
+    private float sampleEmitterThermalPowerWatts(BlockState state) {
+        float powerWatts = 0.0f;
         if (state.isOf(Blocks.LAVA) || state.isOf(Blocks.LAVA_CAULDRON)) {
-            source += THERMAL_SOURCE_LAVA;
+            powerWatts += THERMAL_EMITTER_POWER_LAVA_W;
         }
         if (state.isOf(Blocks.MAGMA_BLOCK)) {
-            source += THERMAL_SOURCE_MAGMA;
+            powerWatts += THERMAL_EMITTER_POWER_MAGMA_W;
         }
         if (state.isOf(Blocks.CAMPFIRE)) {
-            source += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_CAMPFIRE : 0.0f;
+            powerWatts += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_EMITTER_POWER_CAMPFIRE_W : 0.0f;
         }
         if (state.isOf(Blocks.SOUL_CAMPFIRE)) {
-            source += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_SOURCE_SOUL_CAMPFIRE : 0.0f;
+            powerWatts += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_EMITTER_POWER_SOUL_CAMPFIRE_W : 0.0f;
         }
         if (state.isOf(Blocks.FIRE)) {
-            source += THERMAL_SOURCE_FIRE;
+            powerWatts += THERMAL_EMITTER_POWER_FIRE_W;
         }
         if (state.isOf(Blocks.SOUL_FIRE)) {
-            source += THERMAL_SOURCE_SOUL_FIRE;
+            powerWatts += THERMAL_EMITTER_POWER_SOUL_FIRE_W;
         }
         if (state.isOf(Blocks.TORCH) || state.isOf(Blocks.WALL_TORCH)) {
-            source += THERMAL_SOURCE_TORCH;
+            powerWatts += THERMAL_EMITTER_POWER_TORCH_W;
         }
         if (state.isOf(Blocks.SOUL_TORCH) || state.isOf(Blocks.SOUL_WALL_TORCH)) {
-            source += THERMAL_SOURCE_SOUL_TORCH;
+            powerWatts += THERMAL_EMITTER_POWER_SOUL_TORCH_W;
         }
         if (state.isOf(Blocks.LANTERN)) {
-            source += THERMAL_SOURCE_LANTERN;
+            powerWatts += THERMAL_EMITTER_POWER_LANTERN_W;
         }
         if (state.isOf(Blocks.SOUL_LANTERN)) {
-            source += THERMAL_SOURCE_SOUL_LANTERN;
+            powerWatts += THERMAL_EMITTER_POWER_SOUL_LANTERN_W;
         }
-        return MathHelper.clamp(source, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
+        return Math.max(powerWatts, 0.0f);
     }
 
-    private float sampleFluidThermalSource(ServerWorld world, BlockPos pos, BlockState state, ThermalEnvironment environment) {
-        if (!state.getFluidState().isIn(FluidTags.WATER)) {
+    private float sampleUnsupportedEmitterThermalSource(BlockState state) {
+        ThermalMaterial material = thermalMaterial(state);
+        if (material != null) {
             return 0.0f;
         }
-        float diffuseSky = sampleSkyExposure(world, pos);
-        float directSky = sampleDirectSunExposure(world, pos);
-        float source = environment.biomeBias() * 0.20f;
-        source += sampleAltitudeThermalFlux(world, pos) * 0.25f;
-        source += environment.directRadiation() * 0.10f * directSky;
-        source += environment.diffuseRadiation() * 0.18f * diffuseSky;
-        source -= THERMAL_SOURCE_OPEN_WATER_BASE_COOLING;
-        source -= environment.skyCooling() * 0.70f * diffuseSky;
-        source -= environment.precipitationCooling() * diffuseSky;
-        return MathHelper.clamp(source, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
+        return temperatureSourceFromPowerWatts(sampleEmitterThermalPowerWatts(state));
     }
 
-    private float sampleAltitudeThermalFlux(World world, BlockPos pos) {
-        float lapse = (world.getSeaLevel() - pos.getY()) * THERMAL_SOURCE_ALTITUDE_LAPSE_PER_BLOCK;
-        return MathHelper.clamp(lapse, -THERMAL_SOURCE_ALTITUDE_LAPSE_MAX, THERMAL_SOURCE_ALTITUDE_LAPSE_MAX);
-    }
-
-    private ThermalEnvironment sampleThermalEnvironment(ServerWorld world, BlockPos samplePos) {
+    private ThermalEnvironment sampleThermalEnvironment(ServerWorld world, BlockPos samplePos, float surfaceDeltaSeconds) {
         float dayPhase = (float) Math.floorMod(world.getTimeOfDay(), 24000L) / 24000.0f;
         float solarAltitude = Math.max(0.0f, (float) Math.sin(dayPhase * (float) (Math.PI * 2.0)));
         float rain = world.getRainGradient(1.0f);
         float thunder = world.getThunderGradient(1.0f);
         float clearSky = MathHelper.clamp(1.0f - 0.65f * rain - 0.25f * thunder, 0.15f, 1.0f);
-        float directRadiation = THERMAL_SOURCE_SOLAR_DIRECT * solarAltitude * clearSky;
-        float diffuseRadiation = THERMAL_SOURCE_SOLAR_DIFFUSE
+        float directRadiation = THERMAL_SOLAR_DIRECT_FLUX_W_M2 * solarAltitude * clearSky;
+        float diffuseRadiation = THERMAL_SOLAR_DIFFUSE_FLUX_W_M2
             * (0.30f + 0.70f * solarAltitude)
             * (0.55f + 0.45f * clearSky);
-        float skyCooling = (THERMAL_SOURCE_SKY_COOLING_DAY + THERMAL_SOURCE_SKY_COOLING_NIGHT * (1.0f - solarAltitude))
-            * (0.45f + 0.55f * clearSky);
-        float precipitationCooling = THERMAL_SOURCE_PRECIP_COOLING * Math.max(rain, thunder * 0.60f);
+        float precipitationStrength = Math.max(rain, thunder * 0.60f);
         float biomeTemperature = world.getBiome(samplePos).value().getTemperature();
-        float biomeBias = MathHelper.clamp(
-            (biomeTemperature - 0.8f) * THERMAL_SOURCE_BIOME_COUPLING,
-            -0.00045f,
-            0.00045f
-        );
+        float altitudeOffsetK = (samplePos.getY() - world.getSeaLevel()) * THERMAL_ALTITUDE_LAPSE_RATE_K_PER_BLOCK;
+        float ambientAirTemperatureKelvin = THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K
+            + (biomeTemperature - 0.8f) * THERMAL_BIOME_TEMPERATURE_SCALE_K
+            - altitudeOffsetK;
+        float deepGroundTemperatureKelvin = ambientAirTemperatureKelvin + THERMAL_DEEP_GROUND_OFFSET_K;
+        float skyTemperatureDropK = MathHelper.lerp(solarAltitude, THERMAL_SKY_TEMP_DROP_NIGHT_K, THERMAL_SKY_TEMP_DROP_DAY_K);
+        float skyTemperatureKelvin = ambientAirTemperatureKelvin - skyTemperatureDropK * clearSky;
+        float precipitationTemperatureKelvin = ambientAirTemperatureKelvin - THERMAL_PRECIP_TEMP_DROP_K;
         float azimuth = dayPhase * (float) (Math.PI * 2.0) - (float) (Math.PI * 0.5);
         float horizontal = (float) Math.sqrt(Math.max(0.0, 1.0 - solarAltitude * solarAltitude));
         return new ThermalEnvironment(
-            biomeBias,
             directRadiation,
             diffuseRadiation,
-            skyCooling,
-            precipitationCooling,
+            ambientAirTemperatureKelvin,
+            deepGroundTemperatureKelvin,
+            skyTemperatureKelvin,
+            precipitationTemperatureKelvin,
+            precipitationStrength,
             (float) Math.cos(azimuth) * horizontal,
             solarAltitude,
-            (float) Math.sin(azimuth) * horizontal
+            (float) Math.sin(azimuth) * horizontal,
+            surfaceDeltaSeconds
         );
     }
 
@@ -1957,62 +1955,46 @@ public final class AeroServerRuntime {
         return world.isSkyVisibleAllowingSea(pos) ? 1.0f : 0.0f;
     }
 
-    private float samplePassiveSurfaceFlux(
-        ServerWorld world,
-        BlockPos airPos,
-        Direction face,
-        ThermalMaterial material,
-        ThermalEnvironment environment,
-        float altitudeFlux
+    private float sampleNeighborFluidTemperatureKelvin(
+        float[] sectionTemperatureState,
+        int x,
+        int y,
+        int z,
+        ThermalEnvironment environment
     ) {
-        if (material == null) {
-            return 0.0f;
+        if (!inSectionBounds(x, y, z) || sectionTemperatureState == null) {
+            return environment.ambientAirTemperatureKelvin();
         }
-        float diffuseSky = sampleSkyExposure(world, airPos);
-        float exposure = 0.20f + 0.80f * diffuseSky;
-        float directSky = sampleDirectSunExposure(world, airPos);
-        float sunDot = Math.max(
-            0.0f,
-            face.getOffsetX() * environment.sunX()
-                + face.getOffsetY() * environment.sunY()
-                + face.getOffsetZ() * environment.sunZ()
-        );
-        float diffuseWeight = switch (face) {
-            case UP -> 1.0f;
-            case DOWN -> 0.05f;
-            default -> 0.42f;
-        };
-        float coolingWeight = switch (face) {
-            case UP -> 1.0f;
-            case DOWN -> 0.08f;
-            default -> 0.55f;
-        };
-        float rainWeight = switch (face) {
-            case UP -> 1.0f;
-            case DOWN -> 0.0f;
-            default -> 0.35f;
-        };
-        float baseWeight = switch (face) {
-            case UP -> 1.0f;
-            case DOWN -> 0.15f;
-            default -> 0.45f;
-        };
-        float direct = environment.directRadiation() * material.directAbsorption() * directSky * sunDot;
-        float diffuse = environment.diffuseRadiation() * material.diffuseAbsorption() * diffuseSky * diffuseWeight;
-        float skyCooling = environment.skyCooling() * material.skyCooling() * diffuseSky * coolingWeight;
-        float rainCooling = environment.precipitationCooling() * material.rainCooling() * diffuseSky * rainWeight;
-        float biome = environment.biomeBias() * material.biomeCoupling() * exposure * coolingWeight;
-        float altitude = altitudeFlux * material.altitudeCoupling() * exposure * coolingWeight;
-        float base = material.baseFlux() * exposure * baseWeight;
-        float flux = base + direct + diffuse + biome + altitude - skyCooling - rainCooling;
-        if (face.getAxis().isHorizontal()) {
-            flux *= material.wallMultiplier();
-        }
-        return MathHelper.clamp(flux, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
+        int localIndex = localSectionCellIndex(x, y, z);
+        return environment.ambientAirTemperatureKelvin()
+            + sectionTemperatureState[localIndex] * RUNTIME_TEMPERATURE_SCALE_KELVIN;
     }
 
-    private void emitSolidBlockThermalSource(
+    private float initializeSurfaceTemperatureKelvin(
+        ThermalMaterial material,
+        ThermalEnvironment environment,
+        float emitterPowerWatts,
+        int openFaces
+    ) {
+        float exposedArea = Math.max(1, openFaces) * CELL_FACE_AREA_SQUARE_METERS;
+        float ambient = 0.70f * environment.ambientAirTemperatureKelvin()
+            + 0.30f * environment.deepGroundTemperatureKelvin();
+        float denominator = Math.max(
+            1.0f,
+            material.convectiveExchangeCoefficientWm2K() * exposedArea
+                + material.bulkConductanceWm2K() * exposedArea
+        );
+        return MathHelper.clamp(
+            ambient + emitterPowerWatts / denominator,
+            THERMAL_SURFACE_INIT_MIN_K,
+            THERMAL_SURFACE_MAX_K
+        );
+    }
+
+    private void emitSurfaceThermalSource(
         float[] thermal,
+        float[] surfaceTemperature,
+        float[] sectionTemperatureState,
         ServerWorld world,
         BlockPos pos,
         BlockState state,
@@ -2023,26 +2005,17 @@ public final class AeroServerRuntime {
         BlockPos.Mutable neighborCursor
     ) {
         ThermalMaterial material = thermalMaterial(state);
-        float emitterSource = sampleEmitterThermalSource(state);
-        float altitudeFlux = sampleAltitudeThermalFlux(world, pos);
-        int openFaces = 0;
-        for (Direction direction : Direction.values()) {
-            neighborCursor.set(
-                pos.getX() + direction.getOffsetX(),
-                pos.getY() + direction.getOffsetY(),
-                pos.getZ() + direction.getOffsetZ()
-            );
-            BlockState neighborState = world.getBlockState(neighborCursor);
-            if (!isSolidObstacle(world, neighborCursor, neighborState)) {
-                openFaces++;
-            }
-        }
-        if (openFaces <= 0) {
+        if (material == null) {
             return;
         }
-        float emitterPerFace = emitterSource == 0.0f
-            ? 0.0f
-            : (emitterSource * THERMAL_SOURCE_SOLID_FACE_COUPLING) / openFaces;
+        float emitterPowerWatts = sampleEmitterThermalPowerWatts(state);
+        boolean surfaceInsideSection = inSectionBounds(x, y, z);
+        int surfaceLocalIndex = surfaceInsideSection ? localSectionCellIndex(x, y, z) : -1;
+        int openFaces = 0;
+        float solarWatts = 0.0f;
+        float longwaveWatts = 0.0f;
+        float rainWatts = 0.0f;
+        float convectiveWatts = 0.0f;
         for (Direction direction : Direction.values()) {
             neighborCursor.set(
                 pos.getX() + direction.getOffsetX(),
@@ -2050,17 +2023,141 @@ public final class AeroServerRuntime {
                 pos.getZ() + direction.getOffsetZ()
             );
             BlockState neighborState = world.getBlockState(neighborCursor);
-            if (isSolidObstacle(world, neighborCursor, neighborState)) {
+            boolean openFace = material.atmosphericExchangeRequiresAirNeighbor()
+                ? neighborState.isAir()
+                : !isSolidObstacle(world, neighborCursor, neighborState);
+            if (!openFace) {
                 continue;
             }
-            float faceFlux = emitterPerFace
-                + samplePassiveSurfaceFlux(world, neighborCursor, direction, material, environment, altitudeFlux);
+            openFaces++;
+        }
+        if (openFaces <= 0) {
+            if (surfaceInsideSection) {
+                surfaceTemperature[surfaceLocalIndex] = 0.0f;
+            }
+            return;
+        }
+
+        float currentSurfaceTemperatureKelvin = surfaceInsideSection
+            ? surfaceTemperature[surfaceLocalIndex]
+            : 0.0f;
+        if (!Float.isFinite(currentSurfaceTemperatureKelvin) || currentSurfaceTemperatureKelvin <= 0.0f) {
+            currentSurfaceTemperatureKelvin = initializeSurfaceTemperatureKelvin(
+                material,
+                environment,
+                emitterPowerWatts,
+                openFaces
+            );
+        }
+        for (Direction direction : Direction.values()) {
+            neighborCursor.set(
+                pos.getX() + direction.getOffsetX(),
+                pos.getY() + direction.getOffsetY(),
+                pos.getZ() + direction.getOffsetZ()
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            boolean openFace = material.atmosphericExchangeRequiresAirNeighbor()
+                ? neighborState.isAir()
+                : !isSolidObstacle(world, neighborCursor, neighborState);
+            if (!openFace) {
+                continue;
+            }
+            float diffuseSky = sampleSkyExposure(world, neighborCursor);
+            float directSky = sampleDirectSunExposure(world, neighborCursor);
+            float sunDot = Math.max(
+                0.0f,
+                direction.getOffsetX() * environment.sunX()
+                    + direction.getOffsetY() * environment.sunY()
+                    + direction.getOffsetZ() * environment.sunZ()
+            );
+            float diffuseWeight = switch (direction) {
+                case UP -> 1.0f;
+                case DOWN -> 0.05f;
+                default -> 0.42f;
+            };
+            float skyWeight = switch (direction) {
+                case UP -> 1.0f;
+                case DOWN -> 0.08f;
+                default -> 0.55f;
+            };
+            float rainWeight = switch (direction) {
+                case UP -> 1.0f;
+                case DOWN -> 0.0f;
+                default -> 0.35f;
+            };
+            float airTemperatureKelvin = sampleNeighborFluidTemperatureKelvin(
+                sectionTemperatureState,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                environment
+            );
+            solarWatts += material.solarAbsorptivity()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (environment.directSolarFluxWm2() * directSky * sunDot
+                    + environment.diffuseSolarFluxWm2() * diffuseSky * diffuseWeight);
+            float surfaceTempSq = currentSurfaceTemperatureKelvin * currentSurfaceTemperatureKelvin;
+            float skyTempSq = environment.skyTemperatureKelvin() * environment.skyTemperatureKelvin();
+            longwaveWatts += material.emissivity()
+                * THERMAL_STEFAN_BOLTZMANN
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (skyTempSq * skyTempSq - surfaceTempSq * surfaceTempSq)
+                * diffuseSky
+                * skyWeight;
+            rainWatts += material.rainExchangeCoefficientWm2K()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * environment.precipitationStrength()
+                * rainWeight
+                * (environment.precipitationTemperatureKelvin() - currentSurfaceTemperatureKelvin);
+            convectiveWatts += material.convectiveExchangeCoefficientWm2K()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (airTemperatureKelvin - currentSurfaceTemperatureKelvin);
+        }
+        float exposedArea = openFaces * CELL_FACE_AREA_SQUARE_METERS;
+        float bulkWatts = material.bulkConductanceWm2K()
+            * exposedArea
+            * (environment.deepGroundTemperatureKelvin() - currentSurfaceTemperatureKelvin);
+        float thermalMassJPerK = Math.max(1.0f, material.surfaceHeatCapacityJm2K() * exposedArea);
+        float updatedSurfaceTemperatureKelvin = MathHelper.clamp(
+            currentSurfaceTemperatureKelvin
+                + (solarWatts + longwaveWatts + rainWatts + bulkWatts + convectiveWatts + emitterPowerWatts)
+                    * environment.surfaceDeltaSeconds()
+                    / thermalMassJPerK,
+            THERMAL_SURFACE_INIT_MIN_K,
+            THERMAL_SURFACE_MAX_K
+        );
+        if (surfaceInsideSection) {
+            surfaceTemperature[surfaceLocalIndex] = updatedSurfaceTemperatureKelvin;
+        }
+        for (Direction direction : Direction.values()) {
+            neighborCursor.set(
+                pos.getX() + direction.getOffsetX(),
+                pos.getY() + direction.getOffsetY(),
+                pos.getZ() + direction.getOffsetZ()
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            boolean openFace = material.atmosphericExchangeRequiresAirNeighbor()
+                ? neighborState.isAir()
+                : !isSolidObstacle(world, neighborCursor, neighborState);
+            if (!openFace) {
+                continue;
+            }
+            float airTemperatureKelvin = sampleNeighborFluidTemperatureKelvin(
+                sectionTemperatureState,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                environment
+            );
+            float convectivePowerWatts = material.convectiveExchangeCoefficientWm2K()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (updatedSurfaceTemperatureKelvin - airTemperatureKelvin);
             addSectionThermalSource(
                 thermal,
                 x + direction.getOffsetX(),
                 y + direction.getOffsetY(),
                 z + direction.getOffsetZ(),
-                faceFlux
+                temperatureSourceFromPowerWatts(convectivePowerWatts)
             );
         }
     }
@@ -2104,7 +2201,22 @@ public final class AeroServerRuntime {
             || state.isOf(Blocks.BLUE_ICE);
     }
 
+    private boolean isWaterSurface(BlockState state) {
+        return state.getFluidState().isIn(FluidTags.WATER);
+    }
+
+    private boolean isMoltenSurface(BlockState state) {
+        return state.isOf(Blocks.LAVA)
+            || state.isOf(Blocks.LAVA_CAULDRON);
+    }
+
     private ThermalMaterial thermalMaterial(BlockState state) {
+        if (isMoltenSurface(state)) {
+            return ThermalMaterial.MOLTEN;
+        }
+        if (isWaterSurface(state)) {
+            return ThermalMaterial.WATER;
+        }
         if (isSnowOrIceSurface(state)) {
             return ThermalMaterial.SNOW_ICE;
         }
@@ -2131,7 +2243,17 @@ public final class AeroServerRuntime {
 
     private WindowSection sampleWindowSection(ServerWorld world, BlockPos origin) {
         WindowSection section = new WindowSection();
-        sampleSectionFields(world, origin, section.obstacle, section.air, section.thermal);
+        sampleSectionFields(
+            world,
+            origin,
+            section.obstacle,
+            section.air,
+            section.thermal,
+            section.surfaceTemperature,
+            section.surfaceKind,
+            section.temperatureState,
+            0.0f
+        );
         return section;
     }
 
@@ -2140,7 +2262,11 @@ public final class AeroServerRuntime {
         BlockPos origin,
         float[] obstacleOut,
         float[] airOut,
-        float[] thermalOut
+        float[] thermalOut,
+        float[] surfaceTemperatureOut,
+        byte[] surfaceKindOut,
+        float[] sectionTemperatureState,
+        float surfaceDeltaSeconds
     ) {
         Arrays.fill(thermalOut, 0.0f);
         BlockPos.Mutable cursor = new BlockPos.Mutable();
@@ -2153,13 +2279,19 @@ public final class AeroServerRuntime {
                     boolean solid = isSolidObstacle(world, cursor, state);
                     obstacleOut[cell] = solid ? 1.0f : 0.0f;
                     airOut[cell] = state.isAir() ? 1.0f : 0.0f;
+                    ThermalMaterial material = thermalMaterial(state);
+                    surfaceKindOut[cell] = material == null ? SURFACE_KIND_NONE : material.kind();
+                    if (surfaceKindOut[cell] == SURFACE_KIND_NONE) {
+                        surfaceTemperatureOut[cell] = 0.0f;
+                    }
                 }
             }
         }
 
         ThermalEnvironment environment = sampleThermalEnvironment(
             world,
-            new BlockPos(origin.getX() + CHUNK_SIZE / 2, origin.getY() + CHUNK_SIZE / 2, origin.getZ() + CHUNK_SIZE / 2)
+            new BlockPos(origin.getX() + CHUNK_SIZE / 2, origin.getY() + CHUNK_SIZE / 2, origin.getZ() + CHUNK_SIZE / 2),
+            surfaceDeltaSeconds
         );
         BlockPos.Mutable neighborCursor = new BlockPos.Mutable();
         for (int x = -1; x <= CHUNK_SIZE; x++) {
@@ -2167,11 +2299,23 @@ public final class AeroServerRuntime {
                 for (int z = -1; z <= CHUNK_SIZE; z++) {
                     cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
                     BlockState state = world.getBlockState(cursor);
-                    boolean solid = isSolidObstacle(world, cursor, state);
-                    if (solid) {
-                        emitSolidBlockThermalSource(thermalOut, world, cursor, state, x, y, z, environment, neighborCursor);
+                    ThermalMaterial material = thermalMaterial(state);
+                    if (material != null) {
+                        emitSurfaceThermalSource(
+                            thermalOut,
+                            surfaceTemperatureOut,
+                            sectionTemperatureState,
+                            world,
+                            cursor,
+                            state,
+                            x,
+                            y,
+                            z,
+                            environment,
+                            neighborCursor
+                        );
                     } else {
-                        float source = sampleEmitterThermalSource(state) + sampleFluidThermalSource(world, cursor, state, environment);
+                        float source = sampleUnsupportedEmitterThermalSource(state);
                         addSectionThermalSource(thermalOut, x, y, z, source);
                     }
                 }
@@ -2185,25 +2329,43 @@ public final class AeroServerRuntime {
         WindowSection section,
         float[] obstacleScratch,
         float[] airScratch,
-        float[] thermalScratch
+        float[] thermalScratch,
+        float[] surfaceTemperatureScratch,
+        byte[] surfaceKindScratch,
+        float deltaSeconds
     ) {
-        sampleSectionFields(world, origin, obstacleScratch, airScratch, thermalScratch);
+        System.arraycopy(section.surfaceTemperature, 0, surfaceTemperatureScratch, 0, SECTION_CELL_COUNT);
+        sampleSectionFields(
+            world,
+            origin,
+            obstacleScratch,
+            airScratch,
+            thermalScratch,
+            surfaceTemperatureScratch,
+            surfaceKindScratch,
+            section.temperatureState,
+            deltaSeconds
+        );
         boolean geometryChanged = false;
         for (int i = 0; i < SECTION_CELL_COUNT; i++) {
-            if (section.obstacle[i] == obstacleScratch[i]) {
-                continue;
+            boolean obstacleChanged = section.obstacle[i] != obstacleScratch[i];
+            boolean airChanged = section.air[i] != airScratch[i];
+            boolean surfaceKindChanged = section.surfaceKind[i] != surfaceKindScratch[i];
+            if (obstacleChanged || airChanged || surfaceKindChanged) {
+                geometryChanged = true;
+                int stateIdx = i * RESPONSE_CHANNELS;
+                section.state[stateIdx] = 0.0f;
+                section.state[stateIdx + 1] = 0.0f;
+                section.state[stateIdx + 2] = 0.0f;
+                section.state[stateIdx + 3] = 0.0f;
+                section.temperatureState[i] = 0.0f;
             }
-            geometryChanged = true;
-            int stateIdx = i * RESPONSE_CHANNELS;
-            section.state[stateIdx] = 0.0f;
-            section.state[stateIdx + 1] = 0.0f;
-            section.state[stateIdx + 2] = 0.0f;
-            section.state[stateIdx + 3] = 0.0f;
-            section.temperatureState[i] = 0.0f;
         }
         System.arraycopy(obstacleScratch, 0, section.obstacle, 0, SECTION_CELL_COUNT);
         System.arraycopy(airScratch, 0, section.air, 0, SECTION_CELL_COUNT);
         System.arraycopy(thermalScratch, 0, section.thermal, 0, SECTION_CELL_COUNT);
+        System.arraycopy(surfaceTemperatureScratch, 0, section.surfaceTemperature, 0, SECTION_CELL_COUNT);
+        System.arraycopy(surfaceKindScratch, 0, section.surfaceKind, 0, SECTION_CELL_COUNT);
         return geometryChanged;
     }
 
@@ -2211,9 +2373,12 @@ public final class AeroServerRuntime {
         window.ambientThermalBias = sampleAmbientThermalBias(world);
         if (!forceFullResample && window.sections != null) {
             boolean geometryChanged = false;
+            float deltaSeconds = Math.max(1, tickCounter - window.lastSampleRefreshTick) * SOLVER_STEP_SECONDS;
             float[] obstacleScratch = new float[SECTION_CELL_COUNT];
             float[] airScratch = new float[SECTION_CELL_COUNT];
             float[] thermalScratch = new float[SECTION_CELL_COUNT];
+            float[] surfaceTemperatureScratch = new float[SECTION_CELL_COUNT];
+            byte[] surfaceKindScratch = new byte[SECTION_CELL_COUNT];
             for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
                 for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
                     for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
@@ -2230,7 +2395,10 @@ public final class AeroServerRuntime {
                             section,
                             obstacleScratch,
                             airScratch,
-                            thermalScratch
+                            thermalScratch,
+                            surfaceTemperatureScratch,
+                            surfaceKindScratch,
+                            deltaSeconds
                         );
                     }
                 }
@@ -3025,31 +3193,36 @@ public final class AeroServerRuntime {
     }
 
     private record ThermalEnvironment(
-        float biomeBias,
-        float directRadiation,
-        float diffuseRadiation,
-        float skyCooling,
-        float precipitationCooling,
+        float directSolarFluxWm2,
+        float diffuseSolarFluxWm2,
+        float ambientAirTemperatureKelvin,
+        float deepGroundTemperatureKelvin,
+        float skyTemperatureKelvin,
+        float precipitationTemperatureKelvin,
+        float precipitationStrength,
         float sunX,
         float sunY,
-        float sunZ
+        float sunZ,
+        float surfaceDeltaSeconds
     ) {
     }
 
     private record ThermalMaterial(
-        float directAbsorption,
-        float diffuseAbsorption,
-        float skyCooling,
-        float rainCooling,
-        float biomeCoupling,
-        float altitudeCoupling,
-        float wallMultiplier,
-        float baseFlux
+        byte kind,
+        float solarAbsorptivity,
+        float emissivity,
+        float surfaceHeatCapacityJm2K,
+        float convectiveExchangeCoefficientWm2K,
+        float bulkConductanceWm2K,
+        float rainExchangeCoefficientWm2K,
+        boolean atmosphericExchangeRequiresAirNeighbor
     ) {
-        private static final ThermalMaterial ROCK = new ThermalMaterial(0.78f, 0.52f, 0.70f, 0.18f, 0.30f, 0.28f, 0.72f, 0.0f);
-        private static final ThermalMaterial SOIL = new ThermalMaterial(1.00f, 0.68f, 0.55f, 0.25f, 0.40f, 0.42f, 0.60f, 0.0f);
-        private static final ThermalMaterial VEGETATION = new ThermalMaterial(0.62f, 0.55f, 0.72f, 0.85f, 0.25f, 0.25f, 0.58f, -THERMAL_SOURCE_VEGETATION_BASE_COOLING);
-        private static final ThermalMaterial SNOW_ICE = new ThermalMaterial(0.18f, 0.24f, 0.88f, 0.10f, 0.15f, 0.22f, 0.62f, -THERMAL_SOURCE_SNOW_BASE_COOLING);
+        private static final ThermalMaterial ROCK = new ThermalMaterial(SURFACE_KIND_ROCK, 0.78f, 0.92f, 1.60e5f, 8.0f, 2.4f, 20.0f, false);
+        private static final ThermalMaterial SOIL = new ThermalMaterial(SURFACE_KIND_SOIL, 0.88f, 0.94f, 1.35e5f, 7.0f, 1.7f, 24.0f, false);
+        private static final ThermalMaterial VEGETATION = new ThermalMaterial(SURFACE_KIND_VEGETATION, 0.64f, 0.96f, 1.90e5f, 9.0f, 1.2f, 32.0f, false);
+        private static final ThermalMaterial SNOW_ICE = new ThermalMaterial(SURFACE_KIND_SNOW_ICE, 0.22f, 0.98f, 2.40e5f, 6.0f, 1.0f, 18.0f, false);
+        private static final ThermalMaterial WATER = new ThermalMaterial(SURFACE_KIND_WATER, 0.93f, 0.96f, 1.00e6f, 10.0f, 0.6f, 40.0f, true);
+        private static final ThermalMaterial MOLTEN = new ThermalMaterial(SURFACE_KIND_MOLTEN, 0.95f, 0.95f, 3.50e5f, 14.0f, 4.0f, 18.0f, false);
     }
 
     private record FanSource(BlockPos pos, Direction facing, int ductLength) {
@@ -3249,6 +3422,8 @@ public final class AeroServerRuntime {
         private final float[] air = new float[SECTION_CELL_COUNT];
         private final float[] thermal = new float[SECTION_CELL_COUNT];
         private final float[] temperatureState = new float[SECTION_CELL_COUNT];
+        private final float[] surfaceTemperature = new float[SECTION_CELL_COUNT];
+        private final byte[] surfaceKind = new byte[SECTION_CELL_COUNT];
         private final float[] state = new float[SECTION_CELL_COUNT * RESPONSE_CHANNELS];
     }
 
