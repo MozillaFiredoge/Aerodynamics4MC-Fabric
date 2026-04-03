@@ -1910,12 +1910,65 @@ public final class AeroServerRuntime {
         return Math.max(powerWatts, 0.0f);
     }
 
-    private float sampleUnsupportedEmitterThermalSource(BlockState state) {
+    private void emitUnsupportedEmitterThermalSource(
+        float[] thermal,
+        ServerWorld world,
+        BlockPos pos,
+        BlockState state,
+        int x,
+        int y,
+        int z,
+        BlockPos.Mutable neighborCursor
+    ) {
         ThermalMaterial material = thermalMaterial(state);
         if (material != null) {
-            return 0.0f;
+            return;
         }
-        return temperatureSourceFromPowerWatts(sampleEmitterThermalPowerWatts(state));
+        float emitterPowerWatts = sampleEmitterThermalPowerWatts(state);
+        if (emitterPowerWatts <= 0.0f) {
+            return;
+        }
+        float selfWeight = isSolidObstacle(world, pos, state) ? 0.0f : 0.30f;
+        float totalWeight = selfWeight;
+        float[] faceWeights = new float[Direction.values().length];
+        for (Direction direction : Direction.values()) {
+            neighborCursor.set(
+                pos.getX() + direction.getOffsetX(),
+                pos.getY() + direction.getOffsetY(),
+                pos.getZ() + direction.getOffsetZ()
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            if (!neighborState.isAir()) {
+                continue;
+            }
+            float weight = switch (direction) {
+                case UP -> 0.55f;
+                case DOWN -> 0.03f;
+                default -> 0.12f;
+            };
+            faceWeights[direction.ordinal()] = weight;
+            totalWeight += weight;
+        }
+        if (totalWeight <= 1.0e-6f) {
+            return;
+        }
+        float scalarSource = temperatureSourceFromPowerWatts(emitterPowerWatts);
+        if (selfWeight > 0.0f) {
+            addSectionThermalSource(thermal, x, y, z, scalarSource * (selfWeight / totalWeight));
+        }
+        for (Direction direction : Direction.values()) {
+            float weight = faceWeights[direction.ordinal()];
+            if (weight <= 0.0f) {
+                continue;
+            }
+            addSectionThermalSource(
+                thermal,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                scalarSource * (weight / totalWeight)
+            );
+        }
     }
 
     private ThermalEnvironment sampleThermalEnvironment(ServerWorld world, BlockPos samplePos, float surfaceDeltaSeconds) {
@@ -2323,8 +2376,16 @@ public final class AeroServerRuntime {
                             neighborCursor
                         );
                     } else {
-                        float source = sampleUnsupportedEmitterThermalSource(state);
-                        addSectionThermalSource(thermalOut, x, y, z, source);
+                        emitUnsupportedEmitterThermalSource(
+                            thermalOut,
+                            world,
+                            cursor,
+                            state,
+                            x,
+                            y,
+                            z,
+                            neighborCursor
+                        );
                     }
                 }
             }
