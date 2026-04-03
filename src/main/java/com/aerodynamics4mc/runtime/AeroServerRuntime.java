@@ -110,7 +110,8 @@ public final class AeroServerRuntime {
     private static final int FLOW_COUNT = GRID_SIZE * GRID_SIZE * GRID_SIZE * RESPONSE_CHANNELS;
 
     private static final int WINDOW_REFRESH_TICKS = 100;
-    private static final int WINDOW_SAMPLE_RESYNC_TICKS = 200;
+    private static final int WINDOW_GEOMETRY_RESYNC_TICKS = 200;
+    private static final int WINDOW_THERMAL_REFRESH_TICKS = 10;
     private static final int FLOW_SYNC_INTERVAL_TICKS = 2;
     private static final int MAX_SIMULATION_STEP_BACKLOG = 2;
     private static final int CHUNK_SIZE = 16;
@@ -157,6 +158,8 @@ public final class AeroServerRuntime {
     private static final byte SURFACE_KIND_SNOW_ICE = 4;
     private static final byte SURFACE_KIND_WATER = 5;
     private static final byte SURFACE_KIND_MOLTEN = 6;
+    private static final Direction[] CARDINAL_DIRECTIONS = Direction.values();
+    private static final int FACE_COUNT = 6;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
@@ -514,10 +517,14 @@ public final class AeroServerRuntime {
                     it.remove();
                     continue;
                 }
-                if (!window.busy.get() && shouldResampleWindowSamples(window)) {
-                    boolean geometryChanged = refreshSampleFields(world, key.origin(), window, false);
-                    if (geometryChanged) {
-                        markWindowBackendDirty(window);
+                if (!window.busy.get()) {
+                    if (shouldResampleWindowGeometry(window)) {
+                        boolean geometryChanged = refreshSampleFields(world, key.origin(), window, false);
+                        if (geometryChanged) {
+                            markWindowBackendDirty(window);
+                        }
+                    } else if (shouldRefreshWindowThermal(window)) {
+                        refreshWindowThermalFields(world, key.origin(), window);
                     }
                 }
             }
@@ -978,6 +985,14 @@ public final class AeroServerRuntime {
                     dstSection.temperatureState[dstLocal] = srcSection.temperatureState[srcLocal];
                     dstSection.surfaceTemperature[dstLocal] = srcSection.surfaceTemperature[srcLocal];
                     dstSection.surfaceKind[dstLocal] = srcSection.surfaceKind[srcLocal];
+                    dstSection.emitterPowerWatts[dstLocal] = srcSection.emitterPowerWatts[srcLocal];
+                    dstSection.openFaceMask[dstLocal] = srcSection.openFaceMask[srcLocal];
+                    for (Direction direction : CARDINAL_DIRECTIONS) {
+                        int srcFace = faceDataIndex(srcLocal, direction);
+                        int dstFace = faceDataIndex(dstLocal, direction);
+                        dstSection.faceSkyExposure[dstFace] = srcSection.faceSkyExposure[srcFace];
+                        dstSection.faceDirectExposure[dstFace] = srcSection.faceDirectExposure[srcFace];
+                    }
                 }
             }
         }
@@ -1070,8 +1085,6 @@ public final class AeroServerRuntime {
                 section.state[idx + 2] = 0.0f;
                 section.state[idx + 3] = 0.0f;
                 section.temperatureState[i] = 0.0f;
-                section.surfaceTemperature[i] = 0.0f;
-                section.surfaceKind[i] = SURFACE_KIND_NONE;
             }
         }
         window.clearCompletedSolveResult();
@@ -1129,8 +1142,12 @@ public final class AeroServerRuntime {
         }
     }
 
-    private boolean shouldResampleWindowSamples(WindowState window) {
-        return tickCounter - window.lastSampleRefreshTick >= WINDOW_SAMPLE_RESYNC_TICKS;
+    private boolean shouldResampleWindowGeometry(WindowState window) {
+        return tickCounter - window.lastGeometryRefreshTick >= WINDOW_GEOMETRY_RESYNC_TICKS;
+    }
+
+    private boolean shouldRefreshWindowThermal(WindowState window) {
+        return tickCounter - window.lastThermalRefreshTick >= WINDOW_THERMAL_REFRESH_TICKS;
     }
 
     private boolean captureTemperatureStateFromNative(WindowState window) {
@@ -2293,6 +2310,38 @@ public final class AeroServerRuntime {
         return null;
     }
 
+    private ThermalMaterial thermalMaterial(byte kind) {
+        return switch (kind) {
+            case SURFACE_KIND_ROCK -> ThermalMaterial.ROCK;
+            case SURFACE_KIND_SOIL -> ThermalMaterial.SOIL;
+            case SURFACE_KIND_VEGETATION -> ThermalMaterial.VEGETATION;
+            case SURFACE_KIND_SNOW_ICE -> ThermalMaterial.SNOW_ICE;
+            case SURFACE_KIND_WATER -> ThermalMaterial.WATER;
+            case SURFACE_KIND_MOLTEN -> ThermalMaterial.MOLTEN;
+            default -> null;
+        };
+    }
+
+    private int faceDataIndex(int cell, Direction direction) {
+        return cell * FACE_COUNT + direction.ordinal();
+    }
+
+    private byte setFaceBit(byte mask, Direction direction) {
+        return (byte) (mask | (1 << direction.ordinal()));
+    }
+
+    private boolean hasFaceBit(byte mask, Direction direction) {
+        return (mask & (1 << direction.ordinal())) != 0;
+    }
+
+    private byte quantizeUnitFloat(float value) {
+        return (byte) MathHelper.clamp(Math.round(MathHelper.clamp(value, 0.0f, 1.0f) * 255.0f), 0, 255);
+    }
+
+    private float dequantizeUnitFloat(byte value) {
+        return (value & 0xFF) / 255.0f;
+    }
+
     private void addSectionThermalSource(float[] thermal, int x, int y, int z, float source) {
         if (source == 0.0f || !inSectionBounds(x, y, z)) {
             return;
@@ -2307,6 +2356,7 @@ public final class AeroServerRuntime {
         sampleSectionFields(
             world,
             origin,
+            section,
             section.obstacle,
             section.air,
             section.thermal,
@@ -2318,9 +2368,22 @@ public final class AeroServerRuntime {
         return section;
     }
 
+    private boolean geometryMatchesSectionState(ServerWorld world, BlockPos pos, WindowSection section, BlockState state, int x, int y, int z) {
+        if (!inSectionBounds(x, y, z)) {
+            return true;
+        }
+        int cell = localSectionCellIndex(x, y, z);
+        boolean expectedSolid = section.obstacle[cell] != 0.0f;
+        boolean expectedAir = section.air[cell] != 0.0f;
+        boolean actualSolid = isSolidObstacle(world, pos, state);
+        boolean actualAir = state.isAir();
+        return expectedSolid == actualSolid && expectedAir == actualAir;
+    }
+
     private void sampleSectionFields(
         ServerWorld world,
         BlockPos origin,
+        WindowSection section,
         float[] obstacleOut,
         float[] airOut,
         float[] thermalOut,
@@ -2330,6 +2393,8 @@ public final class AeroServerRuntime {
         float surfaceDeltaSeconds
     ) {
         Arrays.fill(thermalOut, 0.0f);
+        Arrays.fill(surfaceTemperatureOut, 0.0f);
+        Arrays.fill(surfaceKindOut, SURFACE_KIND_NONE);
         BlockPos.Mutable cursor = new BlockPos.Mutable();
         for (int x = 0; x < CHUNK_SIZE; x++) {
             for (int y = 0; y < CHUNK_SIZE; y++) {
@@ -2342,9 +2407,7 @@ public final class AeroServerRuntime {
                     airOut[cell] = state.isAir() ? 1.0f : 0.0f;
                     ThermalMaterial material = thermalMaterial(state);
                     surfaceKindOut[cell] = material == null ? SURFACE_KIND_NONE : material.kind();
-                    if (surfaceKindOut[cell] == SURFACE_KIND_NONE) {
-                        surfaceTemperatureOut[cell] = 0.0f;
-                    }
+                    sectionStaticThermalFields(world, cursor, state, x, y, z, material, section);
                 }
             }
         }
@@ -2354,41 +2417,292 @@ public final class AeroServerRuntime {
             new BlockPos(origin.getX() + CHUNK_SIZE / 2, origin.getY() + CHUNK_SIZE / 2, origin.getZ() + CHUNK_SIZE / 2),
             surfaceDeltaSeconds
         );
+        recomputeSectionThermalFields(section, sectionTemperatureState, thermalOut, surfaceTemperatureOut, surfaceKindOut, environment);
+    }
+
+    private void sectionStaticThermalFields(
+        ServerWorld world,
+        BlockPos pos,
+        BlockState state,
+        int x,
+        int y,
+        int z,
+        ThermalMaterial material,
+        WindowSection section
+    ) {
+        if (!inSectionBounds(x, y, z)) {
+            return;
+        }
+        int cell = localSectionCellIndex(x, y, z);
+        float emitterPowerWatts = sampleEmitterThermalPowerWatts(state);
+        byte openFaceMask = 0;
+        if (section != null) {
+            section.emitterPowerWatts[cell] = emitterPowerWatts;
+            section.openFaceMask[cell] = 0;
+            Arrays.fill(section.faceSkyExposure, cell * FACE_COUNT, cell * FACE_COUNT + FACE_COUNT, (byte) 0);
+            Arrays.fill(section.faceDirectExposure, cell * FACE_COUNT, cell * FACE_COUNT + FACE_COUNT, (byte) 0);
+        }
+        if (material == null && emitterPowerWatts <= 0.0f) {
+            return;
+        }
         BlockPos.Mutable neighborCursor = new BlockPos.Mutable();
-        for (int x = -1; x <= CHUNK_SIZE; x++) {
-            for (int y = -1; y <= CHUNK_SIZE; y++) {
-                for (int z = -1; z <= CHUNK_SIZE; z++) {
-                    cursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
-                    BlockState state = world.getBlockState(cursor);
-                    ThermalMaterial material = thermalMaterial(state);
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            neighborCursor.set(
+                pos.getX() + direction.getOffsetX(),
+                pos.getY() + direction.getOffsetY(),
+                pos.getZ() + direction.getOffsetZ()
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            boolean openFace;
+            if (material != null) {
+                openFace = material.atmosphericExchangeRequiresAirNeighbor()
+                    ? neighborState.isAir()
+                    : !isSolidObstacle(world, neighborCursor, neighborState);
+            } else {
+                openFace = neighborState.isAir();
+            }
+            if (!openFace) {
+                continue;
+            }
+            openFaceMask = setFaceBit(openFaceMask, direction);
+            if (section != null) {
+                int faceIndex = faceDataIndex(cell, direction);
+                section.faceSkyExposure[faceIndex] = quantizeUnitFloat(sampleSkyExposure(world, neighborCursor));
+                section.faceDirectExposure[faceIndex] = quantizeUnitFloat(sampleDirectSunExposure(world, neighborCursor));
+            }
+        }
+        if (section != null) {
+            section.openFaceMask[cell] = openFaceMask;
+        }
+    }
+
+    private void recomputeSectionThermalFields(
+        WindowSection section,
+        float[] sectionTemperatureState,
+        float[] thermalOut,
+        float[] surfaceTemperatureOut,
+        byte[] surfaceKindOut,
+        ThermalEnvironment environment
+    ) {
+        Arrays.fill(thermalOut, 0.0f);
+        if (section == null) {
+            return;
+        }
+        for (int x = 0; x < CHUNK_SIZE; x++) {
+            for (int y = 0; y < CHUNK_SIZE; y++) {
+                for (int z = 0; z < CHUNK_SIZE; z++) {
+                    int cell = localSectionCellIndex(x, y, z);
+                    ThermalMaterial material = thermalMaterial(surfaceKindOut[cell]);
+                    float emitterPowerWatts = section.emitterPowerWatts[cell];
+                    byte openFaceMask = section.openFaceMask[cell];
                     if (material != null) {
-                        emitSurfaceThermalSource(
+                        emitSurfaceThermalSourceCached(
                             thermalOut,
                             surfaceTemperatureOut,
                             sectionTemperatureState,
-                            world,
-                            cursor,
-                            state,
                             x,
                             y,
                             z,
-                            environment,
-                            neighborCursor
+                            material,
+                            emitterPowerWatts,
+                            openFaceMask,
+                            section.faceSkyExposure,
+                            section.faceDirectExposure,
+                            environment
+                        );
+                    } else if (emitterPowerWatts > 0.0f) {
+                        emitUnsupportedEmitterThermalSourceCached(
+                            thermalOut,
+                            section.obstacle,
+                            x,
+                            y,
+                            z,
+                            emitterPowerWatts,
+                            openFaceMask
                         );
                     } else {
-                        emitUnsupportedEmitterThermalSource(
-                            thermalOut,
-                            world,
-                            cursor,
-                            state,
-                            x,
-                            y,
-                            z,
-                            neighborCursor
-                        );
+                        surfaceTemperatureOut[cell] = 0.0f;
                     }
                 }
             }
+        }
+    }
+
+    private void emitUnsupportedEmitterThermalSourceCached(
+        float[] thermal,
+        float[] obstacleField,
+        int x,
+        int y,
+        int z,
+        float emitterPowerWatts,
+        byte openFaceMask
+    ) {
+        if (emitterPowerWatts <= 0.0f || openFaceMask == 0) {
+            return;
+        }
+        int cell = localSectionCellIndex(x, y, z);
+        float selfWeight = obstacleField[cell] != 0.0f ? 0.0f : 0.30f;
+        float totalWeight = selfWeight;
+        float[] faceWeights = new float[FACE_COUNT];
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            if (!hasFaceBit(openFaceMask, direction)) {
+                continue;
+            }
+            float weight = switch (direction) {
+                case UP -> 0.55f;
+                case DOWN -> 0.03f;
+                default -> 0.12f;
+            };
+            faceWeights[direction.ordinal()] = weight;
+            totalWeight += weight;
+        }
+        if (totalWeight <= 1.0e-6f) {
+            return;
+        }
+        float scalarSource = temperatureSourceFromPowerWatts(emitterPowerWatts);
+        if (selfWeight > 0.0f) {
+            addSectionThermalSource(thermal, x, y, z, scalarSource * (selfWeight / totalWeight));
+        }
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            float weight = faceWeights[direction.ordinal()];
+            if (weight <= 0.0f) {
+                continue;
+            }
+            addSectionThermalSource(
+                thermal,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                scalarSource * (weight / totalWeight)
+            );
+        }
+    }
+
+    private void emitSurfaceThermalSourceCached(
+        float[] thermal,
+        float[] surfaceTemperature,
+        float[] sectionTemperatureState,
+        int x,
+        int y,
+        int z,
+        ThermalMaterial material,
+        float emitterPowerWatts,
+        byte openFaceMask,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure,
+        ThermalEnvironment environment
+    ) {
+        if (openFaceMask == 0) {
+            surfaceTemperature[localSectionCellIndex(x, y, z)] = 0.0f;
+            return;
+        }
+        int surfaceLocalIndex = localSectionCellIndex(x, y, z);
+        int openFaces = Integer.bitCount(openFaceMask & 0xFF);
+        float currentSurfaceTemperatureKelvin = surfaceTemperature[surfaceLocalIndex];
+        if (!Float.isFinite(currentSurfaceTemperatureKelvin) || currentSurfaceTemperatureKelvin <= 0.0f) {
+            currentSurfaceTemperatureKelvin = initializeSurfaceTemperatureKelvin(
+                material,
+                environment,
+                emitterPowerWatts,
+                openFaces
+            );
+        }
+
+        float solarWatts = 0.0f;
+        float longwaveWatts = 0.0f;
+        float rainWatts = 0.0f;
+        float convectiveWatts = 0.0f;
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            if (!hasFaceBit(openFaceMask, direction)) {
+                continue;
+            }
+            int faceIndex = faceDataIndex(surfaceLocalIndex, direction);
+            float diffuseSky = dequantizeUnitFloat(faceSkyExposure[faceIndex]);
+            float directSky = dequantizeUnitFloat(faceDirectExposure[faceIndex]);
+            float sunDot = Math.max(
+                0.0f,
+                direction.getOffsetX() * environment.sunX()
+                    + direction.getOffsetY() * environment.sunY()
+                    + direction.getOffsetZ() * environment.sunZ()
+            );
+            float diffuseWeight = switch (direction) {
+                case UP -> 1.0f;
+                case DOWN -> 0.05f;
+                default -> 0.42f;
+            };
+            float skyWeight = switch (direction) {
+                case UP -> 1.0f;
+                case DOWN -> 0.08f;
+                default -> 0.55f;
+            };
+            float rainWeight = switch (direction) {
+                case UP -> 1.0f;
+                case DOWN -> 0.0f;
+                default -> 0.35f;
+            };
+            float airTemperatureKelvin = sampleNeighborFluidTemperatureKelvin(
+                sectionTemperatureState,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                environment
+            );
+            solarWatts += material.solarAbsorptivity()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (environment.directSolarFluxWm2() * directSky * sunDot
+                    + environment.diffuseSolarFluxWm2() * diffuseSky * diffuseWeight);
+            float surfaceTempSq = currentSurfaceTemperatureKelvin * currentSurfaceTemperatureKelvin;
+            float skyTempSq = environment.skyTemperatureKelvin() * environment.skyTemperatureKelvin();
+            longwaveWatts += material.emissivity()
+                * THERMAL_STEFAN_BOLTZMANN
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (skyTempSq * skyTempSq - surfaceTempSq * surfaceTempSq)
+                * diffuseSky
+                * skyWeight;
+            rainWatts += material.rainExchangeCoefficientWm2K()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * environment.precipitationStrength()
+                * rainWeight
+                * (environment.precipitationTemperatureKelvin() - currentSurfaceTemperatureKelvin);
+            convectiveWatts += material.convectiveExchangeCoefficientWm2K()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (airTemperatureKelvin - currentSurfaceTemperatureKelvin);
+        }
+        float exposedArea = openFaces * CELL_FACE_AREA_SQUARE_METERS;
+        float bulkWatts = material.bulkConductanceWm2K()
+            * exposedArea
+            * (environment.deepGroundTemperatureKelvin() - currentSurfaceTemperatureKelvin);
+        float thermalMassJPerK = Math.max(1.0f, material.surfaceHeatCapacityJm2K() * exposedArea);
+        float updatedSurfaceTemperatureKelvin = MathHelper.clamp(
+            currentSurfaceTemperatureKelvin
+                + (solarWatts + longwaveWatts + rainWatts + bulkWatts + convectiveWatts + emitterPowerWatts)
+                    * environment.surfaceDeltaSeconds()
+                    / thermalMassJPerK,
+            THERMAL_SURFACE_INIT_MIN_K,
+            THERMAL_SURFACE_MAX_K
+        );
+        surfaceTemperature[surfaceLocalIndex] = updatedSurfaceTemperatureKelvin;
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            if (!hasFaceBit(openFaceMask, direction)) {
+                continue;
+            }
+            float airTemperatureKelvin = sampleNeighborFluidTemperatureKelvin(
+                sectionTemperatureState,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                environment
+            );
+            float convectivePowerWatts = material.convectiveExchangeCoefficientWm2K()
+                * CELL_FACE_AREA_SQUARE_METERS
+                * (updatedSurfaceTemperatureKelvin - airTemperatureKelvin);
+            addSectionThermalSource(
+                thermal,
+                x + direction.getOffsetX(),
+                y + direction.getOffsetY(),
+                z + direction.getOffsetZ(),
+                temperatureSourceFromPowerWatts(convectivePowerWatts)
+            );
         }
     }
 
@@ -2407,6 +2721,7 @@ public final class AeroServerRuntime {
         sampleSectionFields(
             world,
             origin,
+            section,
             obstacleScratch,
             airScratch,
             thermalScratch,
@@ -2438,11 +2753,64 @@ public final class AeroServerRuntime {
         return geometryChanged;
     }
 
+    private void sampleSectionThermalFields(
+        ServerWorld world,
+        BlockPos origin,
+        WindowSection section,
+        float[] thermalOut,
+        float[] surfaceTemperatureOut,
+        byte[] surfaceKindOut,
+        float surfaceDeltaSeconds
+    ) {
+        System.arraycopy(section.surfaceTemperature, 0, surfaceTemperatureOut, 0, SECTION_CELL_COUNT);
+        System.arraycopy(section.surfaceKind, 0, surfaceKindOut, 0, SECTION_CELL_COUNT);
+        ThermalEnvironment environment = sampleThermalEnvironment(
+            world,
+            new BlockPos(origin.getX() + CHUNK_SIZE / 2, origin.getY() + CHUNK_SIZE / 2, origin.getZ() + CHUNK_SIZE / 2),
+            surfaceDeltaSeconds
+        );
+        recomputeSectionThermalFields(section, section.temperatureState, thermalOut, surfaceTemperatureOut, surfaceKindOut, environment);
+    }
+
+    private void refreshWindowThermalFields(ServerWorld world, BlockPos origin, WindowState window) {
+        if (window.sections == null) {
+            return;
+        }
+        window.ambientThermalBias = sampleAmbientThermalBias(world);
+        float deltaSeconds = Math.max(1, tickCounter - window.lastThermalRefreshTick) * SOLVER_STEP_SECONDS;
+        float[] thermalScratch = new float[SECTION_CELL_COUNT];
+        float[] surfaceTemperatureScratch = new float[SECTION_CELL_COUNT];
+        byte[] surfaceKindScratch = new byte[SECTION_CELL_COUNT];
+        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+            for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                    WindowSection section = window.sectionAt(sx, sy, sz);
+                    if (section == null) {
+                        continue;
+                    }
+                    sampleSectionThermalFields(
+                        world,
+                        sectionOrigin(origin, sx, sy, sz),
+                        section,
+                        thermalScratch,
+                        surfaceTemperatureScratch,
+                        surfaceKindScratch,
+                        deltaSeconds
+                    );
+                    System.arraycopy(thermalScratch, 0, section.thermal, 0, SECTION_CELL_COUNT);
+                    System.arraycopy(surfaceTemperatureScratch, 0, section.surfaceTemperature, 0, SECTION_CELL_COUNT);
+                    System.arraycopy(surfaceKindScratch, 0, section.surfaceKind, 0, SECTION_CELL_COUNT);
+                }
+            }
+        }
+        window.lastThermalRefreshTick = tickCounter;
+    }
+
     private boolean refreshSampleFields(ServerWorld world, BlockPos origin, WindowState window, boolean forceFullResample) {
         window.ambientThermalBias = sampleAmbientThermalBias(world);
         if (!forceFullResample && window.sections != null) {
             boolean geometryChanged = false;
-            float deltaSeconds = Math.max(1, tickCounter - window.lastSampleRefreshTick) * SOLVER_STEP_SECONDS;
+            float deltaSeconds = Math.max(1, tickCounter - window.lastThermalRefreshTick) * SOLVER_STEP_SECONDS;
             float[] obstacleScratch = new float[SECTION_CELL_COUNT];
             float[] airScratch = new float[SECTION_CELL_COUNT];
             float[] thermalScratch = new float[SECTION_CELL_COUNT];
@@ -2472,7 +2840,8 @@ public final class AeroServerRuntime {
                     }
                 }
             }
-            window.lastSampleRefreshTick = tickCounter;
+            window.lastGeometryRefreshTick = tickCounter;
+            window.lastThermalRefreshTick = tickCounter;
             return geometryChanged;
         }
 
@@ -2485,7 +2854,8 @@ public final class AeroServerRuntime {
             }
         }
         clearWindowStateChannels(window);
-        window.lastSampleRefreshTick = tickCounter;
+        window.lastGeometryRefreshTick = tickCounter;
+        window.lastThermalRefreshTick = tickCounter;
         return false;
     }
 
@@ -3356,7 +3726,8 @@ public final class AeroServerRuntime {
         private float[] solveField;
         private float[] temperatureTransferBuffer;
         private float ambientThermalBias = 0.0f;
-        private int lastSampleRefreshTick;
+        private int lastGeometryRefreshTick;
+        private int lastThermalRefreshTick;
         private List<FanSource> fans = List.of();
         private volatile boolean detached;
         private volatile boolean backendResetPending;
@@ -3493,6 +3864,10 @@ public final class AeroServerRuntime {
         private final float[] temperatureState = new float[SECTION_CELL_COUNT];
         private final float[] surfaceTemperature = new float[SECTION_CELL_COUNT];
         private final byte[] surfaceKind = new byte[SECTION_CELL_COUNT];
+        private final float[] emitterPowerWatts = new float[SECTION_CELL_COUNT];
+        private final byte[] openFaceMask = new byte[SECTION_CELL_COUNT];
+        private final byte[] faceSkyExposure = new byte[SECTION_CELL_COUNT * FACE_COUNT];
+        private final byte[] faceDirectExposure = new byte[SECTION_CELL_COUNT * FACE_COUNT];
         private final float[] state = new float[SECTION_CELL_COUNT * RESPONSE_CHANNELS];
     }
 
