@@ -142,21 +142,29 @@ constexpr float kCs2 = 1.0f / 3.0f;
 constexpr float kRuntimeSecondsPerStep = 1.0f / 20.0f;
 constexpr float kRuntimeMetersPerCell = 1.0f;
 constexpr float kRuntimeVelocityScale = kRuntimeMetersPerCell / kRuntimeSecondsPerStep;
+constexpr float kRuntimeAirKinematicViscosityMetersSqPerSecond = 1.50e-5f;
 constexpr float kRuntimeTemperatureScaleKelvin = 20.0f;
 constexpr float kRuntimeAirThermalExpansionPerKelvin = 1.0f / 300.0f;
 constexpr float kRuntimeGravityMetersPerSecondSq = 9.81f;
+constexpr float kRuntimeMolecularNu0 =
+    kRuntimeAirKinematicViscosityMetersSqPerSecond
+    * (kRuntimeSecondsPerStep / (kRuntimeMetersPerCell * kRuntimeMetersPerCell));
 
 constexpr float kRhoMin = 0.97f;
 constexpr float kRhoMax = 1.03f;
 constexpr float kPressureMin = -0.03f;
 constexpr float kPressureMax = 0.03f;
 
-// D3Q27 cumulant closure with low-viscosity baseline tau.
-constexpr float kTauShear = 0.50003f;
-constexpr float kTauShearMin = 0.5005;
+// D3Q27 cumulant closure with an explicit molecular viscosity baseline.
+constexpr float kNuShearMin = 1.0e-8f;
+constexpr float kNuShearMax = (0.95f - 0.5f) / 3.0f;
+constexpr float kNuNormalMin = 1.0e-8f;
+constexpr float kNuNormalMax = (0.95f - 0.5f) / 3.0f;
+constexpr float kTauShear = 0.5f + 3.0f * kRuntimeMolecularNu0;
+constexpr float kTauShearMin = 0.5f + 3.0f * kNuShearMin;
 constexpr float kTauShearMax = 0.95f;
-constexpr float kTauNormal = 0.50003f;
-constexpr float kTauNormalMin = 0.5005f;
+constexpr float kTauNormal = 0.5f + 3.0f * kRuntimeMolecularNu0;
+constexpr float kTauNormalMin = 0.5f + 3.0f * kNuNormalMin;
 constexpr float kTauNormalMax = 0.95f;
 constexpr bool kEnableSgs = true;
 constexpr float kSgsC = 0.025f;
@@ -832,35 +840,61 @@ inline float effective_thermal_dt() {
     return static_cast<float>(effective_thermal_update_stride());
 }
 
-inline float effective_benchmark_tau_shear() {
-    if (!benchmark_mode_active()) return kTauShear;
+inline float clamp_shear_nu(float nu) {
+    return clampf(nu, kNuShearMin, kNuShearMax);
+}
+
+inline float clamp_normal_nu(float nu) {
+    return clampf(nu, kNuNormalMin, kNuNormalMax);
+}
+
+inline float tau_from_shear_nu(float nu) {
+    return 0.5f + 3.0f * clamp_shear_nu(nu);
+}
+
+inline float tau_from_normal_nu(float nu) {
+    return 0.5f + 3.0f * clamp_normal_nu(nu);
+}
+
+inline float runtime_molecular_nu0() {
+    return clamp_shear_nu(kRuntimeMolecularNu0);
+}
+
+inline float effective_base_nu_shear() {
+    if (!benchmark_mode_active()) return runtime_molecular_nu0();
     if (heated_cavity_benchmark_active()) {
         const float ra = std::max(1.0e-6f, finite_or(g_benchmark_cfg.rayleigh_number, 1.0e5f));
         const float pr = std::max(1.0e-6f, finite_or(g_benchmark_cfg.prandtl_number, 0.71f));
         const float ref_speed = benchmark_reference_speed();
         const float ref_length = std::max(1.0e-6f, finite_or(g_benchmark_cfg.reference_length, 1.0f));
-        const float nu = ref_speed * ref_length * std::sqrt(pr / ra);
-        return clampf(0.5f + 3.0f * nu, kTauShearMin, kTauShearMax);
+        return clamp_shear_nu(ref_speed * ref_length * std::sqrt(pr / ra));
     }
     const float re = finite_or(g_benchmark_cfg.reynolds_number, 0.0f);
     const float ref_speed = benchmark_reference_speed();
     const float ref_length = std::max(1.0e-6f, finite_or(g_benchmark_cfg.reference_length, 1.0f));
-    if (re <= 1.0e-6f || ref_speed <= 1.0e-8f) return kTauShear;
-    const float nu = ref_speed * ref_length / re;
-    return clampf(0.5f + 3.0f * nu, kTauShearMin, kTauShearMax);
+    if (re <= 1.0e-6f || ref_speed <= 1.0e-8f) return runtime_molecular_nu0();
+    return clamp_shear_nu(ref_speed * ref_length / re);
+}
+
+inline float effective_base_nu_normal(float nu_shear_eff) {
+    if (!benchmark_mode_active()) return clamp_normal_nu(runtime_molecular_nu0());
+    return clamp_normal_nu(nu_shear_eff);
+}
+
+inline float effective_benchmark_tau_shear() {
+    return clampf(tau_from_shear_nu(effective_base_nu_shear()), kTauShearMin, kTauShearMax);
 }
 
 inline float effective_benchmark_tau_normal(float tau_shear_eff) {
     if (!benchmark_mode_active()) return clampf(kTauNormal, kTauNormalMin, kTauNormalMax);
-    return clampf(tau_shear_eff, kTauNormalMin, kTauNormalMax);
+    (void)tau_shear_eff;
+    return clampf(tau_from_normal_nu(effective_base_nu_normal(effective_base_nu_shear())), kTauNormalMin, kTauNormalMax);
 }
 
 inline float effective_thermal_diffusivity() {
     if (!heated_cavity_benchmark_active()) return kThermalDiffusivity;
     const float pr = std::max(1.0e-6f, finite_or(g_benchmark_cfg.prandtl_number, 0.71f));
-    const float tau_shear_eff = effective_benchmark_tau_shear();
-    const float nu = std::max(1.0e-6f, (tau_shear_eff - 0.5f) / 3.0f);
-    return nu / pr;
+    return effective_base_nu_shear() / pr;
 }
 
 inline float effective_thermal_tau() {
@@ -993,6 +1027,10 @@ inline std::array<float, 2> opencl_effective_tau_pair() {
     const float tau_shear = effective_benchmark_tau_shear();
     const float tau_normal = effective_benchmark_tau_normal(tau_shear);
     return {tau_shear, tau_normal};
+}
+
+inline float opencl_effective_base_nu_shear() {
+    return effective_base_nu_shear();
 }
 
 inline std::array<float, 3> opencl_effective_thermal_transport() {
@@ -1949,7 +1987,7 @@ void collide(ContextState& ctx) {
         float tau_shear_local = tau_shear_base;
         float tau_normal_local = tau_normal_base;
         if (effective_enable_sgs()) {
-            const float nu0 = std::max(1e-6f, (tau_shear_base - 0.5f) / 3.0f);
+            const float nu0 = std::max(1e-6f, effective_base_nu_shear());
             const float neq_xx = central_pre[2][0][0] - rho_safe * kCs2;
             const float neq_yy = central_pre[0][2][0] - rho_safe * kCs2;
             const float neq_zz = central_pre[0][0][2] - rho_safe * kCs2;
@@ -1962,7 +2000,7 @@ void collide(ContextState& ctx) {
             const float s_mag = q_mag / std::max(1e-6f, 2.0f * rho_safe * nu0);
             float nu_t = kSgsC2 * s_mag;
             nu_t = std::min(nu_t, kSgsNutToNu0Max * nu0);
-            tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), kTauShearMin, kTauShearMax);
+            tau_shear_local = clampf(tau_from_shear_nu(nu0 + nu_t), kTauShearMin, kTauShearMax);
             tau_normal_local = clampf(
                 tau_normal_base + (tau_shear_local - tau_shear_base) * kSgsBulkCoupling,
                 kTauNormalMin,
@@ -2264,11 +2302,16 @@ __constant float TINV[3][3] = {
     {0.0f, 0.5f, 0.5f}
 };
 
-__constant float TAU_SHEAR = 0.50003f;
-__constant float TAU_SHEAR_MIN = 0.5005f;
+__constant float RUNTIME_MOLECULAR_NU0 = 7.500000e-7f;
+__constant float NU_SHEAR_MIN = 1.0e-8f;
+__constant float NU_SHEAR_MAX = (0.95f - 0.5f) / 3.0f;
+__constant float NU_NORMAL_MIN = 1.0e-8f;
+__constant float NU_NORMAL_MAX = (0.95f - 0.5f) / 3.0f;
+__constant float TAU_SHEAR = 0.5f + 3.0f * RUNTIME_MOLECULAR_NU0;
+__constant float TAU_SHEAR_MIN = 0.5f + 3.0f * NU_SHEAR_MIN;
 __constant float TAU_SHEAR_MAX = 0.95f;
-__constant float TAU_NORMAL = 0.50003f;
-__constant float TAU_NORMAL_MIN = 0.5005f;
+__constant float TAU_NORMAL = 0.5f + 3.0f * RUNTIME_MOLECULAR_NU0;
+__constant float TAU_NORMAL_MIN = 0.5f + 3.0f * NU_NORMAL_MIN;
 __constant float TAU_NORMAL_MAX = 0.95f;
 __constant int SGS_ENABLED = 1;
 __constant float SGS_C2 = 0.0049f;
@@ -2325,6 +2368,10 @@ __constant float BOUSSINESQ_FORCE_MAX = 0.02f;
 
 inline float clampf(float v, float lo, float hi) { return fmin(hi, fmax(lo, v)); }
 inline int clampi(int v, int lo, int hi) { return min(hi, max(lo, v)); }
+inline float clamp_shear_nu(float nu) { return clampf(nu, NU_SHEAR_MIN, NU_SHEAR_MAX); }
+inline float clamp_normal_nu(float nu) { return clampf(nu, NU_NORMAL_MIN, NU_NORMAL_MAX); }
+inline float tau_from_shear_nu(float nu) { return 0.5f + 3.0f * clamp_shear_nu(nu); }
+inline float tau_from_normal_nu(float nu) { return 0.5f + 3.0f * clamp_normal_nu(nu); }
 inline int binom(int n, int k) {
     if (k < 0 || k > n) return 0;
     if (n <= 1 || k == 0 || k == n) return 1;
@@ -2997,7 +3044,7 @@ kernel void stream_collide_hydro_forced_step(
     __global const float* payload,
     __global const float* temp_read,
     int in_ch, int nx, int ny, int nz, int cells, int tick, int benchmark_flags, int hydro_periodic_mask,
-    float tau_shear_eff, float tau_normal_eff, float boussinesq_beta_eff, float state_nudge,
+    float tau_shear_eff, float tau_normal_eff, float nu0_shear_eff, float boussinesq_beta_eff, float state_nudge,
     int x_min_kind, int x_max_kind, int y_min_kind, int y_max_kind, int z_min_kind, int z_max_kind,
     float4 x_min_data, float4 x_max_data, float4 y_min_data, float4 y_max_data, float4 z_min_data, float4 z_max_data,
     int benchmark_preset,
@@ -3176,7 +3223,7 @@ R"CLC(
     float tau_shear_local = tau_shear_base;
     float tau_normal_local = tau_normal_base;
     if (SGS_ENABLED && (benchmark_flags & BENCH_DISABLE_SGS) == 0) {
-        float nu0 = fmax(1e-6f, (tau_shear_base - 0.5f) / 3.0f);
+        float nu0 = fmax(1e-6f, clamp_shear_nu(nu0_shear_eff));
         float neq_xx = central_pre[MI(2, 0, 0)] - rho_safe * CS2;
         float neq_yy = central_pre[MI(0, 2, 0)] - rho_safe * CS2;
         float neq_zz = central_pre[MI(0, 0, 2)] - rho_safe * CS2;
@@ -3189,7 +3236,7 @@ R"CLC(
         float s_mag = q_mag / fmax(1e-6f, 2.0f * rho_safe * nu0);
         float nu_t = SGS_C2 * s_mag;
         nu_t = fmin(nu_t, SGS_NUT_TO_NU0_MAX * nu0);
-        tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), TAU_SHEAR_MIN, TAU_SHEAR_MAX);
+        tau_shear_local = clampf(tau_from_shear_nu(nu0 + nu_t), TAU_SHEAR_MIN, TAU_SHEAR_MAX);
         tau_normal_local = clampf(
             tau_normal_base + (tau_shear_local - tau_shear_base) * SGS_BULK_COUPLING,
             TAU_NORMAL_MIN,
@@ -3523,6 +3570,7 @@ kernel void stream_collide_hydro_benchmark_step(
     int hydro_periodic_mask,
     float tau_shear_eff,
     float tau_normal_eff,
+    float nu0_shear_eff,
     int x_min_kind,
     int x_max_kind,
     int y_min_kind,
@@ -3663,7 +3711,7 @@ kernel void stream_collide_hydro_benchmark_step(
     float tau_shear_local = tau_shear_base;
     float tau_normal_local = tau_normal_base;
     if (SGS_ENABLED && (benchmark_flags & BENCH_DISABLE_SGS) == 0) {
-        float nu0 = fmax(1e-6f, (tau_shear_base - 0.5f) / 3.0f);
+        float nu0 = fmax(1e-6f, clamp_shear_nu(nu0_shear_eff));
         float neq_xx = central_pre[MI(2, 0, 0)] - rho * CS2;
         float neq_yy = central_pre[MI(0, 2, 0)] - rho * CS2;
         float neq_zz = central_pre[MI(0, 0, 2)] - rho * CS2;
@@ -3676,7 +3724,7 @@ kernel void stream_collide_hydro_benchmark_step(
         float s_mag = q_mag / fmax(1e-6f, 2.0f * rho * nu0);
         float nu_t = SGS_C2 * s_mag;
         nu_t = fmin(nu_t, SGS_NUT_TO_NU0_MAX * nu0);
-        tau_shear_local = clampf(0.5f + 3.0f * (nu0 + nu_t), TAU_SHEAR_MIN, TAU_SHEAR_MAX);
+        tau_shear_local = clampf(tau_from_shear_nu(nu0 + nu_t), TAU_SHEAR_MIN, TAU_SHEAR_MAX);
         tau_normal_local = clampf(
             tau_normal_base + (tau_shear_local - tau_shear_base) * SGS_BULK_COUPLING,
             TAU_NORMAL_MIN,
@@ -4157,6 +4205,7 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     const auto thermal_face_kinds = opencl_thermal_face_kinds();
     const auto thermal_face_data = opencl_thermal_face_data();
     const auto tau_pair = opencl_effective_tau_pair();
+    const float base_nu_shear = opencl_effective_base_nu_shear();
     const auto thermal_transport = opencl_effective_thermal_transport();
     const int thermal_update_stride = opencl_effective_thermal_update_stride();
     
@@ -4285,20 +4334,21 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 8, sizeof(int), &hydro_periodic_mask);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 9, sizeof(float), &tau_pair[0]);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 10, sizeof(float), &tau_pair[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 11, sizeof(int), &hydro_face_kinds[0]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 12, sizeof(int), &hydro_face_kinds[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 13, sizeof(int), &hydro_face_kinds[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 14, sizeof(int), &hydro_face_kinds[3]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 15, sizeof(int), &hydro_face_kinds[4]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 16, sizeof(int), &hydro_face_kinds[5]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 17, sizeof(OpenClFaceData), hydro_face_data[0].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 18, sizeof(OpenClFaceData), hydro_face_data[1].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 19, sizeof(OpenClFaceData), hydro_face_data[2].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 20, sizeof(OpenClFaceData), hydro_face_data[3].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 21, sizeof(OpenClFaceData), hydro_face_data[4].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 22, sizeof(OpenClFaceData), hydro_face_data[5].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 23, sizeof(int), &benchmark_preset);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 24, sizeof(cl_mem), &write_buf);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 11, sizeof(float), &base_nu_shear);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 12, sizeof(int), &hydro_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 13, sizeof(int), &hydro_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 14, sizeof(int), &hydro_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 15, sizeof(int), &hydro_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 16, sizeof(int), &hydro_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 17, sizeof(int), &hydro_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 18, sizeof(OpenClFaceData), hydro_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 19, sizeof(OpenClFaceData), hydro_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 20, sizeof(OpenClFaceData), hydro_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 21, sizeof(OpenClFaceData), hydro_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 22, sizeof(OpenClFaceData), hydro_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 23, sizeof(OpenClFaceData), hydro_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 24, sizeof(int), &benchmark_preset);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_bench, 25, sizeof(cl_mem), &write_buf);
         if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_stream_collide_hydro_bench)", err);
         err = enqueue_kernel_1d(g_opencl.k_stream_collide_hydro_bench, cells_i32);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_stream_collide_hydro_bench)", err);
@@ -4317,22 +4367,23 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         const float state_nudge = effective_state_nudge();
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 11, sizeof(float), &tau_pair[0]);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 12, sizeof(float), &tau_pair[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 13, sizeof(float), &thermal_transport[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 14, sizeof(float), &state_nudge);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 15, sizeof(int), &hydro_face_kinds[0]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 16, sizeof(int), &hydro_face_kinds[1]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 17, sizeof(int), &hydro_face_kinds[2]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 18, sizeof(int), &hydro_face_kinds[3]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 19, sizeof(int), &hydro_face_kinds[4]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 20, sizeof(int), &hydro_face_kinds[5]);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 21, sizeof(OpenClFaceData), hydro_face_data[0].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 22, sizeof(OpenClFaceData), hydro_face_data[1].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 23, sizeof(OpenClFaceData), hydro_face_data[2].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 24, sizeof(OpenClFaceData), hydro_face_data[3].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 25, sizeof(OpenClFaceData), hydro_face_data[4].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 26, sizeof(OpenClFaceData), hydro_face_data[5].data());
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 27, sizeof(int), &benchmark_preset);
-        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 28, sizeof(cl_mem), &write_buf);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 13, sizeof(float), &base_nu_shear);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 14, sizeof(float), &thermal_transport[2]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 15, sizeof(float), &state_nudge);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 16, sizeof(int), &hydro_face_kinds[0]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 17, sizeof(int), &hydro_face_kinds[1]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 18, sizeof(int), &hydro_face_kinds[2]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 19, sizeof(int), &hydro_face_kinds[3]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 20, sizeof(int), &hydro_face_kinds[4]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 21, sizeof(int), &hydro_face_kinds[5]);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 22, sizeof(OpenClFaceData), hydro_face_data[0].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 23, sizeof(OpenClFaceData), hydro_face_data[1].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 24, sizeof(OpenClFaceData), hydro_face_data[2].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 25, sizeof(OpenClFaceData), hydro_face_data[3].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 26, sizeof(OpenClFaceData), hydro_face_data[4].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 27, sizeof(OpenClFaceData), hydro_face_data[5].data());
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 28, sizeof(int), &benchmark_preset);
+        err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 29, sizeof(cl_mem), &write_buf);
         if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_stream_collide_hydro_forced)", err);
         err = enqueue_kernel_1d(g_opencl.k_stream_collide_hydro_forced, cells_i32);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_stream_collide_hydro_forced)", err);
