@@ -30,17 +30,20 @@ final class ActiveWindowWorldCache {
     private static final String LOG_PREFIX = "[aerodynamics4mc/cache] ";
     private static final int SECTION_SIZE = 16;
     private static final int SECTION_CELLS = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE;
-    private static final int CHANNELS = 5; // vx vy vz p temperature
+    private static final int FLUID_CHANNELS = 5; // vx vy vz p temperature
     private static final int MASK_WORDS = SECTION_CELLS / Long.SIZE;
-    private static final int VALUES_BYTES = SECTION_CELLS * CHANNELS;
+    private static final int FLUID_VALUES_BYTES = SECTION_CELLS * FLUID_CHANNELS;
+    private static final int SURFACE_VALUES_BYTES = SECTION_CELLS * 2;
 
-    private static final int FORMAT_VERSION = 2;
+    private static final int FORMAT_VERSION = 3;
     private static final int MAGIC = 0x41575743; // "AWWC"
     private static final String FILE_SUFFIX = ".awwc.zst";
 
     private static final float SCALE_VELOCITY = 32.0f;
     private static final float SCALE_PRESSURE = 1.0f;
     private static final float SCALE_TEMPERATURE = 0.25f;
+    private static final float SURFACE_TEMPERATURE_MIN_K = 220.0f;
+    private static final float SURFACE_TEMPERATURE_MAX_K = 1800.0f;
     private static final float INV_127 = 1.0f / 127.0f;
 
     private final Map<RegistryKey<World>, DimensionCache> dimensions = new HashMap<>();
@@ -60,6 +63,8 @@ final class ActiveWindowWorldCache {
         float[] airField,
         float[] baseField,
         float[] temperatureField,
+        byte[] surfaceKindField,
+        float[] surfaceTemperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -95,25 +100,45 @@ final class ActiveWindowWorldCache {
                         if (temperatureField != null && cell < temperatureField.length) {
                             temperatureField[cell] = 0.0f;
                         }
-                        continue;
-                    }
-                    expectedAirCells++;
+                    } else {
+                        expectedAirCells++;
 
-                    CellAddress address = cellAddress(wx, wy, wz);
-                    SectionData section = cache.sections.get(address.section());
-                    if (section == null || !section.isValid(address.localIndex())) {
-                        continue;
+                        CellAddress address = cellAddress(wx, wy, wz);
+                        SectionData section = cache.sections.get(address.section());
+                        if (section != null && section.isFluidValid(address.localIndex())) {
+                            int valueBase = address.localIndex() * FLUID_CHANNELS;
+                            baseField[idx + chStateVx] = dequantize(section.fluidValues[valueBase], SCALE_VELOCITY);
+                            baseField[idx + chStateVy] = dequantize(section.fluidValues[valueBase + 1], SCALE_VELOCITY);
+                            baseField[idx + chStateVz] = dequantize(section.fluidValues[valueBase + 2], SCALE_VELOCITY);
+                            baseField[idx + chStateP] = dequantize(section.fluidValues[valueBase + 3], SCALE_PRESSURE);
+                            if (temperatureField != null && cell < temperatureField.length) {
+                                temperatureField[cell] = dequantize(section.fluidValues[valueBase + 4], SCALE_TEMPERATURE);
+                            }
+                            loadedAirCells++;
+                        } else {
+                            baseField[idx + chStateVx] = 0.0f;
+                            baseField[idx + chStateVy] = 0.0f;
+                            baseField[idx + chStateVz] = 0.0f;
+                            baseField[idx + chStateP] = 0.0f;
+                            if (temperatureField != null && cell < temperatureField.length) {
+                                temperatureField[cell] = 0.0f;
+                            }
+                        }
                     }
-
-                    int valueBase = address.localIndex() * CHANNELS;
-                    baseField[idx + chStateVx] = dequantize(section.values[valueBase], SCALE_VELOCITY);
-                    baseField[idx + chStateVy] = dequantize(section.values[valueBase + 1], SCALE_VELOCITY);
-                    baseField[idx + chStateVz] = dequantize(section.values[valueBase + 2], SCALE_VELOCITY);
-                    baseField[idx + chStateP] = dequantize(section.values[valueBase + 3], SCALE_PRESSURE);
-                    if (temperatureField != null && cell < temperatureField.length) {
-                        temperatureField[cell] = dequantize(section.values[valueBase + 4], SCALE_TEMPERATURE);
+                    boolean hasSurface = surfaceKindField != null && cell < surfaceKindField.length && surfaceKindField[cell] != 0;
+                    if (surfaceTemperatureField != null && cell < surfaceTemperatureField.length) {
+                        if (!hasSurface) {
+                            surfaceTemperatureField[cell] = 0.0f;
+                        } else {
+                            CellAddress address = cellAddress(wx, wy, wz);
+                            SectionData section = cache.sections.get(address.section());
+                            if (section != null && section.isSurfaceValid(address.localIndex())) {
+                                surfaceTemperatureField[cell] = dequantizeSurfaceTemperature(
+                                    section.getSurfaceTemperatureQuantized(address.localIndex())
+                                );
+                            }
+                        }
                     }
-                    loadedAirCells++;
                 }
             }
         }
@@ -127,6 +152,8 @@ final class ActiveWindowWorldCache {
         float[] airField,
         float[] stateField,
         float[] temperatureField,
+        byte[] surfaceKindField,
+        float[] surfaceTemperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -160,7 +187,7 @@ final class ActiveWindowWorldCache {
                 continue;
             }
             expectedAirCells++;
-            if (section == null || !section.isValid(localIndex)) {
+            if (section == null || !section.isFluidValid(localIndex)) {
                 stateField[idx + chStateVx] = 0.0f;
                 stateField[idx + chStateVy] = 0.0f;
                 stateField[idx + chStateVz] = 0.0f;
@@ -170,15 +197,31 @@ final class ActiveWindowWorldCache {
                 }
                 continue;
             }
-            int valueBase = localIndex * CHANNELS;
-            stateField[idx + chStateVx] = dequantize(section.values[valueBase], SCALE_VELOCITY);
-            stateField[idx + chStateVy] = dequantize(section.values[valueBase + 1], SCALE_VELOCITY);
-            stateField[idx + chStateVz] = dequantize(section.values[valueBase + 2], SCALE_VELOCITY);
-            stateField[idx + chStateP] = dequantize(section.values[valueBase + 3], SCALE_PRESSURE);
+            int valueBase = localIndex * FLUID_CHANNELS;
+            stateField[idx + chStateVx] = dequantize(section.fluidValues[valueBase], SCALE_VELOCITY);
+            stateField[idx + chStateVy] = dequantize(section.fluidValues[valueBase + 1], SCALE_VELOCITY);
+            stateField[idx + chStateVz] = dequantize(section.fluidValues[valueBase + 2], SCALE_VELOCITY);
+            stateField[idx + chStateP] = dequantize(section.fluidValues[valueBase + 3], SCALE_PRESSURE);
             if (temperatureField != null && localIndex < temperatureField.length) {
-                temperatureField[localIndex] = dequantize(section.values[valueBase + 4], SCALE_TEMPERATURE);
+                temperatureField[localIndex] = dequantize(section.fluidValues[valueBase + 4], SCALE_TEMPERATURE);
             }
             loadedAirCells++;
+        }
+        if (surfaceKindField != null && surfaceTemperatureField != null) {
+            for (int localIndex = 0; localIndex < SECTION_CELLS; localIndex++) {
+                if (localIndex >= surfaceKindField.length || localIndex >= surfaceTemperatureField.length) {
+                    break;
+                }
+                if (surfaceKindField[localIndex] == 0) {
+                    surfaceTemperatureField[localIndex] = 0.0f;
+                    continue;
+                }
+                if (section != null && section.isSurfaceValid(localIndex)) {
+                    surfaceTemperatureField[localIndex] = dequantizeSurfaceTemperature(
+                        section.getSurfaceTemperatureQuantized(localIndex)
+                    );
+                }
+            }
         }
         return expectedAirCells > 0 && loadedAirCells == expectedAirCells;
     }
@@ -191,6 +234,8 @@ final class ActiveWindowWorldCache {
         float[] airField,
         float[] baseField,
         float[] temperatureField,
+        byte[] surfaceKindField,
+        float[] surfaceTemperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -217,20 +262,29 @@ final class ActiveWindowWorldCache {
 
                     boolean isSolid = obstacleField != null && cell < obstacleField.length && obstacleField[cell] > 0.5f;
                     boolean isAir = airField != null && cell < airField.length && airField[cell] > 0.5f;
-                    if (isSolid || !isAir) {
-                        section.clear(address.localIndex());
-                        continue;
+                    if (!isSolid && isAir) {
+                        int idx = cell * channelsPerCell;
+                        int valueBase = address.localIndex() * FLUID_CHANNELS;
+                        section.fluidValues[valueBase] = quantize(baseField[idx + chStateVx], SCALE_VELOCITY);
+                        section.fluidValues[valueBase + 1] = quantize(baseField[idx + chStateVy], SCALE_VELOCITY);
+                        section.fluidValues[valueBase + 2] = quantize(baseField[idx + chStateVz], SCALE_VELOCITY);
+                        section.fluidValues[valueBase + 3] = quantize(baseField[idx + chStateP], SCALE_PRESSURE);
+                        float temperature = temperatureField != null && cell < temperatureField.length ? temperatureField[cell] : 0.0f;
+                        section.fluidValues[valueBase + 4] = quantize(temperature, SCALE_TEMPERATURE);
+                        section.markFluidValid(address.localIndex());
+                    } else {
+                        section.clearFluid(address.localIndex());
                     }
-
-                    int idx = cell * channelsPerCell;
-                    int valueBase = address.localIndex() * CHANNELS;
-                    section.values[valueBase] = quantize(baseField[idx + chStateVx], SCALE_VELOCITY);
-                    section.values[valueBase + 1] = quantize(baseField[idx + chStateVy], SCALE_VELOCITY);
-                    section.values[valueBase + 2] = quantize(baseField[idx + chStateVz], SCALE_VELOCITY);
-                    section.values[valueBase + 3] = quantize(baseField[idx + chStateP], SCALE_PRESSURE);
-                    float temperature = temperatureField != null && cell < temperatureField.length ? temperatureField[cell] : 0.0f;
-                    section.values[valueBase + 4] = quantize(temperature, SCALE_TEMPERATURE);
-                    section.markValid(address.localIndex());
+                    boolean hasSurface = surfaceKindField != null && cell < surfaceKindField.length && surfaceKindField[cell] != 0;
+                    if (hasSurface && surfaceTemperatureField != null && cell < surfaceTemperatureField.length) {
+                        section.setSurfaceTemperatureQuantized(
+                            address.localIndex(),
+                            quantizeSurfaceTemperature(surfaceTemperatureField[cell])
+                        );
+                        section.markSurfaceValid(address.localIndex());
+                    } else {
+                        section.clearSurface(address.localIndex());
+                    }
                 }
             }
         }
@@ -247,6 +301,8 @@ final class ActiveWindowWorldCache {
         float[] airField,
         float[] stateField,
         float[] temperatureField,
+        byte[] surfaceKindField,
+        float[] surfaceTemperatureField,
         int channelsPerCell,
         int chStateVx,
         int chStateVy,
@@ -266,20 +322,26 @@ final class ActiveWindowWorldCache {
         for (int localIndex = 0; localIndex < SECTION_CELLS; localIndex++) {
             boolean isSolid = obstacleField != null && localIndex < obstacleField.length && obstacleField[localIndex] > 0.5f;
             boolean isAir = airField != null && localIndex < airField.length && airField[localIndex] > 0.5f;
-            if (isSolid || !isAir) {
-                section.clear(localIndex);
-                continue;
+            if (!isSolid && isAir) {
+                int idx = localIndex * channelsPerCell;
+                int valueBase = localIndex * FLUID_CHANNELS;
+                section.fluidValues[valueBase] = quantize(stateField[idx + chStateVx], SCALE_VELOCITY);
+                section.fluidValues[valueBase + 1] = quantize(stateField[idx + chStateVy], SCALE_VELOCITY);
+                section.fluidValues[valueBase + 2] = quantize(stateField[idx + chStateVz], SCALE_VELOCITY);
+                section.fluidValues[valueBase + 3] = quantize(stateField[idx + chStateP], SCALE_PRESSURE);
+                float temperature = temperatureField != null && localIndex < temperatureField.length ? temperatureField[localIndex] : 0.0f;
+                section.fluidValues[valueBase + 4] = quantize(temperature, SCALE_TEMPERATURE);
+                section.markFluidValid(localIndex);
+            } else {
+                section.clearFluid(localIndex);
             }
-
-            int idx = localIndex * channelsPerCell;
-            int valueBase = localIndex * CHANNELS;
-            section.values[valueBase] = quantize(stateField[idx + chStateVx], SCALE_VELOCITY);
-            section.values[valueBase + 1] = quantize(stateField[idx + chStateVy], SCALE_VELOCITY);
-            section.values[valueBase + 2] = quantize(stateField[idx + chStateVz], SCALE_VELOCITY);
-            section.values[valueBase + 3] = quantize(stateField[idx + chStateP], SCALE_PRESSURE);
-            float temperature = temperatureField != null && localIndex < temperatureField.length ? temperatureField[localIndex] : 0.0f;
-            section.values[valueBase + 4] = quantize(temperature, SCALE_TEMPERATURE);
-            section.markValid(localIndex);
+            boolean hasSurface = surfaceKindField != null && localIndex < surfaceKindField.length && surfaceKindField[localIndex] != 0;
+            if (hasSurface && surfaceTemperatureField != null && localIndex < surfaceTemperatureField.length) {
+                section.setSurfaceTemperatureQuantized(localIndex, quantizeSurfaceTemperature(surfaceTemperatureField[localIndex]));
+                section.markSurfaceValid(localIndex);
+            } else {
+                section.clearSurface(localIndex);
+            }
         }
 
         if (section.isEmpty()) {
@@ -425,7 +487,7 @@ final class ActiveWindowWorldCache {
         try (DataOutputStream out = new DataOutputStream(bos)) {
             out.writeInt(MAGIC);
             out.writeInt(FORMAT_VERSION);
-            out.writeInt(CHANNELS);
+            out.writeInt(FLUID_CHANNELS);
             out.writeInt(SECTION_SIZE);
             out.writeInt(sections.size());
             for (Map.Entry<SectionKey, SectionData> entry : sections.entrySet()) {
@@ -434,10 +496,14 @@ final class ActiveWindowWorldCache {
                 out.writeInt(key.sx());
                 out.writeInt(key.sy());
                 out.writeInt(key.sz());
-                for (long word : section.validMask) {
+                for (long word : section.fluidValidMask) {
                     out.writeLong(word);
                 }
-                out.write(section.values);
+                for (long word : section.surfaceValidMask) {
+                    out.writeLong(word);
+                }
+                out.write(section.fluidValues);
+                out.write(section.surfaceValues);
             }
         }
         return bos.toByteArray();
@@ -456,7 +522,7 @@ final class ActiveWindowWorldCache {
             }
             int channels = in.readInt();
             int sectionSize = in.readInt();
-            if (channels != CHANNELS || sectionSize != SECTION_SIZE) {
+            if (channels != FLUID_CHANNELS || sectionSize != SECTION_SIZE) {
                 return;
             }
             int sectionCount = in.readInt();
@@ -466,10 +532,14 @@ final class ActiveWindowWorldCache {
                 int sz = in.readInt();
                 SectionData section = new SectionData();
                 for (int w = 0; w < MASK_WORDS; w++) {
-                    section.validMask[w] = in.readLong();
+                    section.fluidValidMask[w] = in.readLong();
                 }
-                int read = in.readNBytes(section.values, 0, section.values.length);
-                if (read != section.values.length) {
+                for (int w = 0; w < MASK_WORDS; w++) {
+                    section.surfaceValidMask[w] = in.readLong();
+                }
+                int readFluid = in.readNBytes(section.fluidValues, 0, section.fluidValues.length);
+                int readSurface = in.readNBytes(section.surfaceValues, 0, section.surfaceValues.length);
+                if (readFluid != section.fluidValues.length || readSurface != section.surfaceValues.length) {
                     cache.sections.clear();
                     return;
                 }
@@ -517,6 +587,20 @@ final class ActiveWindowWorldCache {
         return q * INV_127 * scale;
     }
 
+    private static int quantizeSurfaceTemperature(float valueKelvin) {
+        float normalized = MathHelper.clamp(
+            (valueKelvin - SURFACE_TEMPERATURE_MIN_K) / (SURFACE_TEMPERATURE_MAX_K - SURFACE_TEMPERATURE_MIN_K),
+            0.0f,
+            1.0f
+        );
+        return MathHelper.clamp(Math.round(normalized * 65535.0f), 0, 65535);
+    }
+
+    private static float dequantizeSurfaceTemperature(int quantized) {
+        float normalized = quantized / 65535.0f;
+        return SURFACE_TEMPERATURE_MIN_K + normalized * (SURFACE_TEMPERATURE_MAX_K - SURFACE_TEMPERATURE_MIN_K);
+    }
+
     private void log(String message) {
         System.out.println(LOG_PREFIX + message);
     }
@@ -538,35 +622,75 @@ final class ActiveWindowWorldCache {
     }
 
     private static final class SectionData {
-        private final long[] validMask = new long[MASK_WORDS];
-        private final byte[] values = new byte[VALUES_BYTES];
+        private final long[] fluidValidMask = new long[MASK_WORDS];
+        private final long[] surfaceValidMask = new long[MASK_WORDS];
+        private final byte[] fluidValues = new byte[FLUID_VALUES_BYTES];
+        private final byte[] surfaceValues = new byte[SURFACE_VALUES_BYTES];
 
-        private boolean isValid(int localIndex) {
+        private boolean isFluidValid(int localIndex) {
             int word = localIndex >>> 6;
             long bit = 1L << (localIndex & 63);
-            return (validMask[word] & bit) != 0L;
+            return (fluidValidMask[word] & bit) != 0L;
         }
 
-        private void markValid(int localIndex) {
+        private void markFluidValid(int localIndex) {
             int word = localIndex >>> 6;
             long bit = 1L << (localIndex & 63);
-            validMask[word] |= bit;
+            fluidValidMask[word] |= bit;
         }
 
-        private void clear(int localIndex) {
+        private boolean isSurfaceValid(int localIndex) {
             int word = localIndex >>> 6;
             long bit = 1L << (localIndex & 63);
-            validMask[word] &= ~bit;
-            int base = localIndex * CHANNELS;
-            values[base] = 0;
-            values[base + 1] = 0;
-            values[base + 2] = 0;
-            values[base + 3] = 0;
-            values[base + 4] = 0;
+            return (surfaceValidMask[word] & bit) != 0L;
+        }
+
+        private void markSurfaceValid(int localIndex) {
+            int word = localIndex >>> 6;
+            long bit = 1L << (localIndex & 63);
+            surfaceValidMask[word] |= bit;
+        }
+
+        private void clearFluid(int localIndex) {
+            int word = localIndex >>> 6;
+            long bit = 1L << (localIndex & 63);
+            fluidValidMask[word] &= ~bit;
+            int base = localIndex * FLUID_CHANNELS;
+            fluidValues[base] = 0;
+            fluidValues[base + 1] = 0;
+            fluidValues[base + 2] = 0;
+            fluidValues[base + 3] = 0;
+            fluidValues[base + 4] = 0;
+        }
+
+        private void clearSurface(int localIndex) {
+            int word = localIndex >>> 6;
+            long bit = 1L << (localIndex & 63);
+            surfaceValidMask[word] &= ~bit;
+            int base = localIndex * 2;
+            surfaceValues[base] = 0;
+            surfaceValues[base + 1] = 0;
+        }
+
+        private void setSurfaceTemperatureQuantized(int localIndex, int quantized) {
+            int base = localIndex * 2;
+            surfaceValues[base] = (byte) ((quantized >>> 8) & 0xFF);
+            surfaceValues[base + 1] = (byte) (quantized & 0xFF);
+        }
+
+        private int getSurfaceTemperatureQuantized(int localIndex) {
+            int base = localIndex * 2;
+            return (Byte.toUnsignedInt(surfaceValues[base]) << 8)
+                | Byte.toUnsignedInt(surfaceValues[base + 1]);
         }
 
         private boolean isEmpty() {
-            for (long word : validMask) {
+            for (long word : fluidValidMask) {
+                if (word != 0L) {
+                    return false;
+                }
+            }
+            for (long word : surfaceValidMask) {
                 if (word != 0L) {
                     return false;
                 }
@@ -576,8 +700,10 @@ final class ActiveWindowWorldCache {
 
         private SectionData copy() {
             SectionData copied = new SectionData();
-            System.arraycopy(validMask, 0, copied.validMask, 0, validMask.length);
-            System.arraycopy(values, 0, copied.values, 0, values.length);
+            System.arraycopy(fluidValidMask, 0, copied.fluidValidMask, 0, fluidValidMask.length);
+            System.arraycopy(surfaceValidMask, 0, copied.surfaceValidMask, 0, surfaceValidMask.length);
+            System.arraycopy(fluidValues, 0, copied.fluidValues, 0, fluidValues.length);
+            System.arraycopy(surfaceValues, 0, copied.surfaceValues, 0, surfaceValues.length);
             return copied;
         }
     }
