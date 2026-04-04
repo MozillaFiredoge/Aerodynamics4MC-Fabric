@@ -22,9 +22,15 @@ final class BackgroundMetGrid {
     private final int cellSizeBlocks;
     private final int radiusCells;
     private final Map<Long, CellState> cells = new HashMap<>();
+    private ServerWorld currentWorld;
+    private SeedTerrainProvider currentProvider;
     private int centerCellX;
     private int centerCellZ;
     private long lastRefreshTick = Long.MIN_VALUE;
+    private long currentRefreshTick = Long.MIN_VALUE;
+    private float currentDeltaSeconds = 1.0f;
+    private float currentSolarAltitude = 0.0f;
+    private float currentClearSky = 1.0f;
 
     BackgroundMetGrid(int cellSizeBlocks, int radiusCells) {
         this.cellSizeBlocks = cellSizeBlocks;
@@ -32,41 +38,19 @@ final class BackgroundMetGrid {
     }
 
     void refresh(ServerWorld world, BlockPos focus, long tickCounter, float dtSeconds, SeedTerrainProvider provider) {
+        currentWorld = world;
+        currentProvider = provider;
         centerCellX = Math.floorDiv(focus.getX(), cellSizeBlocks);
         centerCellZ = Math.floorDiv(focus.getZ(), cellSizeBlocks);
-        float deltaSeconds = lastRefreshTick == Long.MIN_VALUE ? dtSeconds : Math.max(1L, tickCounter - lastRefreshTick) * dtSeconds;
+        currentDeltaSeconds = lastRefreshTick == Long.MIN_VALUE ? dtSeconds : Math.max(1L, tickCounter - lastRefreshTick) * dtSeconds;
         lastRefreshTick = tickCounter;
+        currentRefreshTick = tickCounter;
 
         float dayPhase = (float) Math.floorMod(world.getTimeOfDay(), 24000L) / 24000.0f;
-        float solarAltitude = Math.max(0.0f, (float) Math.sin(dayPhase * (float) (Math.PI * 2.0)));
+        currentSolarAltitude = Math.max(0.0f, (float) Math.sin(dayPhase * (float) (Math.PI * 2.0)));
         float rain = world.getRainGradient(1.0f);
         float thunder = world.getThunderGradient(1.0f);
-        float clearSky = MathHelper.clamp(1.0f - 0.65f * rain - 0.25f * thunder, 0.15f, 1.0f);
-
-        for (int cx = centerCellX - radiusCells; cx <= centerCellX + radiusCells; cx++) {
-            for (int cz = centerCellZ - radiusCells; cz <= centerCellZ + radiusCells; cz++) {
-                long key = pack(cx, cz);
-                int sampleX = cellCenterBlock(cx);
-                int sampleZ = cellCenterBlock(cz);
-                SeedTerrainProvider.TerrainSample terrain = provider.sample(world, sampleX, sampleZ);
-                float ambientAirTemperatureKelvin = BASE_AIR_TEMPERATURE_K
-                    + (terrain.biomeTemperature() - 0.8f) * BIOME_TEMPERATURE_SCALE_K
-                    - Math.max(0.0f, terrain.terrainHeightBlocks() - world.getSeaLevel()) * ALTITUDE_LAPSE_RATE_K_PER_BLOCK;
-                float targetSurfaceTemperatureKelvin = ambientAirTemperatureKelvin
-                    + solarAltitude * clearSky * SOLAR_SURFACE_HEATING_K
-                    - (1.0f - solarAltitude) * clearSky * CLEAR_SKY_COOLING_K;
-                CellState cell = cells.computeIfAbsent(key, ignored -> new CellState());
-                cell.terrainHeightBlocks = terrain.terrainHeightBlocks();
-                cell.biomeTemperature = terrain.biomeTemperature();
-                cell.surfaceClass = terrain.surfaceClass();
-                cell.roughnessLengthMeters = terrain.roughnessLengthMeters();
-                cell.ambientAirTemperatureKelvin = ambientAirTemperatureKelvin;
-                cell.deepGroundTemperatureKelvin = ambientAirTemperatureKelvin + DEEP_GROUND_OFFSET_K;
-                cell.surfaceTemperatureKelvin = relax(cell.surfaceTemperatureKelvin, targetSurfaceTemperatureKelvin, deltaSeconds);
-                cell.backgroundWindX = prevailingWindComponent(world.getSeed(), cx, cz, 0x517cc1b727220a95L);
-                cell.backgroundWindZ = prevailingWindComponent(world.getSeed(), cx, cz, 0x9e3779b97f4a7c15L);
-            }
-        }
+        currentClearSky = MathHelper.clamp(1.0f - 0.65f * rain - 0.25f * thunder, 0.15f, 1.0f);
 
         Iterator<Map.Entry<Long, CellState>> it = cells.entrySet().iterator();
         while (it.hasNext()) {
@@ -80,12 +64,12 @@ final class BackgroundMetGrid {
     }
 
     Sample sample(BlockPos pos) {
-        int cellX = Math.floorDiv(pos.getX(), cellSizeBlocks);
-        int cellZ = Math.floorDiv(pos.getZ(), cellSizeBlocks);
-        CellState state = cells.get(pack(cellX, cellZ));
-        if (state == null) {
+        if (currentWorld == null || currentProvider == null) {
             return null;
         }
+        int cellX = Math.floorDiv(pos.getX(), cellSizeBlocks);
+        int cellZ = Math.floorDiv(pos.getZ(), cellSizeBlocks);
+        CellState state = ensureCell(cellX, cellZ);
         return new Sample(
             state.terrainHeightBlocks,
             state.biomeTemperature,
@@ -109,6 +93,42 @@ final class BackgroundMetGrid {
 
     private int cellCenterBlock(int cell) {
         return cell * cellSizeBlocks + cellSizeBlocks / 2;
+    }
+
+    private CellState ensureCell(int cellX, int cellZ) {
+        long key = pack(cellX, cellZ);
+        CellState cell = cells.get(key);
+        if (cell == null) {
+            int sampleX = cellCenterBlock(cellX);
+            int sampleZ = cellCenterBlock(cellZ);
+            SeedTerrainProvider.TerrainSample terrain = currentProvider.sample(currentWorld, sampleX, sampleZ);
+            cell = new CellState();
+            cell.terrainHeightBlocks = terrain.terrainHeightBlocks();
+            cell.biomeTemperature = terrain.biomeTemperature();
+            cell.surfaceClass = terrain.surfaceClass();
+            cell.roughnessLengthMeters = terrain.roughnessLengthMeters();
+            cells.put(key, cell);
+        }
+        updateDynamicState(cell, cellX, cellZ);
+        return cell;
+    }
+
+    private void updateDynamicState(CellState cell, int cellX, int cellZ) {
+        if (cell.lastUpdatedTick == currentRefreshTick) {
+            return;
+        }
+        float ambientAirTemperatureKelvin = BASE_AIR_TEMPERATURE_K
+            + (cell.biomeTemperature - 0.8f) * BIOME_TEMPERATURE_SCALE_K
+            - Math.max(0.0f, cell.terrainHeightBlocks - currentWorld.getSeaLevel()) * ALTITUDE_LAPSE_RATE_K_PER_BLOCK;
+        float targetSurfaceTemperatureKelvin = ambientAirTemperatureKelvin
+            + currentSolarAltitude * currentClearSky * SOLAR_SURFACE_HEATING_K
+            - (1.0f - currentSolarAltitude) * currentClearSky * CLEAR_SKY_COOLING_K;
+        cell.ambientAirTemperatureKelvin = ambientAirTemperatureKelvin;
+        cell.deepGroundTemperatureKelvin = ambientAirTemperatureKelvin + DEEP_GROUND_OFFSET_K;
+        cell.surfaceTemperatureKelvin = relax(cell.surfaceTemperatureKelvin, targetSurfaceTemperatureKelvin, currentDeltaSeconds);
+        cell.backgroundWindX = prevailingWindComponent(currentWorld.getSeed(), cellX, cellZ, 0x517cc1b727220a95L);
+        cell.backgroundWindZ = prevailingWindComponent(currentWorld.getSeed(), cellX, cellZ, 0x9e3779b97f4a7c15L);
+        cell.lastUpdatedTick = currentRefreshTick;
     }
 
     private float relax(float current, float target, float deltaSeconds) {
@@ -163,5 +183,6 @@ final class BackgroundMetGrid {
         private float backgroundWindX;
         private float backgroundWindZ;
         private byte surfaceClass;
+        private long lastUpdatedTick = Long.MIN_VALUE;
     }
 }

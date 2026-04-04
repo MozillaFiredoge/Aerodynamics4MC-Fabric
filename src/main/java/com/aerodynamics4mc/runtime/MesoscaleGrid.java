@@ -163,10 +163,10 @@ final class MesoscaleGrid implements AutoCloseable {
                 long key = pack(cx, cz);
                 int sampleX = cellCenterBlock(cx);
                 int sampleZ = cellCenterBlock(cz);
-                SeedTerrainProvider.TerrainSample terrain = provider.sample(world, sampleX, sampleZ);
-                BackgroundMetGrid.Sample bg = background.sample(new BlockPos(sampleX, world.getSeaLevel(), sampleZ));
                 CellColumnState cell = cells.computeIfAbsent(key, ignored -> new CellColumnState(activeLayers));
                 cell.ensureLayers(activeLayers);
+                ensureStaticColumnState(cell, world, provider, sampleX, sampleZ);
+                BackgroundMetGrid.Sample bg = background.sample(new BlockPos(sampleX, world.getSeaLevel(), sampleZ));
 
                 float ambientAirTemperatureKelvin = bg != null
                     ? bg.ambientAirTemperatureKelvin()
@@ -174,7 +174,7 @@ final class MesoscaleGrid implements AutoCloseable {
                 float deepGroundTemperatureKelvin = bg != null
                     ? bg.deepGroundTemperatureKelvin()
                     : ambientAirTemperatureKelvin + 1.5f;
-                float terrainDelta = terrain.terrainHeightBlocks() - world.getSeaLevel();
+                float terrainDelta = cell.terrainHeightBlocks - world.getSeaLevel();
                 float temperatureAdjustment = -Math.max(0.0f, terrainDelta) * 0.01f * TERRAIN_TEMPERATURE_OFFSET_K;
                 float terrainSteer = MathHelper.clamp(terrainDelta / 96.0f, -1.0f, 1.0f);
                 float bgWindX = bg != null ? bg.backgroundWindX() : 0.0f;
@@ -184,35 +184,49 @@ final class MesoscaleGrid implements AutoCloseable {
                 targetWindX = MathHelper.clamp(targetWindX, -maxBackgroundWind, maxBackgroundWind);
                 targetWindZ = MathHelper.clamp(targetWindZ, -maxBackgroundWind, maxBackgroundWind);
 
-                cell.terrainHeightBlocks = terrain.terrainHeightBlocks();
-                cell.biomeTemperature = terrain.biomeTemperature();
-                cell.surfaceClass = terrain.surfaceClass();
-                cell.roughnessLengthMeters = terrain.roughnessLengthMeters();
                 for (int layer = 0; layer < activeLayers; layer++) {
                     int sampleY = layerCenterBlockY(layer);
                     float layerHeightAboveBase = Math.max(0.0f, sampleY - verticalBaseY);
                     float layerAmbient = ambientAirTemperatureKelvin + temperatureAdjustment
                         - Math.max(0.0f, sampleY - world.getSeaLevel()) * AMBIENT_LAPSE_RATE_K_PER_BLOCK;
                     float layerDeep = deepGroundTemperatureKelvin + temperatureAdjustment * 0.5f;
-                    float aboveGround = Math.max(0.0f, sampleY - terrain.terrainHeightBlocks());
+                    float aboveGround = Math.max(0.0f, sampleY - cell.terrainHeightBlocks);
                     float surfaceInfluence = (float) Math.exp(-aboveGround / Math.max(1.0f, layerHeightBlocks * 1.5f));
                     float layerSurfaceTarget = layerAmbient + surfaceInfluence
                         * (((bg != null ? bg.surfaceTemperatureKelvin() : ambientAirTemperatureKelvin) + temperatureAdjustment) - layerAmbient);
                     float shearFactor = 0.75f + 0.45f * (float) Math.sqrt(MathHelper.clamp(layerHeightAboveBase / 320.0f, 0.0f, 1.0f));
                     float roughnessDecay = 1.0f / (1.0f + aboveGround / 64.0f);
                     int base = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS;
-                    forcingBuffer[base + CH_TERRAIN_HEIGHT] = terrain.terrainHeightBlocks();
-                    forcingBuffer[base + CH_BIOME_TEMPERATURE] = terrain.biomeTemperature();
+                    forcingBuffer[base + CH_TERRAIN_HEIGHT] = cell.terrainHeightBlocks;
+                    forcingBuffer[base + CH_BIOME_TEMPERATURE] = cell.biomeTemperature;
                     forcingBuffer[base + CH_AMBIENT_TARGET] = layerAmbient;
                     forcingBuffer[base + CH_DEEP_GROUND_TARGET] = layerDeep;
                     forcingBuffer[base + CH_SURFACE_TARGET] = layerSurfaceTarget;
-                    forcingBuffer[base + CH_ROUGHNESS] = terrain.roughnessLengthMeters() * roughnessDecay;
+                    forcingBuffer[base + CH_ROUGHNESS] = cell.roughnessLengthMeters * roughnessDecay;
                     forcingBuffer[base + CH_BACKGROUND_WIND_X] = targetWindX * shearFactor;
                     forcingBuffer[base + CH_BACKGROUND_WIND_Z] = targetWindZ * shearFactor;
-                    forcingBuffer[base + CH_SURFACE_CLASS] = terrain.surfaceClass();
+                    forcingBuffer[base + CH_SURFACE_CLASS] = cell.surfaceClass;
                 }
             }
         }
+    }
+
+    private void ensureStaticColumnState(
+        CellColumnState cell,
+        ServerWorld world,
+        SeedTerrainProvider provider,
+        int sampleX,
+        int sampleZ
+    ) {
+        if (cell.staticInitialized) {
+            return;
+        }
+        SeedTerrainProvider.TerrainSample terrain = provider.sample(world, sampleX, sampleZ);
+        cell.terrainHeightBlocks = terrain.terrainHeightBlocks();
+        cell.biomeTemperature = terrain.biomeTemperature();
+        cell.surfaceClass = terrain.surfaceClass();
+        cell.roughnessLengthMeters = terrain.roughnessLengthMeters();
+        cell.staticInitialized = true;
     }
 
     private boolean stepNative(float deltaSeconds) {
@@ -381,6 +395,7 @@ final class MesoscaleGrid implements AutoCloseable {
     }
 
     private static final class CellColumnState {
+        private boolean staticInitialized;
         private float terrainHeightBlocks;
         private float biomeTemperature;
         private float roughnessLengthMeters;
