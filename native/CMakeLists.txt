@@ -65,6 +65,9 @@ option(AERO_LBM_ENABLE_OPENCL "Enable OpenCL backend in native solver" ON)
 
 add_library(aero_lbm SHARED
     src/aero_lbm_jni.cpp
+    src/aero_lbm_hydro_core.cpp
+    src/aero_lbm_thermal_core.cpp
+    src/aero_lbm_mesoscale.cpp
 )
 
 target_include_directories(aero_lbm PRIVATE ${JNI_INCLUDE_DIRS})

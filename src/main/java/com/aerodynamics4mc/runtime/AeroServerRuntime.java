@@ -160,6 +160,13 @@ public final class AeroServerRuntime {
     private static final byte SURFACE_KIND_MOLTEN = 6;
     private static final Direction[] CARDINAL_DIRECTIONS = Direction.values();
     private static final int FACE_COUNT = 6;
+    private static final int BACKGROUND_MET_CELL_SIZE_BLOCKS = 256;
+    private static final int BACKGROUND_MET_RADIUS_CELLS = 20;
+    private static final int MESOSCALE_MET_CELL_SIZE_BLOCKS = 64;
+    private static final int MESOSCALE_MET_RADIUS_CELLS = 16;
+    private static final int MESOSCALE_MET_LAYER_HEIGHT_BLOCKS = 40;
+    private static final int MESOSCALE_MET_MAX_LAYERS = Math.max(1, 320 / MESOSCALE_MET_LAYER_HEIGHT_BLOCKS);
+    private static final int BACKGROUND_MET_REFRESH_TICKS = 20;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
@@ -180,6 +187,10 @@ public final class AeroServerRuntime {
     private final Map<WindowKey, WindowState> windows = new HashMap<>();
     private final NativeLbmBridge nativeBackend = new NativeLbmBridge();
     private final ActiveWindowWorldCache worldCache = new ActiveWindowWorldCache();
+    private final SeedTerrainProvider seedTerrainProvider = new WorldgenSeedTerrainProvider();
+    private final NestedBoundaryCoupler nestedBoundaryCoupler = new NestedBoundaryCoupler();
+    private final Map<RegistryKey<World>, BackgroundMetGrid> backgroundMetGrids = new HashMap<>();
+    private final Map<RegistryKey<World>, MesoscaleGrid> mesoscaleMetGrids = new HashMap<>();
     private final Object simulationStateLock = new Object();
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT, runnable -> {
         Thread thread = new Thread(runnable, "aero-server-solver");
@@ -390,6 +401,7 @@ public final class AeroServerRuntime {
                     int statusWindowCount = isClientMasterActive(ctx.getSource().getServer())
                         ? clientMasterDetectedWindows
                         : windows.size();
+                    PublishedFrame currentFrame = publishedFrame.get();
                     feedback(
                         ctx.getSource(),
                         "Status streaming=" + streamingEnabled
@@ -410,6 +422,9 @@ public final class AeroServerRuntime {
                             + " clientMaster=" + (singleplayerClientMasterEnabled ? "on" : "off")
                             + "(active=" + isClientMasterActive(ctx.getSource().getServer()) + ")"
                             + " maxFlow=" + format2(lastMaxFlowSpeed)
+                            + " publishedRegions=" + (currentFrame == null ? 0 : currentFrame.regions().size())
+                            + " l0Cells=" + backgroundMetCellCount()
+                            + " l1Cells=" + mesoscaleMetCellCount()
                     );
                     if (!lastSolverError.isEmpty()) {
                         feedback(ctx.getSource(), "Last solver error: " + lastSolverError);
@@ -475,6 +490,9 @@ public final class AeroServerRuntime {
             return;
         }
         tickCounter++;
+        if (tickCounter == 1 || tickCounter % BACKGROUND_MET_REFRESH_TICKS == 0) {
+            refreshBackgroundMetGrids(server);
+        }
         ensureSimulationCoordinatorRunning();
 
         boolean clientMasterActive = isClientMasterActive(server);
@@ -607,6 +625,11 @@ public final class AeroServerRuntime {
             }
             windows.clear();
         }
+        backgroundMetGrids.clear();
+        for (MesoscaleGrid grid : mesoscaleMetGrids.values()) {
+            grid.close();
+        }
+        mesoscaleMetGrids.clear();
         publishedFrame.set(null);
         waitForSolverIdle();
         clientMasterDetectedWindows = 0;
@@ -615,6 +638,70 @@ public final class AeroServerRuntime {
             worldCache.flushSaves();
         }
         nativeBackend.shutdown();
+    }
+
+    private void refreshBackgroundMetGrids(MinecraftServer server) {
+        for (ServerWorld world : server.getWorlds()) {
+            List<ServerPlayerEntity> players = world.getPlayers();
+            if (players.isEmpty()) {
+                backgroundMetGrids.remove(world.getRegistryKey());
+                MesoscaleGrid grid = mesoscaleMetGrids.remove(world.getRegistryKey());
+                if (grid != null) {
+                    grid.close();
+                }
+                continue;
+            }
+            double sumX = 0.0;
+            double sumZ = 0.0;
+            for (ServerPlayerEntity player : players) {
+                sumX += player.getX();
+                sumZ += player.getZ();
+            }
+            int focusX = MathHelper.floor(sumX / players.size());
+            int focusZ = MathHelper.floor(sumZ / players.size());
+            BlockPos focus = new BlockPos(focusX, world.getSeaLevel(), focusZ);
+            BackgroundMetGrid grid = backgroundMetGrids.computeIfAbsent(
+                world.getRegistryKey(),
+                ignored -> new BackgroundMetGrid(BACKGROUND_MET_CELL_SIZE_BLOCKS, BACKGROUND_MET_RADIUS_CELLS)
+            );
+            grid.refresh(world, focus, tickCounter, SOLVER_STEP_SECONDS, seedTerrainProvider);
+            MesoscaleGrid mesoscale = mesoscaleMetGrids.computeIfAbsent(
+                world.getRegistryKey(),
+                ignored -> new MesoscaleGrid(
+                    MESOSCALE_MET_CELL_SIZE_BLOCKS,
+                    MESOSCALE_MET_RADIUS_CELLS,
+                    MESOSCALE_MET_LAYER_HEIGHT_BLOCKS,
+                    MESOSCALE_MET_MAX_LAYERS
+                )
+            );
+            mesoscale.refresh(world, focus, tickCounter, SOLVER_STEP_SECONDS, seedTerrainProvider, grid);
+        }
+    }
+
+    private BackgroundMetGrid.Sample sampleBackgroundMet(ServerWorld world, BlockPos pos) {
+        BackgroundMetGrid grid = backgroundMetGrids.get(world.getRegistryKey());
+        return grid == null ? null : grid.sample(pos);
+    }
+
+    private MesoscaleGrid.Sample sampleMesoscaleMet(ServerWorld world, BlockPos pos) {
+        MesoscaleGrid grid = mesoscaleMetGrids.get(world.getRegistryKey());
+        return grid == null ? null : grid.sample(pos);
+    }
+
+    private int backgroundMetCellCount() {
+        int total = 0;
+        for (BackgroundMetGrid grid : backgroundMetGrids.values()) {
+            total += grid.cellCount();
+        }
+        return total;
+    }
+
+    private int mesoscaleMetCellCount() {
+        int total = 0;
+        for (MesoscaleGrid grid : mesoscaleMetGrids.values()) {
+            total += grid.cellCount();
+        }
+        return total;
     }
 
     private boolean isClientMasterActive(MinecraftServer server) {
@@ -1387,6 +1474,14 @@ public final class AeroServerRuntime {
                         keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(regionCore)));
                     }
                 }
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))
+                ));
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))
+                ));
             }
         }
         return keys;
@@ -1772,21 +1867,46 @@ public final class AeroServerRuntime {
     }
 
     private SolveSnapshot createSolveSnapshot(
+        WindowKey key,
         WindowState window,
-        BlockPos origin,
         BackendMode backend,
         float speedCap,
         long generation
     ) {
         return new SolveSnapshot(
             window,
-            origin,
+            key.origin(),
             List.copyOf(window.fans),
             window.copySectionRefs(),
             backend,
             speedCap,
-            generation
+            generation,
+            sampleNestedBoundaryAtWindow(key)
         );
+    }
+
+    private BackgroundMetGrid.Sample sampleBackgroundMetAtWindow(WindowKey key) {
+        BackgroundMetGrid grid = backgroundMetGrids.get(key.worldKey());
+        if (grid == null) {
+            return null;
+        }
+        return grid.sample(key.origin().add(GRID_SIZE / 2, GRID_SIZE / 2, GRID_SIZE / 2));
+    }
+
+    private MesoscaleGrid.Sample sampleMesoscaleMetAtWindow(WindowKey key) {
+        MesoscaleGrid grid = mesoscaleMetGrids.get(key.worldKey());
+        if (grid == null) {
+            return null;
+        }
+        return grid.sample(key.origin().add(GRID_SIZE / 2, GRID_SIZE / 2, GRID_SIZE / 2));
+    }
+
+    private NestedBoundaryCoupler.BoundarySample sampleNestedBoundaryAtWindow(WindowKey key) {
+        MesoscaleGrid.Sample mesoscaleSample = sampleMesoscaleMetAtWindow(key);
+        if (mesoscaleSample != null) {
+            return nestedBoundaryCoupler.fromMesoscaleSample(mesoscaleSample);
+        }
+        return nestedBoundaryCoupler.fromBackgroundSample(sampleBackgroundMetAtWindow(key));
     }
 
     private PreparedPayload captureWindow(SolveSnapshot snapshot) {
@@ -1795,6 +1915,8 @@ public final class AeroServerRuntime {
         window.ensureSolveFieldInitialized();
         float[] solveField = window.solveField;
         WindowSection[] sections = snapshot.sections();
+        NestedBoundaryCoupler.BoundarySample boundarySample = snapshot.boundarySample();
+        boolean thermalBoundaryTouched = false;
         int minX = snapshot.origin().getX();
         int minY = snapshot.origin().getY();
         int minZ = snapshot.origin().getZ();
@@ -1817,6 +1939,23 @@ public final class AeroServerRuntime {
                                 int idx = cell * CHANNELS;
                                 int stateIdx = localCell * RESPONSE_CHANNELS;
                                 boolean solid = section == null || section.obstacle[localCell] > 0.5f;
+                                if (!solid && section != null && boundarySample != null) {
+                                    int edgeDistance = Math.min(
+                                        Math.min(Math.min(x, y), z),
+                                        Math.min(Math.min(GRID_SIZE - 1 - x, GRID_SIZE - 1 - y), GRID_SIZE - 1 - z)
+                                    );
+                                    if (edgeDistance < WINDOW_EDGE_STABILIZATION_LAYERS) {
+                                        float eta = (WINDOW_EDGE_STABILIZATION_LAYERS - edgeDistance)
+                                            / (float) WINDOW_EDGE_STABILIZATION_LAYERS;
+                                        float keep = WINDOW_EDGE_STABILIZATION_MIN_KEEP
+                                            + (1.0f - WINDOW_EDGE_STABILIZATION_MIN_KEEP) * (1.0f - eta * eta);
+                                        float relaxed = section.temperatureState[localCell] * keep;
+                                        if (relaxed != section.temperatureState[localCell]) {
+                                            section.temperatureState[localCell] = relaxed;
+                                            thermalBoundaryTouched = true;
+                                        }
+                                    }
+                                }
                                 float sampledThermal = section == null ? 0.0f : section.thermal[localCell];
                                 sampledThermal = MathHelper.clamp(sampledThermal, -NATIVE_THERMAL_SOURCE_MAX, NATIVE_THERMAL_SOURCE_MAX);
 
@@ -1854,6 +1993,22 @@ public final class AeroServerRuntime {
             applyFanSource(window, fan, minX, minY, minZ);
         }
         applyTunnelInflow(window);
+        if (thermalBoundaryTouched) {
+            window.markTemperatureRestorePending();
+        }
+        nestedBoundaryCoupler.applyBackgroundWindBoundary(
+            solveField,
+            boundarySample,
+            GRID_SIZE,
+            CHANNELS,
+            CH_OBSTACLE,
+            CH_STATE_VX,
+            CH_STATE_VY,
+            CH_STATE_VZ,
+            CH_STATE_P,
+            WINDOW_EDGE_STABILIZATION_LAYERS,
+            WINDOW_EDGE_STABILIZATION_MIN_KEEP
+        );
 
         float nativeInputScale = snapshot.backend() == BackendMode.NATIVE ? (1.0f / NATIVE_VELOCITY_SCALE) : 1.0f;
         int cellCount = GRID_SIZE * GRID_SIZE * GRID_SIZE;
@@ -1999,12 +2154,28 @@ public final class AeroServerRuntime {
             * (0.30f + 0.70f * solarAltitude)
             * (0.55f + 0.45f * clearSky);
         float precipitationStrength = Math.max(rain, thunder * 0.60f);
-        float biomeTemperature = world.getBiome(samplePos).value().getTemperature();
-        float altitudeOffsetK = (samplePos.getY() - world.getSeaLevel()) * THERMAL_ALTITUDE_LAPSE_RATE_K_PER_BLOCK;
-        float ambientAirTemperatureKelvin = THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K
-            + (biomeTemperature - 0.8f) * THERMAL_BIOME_TEMPERATURE_SCALE_K
-            - altitudeOffsetK;
-        float deepGroundTemperatureKelvin = ambientAirTemperatureKelvin + THERMAL_DEEP_GROUND_OFFSET_K;
+        MesoscaleGrid.Sample mesoscaleSample = sampleMesoscaleMet(world, samplePos);
+        BackgroundMetGrid.Sample backgroundSample = mesoscaleSample == null ? sampleBackgroundMet(world, samplePos) : null;
+        float biomeTemperature = mesoscaleSample != null
+            ? mesoscaleSample.biomeTemperature()
+            : backgroundSample != null
+                ? backgroundSample.biomeTemperature()
+            : world.getBiome(samplePos).value().getTemperature();
+        float ambientAirTemperatureKelvin;
+        float deepGroundTemperatureKelvin;
+        if (mesoscaleSample != null) {
+            ambientAirTemperatureKelvin = mesoscaleSample.ambientAirTemperatureKelvin();
+            deepGroundTemperatureKelvin = mesoscaleSample.deepGroundTemperatureKelvin();
+        } else if (backgroundSample != null) {
+            ambientAirTemperatureKelvin = backgroundSample.ambientAirTemperatureKelvin();
+            deepGroundTemperatureKelvin = backgroundSample.deepGroundTemperatureKelvin();
+        } else {
+            float altitudeOffsetK = (samplePos.getY() - world.getSeaLevel()) * THERMAL_ALTITUDE_LAPSE_RATE_K_PER_BLOCK;
+            ambientAirTemperatureKelvin = THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K
+                + (biomeTemperature - 0.8f) * THERMAL_BIOME_TEMPERATURE_SCALE_K
+                - altitudeOffsetK;
+            deepGroundTemperatureKelvin = ambientAirTemperatureKelvin + THERMAL_DEEP_GROUND_OFFSET_K;
+        }
         float skyTemperatureDropK = MathHelper.lerp(solarAltitude, THERMAL_SKY_TEMP_DROP_NIGHT_K, THERMAL_SKY_TEMP_DROP_DAY_K);
         float skyTemperatureKelvin = ambientAirTemperatureKelvin - skyTemperatureDropK * clearSky;
         float precipitationTemperatureKelvin = ambientAirTemperatureKelvin - THERMAL_PRECIP_TEMP_DROP_K;
@@ -3377,8 +3548,8 @@ public final class AeroServerRuntime {
                 continue;
             }
             SolveSnapshot snapshot = createSolveSnapshot(
+                active.key(),
                 window,
-                active.key().origin(),
                 backendMode,
                 maxWindSpeed,
                 runtimeGeneration.get()
@@ -3677,7 +3848,8 @@ public final class AeroServerRuntime {
         WindowSection[] sections,
         BackendMode backend,
         float speedCap,
-        long generation
+        long generation,
+        NestedBoundaryCoupler.BoundarySample boundarySample
     ) {
     }
 

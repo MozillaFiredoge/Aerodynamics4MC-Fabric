@@ -1,6 +1,9 @@
 #include <jni.h>
 
 #include "aero_lbm_capi.h"
+#include "aero_lbm_hydro_core.h"
+#include "aero_lbm_mesoscale.h"
+#include "aero_lbm_thermal_core.h"
 
 #include <algorithm>
 #include <array>
@@ -26,103 +29,28 @@
 
 namespace {
 
-constexpr int kQ = 27;
-constexpr int kThermalQ = 7;
-constexpr std::array<int, 3> kVel1D = {-1, 0, 1};
-constexpr std::array<float, 3> kW1D = {1.0f / 6.0f, 2.0f / 3.0f, 1.0f / 6.0f};
+constexpr int kQ = aero_lbm::hydro_core::kQ;
+constexpr int kThermalQ = aero_lbm::thermal_core::kQ;
+constexpr int lattice_q(int ix, int iy, int iz) {
+    return aero_lbm::hydro_core::lattice_q(ix, iy, iz);
+}
 constexpr std::array<std::array<float, 3>, 3> kMomentInv1D = {{
     {{0.0f, -0.5f, 0.5f}},  // c = -1
     {{1.0f, 0.0f, -1.0f}},  // c =  0
     {{0.0f, 0.5f, 0.5f}}    // c = +1
 }};
+constexpr auto kCx = aero_lbm::hydro_core::kCx;
+constexpr auto kCy = aero_lbm::hydro_core::kCy;
+constexpr auto kCz = aero_lbm::hydro_core::kCz;
+constexpr auto kOpp = aero_lbm::hydro_core::kOpp;
+constexpr auto kW = aero_lbm::hydro_core::kW;
 
-constexpr int lattice_q(int ix, int iy, int iz) {
-    return (ix * 3 + iy) * 3 + iz;
-}
-
-constexpr std::array<int, kQ> make_cx() {
-    std::array<int, kQ> out{};
-    int q = 0;
-    for (int ix = 0; ix < 3; ++ix) {
-        for (int iy = 0; iy < 3; ++iy) {
-            for (int iz = 0; iz < 3; ++iz) {
-                (void)iy;
-                (void)iz;
-                out[q++] = kVel1D[ix];
-            }
-        }
-    }
-    return out;
-}
-
-constexpr std::array<int, kQ> make_cy() {
-    std::array<int, kQ> out{};
-    int q = 0;
-    for (int ix = 0; ix < 3; ++ix) {
-        (void)ix;
-        for (int iy = 0; iy < 3; ++iy) {
-            for (int iz = 0; iz < 3; ++iz) {
-                (void)iz;
-                out[q++] = kVel1D[iy];
-            }
-        }
-    }
-    return out;
-}
-
-constexpr std::array<int, kQ> make_cz() {
-    std::array<int, kQ> out{};
-    int q = 0;
-    for (int ix = 0; ix < 3; ++ix) {
-        (void)ix;
-        for (int iy = 0; iy < 3; ++iy) {
-            (void)iy;
-            for (int iz = 0; iz < 3; ++iz) {
-                out[q++] = kVel1D[iz];
-            }
-        }
-    }
-    return out;
-}
-
-constexpr std::array<int, kQ> make_opp() {
-    std::array<int, kQ> out{};
-    int q = 0;
-    for (int ix = 0; ix < 3; ++ix) {
-        for (int iy = 0; iy < 3; ++iy) {
-            for (int iz = 0; iz < 3; ++iz) {
-                out[q++] = lattice_q(2 - ix, 2 - iy, 2 - iz);
-            }
-        }
-    }
-    return out;
-}
-
-constexpr std::array<float, kQ> make_w() {
-    std::array<float, kQ> out{};
-    int q = 0;
-    for (int ix = 0; ix < 3; ++ix) {
-        for (int iy = 0; iy < 3; ++iy) {
-            for (int iz = 0; iz < 3; ++iz) {
-                out[q++] = kW1D[ix] * kW1D[iy] * kW1D[iz];
-            }
-        }
-    }
-    return out;
-}
-
-constexpr std::array<int, kQ> kCx = make_cx();
-constexpr std::array<int, kQ> kCy = make_cy();
-constexpr std::array<int, kQ> kCz = make_cz();
-constexpr std::array<int, kQ> kOpp = make_opp();
-constexpr std::array<float, kQ> kW = make_w();
-
-constexpr std::array<int, kThermalQ> kThermalCx = {0, 1, -1, 0, 0, 0, 0};
-constexpr std::array<int, kThermalQ> kThermalCy = {0, 0, 0, 1, -1, 0, 0};
-constexpr std::array<int, kThermalQ> kThermalCz = {0, 0, 0, 0, 0, 1, -1};
-constexpr std::array<int, kThermalQ> kThermalOpp = {0, 2, 1, 4, 3, 6, 5};
-constexpr std::array<float, kThermalQ> kThermalW = {0.25f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f};
-constexpr float kThermalCs2 = 0.25f;
+constexpr auto kThermalCx = aero_lbm::thermal_core::kCx;
+constexpr auto kThermalCy = aero_lbm::thermal_core::kCy;
+constexpr auto kThermalCz = aero_lbm::thermal_core::kCz;
+constexpr auto kThermalOpp = aero_lbm::thermal_core::kOpp;
+constexpr auto kThermalW = aero_lbm::thermal_core::kW;
+constexpr float kThermalCs2 = aero_lbm::thermal_core::kCs2;
 
 constexpr int kChannelObstacle = 0;
 constexpr int kChannelFanMask = 1;
@@ -146,16 +74,25 @@ constexpr float kRuntimeAirKinematicViscosityMetersSqPerSecond = 1.50e-5f;
 constexpr float kRuntimeAirPrandtl = 0.71f;
 constexpr float kRuntimeTurbulentPrandtl = 0.85f;
 constexpr float kRuntimeAirThermalDiffusivityMetersSqPerSecond =
-    kRuntimeAirKinematicViscosityMetersSqPerSecond / kRuntimeAirPrandtl;
+    aero_lbm::thermal_core::thermal_diffusivity_from_nu_pr(
+        kRuntimeAirKinematicViscosityMetersSqPerSecond,
+        kRuntimeAirPrandtl
+    );
 constexpr float kRuntimeTemperatureScaleKelvin = 20.0f;
 constexpr float kRuntimeAirThermalExpansionPerKelvin = 1.0f / 300.0f;
 constexpr float kRuntimeGravityMetersPerSecondSq = 9.81f;
 constexpr float kRuntimeMolecularNu0 =
-    kRuntimeAirKinematicViscosityMetersSqPerSecond
-    * (kRuntimeSecondsPerStep / (kRuntimeMetersPerCell * kRuntimeMetersPerCell));
+    aero_lbm::hydro_core::physical_diffusivity_to_lattice(
+        kRuntimeAirKinematicViscosityMetersSqPerSecond,
+        kRuntimeMetersPerCell,
+        kRuntimeSecondsPerStep
+    );
 constexpr float kRuntimeMolecularAlpha0 =
-    kRuntimeAirThermalDiffusivityMetersSqPerSecond
-    * (kRuntimeSecondsPerStep / (kRuntimeMetersPerCell * kRuntimeMetersPerCell));
+    aero_lbm::hydro_core::physical_diffusivity_to_lattice(
+        kRuntimeAirThermalDiffusivityMetersSqPerSecond,
+        kRuntimeMetersPerCell,
+        kRuntimeSecondsPerStep
+    );
 
 constexpr float kRhoMin = 0.97f;
 constexpr float kRhoMax = 1.03f;
@@ -167,10 +104,10 @@ constexpr float kNuShearMin = 1.0e-8f;
 constexpr float kNuShearMax = (0.95f - 0.5f) / 3.0f;
 constexpr float kNuNormalMin = 1.0e-8f;
 constexpr float kNuNormalMax = (0.95f - 0.5f) / 3.0f;
-constexpr float kTauShear = 0.5f + 3.0f * kRuntimeMolecularNu0;
+constexpr float kTauShear = aero_lbm::hydro_core::tau_from_lattice_diffusivity(kRuntimeMolecularNu0);
 constexpr float kTauShearMin = 0.5f + 3.0f * kNuShearMin;
 constexpr float kTauShearMax = 0.95f;
-constexpr float kTauNormal = 0.5f + 3.0f * kRuntimeMolecularNu0;
+constexpr float kTauNormal = aero_lbm::hydro_core::tau_from_lattice_diffusivity(kRuntimeMolecularNu0);
 constexpr float kTauNormalMin = 0.5f + 3.0f * kNuNormalMin;
 constexpr float kTauNormalMax = 0.95f;
 constexpr bool kEnableSgs = true;
@@ -203,11 +140,13 @@ constexpr float kThermalSourceMax = 0.006f;
 constexpr float kThermalMin = -1.00f;
 constexpr float kThermalMax = 1.00f;
 constexpr int kThermalUpdateStride = 2;
-constexpr float kBoussinesqBeta =
-    kRuntimeGravityMetersPerSecondSq
-    * kRuntimeAirThermalExpansionPerKelvin
-    * kRuntimeTemperatureScaleKelvin
-    * (kRuntimeSecondsPerStep * kRuntimeSecondsPerStep / kRuntimeMetersPerCell);
+constexpr float kBoussinesqBeta = aero_lbm::thermal_core::runtime_boussinesq_beta(
+    kRuntimeGravityMetersPerSecondSq,
+    kRuntimeAirThermalExpansionPerKelvin,
+    kRuntimeTemperatureScaleKelvin,
+    kRuntimeSecondsPerStep,
+    kRuntimeMetersPerCell
+);
 constexpr float kBoussinesqForceMax = 0.02f;
 
 constexpr float kCylinderBenchmarkLength = 2.2f;
@@ -911,14 +850,11 @@ inline float effective_thermal_diffusivity() {
 
 inline float effective_thermal_tau() {
     const float alpha = std::max(1.0e-6f, effective_thermal_diffusivity());
-    return clampf(0.5f + alpha / kThermalCs2, 0.5005f, 3.0f);
+    return clampf(aero_lbm::thermal_core::tau_from_alpha(alpha), 0.5005f, 3.0f);
 }
 
 inline float thermal_feq(int q, float temperature, float ux, float uy, float uz) {
-    const float cu = static_cast<float>(kThermalCx[q]) * ux
-                   + static_cast<float>(kThermalCy[q]) * uy
-                   + static_cast<float>(kThermalCz[q]) * uz;
-    return kThermalW[q] * temperature * (1.0f + cu / kThermalCs2);
+    return aero_lbm::thermal_core::equilibrium_d3q7(q, temperature, ux, uy, uz);
 }
 
 inline float effective_thermal_cooling() {
@@ -1115,9 +1051,7 @@ inline float finite_or(float v, float fallback) {
 }
 
 inline float feq(int q, float rho, float ux, float uy, float uz) {
-    const float cu = 3.0f * (kCx[q] * ux + kCy[q] * uy + kCz[q] * uz);
-    const float uu = ux * ux + uy * uy + uz * uz;
-    return kW[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
+    return aero_lbm::hydro_core::equilibrium_d3q27(q, rho, ux, uy, uz);
 }
 
 inline void decode_cell(std::size_t cell, int nx, int ny, int nz, int& x, int& y, int& z) {
@@ -6026,6 +5960,48 @@ JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_native
 }
 JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeTimingInfo(JNIEnv* env, jclass) {
     return native_timing_info_impl(env);
+}
+
+JNIEXPORT jfloatArray JNICALL Java_com_aerodynamics4mc_runtime_MesoscaleNativeBridge_nativeDeriveTransport(
+    JNIEnv* env,
+    jclass,
+    jint nx,
+    jint ny,
+    jint nz,
+    jfloat dx_m,
+    jfloat dt_s,
+    jfloat molecular_nu_m2_s,
+    jfloat prandtl_air,
+    jfloat turbulent_prandtl
+) {
+    AeroLbmMesoscaleConfig cfg{};
+    aero_lbm_mesoscale_default_config(&cfg);
+    cfg.nx = nx;
+    cfg.ny = ny;
+    cfg.nz = nz;
+    cfg.dx_m = dx_m;
+    cfg.dt_s = dt_s;
+    cfg.molecular_nu_m2_s = molecular_nu_m2_s;
+    cfg.prandtl_air = prandtl_air;
+    cfg.turbulent_prandtl = turbulent_prandtl;
+
+    AeroLbmMesoscaleTransport transport{};
+    if (!aero_lbm_mesoscale_derive_transport(&cfg, &transport)) {
+        return nullptr;
+    }
+    jfloatArray out = env->NewFloatArray(5);
+    if (!out) {
+        return nullptr;
+    }
+    const jfloat values[5] = {
+        transport.velocity_scale_m_s_per_lattice,
+        transport.nu_molecular_lattice,
+        transport.alpha_molecular_lattice,
+        transport.tau_shear_molecular,
+        transport.tau_thermal_molecular
+    };
+    env->SetFloatArrayRegion(out, 0, 5, values);
+    return out;
 }
 
 }  // extern "C"

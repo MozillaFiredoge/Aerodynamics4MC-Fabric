@@ -14,7 +14,10 @@ extern "C" {
 #endif
 
 enum {
-    AERO_LBM_BENCHMARK_ABI_VERSION = 1
+    AERO_LBM_BENCHMARK_ABI_VERSION = 1,
+    AERO_LBM_MESOSCALE_ABI_VERSION = 1,
+    AERO_LBM_MESOSCALE_FORCING_CHANNELS = 9,
+    AERO_LBM_MESOSCALE_STATE_CHANNELS = 5
 };
 
 typedef enum AeroLbmBenchmarkPreset {
@@ -107,6 +110,32 @@ typedef struct AeroLbmTimingSnapshot {
     double avg_total_ms;
 } AeroLbmTimingSnapshot;
 
+typedef struct AeroLbmMesoscaleConfig {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    int nx;
+    int ny;
+    int nz;
+    float dx_m;
+    float dt_s;
+    float molecular_nu_m2_s;
+    float prandtl_air;
+    float turbulent_prandtl;
+    float reference_density_kg_m3;
+    float ambient_air_temperature_k;
+    float deep_ground_temperature_k;
+    float background_wind_m_s[3];
+    uint32_t reserved[8];
+} AeroLbmMesoscaleConfig;
+
+typedef struct AeroLbmMesoscaleTransport {
+    float velocity_scale_m_s_per_lattice;
+    float nu_molecular_lattice;
+    float alpha_molecular_lattice;
+    float tau_shear_molecular;
+    float tau_thermal_molecular;
+} AeroLbmMesoscaleTransport;
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_init(int grid_size, int input_channels, int output_channels);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step(const float* packet, int grid_size, long long context_key, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_channels, int output_channels);
@@ -128,6 +157,22 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_runtime_info(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_timing_info(void);
 AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_timing_snapshot(AeroLbmTimingSnapshot* out_snapshot);
+AERO_LBM_CAPI_EXPORT void aero_lbm_mesoscale_default_config(AeroLbmMesoscaleConfig* out_config);
+AERO_LBM_CAPI_EXPORT int aero_lbm_mesoscale_derive_transport(
+    const AeroLbmMesoscaleConfig* config,
+    AeroLbmMesoscaleTransport* out_transport
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_mesoscale_create_context(
+    const AeroLbmMesoscaleConfig* config,
+    long long* out_context_key
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_mesoscale_step_context(
+    long long context_key,
+    const AeroLbmMesoscaleConfig* config,
+    const float* forcing,
+    float* out_state
+);
+AERO_LBM_CAPI_EXPORT void aero_lbm_mesoscale_release_context(long long context_key);
 
 AERO_LBM_CAPI_EXPORT void aero_lbm_benchmark_default_config(AeroLbmBenchmarkConfig* out_config);
 AERO_LBM_CAPI_EXPORT int aero_lbm_benchmark_default_preset_config(int preset, AeroLbmBenchmarkConfig* out_config);
