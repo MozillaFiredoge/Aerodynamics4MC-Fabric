@@ -138,6 +138,16 @@ public final class NativeLbmBridge {
         return nativeRuntimeInfo();
     }
 
+    public synchronized String lastError() {
+        if (!LOADED) {
+            return "not_loaded";
+        }
+        if (!initialized) {
+            return "not_initialized";
+        }
+        return nativeLastError();
+    }
+
     public synchronized String timingInfo() {
         if (!LOADED || !initialized) {
             return "ticks=0";
@@ -189,6 +199,8 @@ public final class NativeLbmBridge {
     private static native void nativeShutdown();
 
     private static native String nativeRuntimeInfo();
+
+    private static native String nativeLastError();
 
     private static native String nativeTimingInfo();
 

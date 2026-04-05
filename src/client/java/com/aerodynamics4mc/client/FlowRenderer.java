@@ -167,7 +167,7 @@ public class FlowRenderer {
                     buffer.vertex(matrix, fx, fy, fz)
                         .color(r, g, b, 255)
                         .normal(entry, (float) dir.x, (float) dir.y, (float) dir.z)
-                        .lineWidth(1.2f);
+                        .lineWidth(2.5f);
                     buffer.vertex(
                             matrix,
                             fx + (float) dir.x * lineLength,
@@ -176,7 +176,7 @@ public class FlowRenderer {
                         )
                         .color(r, g, b, 255)
                         .normal(entry, (float) dir.x, (float) dir.y, (float) dir.z)
-                        .lineWidth(1.2f);
+                        .lineWidth(2f);
                 }
             }
         }

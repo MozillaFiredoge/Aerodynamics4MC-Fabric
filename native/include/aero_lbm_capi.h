@@ -154,6 +154,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* o
 AERO_LBM_CAPI_EXPORT void aero_lbm_release_context(long long context_key);
 AERO_LBM_CAPI_EXPORT void aero_lbm_shutdown(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_runtime_info(void);
+AERO_LBM_CAPI_EXPORT const char* aero_lbm_last_error(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_timing_info(void);
 AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_timing_snapshot(AeroLbmTimingSnapshot* out_snapshot);

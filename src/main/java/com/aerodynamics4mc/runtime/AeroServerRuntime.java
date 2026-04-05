@@ -957,9 +957,22 @@ public final class AeroServerRuntime {
                 offsetY,
                 offsetZ
             );
-            if (!nativeHaloSynced && lastSolverError.isEmpty()) {
-                lastSolverError = "Native halo exchange failed for offset "
-                    + offsetX + "," + offsetY + "," + offsetZ;
+            if (!nativeHaloSynced) {
+                String nativeError = nativeBackend.lastError();
+                String runtimeInfo = nativeBackend.runtimeInfo();
+                StringBuilder message = new StringBuilder("Native halo exchange failed for offset ")
+                    .append(offsetX).append(",").append(offsetY).append(",").append(offsetZ);
+                if (nativeError != null && !nativeError.isBlank()
+                    && !"not_initialized".equals(nativeError)
+                    && !"not_loaded".equals(nativeError)) {
+                    message.append(": ").append(nativeError);
+                }
+                if (runtimeInfo != null && !runtimeInfo.isBlank()
+                    && !"not_initialized".equals(runtimeInfo)
+                    && !"not_loaded".equals(runtimeInfo)) {
+                    message.append(" [runtime=").append(runtimeInfo).append("]");
+                }
+                lastSolverError = message.toString();
             }
         }
         if (!nativeHaloSynced) {

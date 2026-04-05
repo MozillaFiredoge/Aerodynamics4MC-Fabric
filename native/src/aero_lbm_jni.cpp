@@ -533,6 +533,7 @@ struct ContextState {
 
 Config g_cfg;
 std::unordered_map<jlong, ContextState> g_contexts;
+std::string g_last_native_error;
 
 struct StepTiming {
     double payload_copy_ms = 0.0;
@@ -553,6 +554,14 @@ struct TimingStats {
 TimingStats g_timing;
 AeroLbmBenchmarkConfig g_benchmark_cfg = make_default_benchmark_config();
 using Clock = std::chrono::steady_clock;
+
+inline void clear_last_native_error() {
+    g_last_native_error.clear();
+}
+
+inline void set_last_native_error(std::string error) {
+    g_last_native_error = std::move(error);
+}
 
 enum BoundaryFaceIndex {
     kFaceXMin = 0,
@@ -4852,14 +4861,33 @@ bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int of
         || !first.gpu_initialized || !second.gpu_initialized) {
         return true;
     }
-    if (first.nx != second.nx || first.ny != second.ny || first.nz != second.nz) return false;
+    if (first.nx != second.nx || first.ny != second.ny || first.nz != second.nz) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: GPU context shape mismatch first="
+            << first.nx << "x" << first.ny << "x" << first.nz
+            << ", second=" << second.nx << "x" << second.ny << "x" << second.nz;
+        set_last_native_error(oss.str());
+        return false;
+    }
     const int nx = first.nx;
     const int ny = first.ny;
     const int nz = first.nz;
-    if (nx != ny || ny != nz) return false;
+    if (nx != ny || ny != nz) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: GPU halo exchange requires cubic contexts, got "
+            << nx << "x" << ny << "x" << nz;
+        set_last_native_error(oss.str());
+        return false;
+    }
     const int halo = std::max(1, nx / 4);
     const int core = nx - halo * 2;
-    if (core <= 0) return false;
+    if (core <= 0) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: invalid GPU halo/core layout nx=" << nx
+            << " halo=" << halo << " core=" << core;
+        set_last_native_error(oss.str());
+        return false;
+    }
 
     int neg_src_x0 = 0;
     int neg_src_y0 = 0;
@@ -4901,6 +4929,11 @@ bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int of
         &size_y,
         &size_z
     )) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: halo slab bounds invalid for GPU offset ("
+            << offset_x << "," << offset_y << "," << offset_z << ")"
+            << " grid=" << nx << " halo=" << halo << " core=" << core;
+        set_last_native_error(oss.str());
         return false;
     }
 
@@ -5256,14 +5289,33 @@ bool halo_exchange_slab_bounds(
 
 bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int offset_x, int offset_y, int offset_z) {
     if (first.cells == 0 || second.cells == 0) return true;
-    if (first.nx != second.nx || first.ny != second.ny || first.nz != second.nz) return false;
+    if (first.nx != second.nx || first.ny != second.ny || first.nz != second.nz) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: CPU context shape mismatch first="
+            << first.nx << "x" << first.ny << "x" << first.nz
+            << ", second=" << second.nx << "x" << second.ny << "x" << second.nz;
+        set_last_native_error(oss.str());
+        return false;
+    }
     const int nx = first.nx;
     const int ny = first.ny;
     const int nz = first.nz;
-    if (nx != ny || ny != nz) return false;
+    if (nx != ny || ny != nz) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: CPU halo exchange requires cubic contexts, got "
+            << nx << "x" << ny << "x" << nz;
+        set_last_native_error(oss.str());
+        return false;
+    }
     const int halo = std::max(1, nx / 4);
     const int core = nx - halo * 2;
-    if (core <= 0) return false;
+    if (core <= 0) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: invalid CPU halo/core layout nx=" << nx
+            << " halo=" << halo << " core=" << core;
+        set_last_native_error(oss.str());
+        return false;
+    }
 
     int neg_src_x0 = 0;
     int neg_src_y0 = 0;
@@ -5305,6 +5357,11 @@ bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int of
         &size_y,
         &size_z
     )) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: halo slab bounds invalid for CPU offset ("
+            << offset_x << "," << offset_y << "," << offset_z << ")"
+            << " grid=" << nx << " halo=" << halo << " core=" << core;
+        set_last_native_error(oss.str());
         return false;
     }
 
@@ -5672,26 +5729,64 @@ static jboolean native_exchange_halo_impl(
     jint offset_y,
     jint offset_z
 ) {
-    if (!g_cfg.initialized || grid_size != g_cfg.grid_size) return JNI_FALSE;
+    clear_last_native_error();
+    if (!g_cfg.initialized) {
+        set_last_native_error("native_exchange_halo: runtime not initialized");
+        return JNI_FALSE;
+    }
+    if (grid_size != g_cfg.grid_size) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: grid size mismatch (requested=" << grid_size
+            << ", configured=" << g_cfg.grid_size << ")";
+        set_last_native_error(oss.str());
+        return JNI_FALSE;
+    }
     if (offset_x < -1 || offset_x > 1 || offset_y < -1 || offset_y > 1 || offset_z < -1 || offset_z > 1) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: invalid offset (" << offset_x << "," << offset_y << "," << offset_z << ")";
+        set_last_native_error(oss.str());
         return JNI_FALSE;
     }
     if (offset_x == 0 && offset_y == 0 && offset_z == 0) {
+        set_last_native_error("native_exchange_halo: zero offset is invalid");
         return JNI_FALSE;
     }
     auto first_it = g_contexts.find(first_context_key);
     auto second_it = g_contexts.find(second_context_key);
-    if (first_it == g_contexts.end() || second_it == g_contexts.end()) return JNI_FALSE;
+    if (first_it == g_contexts.end() || second_it == g_contexts.end()) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: missing context(s) first=" << static_cast<long long>(first_context_key)
+            << (first_it == g_contexts.end() ? " [missing]" : "")
+            << ", second=" << static_cast<long long>(second_context_key)
+            << (second_it == g_contexts.end() ? " [missing]" : "");
+        set_last_native_error(oss.str());
+        return JNI_FALSE;
+    }
     ContextState& first = first_it->second;
     ContextState& second = second_it->second;
     const std::size_t cells = configured_cells();
     ensure_context_shape(first, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     ensure_context_shape(second, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
-    if (first.cells == 0 || second.cells == 0) return JNI_TRUE;
-    if (g_cfg.opencl_enabled) {
-        return exchange_context_halo_gpu(first, second, offset_x, offset_y, offset_z) ? JNI_TRUE : JNI_FALSE;
+    if (first.cells == 0 || second.cells == 0) {
+        clear_last_native_error();
+        return JNI_TRUE;
     }
-    return exchange_context_halo_cpu(first, second, offset_x, offset_y, offset_z) ? JNI_TRUE : JNI_FALSE;
+    if (g_cfg.opencl_enabled) {
+        const bool ok = exchange_context_halo_gpu(first, second, offset_x, offset_y, offset_z);
+        if (!ok && g_last_native_error.empty()) {
+            set_last_native_error(g_opencl.error.empty() ? "native_exchange_halo: OpenCL halo exchange failed"
+                                                         : g_opencl.error);
+        }
+        return ok ? JNI_TRUE : JNI_FALSE;
+    }
+    const bool ok = exchange_context_halo_cpu(first, second, offset_x, offset_y, offset_z);
+    if (!ok && g_last_native_error.empty()) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo: CPU halo exchange failed for offset ("
+            << offset_x << "," << offset_y << "," << offset_z << ")";
+        set_last_native_error(oss.str());
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 static void native_release_context_impl(jlong context_key) {
@@ -5702,6 +5797,9 @@ static void native_release_context_impl(jlong context_key) {
 static void native_shutdown_impl() { reset_runtime_state(); }
 static jstring native_runtime_info_impl(JNIEnv* env) {
     return env->NewStringUTF((g_cfg.runtime_info.empty() ? "uninitialized" : g_cfg.runtime_info).c_str());
+}
+static jstring native_last_error_impl(JNIEnv* env) {
+    return env->NewStringUTF(g_last_native_error.c_str());
 }
 static jstring native_timing_info_impl(JNIEnv* env) {
     return env->NewStringUTF(timing_info_string().c_str());
@@ -5804,6 +5902,10 @@ AERO_LBM_CAPI_EXPORT void aero_lbm_shutdown(void) {
 
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_runtime_info(void) {
     return g_cfg.runtime_info.empty() ? "uninitialized" : g_cfg.runtime_info.c_str();
+}
+
+AERO_LBM_CAPI_EXPORT const char* aero_lbm_last_error(void) {
+    return g_last_native_error.c_str();
 }
 
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_timing_info(void) {
@@ -5953,6 +6055,13 @@ JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_native
 }
 JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeRuntimeInfo(JNIEnv* env, jclass) {
     return native_runtime_info_impl(env);
+}
+
+JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeLastError(JNIEnv* env, jclass) {
+    return native_last_error_impl(env);
+}
+JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeLastError(JNIEnv* env, jclass) {
+    return native_last_error_impl(env);
 }
 
 JNIEXPORT jstring JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeTimingInfo(JNIEnv* env, jclass) {
