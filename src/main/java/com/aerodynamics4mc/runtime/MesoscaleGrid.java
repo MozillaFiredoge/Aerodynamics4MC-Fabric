@@ -37,6 +37,8 @@ final class MesoscaleGrid implements AutoCloseable {
     private final int radiusCells;
     private final int layerHeightBlocks;
     private final int maxLayers;
+    private final float stepSeconds;
+    private final int forcingRebuildTicks;
     private final Map<Long, CellColumnState> cells = new HashMap<>();
     private final MesoscaleNativeBridge nativeBridge = new MesoscaleNativeBridge();
     private long nativeContextKey;
@@ -46,16 +48,28 @@ final class MesoscaleGrid implements AutoCloseable {
     private int centerCellZ;
     private int activeLayers = 1;
     private int verticalBaseY = 0;
-    private long lastRefreshTick = Long.MIN_VALUE;
+    private long lastTickProcessed = Long.MIN_VALUE;
+    private long lastForcingRefreshTick = Long.MIN_VALUE;
+    private float accumulatedStepSeconds = 0.0f;
+    private boolean forcingReady = false;
 
-    MesoscaleGrid(int cellSizeBlocks, int radiusCells, int layerHeightBlocks, int maxLayers) {
+    MesoscaleGrid(
+        int cellSizeBlocks,
+        int radiusCells,
+        int layerHeightBlocks,
+        int maxLayers,
+        float stepSeconds,
+        int forcingRebuildTicks
+    ) {
         this.cellSizeBlocks = cellSizeBlocks;
         this.radiusCells = radiusCells;
         this.layerHeightBlocks = Math.max(1, layerHeightBlocks);
         this.maxLayers = Math.max(1, maxLayers);
+        this.stepSeconds = Math.max(1.0e-3f, stepSeconds);
+        this.forcingRebuildTicks = Math.max(1, forcingRebuildTicks);
     }
 
-    void refresh(
+    synchronized void refresh(
         ServerWorld world,
         BlockPos focus,
         long tickCounter,
@@ -67,7 +81,8 @@ final class MesoscaleGrid implements AutoCloseable {
         int nextCenterCellZ = Math.floorDiv(focus.getZ(), cellSizeBlocks);
         int nextVerticalBaseY = Math.max(0, world.getBottomY());
         int nextActiveLayers = computeActiveLayers(world, nextVerticalBaseY);
-        boolean centerChanged = lastRefreshTick != Long.MIN_VALUE
+        boolean firstRefresh = lastTickProcessed == Long.MIN_VALUE;
+        boolean layoutChanged = lastTickProcessed != Long.MIN_VALUE
             && (nextCenterCellX != centerCellX
                 || nextCenterCellZ != centerCellZ
                 || nextVerticalBaseY != verticalBaseY
@@ -76,15 +91,31 @@ final class MesoscaleGrid implements AutoCloseable {
         centerCellZ = nextCenterCellZ;
         verticalBaseY = nextVerticalBaseY;
         activeLayers = nextActiveLayers;
-        float deltaSeconds = lastRefreshTick == Long.MIN_VALUE ? dtSeconds : Math.max(1L, tickCounter - lastRefreshTick) * dtSeconds;
-        lastRefreshTick = tickCounter;
-        if (centerChanged) {
+        float elapsedSeconds = firstRefresh
+            ? Math.max(1.0e-3f, dtSeconds)
+            : Math.max(1L, tickCounter - lastTickProcessed) * dtSeconds;
+        lastTickProcessed = tickCounter;
+        accumulatedStepSeconds += elapsedSeconds;
+
+        if (layoutChanged) {
             releaseNativeContext();
+            forcingReady = false;
         }
 
-        buildForcing(world, provider, background, deltaSeconds);
-        if (!stepNative(deltaSeconds)) {
-            refreshFallback(deltaSeconds);
+        boolean forcingRebuildDue = !forcingReady
+            || firstRefresh
+            || layoutChanged
+            || lastForcingRefreshTick == Long.MIN_VALUE
+            || tickCounter - lastForcingRefreshTick >= forcingRebuildTicks;
+        if (forcingRebuildDue) {
+            buildForcing(world, provider, background, stepSeconds);
+            lastForcingRefreshTick = tickCounter;
+            forcingReady = true;
+        }
+
+        if (forcingRebuildDue) {
+            // Seed a coherent state immediately after forcing refresh instead of waiting for the first native step.
+            refreshFallback(0.0f);
         }
 
         Iterator<Map.Entry<Long, CellColumnState>> it = cells.entrySet().iterator();
@@ -98,7 +129,7 @@ final class MesoscaleGrid implements AutoCloseable {
         }
     }
 
-    Sample sample(BlockPos pos) {
+    synchronized Sample sample(BlockPos pos) {
         int cellX = Math.floorDiv(pos.getX(), cellSizeBlocks);
         int cellZ = Math.floorDiv(pos.getZ(), cellSizeBlocks);
         CellColumnState state = cells.get(pack(cellX, cellZ));
@@ -119,16 +150,36 @@ final class MesoscaleGrid implements AutoCloseable {
         );
     }
 
-    int cellCount() {
+    synchronized int cellCount() {
         return cells.size() * activeLayers;
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         releaseNativeContext();
         cells.clear();
         forcingBuffer = new float[0];
         stateBuffer = new float[0];
+        lastTickProcessed = Long.MIN_VALUE;
+        lastForcingRefreshTick = Long.MIN_VALUE;
+        accumulatedStepSeconds = 0.0f;
+        forcingReady = false;
+    }
+
+    synchronized void runPendingSteps() {
+        if (!forcingReady) {
+            return;
+        }
+        int stepsToRun = Math.min(4, (int) Math.floor(accumulatedStepSeconds / stepSeconds));
+        if (stepsToRun <= 0) {
+            return;
+        }
+        for (int i = 0; i < stepsToRun; i++) {
+            if (!stepNative(stepSeconds)) {
+                refreshFallback(stepSeconds);
+            }
+        }
+        accumulatedStepSeconds -= stepsToRun * stepSeconds;
     }
 
     private int cellCenterBlock(int cell) {
@@ -149,7 +200,7 @@ final class MesoscaleGrid implements AutoCloseable {
             activeLayers,
             gridWidth,
             cellSizeBlocks,
-            Math.max(1.0e-3f, deltaSeconds),
+            stepSeconds,
             DEFAULT_MOLECULAR_NU_M2_S,
             DEFAULT_PRANDTL_AIR,
             DEFAULT_TURBULENT_PRANDTL
@@ -240,7 +291,7 @@ final class MesoscaleGrid implements AutoCloseable {
                 activeLayers,
                 gridWidth,
                 cellSizeBlocks,
-                Math.max(1.0e-3f, deltaSeconds),
+                stepSeconds,
                 DEFAULT_MOLECULAR_NU_M2_S,
                 DEFAULT_PRANDTL_AIR,
                 DEFAULT_TURBULENT_PRANDTL
@@ -255,7 +306,7 @@ final class MesoscaleGrid implements AutoCloseable {
             activeLayers,
             gridWidth,
             cellSizeBlocks,
-            Math.max(1.0e-3f, deltaSeconds),
+            stepSeconds,
             DEFAULT_MOLECULAR_NU_M2_S,
             DEFAULT_PRANDTL_AIR,
             DEFAULT_TURBULENT_PRANDTL,

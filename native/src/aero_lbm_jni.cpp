@@ -5721,6 +5721,10 @@ static jboolean native_shift_context_impl(jint grid_size, jlong context_key, jin
     return JNI_TRUE;
 }
 
+static jboolean native_has_context_impl(jlong context_key) {
+    return g_contexts.find(context_key) != g_contexts.end() ? JNI_TRUE : JNI_FALSE;
+}
+
 static jboolean native_exchange_halo_impl(
     jint grid_size,
     jlong first_context_key,
@@ -5858,6 +5862,10 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny,
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_shift_context(int grid_size, long long context_key, int dx, int dy, int dz) {
     return native_shift_context_impl(grid_size, static_cast<jlong>(context_key), dx, dy, dz) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_has_context(long long context_key) {
+    return native_has_context_impl(static_cast<jlong>(context_key)) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
@@ -6008,6 +6016,17 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nati
     JNIEnv*, jclass, jint grid_size, jlong context_key, jint dx, jint dy, jint dz
 ) {
     return native_shift_context_impl(grid_size, context_key, dx, dy, dz);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeHasContext(
+    JNIEnv*, jclass, jlong context_key
+) {
+    return native_has_context_impl(context_key);
+}
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeLbmBridge_nativeHasContext(
+    JNIEnv*, jclass, jlong context_key
+) {
+    return native_has_context_impl(context_key);
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_client_NativeLbmBridge_nativeExchangeHalo(

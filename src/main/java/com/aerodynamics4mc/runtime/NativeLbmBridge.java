@@ -111,6 +111,13 @@ public final class NativeLbmBridge {
         return nativeShiftContext(grid, contextKey, dx, dy, dz);
     }
 
+    public synchronized boolean hasContext(long contextKey) {
+        if (!initialized || !LOADED) {
+            return false;
+        }
+        return nativeHasContext(contextKey);
+    }
+
     public synchronized boolean exchangeHalo(
         int grid,
         long firstContextKey,
@@ -186,6 +193,8 @@ public final class NativeLbmBridge {
     private static native void nativeReleaseContext(long contextKey);
 
     private static native boolean nativeShiftContext(int gridSize, long contextKey, int dx, int dy, int dz);
+
+    private static native boolean nativeHasContext(long contextKey);
 
     private static native boolean nativeExchangeHalo(
         int gridSize,

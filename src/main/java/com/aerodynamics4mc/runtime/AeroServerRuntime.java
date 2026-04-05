@@ -166,7 +166,9 @@ public final class AeroServerRuntime {
     private static final int MESOSCALE_MET_RADIUS_CELLS = 16;
     private static final int MESOSCALE_MET_LAYER_HEIGHT_BLOCKS = 40;
     private static final int MESOSCALE_MET_MAX_LAYERS = Math.max(1, 320 / MESOSCALE_MET_LAYER_HEIGHT_BLOCKS);
-    private static final int BACKGROUND_MET_REFRESH_TICKS = 20;
+    private static final int MESOSCALE_FORCING_REBUILD_TICKS = TICKS_PER_SECOND * 60;
+    private static final float MESOSCALE_STEP_SECONDS = MESOSCALE_MET_CELL_SIZE_BLOCKS * SOLVER_STEP_SECONDS;
+    private static final int BACKGROUND_MET_REFRESH_TICKS = TICKS_PER_SECOND * 60 * 3;
     private static final double FORCE_STRENGTH = 0.02;
     private static final double PLAYER_FORCE_STRENGTH = 0.02;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
@@ -491,7 +493,9 @@ public final class AeroServerRuntime {
         }
         tickCounter++;
         if (tickCounter == 1 || tickCounter % BACKGROUND_MET_REFRESH_TICKS == 0) {
-            refreshBackgroundMetGrids(server);
+            synchronized (simulationStateLock) {
+                refreshBackgroundMetGrids(server);
+            }
         }
         ensureSimulationCoordinatorRunning();
 
@@ -671,7 +675,9 @@ public final class AeroServerRuntime {
                     MESOSCALE_MET_CELL_SIZE_BLOCKS,
                     MESOSCALE_MET_RADIUS_CELLS,
                     MESOSCALE_MET_LAYER_HEIGHT_BLOCKS,
-                    MESOSCALE_MET_MAX_LAYERS
+                    MESOSCALE_MET_MAX_LAYERS,
+                    MESOSCALE_STEP_SECONDS,
+                    MESOSCALE_FORCING_REBUILD_TICKS
                 )
             );
             mesoscale.refresh(world, focus, tickCounter, SOLVER_STEP_SECONDS, seedTerrainProvider, grid);
@@ -702,6 +708,19 @@ public final class AeroServerRuntime {
             total += grid.cellCount();
         }
         return total;
+    }
+
+    private List<MesoscaleGrid> snapshotMesoscaleGrids() {
+        synchronized (simulationStateLock) {
+            return new ArrayList<>(mesoscaleMetGrids.values());
+        }
+    }
+
+    private void runMesoscaleStepCycle() {
+        List<MesoscaleGrid> grids = snapshotMesoscaleGrids();
+        for (MesoscaleGrid grid : grids) {
+            grid.runPendingSteps();
+        }
     }
 
     private boolean isClientMasterActive(MinecraftServer server) {
@@ -949,30 +968,34 @@ public final class AeroServerRuntime {
         if (backendMode == BackendMode.NATIVE
             && nativeBackend.isLoaded()
             && nativeBackend.ensureInitialized(GRID_SIZE, CHANNELS, RESPONSE_CHANNELS)) {
-            nativeHaloSynced = nativeBackend.exchangeHalo(
-                GRID_SIZE,
-                first.nativeContextId,
-                second.nativeContextId,
-                offsetX,
-                offsetY,
-                offsetZ
-            );
-            if (!nativeHaloSynced) {
-                String nativeError = nativeBackend.lastError();
-                String runtimeInfo = nativeBackend.runtimeInfo();
-                StringBuilder message = new StringBuilder("Native halo exchange failed for offset ")
-                    .append(offsetX).append(",").append(offsetY).append(",").append(offsetZ);
-                if (nativeError != null && !nativeError.isBlank()
-                    && !"not_initialized".equals(nativeError)
-                    && !"not_loaded".equals(nativeError)) {
-                    message.append(": ").append(nativeError);
+            boolean firstContextReady = nativeBackend.hasContext(first.nativeContextId);
+            boolean secondContextReady = nativeBackend.hasContext(second.nativeContextId);
+            if (firstContextReady && secondContextReady) {
+                nativeHaloSynced = nativeBackend.exchangeHalo(
+                    GRID_SIZE,
+                    first.nativeContextId,
+                    second.nativeContextId,
+                    offsetX,
+                    offsetY,
+                    offsetZ
+                );
+                if (!nativeHaloSynced) {
+                    String nativeError = nativeBackend.lastError();
+                    String runtimeInfo = nativeBackend.runtimeInfo();
+                    StringBuilder message = new StringBuilder("Native halo exchange failed for offset ")
+                        .append(offsetX).append(",").append(offsetY).append(",").append(offsetZ);
+                    if (nativeError != null && !nativeError.isBlank()
+                        && !"not_initialized".equals(nativeError)
+                        && !"not_loaded".equals(nativeError)) {
+                        message.append(": ").append(nativeError);
+                    }
+                    if (runtimeInfo != null && !runtimeInfo.isBlank()
+                        && !"not_initialized".equals(runtimeInfo)
+                        && !"not_loaded".equals(runtimeInfo)) {
+                        message.append(" [runtime=").append(runtimeInfo).append("]");
+                    }
+                    lastSolverError = message.toString();
                 }
-                if (runtimeInfo != null && !runtimeInfo.isBlank()
-                    && !"not_initialized".equals(runtimeInfo)
-                    && !"not_loaded".equals(runtimeInfo)) {
-                    message.append(" [runtime=").append(runtimeInfo).append("]");
-                }
-                lastSolverError = message.toString();
             }
         }
         if (!nativeHaloSynced) {
@@ -4090,6 +4113,8 @@ public final class AeroServerRuntime {
                     sleepQuietly(5L);
                     continue;
                 }
+
+                runMesoscaleStepCycle();
 
                 List<ActiveWindow> activeWindows = snapshotActiveWindowsForCoordinator();
                 if (activeWindows.isEmpty()) {
