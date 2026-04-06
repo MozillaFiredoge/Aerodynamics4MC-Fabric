@@ -1,0 +1,475 @@
+package com.aerodynamics4mc.runtime;
+
+import java.nio.ByteBuffer;
+
+public final class NativeSimulationBridge {
+    public static final int FLOW_STATE_CHANNELS = 4;
+    public static final int PACKED_ATLAS_CHANNELS = 4;
+    public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
+    public static final int WORLD_DELTA_CHUNK_LOADED = 2;
+    public static final int WORLD_DELTA_CHUNK_UNLOADED = 3;
+    public static final int WORLD_DELTA_BLOCK_ENTITY_LOADED = 4;
+    public static final int WORLD_DELTA_BLOCK_ENTITY_UNLOADED = 5;
+    public static final int WORLD_DELTA_WORLD_UNLOADED = 6;
+    public static final int WORLD_DELTA_FOCUS_CHANGED = 7;
+    private static final int WORLD_DELTA_INTS_PER_ENTRY = 8;
+    private static final int WORLD_DELTA_FLOATS_PER_ENTRY = 4;
+
+    private static final String LIB_NAME = "aero_lbm";
+    private static final boolean LOADED;
+    private static final String LOAD_ERROR;
+
+    static {
+        boolean loaded = false;
+        String error = "";
+        try {
+            NativeLibraryLoader.loadBundled(LIB_NAME);
+            loaded = true;
+        } catch (Throwable t) {
+            error = t.getClass().getSimpleName() + ": " + t.getMessage();
+        }
+        LOADED = loaded;
+        LOAD_ERROR = error;
+    }
+
+    public boolean isLoaded() {
+        return LOADED;
+    }
+
+    public String getLoadError() {
+        return LOAD_ERROR;
+    }
+
+    public long createService() {
+        if (!LOADED) {
+            return 0L;
+        }
+        return nativeCreateService();
+    }
+
+    public void releaseService(long serviceKey) {
+        if (!LOADED || serviceKey == 0L) {
+            return;
+        }
+        nativeReleaseService(serviceKey);
+    }
+
+    public boolean setFocus(long serviceKey, int blockX, int blockY, int blockZ, int radiusBlocks) {
+        return LOADED && serviceKey != 0L
+            && nativeSetFocus(serviceKey, blockX, blockY, blockZ, radiusBlocks);
+    }
+
+    public boolean submitWorldDeltas(long serviceKey, WorldDelta[] deltas) {
+        if (!LOADED || serviceKey == 0L || deltas == null) {
+            return false;
+        }
+        if (deltas.length == 0) {
+            return nativeSubmitWorldDeltas(serviceKey, new int[0], new float[0]);
+        }
+        int[] ints = new int[deltas.length * WORLD_DELTA_INTS_PER_ENTRY];
+        float[] floats = new float[deltas.length * WORLD_DELTA_FLOATS_PER_ENTRY];
+        for (int i = 0; i < deltas.length; i++) {
+            WorldDelta delta = deltas[i];
+            int intBase = i * WORLD_DELTA_INTS_PER_ENTRY;
+            ints[intBase] = delta.type();
+            ints[intBase + 1] = delta.x();
+            ints[intBase + 2] = delta.y();
+            ints[intBase + 3] = delta.z();
+            ints[intBase + 4] = delta.data0();
+            ints[intBase + 5] = delta.data1();
+            ints[intBase + 6] = delta.data2();
+            ints[intBase + 7] = delta.data3();
+
+            int floatBase = i * WORLD_DELTA_FLOATS_PER_ENTRY;
+            floats[floatBase] = delta.value0();
+            floats[floatBase + 1] = delta.value1();
+            floats[floatBase + 2] = delta.value2();
+            floats[floatBase + 3] = delta.value3();
+        }
+        return nativeSubmitWorldDeltas(serviceKey, ints, floats);
+    }
+
+    public boolean submitWorldDelta(long serviceKey, WorldDelta delta) {
+        return submitWorldDeltas(serviceKey, new WorldDelta[] {delta});
+    }
+
+    public boolean uploadStaticRegion(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        if (cells <= 0
+            || obstacle == null
+            || surfaceKind == null
+            || openFaceMask == null
+            || emitterPowerWatts == null
+            || obstacle.length != cells
+            || surfaceKind.length != cells
+            || openFaceMask.length != cells
+            || emitterPowerWatts.length != cells) {
+            return false;
+        }
+        return nativeUploadStaticRegion(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            obstacle,
+            surfaceKind,
+            openFaceMask,
+            emitterPowerWatts
+        );
+    }
+
+    public boolean activateRegion(long serviceKey, long regionKey, int nx, int ny, int nz) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return false;
+        }
+        return nativeActivateRegion(serviceKey, regionKey, nx, ny, nz);
+    }
+
+    public boolean deactivateRegion(long serviceKey, long regionKey) {
+        return LOADED && serviceKey != 0L && regionKey != 0L
+            && nativeDeactivateRegion(serviceKey, regionKey);
+    }
+
+    public boolean hasRegion(long serviceKey, long regionKey) {
+        return LOADED && serviceKey != 0L && regionKey != 0L
+            && nativeHasRegion(serviceKey, regionKey);
+    }
+
+    public boolean isRegionReady(long serviceKey, long regionKey) {
+        return LOADED && serviceKey != 0L && regionKey != 0L
+            && nativeIsRegionReady(serviceKey, regionKey);
+    }
+
+    public boolean ensureL2Runtime(
+        long serviceKey,
+        int nx,
+        int ny,
+        int nz,
+        int inputChannels,
+        int outputChannels
+    ) {
+        return LOADED && serviceKey != 0L
+            && nativeEnsureL2Runtime(serviceKey, nx, ny, nz, inputChannels, outputChannels);
+    }
+
+    public boolean hasRegionContext(long serviceKey, long regionKey) {
+        return LOADED && serviceKey != 0L && regionKey != 0L
+            && nativeHasRegionContext(serviceKey, regionKey);
+    }
+
+    public float[] stepRegion(
+        long serviceKey,
+        long regionKey,
+        ByteBuffer payload,
+        int nx,
+        int ny,
+        int nz
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || payload == null || !payload.isDirect()) {
+            return null;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        if (cells <= 0) {
+            return null;
+        }
+        float[] output = new float[cells * FLOW_STATE_CHANNELS];
+        return nativeStepRegion(serviceKey, regionKey, payload, nx, ny, nz, output) ? output : null;
+    }
+
+    public boolean exchangeRegionHalo(
+        long serviceKey,
+        long firstRegionKey,
+        long secondRegionKey,
+        int gridSize,
+        int offsetX,
+        int offsetY,
+        int offsetZ
+    ) {
+        return LOADED && serviceKey != 0L && firstRegionKey != 0L && secondRegionKey != 0L
+            && nativeExchangeRegionHalo(serviceKey, firstRegionKey, secondRegionKey, gridSize, offsetX, offsetY, offsetZ);
+    }
+
+    public boolean getRegionTemperatureState(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] outTemperature
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || outTemperature == null) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        return cells > 0
+            && outTemperature.length == cells
+            && nativeGetRegionTemperatureState(serviceKey, regionKey, nx, ny, nz, outTemperature);
+    }
+
+    public boolean setRegionTemperatureState(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] temperature
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || temperature == null) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        return cells > 0
+            && temperature.length == cells
+            && nativeSetRegionTemperatureState(serviceKey, regionKey, nx, ny, nz, temperature);
+    }
+
+    public boolean releaseRegionRuntime(long serviceKey, long regionKey) {
+        return LOADED && serviceKey != 0L && regionKey != 0L
+            && nativeReleaseRegionRuntime(serviceKey, regionKey);
+    }
+
+    public boolean importDynamicRegion(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] flowState,
+        float[] airTemperature,
+        float[] surfaceTemperature
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        if (cells <= 0
+            || flowState == null
+            || airTemperature == null
+            || surfaceTemperature == null
+            || flowState.length != cells * FLOW_STATE_CHANNELS
+            || airTemperature.length != cells
+            || surfaceTemperature.length != cells) {
+            return false;
+        }
+        return nativeImportDynamicRegion(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            flowState,
+            airTemperature,
+            surfaceTemperature
+        );
+    }
+
+    public boolean exportDynamicRegion(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] outFlowState,
+        float[] outAirTemperature,
+        float[] outSurfaceTemperature
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        if (cells <= 0
+            || outFlowState == null
+            || outAirTemperature == null
+            || outSurfaceTemperature == null
+            || outFlowState.length != cells * FLOW_STATE_CHANNELS
+            || outAirTemperature.length != cells
+            || outSurfaceTemperature.length != cells) {
+            return false;
+        }
+        return nativeExportDynamicRegion(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            outFlowState,
+            outAirTemperature,
+            outSurfaceTemperature
+        );
+    }
+
+    public boolean setPackedFlowAtlas(long serviceKey, long atlasKey, short[] packedValues) {
+        if (!LOADED || serviceKey == 0L || atlasKey == 0L || packedValues == null || packedValues.length == 0) {
+            return false;
+        }
+        return nativeSetPackedFlowAtlas(serviceKey, atlasKey, packedValues);
+    }
+
+    public boolean pollPackedFlowAtlas(long serviceKey, long atlasKey, short[] outPackedValues) {
+        if (!LOADED || serviceKey == 0L || atlasKey == 0L || outPackedValues == null || outPackedValues.length == 0) {
+            return false;
+        }
+        return nativePollPackedFlowAtlas(serviceKey, atlasKey, outPackedValues);
+    }
+
+    public String runtimeInfo() {
+        if (!LOADED) {
+            return "not_loaded";
+        }
+        return nativeRuntimeInfo();
+    }
+
+    public String lastError() {
+        if (!LOADED) {
+            return "not_loaded";
+        }
+        return nativeLastError();
+    }
+
+    private static int checkedCellCount(int nx, int ny, int nz) {
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+            return -1;
+        }
+        long cells = (long) nx * (long) ny * (long) nz;
+        return cells > Integer.MAX_VALUE ? -1 : (int) cells;
+    }
+
+    public record WorldDelta(
+        int type,
+        int x,
+        int y,
+        int z,
+        int data0,
+        int data1,
+        int data2,
+        int data3,
+        float value0,
+        float value1,
+        float value2,
+        float value3
+    ) {
+    }
+
+    private static native long nativeCreateService();
+
+    private static native void nativeReleaseService(long serviceKey);
+
+    private static native boolean nativeSetFocus(long serviceKey, int blockX, int blockY, int blockZ, int radiusBlocks);
+
+    private static native boolean nativeSubmitWorldDeltas(long serviceKey, int[] encodedInts, float[] encodedFloats);
+
+    private static native boolean nativeUploadStaticRegion(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts
+    );
+
+    private static native boolean nativeActivateRegion(long serviceKey, long regionKey, int nx, int ny, int nz);
+
+    private static native boolean nativeDeactivateRegion(long serviceKey, long regionKey);
+
+    private static native boolean nativeHasRegion(long serviceKey, long regionKey);
+
+    private static native boolean nativeIsRegionReady(long serviceKey, long regionKey);
+
+    private static native boolean nativeEnsureL2Runtime(
+        long serviceKey,
+        int nx,
+        int ny,
+        int nz,
+        int inputChannels,
+        int outputChannels
+    );
+
+    private static native boolean nativeHasRegionContext(long serviceKey, long regionKey);
+
+    private static native boolean nativeStepRegion(
+        long serviceKey,
+        long regionKey,
+        ByteBuffer payload,
+        int nx,
+        int ny,
+        int nz,
+        float[] outputFlow
+    );
+
+    private static native boolean nativeExchangeRegionHalo(
+        long serviceKey,
+        long firstRegionKey,
+        long secondRegionKey,
+        int gridSize,
+        int offsetX,
+        int offsetY,
+        int offsetZ
+    );
+
+    private static native boolean nativeGetRegionTemperatureState(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] outTemperature
+    );
+
+    private static native boolean nativeSetRegionTemperatureState(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] temperature
+    );
+
+    private static native boolean nativeReleaseRegionRuntime(long serviceKey, long regionKey);
+
+    private static native boolean nativeImportDynamicRegion(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] flowState,
+        float[] airTemperature,
+        float[] surfaceTemperature
+    );
+
+    private static native boolean nativeExportDynamicRegion(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] outFlowState,
+        float[] outAirTemperature,
+        float[] outSurfaceTemperature
+    );
+
+    private static native boolean nativeSetPackedFlowAtlas(long serviceKey, long atlasKey, short[] packedValues);
+
+    private static native boolean nativePollPackedFlowAtlas(long serviceKey, long atlasKey, short[] outPackedValues);
+
+    private static native String nativeRuntimeInfo();
+
+    private static native String nativeLastError();
+}

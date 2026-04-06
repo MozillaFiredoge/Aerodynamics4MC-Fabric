@@ -68,6 +68,7 @@ add_library(aero_lbm SHARED
     src/aero_lbm_hydro_core.cpp
     src/aero_lbm_thermal_core.cpp
     src/aero_lbm_mesoscale.cpp
+    src/aero_lbm_simulation_bridge.cpp
 )
 
 target_include_directories(aero_lbm PRIVATE ${JNI_INCLUDE_DIRS})

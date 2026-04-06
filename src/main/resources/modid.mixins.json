@@ -1,9 +1,9 @@
 {
 	"required": true,
-	"package": "com.example.mixin",
+	"package": "com.aerodynamics4mc.mixin",
 	"compatibilityLevel": "JAVA_21",
 	"mixins": [
-		"ExampleMixin"
+		"ServerWorldBlockStateMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

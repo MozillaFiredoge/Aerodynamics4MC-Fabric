@@ -21,7 +21,7 @@
 		]
 	},
 	"mixins": [
-		"modid.client.mixins.json"
+		"modid.mixins.json"
 	],
 	"depends": {
 		"fabricloader": ">=0.18.2",

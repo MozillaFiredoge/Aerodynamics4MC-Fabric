@@ -5706,6 +5706,25 @@ static jboolean native_set_temperature_state_impl(
     return JNI_TRUE;
 }
 
+static bool native_set_temperature_state_raw_dims_impl(
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    const float* temperature_state
+) {
+    if (!g_cfg.initialized || !temperature_state) return false;
+    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+
+    ContextState& ctx = g_contexts[context_key];
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
+    assign_temperature_state(ctx, temperature_state);
+    if (g_cfg.opencl_enabled && !sync_context_temperature_to_gpu(ctx)) return false;
+    return true;
+}
+
 static jboolean native_shift_context_impl(jint grid_size, jlong context_key, jint dx, jint dy, jint dz) {
     if (!g_cfg.initialized || grid_size != g_cfg.grid_size) return JNI_FALSE;
     auto it = g_contexts.find(context_key);
@@ -5888,6 +5907,22 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature) {
     return native_get_temperature_state_raw_dims_impl(nx, ny, nz, static_cast<jlong>(context_key), out_temperature) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_set_temperature_state_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    const float* temperature
+) {
+    return native_set_temperature_state_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        temperature
+    ) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz) {

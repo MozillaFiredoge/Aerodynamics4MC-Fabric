@@ -12,7 +12,7 @@ public record AeroFlowPayload(
     Identifier dimensionId,
     BlockPos origin,
     int sampleStride,
-    float[] flow
+    short[] packedFlow
 ) implements CustomPayload {
     public static final CustomPayload.Id<AeroFlowPayload> ID =
         new CustomPayload.Id<>(Identifier.of(ModBlocks.MOD_ID, "flow_field"));
@@ -24,15 +24,15 @@ public record AeroFlowPayload(
             buf.readIdentifier(),
             buf.readBlockPos(),
             buf.readVarInt(),
-            readFlow(buf)
+            readPackedFlow(buf)
         );
     }
 
-    private static float[] readFlow(RegistryByteBuf buf) {
+    private static short[] readPackedFlow(RegistryByteBuf buf) {
         int length = buf.readVarInt();
-        float[] data = new float[length];
+        short[] data = new short[length];
         for (int i = 0; i < length; i++) {
-            data[i] = buf.readFloat();
+            data[i] = buf.readShort();
         }
         return data;
     }
@@ -41,9 +41,9 @@ public record AeroFlowPayload(
         buf.writeIdentifier(dimensionId);
         buf.writeBlockPos(origin);
         buf.writeVarInt(sampleStride);
-        buf.writeVarInt(flow.length);
-        for (float v : flow) {
-            buf.writeFloat(v);
+        buf.writeVarInt(packedFlow.length);
+        for (short v : packedFlow) {
+            buf.writeShort(v);
         }
     }
 
