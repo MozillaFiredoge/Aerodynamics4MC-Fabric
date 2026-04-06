@@ -3,10 +3,10 @@
 #include <jni.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -63,8 +63,8 @@ struct ServiceState {
 };
 
 std::mutex g_simulation_mutex;
-std::unordered_map<long long, ServiceState> g_services;
-std::atomic<long long> g_next_service_key{1};
+std::unique_ptr<ServiceState> g_service;
+long long g_service_key = 0;
 std::string g_simulation_last_error;
 
 constexpr int k_default_packed_atlas_stride = 4;
@@ -73,6 +73,13 @@ constexpr float k_atlas_pressure_quant_range = 0.03f;
 
 void set_simulation_last_error(const std::string& message) {
     g_simulation_last_error = message;
+}
+
+ServiceState* lookup_service(long long service_key) {
+    if (!g_service || g_service_key == 0 || service_key != g_service_key) {
+        return nullptr;
+    }
+    return g_service.get();
 }
 
 bool checked_cell_count(int nx, int ny, int nz, int* out_cells) {
@@ -174,16 +181,21 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_create_service(long long* out_servi
         return 0;
     }
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    const long long key = g_next_service_key.fetch_add(1);
-    g_services.emplace(key, ServiceState{});
-    *out_service_key = key;
+    if (!g_service) {
+        g_service = std::make_unique<ServiceState>();
+        g_service_key = 1;
+    }
+    *out_service_key = g_service_key;
     return 1;
 }
 
 AERO_LBM_CAPI_EXPORT void aero_lbm_simulation_release_service(long long service_key) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    g_services.erase(service_key);
-    if (g_services.empty()) {
+    if (g_service && service_key == g_service_key) {
+        g_service.reset();
+        g_service_key = 0;
+    }
+    if (!g_service) {
         aero_lbm_shutdown();
     }
 }
@@ -196,15 +208,15 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_focus(
     int radius_blocks
 ) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_set_focus: missing service");
         return 0;
     }
-    it->second.focus_x = block_x;
-    it->second.focus_y = block_y;
-    it->second.focus_z = block_z;
-    it->second.focus_radius_blocks = radius_blocks;
+    service->focus_x = block_x;
+    service->focus_y = block_y;
+    service->focus_z = block_z;
+    service->focus_radius_blocks = radius_blocks;
     return 1;
 }
 
@@ -214,8 +226,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_submit_world_deltas(
     int delta_count
 ) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_submit_world_deltas: missing service");
         return 0;
     }
@@ -227,7 +239,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_submit_world_deltas(
         set_simulation_last_error("simulation_submit_world_deltas: deltas is null");
         return 0;
     }
-    it->second.world_deltas.insert(it->second.world_deltas.end(), deltas, deltas + delta_count);
+    service->world_deltas.insert(service->world_deltas.end(), deltas, deltas + delta_count);
     return 1;
 }
 
@@ -255,13 +267,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_upload_static_region: missing service");
         return 0;
     }
 
-    StaticRegionData& region = it->second.static_regions[region_key];
+    StaticRegionData& region = service->static_regions[region_key];
     region.nx = nx;
     region.ny = ny;
     region.nz = nz;
@@ -287,12 +299,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_activate_region(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_activate_region: missing service");
         return 0;
     }
-    RegionLifecycleData& region = it->second.regions[region_key];
+    RegionLifecycleData& region = service->regions[region_key];
     region.nx = nx;
     region.ny = ny;
     region.nz = nz;
@@ -302,13 +314,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_activate_region(
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_deactivate_region(long long service_key, long long region_key) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_deactivate_region: missing service");
         return 0;
     }
-    auto region_it = it->second.regions.find(region_key);
-    if (region_it == it->second.regions.end()) {
+    auto region_it = service->regions.find(region_key);
+    if (region_it == service->regions.end()) {
         return 1;
     }
     region_it->second.active = false;
@@ -318,29 +330,29 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_deactivate_region(long long service
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_has_region(long long service_key, long long region_key) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_has_region: missing service");
         return 0;
     }
-    return it->second.regions.find(region_key) != it->second.regions.end()
-        || it->second.static_regions.find(region_key) != it->second.static_regions.end()
-        || it->second.dynamic_regions.find(region_key) != it->second.dynamic_regions.end()
-        || it->second.atlases.find(region_key) != it->second.atlases.end();
+    return service->regions.find(region_key) != service->regions.end()
+        || service->static_regions.find(region_key) != service->static_regions.end()
+        || service->dynamic_regions.find(region_key) != service->dynamic_regions.end()
+        || service->atlases.find(region_key) != service->atlases.end();
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_is_region_ready(long long service_key, long long region_key) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_is_region_ready: missing service");
         return 0;
     }
-    auto lifecycle_it = it->second.regions.find(region_key);
-    if (lifecycle_it == it->second.regions.end() || !lifecycle_it->second.active) {
+    auto lifecycle_it = service->regions.find(region_key);
+    if (lifecycle_it == service->regions.end() || !lifecycle_it->second.active) {
         return 0;
     }
-    return it->second.static_regions.find(region_key) != it->second.static_regions.end();
+    return service->static_regions.find(region_key) != service->static_regions.end();
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_l2_runtime(
@@ -352,18 +364,18 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_l2_runtime(
     int output_channels
 ) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_ensure_l2_runtime: missing service");
         return 0;
     }
-    return ensure_l2_runtime(it->second, nx, ny, nz, input_channels, output_channels) ? 1 : 0;
+    return ensure_l2_runtime(*service, nx, ny, nz, input_channels, output_channels) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_has_region_context(long long service_key, long long region_key) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_has_region_context: missing service");
         return 0;
     }
@@ -387,24 +399,24 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_step_region: missing service");
         return 0;
     }
-    auto lifecycle_it = it->second.regions.find(region_key);
-    if (lifecycle_it == it->second.regions.end() || !lifecycle_it->second.active) {
+    auto lifecycle_it = service->regions.find(region_key);
+    if (lifecycle_it == service->regions.end() || !lifecycle_it->second.active) {
         set_simulation_last_error("simulation_step_region: inactive region");
         return 0;
     }
-    if (!ensure_l2_runtime(it->second, nx, ny, nz, 10, 4)) {
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
         return 0;
     }
     if (!aero_lbm_step_rect(packet, nx, ny, nz, region_key, out_flow_state)) {
         set_simulation_last_error(std::string("simulation_step_region failed: ") + aero_lbm_last_error());
         return 0;
     }
-    DynamicRegionData& dynamic = it->second.dynamic_regions[region_key];
+    DynamicRegionData& dynamic = service->dynamic_regions[region_key];
     dynamic.nx = nx;
     dynamic.ny = ny;
     dynamic.nz = nz;
@@ -422,7 +434,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
         set_simulation_last_error(std::string("simulation_step_region temperature sync failed: ") + aero_lbm_last_error());
         return 0;
     }
-    rebuild_default_packed_atlas(it->second, region_key);
+    rebuild_default_packed_atlas(*service, region_key);
     return 1;
 }
 
@@ -436,8 +448,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     int offset_z
 ) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_exchange_region_halo: missing service");
         return 0;
     }
@@ -464,12 +476,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_temperature_state(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_get_region_temperature_state: missing service");
         return 0;
     }
-    if (!ensure_l2_runtime(it->second, nx, ny, nz, 10, 4)) {
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
         return 0;
     }
     if (!aero_lbm_get_temperature_state_rect(nx, ny, nz, region_key, out_temperature)) {
@@ -495,12 +507,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_region_temperature_state(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_set_region_temperature_state: missing service");
         return 0;
     }
-    if (!ensure_l2_runtime(it->second, nx, ny, nz, 10, 4)) {
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
         return 0;
     }
     if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, temperature)) {
@@ -512,8 +524,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_region_temperature_state(
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_release_region_runtime(long long service_key, long long region_key) {
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_release_region_runtime: missing service");
         return 0;
     }
@@ -544,20 +556,20 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_import_dynamic_region(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_import_dynamic_region: missing service");
         return 0;
     }
 
-    DynamicRegionData& region = it->second.dynamic_regions[region_key];
+    DynamicRegionData& region = service->dynamic_regions[region_key];
     region.nx = nx;
     region.ny = ny;
     region.nz = nz;
     region.flow_state.assign(flow_state, flow_state + cells * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS);
     region.air_temperature.assign(air_temperature, air_temperature + cells);
     region.surface_temperature.assign(surface_temperature, surface_temperature + cells);
-    rebuild_default_packed_atlas(it->second, region_key);
+    rebuild_default_packed_atlas(*service, region_key);
     return 1;
 }
 
@@ -584,13 +596,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_export_dynamic_region(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto service_it = g_services.find(service_key);
-    if (service_it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_export_dynamic_region: missing service");
         return 0;
     }
-    auto region_it = service_it->second.dynamic_regions.find(region_key);
-    if (region_it == service_it->second.dynamic_regions.end()) {
+    auto region_it = service->dynamic_regions.find(region_key);
+    if (region_it == service->dynamic_regions.end()) {
         set_simulation_last_error("simulation_export_dynamic_region: missing region");
         return 0;
     }
@@ -619,12 +631,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_packed_flow_atlas(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto it = g_services.find(service_key);
-    if (it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_set_packed_flow_atlas: missing service");
         return 0;
     }
-    it->second.atlases[atlas_key].values.assign(atlas_values, atlas_values + value_count);
+    service->atlases[atlas_key].values.assign(atlas_values, atlas_values + value_count);
     return 1;
 }
 
@@ -641,13 +653,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_poll_packed_flow_atlas(
     }
 
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
-    auto service_it = g_services.find(service_key);
-    if (service_it == g_services.end()) {
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
         set_simulation_last_error("simulation_poll_packed_flow_atlas: missing service");
         return 0;
     }
-    auto atlas_it = service_it->second.atlases.find(atlas_key);
-    if (atlas_it == service_it->second.atlases.end()) {
+    auto atlas_it = service->atlases.find(atlas_key);
+    if (atlas_it == service->atlases.end()) {
         set_simulation_last_error("simulation_poll_packed_flow_atlas: missing atlas");
         return 0;
     }
@@ -662,21 +674,21 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_poll_packed_flow_atlas(
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     static std::string text;
     std::lock_guard<std::mutex> lock(g_simulation_mutex);
+    size_t active_region_count = 0;
     size_t static_region_count = 0;
     size_t dynamic_region_count = 0;
     size_t atlas_count = 0;
-    size_t active_region_count = 0;
-    for (const auto& entry : g_services) {
-        for (const auto& region : entry.second.regions) {
+    if (g_service) {
+        for (const auto& region : g_service->regions) {
             if (region.second.active) {
                 ++active_region_count;
             }
         }
-        static_region_count += entry.second.static_regions.size();
-        dynamic_region_count += entry.second.dynamic_regions.size();
-        atlas_count += entry.second.atlases.size();
+        static_region_count = g_service->static_regions.size();
+        dynamic_region_count = g_service->dynamic_regions.size();
+        atlas_count = g_service->atlases.size();
     }
-    text = "simulation_bridge|services=" + std::to_string(g_services.size())
+    text = "simulation_bridge|services=" + std::to_string(g_service ? 1 : 0)
         + "|active_regions=" + std::to_string(active_region_count)
         + "|static_regions=" + std::to_string(static_region_count)
         + "|dynamic_regions=" + std::to_string(dynamic_region_count)
