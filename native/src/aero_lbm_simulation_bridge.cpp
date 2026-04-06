@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -63,7 +62,8 @@ struct ServiceState {
 };
 
 std::mutex g_simulation_mutex;
-std::unique_ptr<ServiceState> g_service;
+ServiceState g_service_storage;
+ServiceState* g_service = nullptr;
 long long g_service_key = 0;
 std::string g_simulation_last_error;
 
@@ -79,7 +79,7 @@ ServiceState* lookup_service(long long service_key) {
     if (!g_service || g_service_key == 0 || service_key != g_service_key) {
         return nullptr;
     }
-    return g_service.get();
+    return g_service;
 }
 
 bool checked_cell_count(int nx, int ny, int nz, int* out_cells) {
@@ -176,13 +176,11 @@ extern "C" {
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_create_service(long long* out_service_key) {
     if (!out_service_key) {
-        std::lock_guard<std::mutex> lock(g_simulation_mutex);
         set_simulation_last_error("simulation_create_service: out_service_key is null");
         return 0;
     }
-    std::lock_guard<std::mutex> lock(g_simulation_mutex);
     if (!g_service) {
-        g_service = std::make_unique<ServiceState>();
+        g_service = &g_service_storage;
         g_service_key = 1;
     }
     *out_service_key = g_service_key;
@@ -190,9 +188,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_create_service(long long* out_servi
 }
 
 AERO_LBM_CAPI_EXPORT void aero_lbm_simulation_release_service(long long service_key) {
-    std::lock_guard<std::mutex> lock(g_simulation_mutex);
     if (g_service && service_key == g_service_key) {
-        g_service.reset();
+        g_service = nullptr;
         g_service_key = 0;
     }
     if (!g_service) {
