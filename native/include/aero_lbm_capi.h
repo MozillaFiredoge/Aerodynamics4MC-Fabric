@@ -20,7 +20,8 @@ enum {
     AERO_LBM_MESOSCALE_FORCING_CHANNELS = 9,
     AERO_LBM_MESOSCALE_STATE_CHANNELS = 5,
     AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS = 4,
-    AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS = 4
+    AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS = 4,
+    AERO_LBM_SIMULATION_PLAYER_PROBE_CHANNELS = 6
 };
 
 typedef enum AeroLbmBenchmarkPreset {
@@ -169,6 +170,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
     int offset_z
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature);
+AERO_LBM_CAPI_EXPORT int aero_lbm_get_flow_state_rect(int nx, int ny, int nz, long long context_key, float* out_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_set_temperature_state_rect(int nx, int ny, int nz, long long context_key, const float* temperature);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz);
 AERO_LBM_CAPI_EXPORT void aero_lbm_release_context(long long context_key);
@@ -218,7 +220,28 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     const uint8_t* obstacle,
     const uint8_t* surface_kind,
     const uint16_t* open_face_mask,
-    const float* emitter_power_watts
+    const float* emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region_patch(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int patch_nx,
+    int patch_ny,
+    int patch_nz,
+    const uint8_t* obstacle,
+    const uint8_t* surface_kind,
+    const uint16_t* open_face_mask,
+    const float* emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_activate_region(
     long long service_key,
@@ -239,6 +262,36 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_l2_runtime(
     int output_channels
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_has_region_context(long long service_key, long long region_key);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_region_forcing(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    const float* thermal_source,
+    const uint8_t* fan_mask,
+    const float* fan_vx,
+    const float* fan_vy,
+    const float* fan_vz
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_refresh_region_thermal(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float direct_solar_flux_w_m2,
+    float diffuse_solar_flux_w_m2,
+    float ambient_air_temperature_k,
+    float deep_ground_temperature_k,
+    float sky_temperature_k,
+    float precipitation_temperature_k,
+    float precipitation_strength,
+    float sun_x,
+    float sun_y,
+    float sun_z,
+    float surface_delta_seconds
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
     long long service_key,
     long long region_key,
@@ -247,6 +300,17 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
     int nz,
     const float* packet,
     float* out_flow_state
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z,
+    float* out_max_speed
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     long long service_key,
@@ -264,6 +328,14 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_temperature_state(
     int ny,
     int nz,
     float* out_temperature
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_flow_state(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float* out_flow_state
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_region_temperature_state(
     long long service_key,
@@ -304,6 +376,18 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_poll_packed_flow_atlas(
     long long service_key,
     long long atlas_key,
     int16_t* out_atlas_values,
+    int value_count
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sample_region_point(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    int sample_x,
+    int sample_y,
+    int sample_z,
+    float* out_probe_values,
     int value_count
 );
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void);

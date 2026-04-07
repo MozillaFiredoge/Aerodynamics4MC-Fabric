@@ -22,6 +22,8 @@ struct StaticRegionData {
     std::vector<uint8_t> surface_kind;
     std::vector<uint16_t> open_face_mask;
     std::vector<float> emitter_power_watts;
+    std::vector<uint8_t> face_sky_exposure;
+    std::vector<uint8_t> face_direct_exposure;
 };
 
 struct DynamicRegionData {
@@ -31,6 +33,17 @@ struct DynamicRegionData {
     std::vector<float> flow_state;
     std::vector<float> air_temperature;
     std::vector<float> surface_temperature;
+};
+
+struct ForcingRegionData {
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    std::vector<float> thermal_source;
+    std::vector<uint8_t> fan_mask;
+    std::vector<float> fan_vx;
+    std::vector<float> fan_vy;
+    std::vector<float> fan_vz;
 };
 
 struct AtlasData {
@@ -59,6 +72,7 @@ struct ServiceState {
     std::unordered_map<long long, RegionLifecycleData> regions;
     std::unordered_map<long long, StaticRegionData> static_regions;
     std::unordered_map<long long, DynamicRegionData> dynamic_regions;
+    std::unordered_map<long long, ForcingRegionData> forcing_regions;
     std::unordered_map<long long, AtlasData> atlases;
 };
 
@@ -84,6 +98,45 @@ std::string g_simulation_last_error;
 constexpr int k_default_packed_atlas_stride = 4;
 constexpr float k_atlas_velocity_quant_range = 5.6f;
 constexpr float k_atlas_pressure_quant_range = 0.03f;
+constexpr int k_face_count = 6;
+constexpr int k_packet_channels = 10;
+constexpr int k_channel_obstacle = 0;
+constexpr int k_channel_fan_mask = 1;
+constexpr int k_channel_fan_vx = 2;
+constexpr int k_channel_fan_vy = 3;
+constexpr int k_channel_fan_vz = 4;
+constexpr int k_channel_state_vx = 5;
+constexpr int k_channel_state_vy = 6;
+constexpr int k_channel_state_vz = 7;
+constexpr int k_channel_state_p = 8;
+constexpr int k_channel_thermal_source = 9;
+constexpr int k_window_edge_stabilization_layers = 8;
+constexpr float k_window_edge_stabilization_min_keep = 0.15f;
+constexpr float k_runtime_temperature_scale_kelvin = 20.0f;
+constexpr float k_cell_face_area_square_meters = 1.0f;
+constexpr float k_cell_volume_cubic_meters = 1.0f;
+constexpr float k_air_density_kg_per_cubic_meter = 1.225f;
+constexpr float k_air_specific_heat_j_per_kg_k = 1005.0f;
+constexpr float k_native_thermal_source_max = 0.006f;
+constexpr float k_thermal_surface_init_min_k = 220.0f;
+constexpr float k_thermal_surface_max_k = 1800.0f;
+constexpr uint8_t k_surface_kind_none = 0;
+constexpr uint8_t k_surface_kind_rock = 1;
+constexpr uint8_t k_surface_kind_soil = 2;
+constexpr uint8_t k_surface_kind_vegetation = 3;
+constexpr uint8_t k_surface_kind_snow_ice = 4;
+constexpr uint8_t k_surface_kind_water = 5;
+constexpr uint8_t k_surface_kind_molten = 6;
+constexpr float k_thermal_stefan_boltzmann = 5.6703744e-8f;
+
+struct ThermalMaterialProperties {
+    float solar_absorptivity;
+    float emissivity;
+    float surface_heat_capacity_jm2k;
+    float convective_exchange_coefficient_wm2k;
+    float bulk_conductance_wm2k;
+    float rain_exchange_coefficient_wm2k;
+};
 
 void set_simulation_last_error(const std::string& message) {
     g_simulation_last_error = message;
@@ -121,6 +174,115 @@ int16_t quantize_signed(float value, float range) {
     }
     const float normalized = std::clamp(value / range, -1.0f, 1.0f);
     return static_cast<int16_t>(std::lround(normalized * 32767.0f));
+}
+
+int local_face_index(int cell, int direction_index) {
+    return cell * k_face_count + direction_index;
+}
+
+bool has_face_bit(uint16_t mask, int direction_index) {
+    return (mask & (1u << direction_index)) != 0;
+}
+
+int count_open_faces(uint16_t mask) {
+    int count = 0;
+    for (int direction = 0; direction < k_face_count; ++direction) {
+        if (has_face_bit(mask, direction)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+float dequantize_unit_float(uint8_t value) {
+    return value / 255.0f;
+}
+
+float temperature_source_from_power_watts(float thermal_power_watts) {
+    const float scalar = thermal_power_watts
+        / (k_air_density_kg_per_cubic_meter * k_air_specific_heat_j_per_kg_k
+            * k_cell_volume_cubic_meters * k_runtime_temperature_scale_kelvin);
+    return std::clamp(scalar, -k_native_thermal_source_max, k_native_thermal_source_max);
+}
+
+float temperature_source_from_surface_flux(float heat_flux_watts_per_square_meter) {
+    const float scalar = heat_flux_watts_per_square_meter * k_cell_face_area_square_meters
+        / (k_air_density_kg_per_cubic_meter * k_air_specific_heat_j_per_kg_k
+            * k_cell_volume_cubic_meters * k_runtime_temperature_scale_kelvin);
+    return std::clamp(scalar, -k_native_thermal_source_max, k_native_thermal_source_max);
+}
+
+const ThermalMaterialProperties* thermal_material_properties(uint8_t kind) {
+    static constexpr ThermalMaterialProperties rock{0.78f, 0.92f, 1.60e5f, 8.0f, 2.4f, 20.0f};
+    static constexpr ThermalMaterialProperties soil{0.88f, 0.94f, 1.35e5f, 7.0f, 1.7f, 24.0f};
+    static constexpr ThermalMaterialProperties vegetation{0.64f, 0.96f, 1.90e5f, 9.0f, 1.2f, 32.0f};
+    static constexpr ThermalMaterialProperties snow_ice{0.22f, 0.98f, 2.40e5f, 6.0f, 1.0f, 18.0f};
+    static constexpr ThermalMaterialProperties water{0.93f, 0.96f, 1.00e6f, 10.0f, 0.6f, 40.0f};
+    static constexpr ThermalMaterialProperties molten{0.95f, 0.95f, 3.50e5f, 14.0f, 4.0f, 18.0f};
+    switch (kind) {
+        case k_surface_kind_rock: return &rock;
+        case k_surface_kind_soil: return &soil;
+        case k_surface_kind_vegetation: return &vegetation;
+        case k_surface_kind_snow_ice: return &snow_ice;
+        case k_surface_kind_water: return &water;
+        case k_surface_kind_molten: return &molten;
+        default: return nullptr;
+    }
+}
+
+bool in_bounds(int nx, int ny, int nz, int x, int y, int z) {
+    return x >= 0 && y >= 0 && z >= 0 && x < nx && y < ny && z < nz;
+}
+
+int grid_cell_index(int ny, int nz, int x, int y, int z) {
+    return (x * ny + y) * nz + z;
+}
+
+float neighbor_air_temperature_kelvin(
+    const DynamicRegionData& dynamic,
+    int x,
+    int y,
+    int z,
+    float ambient_air_temperature_kelvin
+) {
+    if (!in_bounds(dynamic.nx, dynamic.ny, dynamic.nz, x, y, z)
+        || dynamic.air_temperature.empty()) {
+        return ambient_air_temperature_kelvin;
+    }
+    return ambient_air_temperature_kelvin
+        + dynamic.air_temperature[grid_cell_index(dynamic.ny, dynamic.nz, x, y, z)] * k_runtime_temperature_scale_kelvin;
+}
+
+float initialize_surface_temperature_kelvin(
+    const ThermalMaterialProperties& material,
+    float ambient_air_temperature_kelvin,
+    float deep_ground_temperature_kelvin,
+    float emitter_power_watts,
+    int open_faces
+) {
+    const float exposed_area = std::max(1, open_faces) * k_cell_face_area_square_meters;
+    const float ambient = 0.70f * ambient_air_temperature_kelvin + 0.30f * deep_ground_temperature_kelvin;
+    const float denominator = std::max(
+        1.0f,
+        material.convective_exchange_coefficient_wm2k * exposed_area
+            + material.bulk_conductance_wm2k * exposed_area
+    );
+    return std::clamp(
+        ambient + emitter_power_watts / denominator,
+        k_thermal_surface_init_min_k,
+        k_thermal_surface_max_k
+    );
+}
+
+void add_thermal_source(std::vector<float>& thermal_source, int cell, float source) {
+    if (cell < 0 || static_cast<size_t>(cell) >= thermal_source.size() || source == 0.0f) {
+        return;
+    }
+    thermal_source[static_cast<size_t>(cell)] = std::clamp(
+        thermal_source[static_cast<size_t>(cell)] + source,
+        -k_native_thermal_source_max,
+        k_native_thermal_source_max
+    );
 }
 
 bool ensure_l2_runtime(ServiceState& service, int nx, int ny, int nz, int input_channels, int output_channels) {
@@ -182,6 +344,380 @@ void rebuild_default_packed_atlas(ServiceState& service, long long region_key) {
             }
         }
     }
+}
+
+float sync_dynamic_region_from_native(ServiceState& service, long long region_key) {
+    auto dynamic_it = service.dynamic_regions.find(region_key);
+    if (dynamic_it == service.dynamic_regions.end()) {
+        return 0.0f;
+    }
+    DynamicRegionData& dynamic = dynamic_it->second;
+    int cells = 0;
+    if (!checked_cell_count(dynamic.nx, dynamic.ny, dynamic.nz, &cells)) {
+        return 0.0f;
+    }
+    if (dynamic.flow_state.size() != static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS) {
+        dynamic.flow_state.assign(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+    }
+    if (dynamic.air_temperature.size() != static_cast<size_t>(cells)) {
+        dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
+    }
+    if (!aero_lbm_get_flow_state_rect(dynamic.nx, dynamic.ny, dynamic.nz, region_key, dynamic.flow_state.data())) {
+        return -1.0f;
+    }
+    if (!aero_lbm_get_temperature_state_rect(dynamic.nx, dynamic.ny, dynamic.nz, region_key, dynamic.air_temperature.data())) {
+        return -1.0f;
+    }
+    float max_speed = 0.0f;
+    for (int cell = 0; cell < cells; ++cell) {
+        size_t base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        float vx = dynamic.flow_state[base];
+        float vy = dynamic.flow_state[base + 1];
+        float vz = dynamic.flow_state[base + 2];
+        float speed = std::sqrt(vx * vx + vy * vy + vz * vz);
+        if (std::isfinite(speed) && speed > max_speed) {
+            max_speed = speed;
+        }
+    }
+    rebuild_default_packed_atlas(service, region_key);
+    return max_speed;
+}
+
+void apply_boundary_wind(
+    std::vector<float>& packet,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z
+) {
+    if (packet.empty() || nx <= 0 || ny <= 0 || nz <= 0) {
+        return;
+    }
+    for (int x = 0; x < nx; ++x) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                int edge_distance = std::min(
+                    std::min(std::min(x, y), z),
+                    std::min(std::min(nx - 1 - x, ny - 1 - y), nz - 1 - z)
+                );
+                if (edge_distance >= k_window_edge_stabilization_layers) {
+                    continue;
+                }
+                int cell = (x * ny + y) * nz + z;
+                size_t base = static_cast<size_t>(cell) * k_packet_channels;
+                if (packet[base + k_channel_obstacle] > 0.5f) {
+                    continue;
+                }
+                float eta = (k_window_edge_stabilization_layers - edge_distance)
+                    / static_cast<float>(k_window_edge_stabilization_layers);
+                float keep = k_window_edge_stabilization_min_keep
+                    + (1.0f - k_window_edge_stabilization_min_keep) * (1.0f - eta * eta);
+                float relax = 1.0f - keep;
+                packet[base + k_channel_state_vx] = packet[base + k_channel_state_vx] * keep + boundary_wind_x * relax;
+                packet[base + k_channel_state_vy] = packet[base + k_channel_state_vy] * keep + boundary_wind_y * relax;
+                packet[base + k_channel_state_vz] = packet[base + k_channel_state_vz] * keep + boundary_wind_z * relax;
+                packet[base + k_channel_state_p] *= keep;
+            }
+        }
+    }
+}
+
+bool build_region_packet(
+    ServiceState& service,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z,
+    std::vector<float>& packet
+) {
+    auto static_it = service.static_regions.find(region_key);
+    auto dynamic_it = service.dynamic_regions.find(region_key);
+    auto forcing_it = service.forcing_regions.find(region_key);
+    if (static_it == service.static_regions.end()) {
+        set_simulation_last_error("simulation_step_region_stored: missing static region");
+        return false;
+    }
+    if (dynamic_it == service.dynamic_regions.end()) {
+        set_simulation_last_error("simulation_step_region_stored: missing dynamic region");
+        return false;
+    }
+    if (forcing_it == service.forcing_regions.end()) {
+        set_simulation_last_error("simulation_step_region_stored: missing forcing region");
+        return false;
+    }
+    const StaticRegionData& stat = static_it->second;
+    const DynamicRegionData& dynamic = dynamic_it->second;
+    const ForcingRegionData& forcing = forcing_it->second;
+    if (stat.nx != nx || stat.ny != ny || stat.nz != nz
+        || dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz
+        || forcing.nx != nx || forcing.ny != ny || forcing.nz != nz) {
+        set_simulation_last_error("simulation_step_region_stored: region dimension mismatch");
+        return false;
+    }
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells)) {
+        set_simulation_last_error("simulation_step_region_stored: invalid dimensions");
+        return false;
+    }
+    packet.assign(static_cast<size_t>(cells) * k_packet_channels, 0.0f);
+    for (int cell = 0; cell < cells; ++cell) {
+        size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
+        size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        packet[packet_base + k_channel_obstacle] = stat.obstacle[cell] != 0 ? 1.0f : 0.0f;
+        packet[packet_base + k_channel_fan_mask] = forcing.fan_mask[cell] != 0 ? 1.0f : 0.0f;
+        packet[packet_base + k_channel_fan_vx] = forcing.fan_vx[cell];
+        packet[packet_base + k_channel_fan_vy] = forcing.fan_vy[cell];
+        packet[packet_base + k_channel_fan_vz] = forcing.fan_vz[cell];
+        packet[packet_base + k_channel_state_vx] = dynamic.flow_state[flow_base];
+        packet[packet_base + k_channel_state_vy] = dynamic.flow_state[flow_base + 1];
+        packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
+        packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
+        packet[packet_base + k_channel_thermal_source] = forcing.thermal_source[cell];
+        if (stat.obstacle[cell] != 0) {
+            packet[packet_base + k_channel_fan_mask] = 0.0f;
+            packet[packet_base + k_channel_fan_vx] = 0.0f;
+            packet[packet_base + k_channel_fan_vy] = 0.0f;
+            packet[packet_base + k_channel_fan_vz] = 0.0f;
+            packet[packet_base + k_channel_state_vx] = 0.0f;
+            packet[packet_base + k_channel_state_vy] = 0.0f;
+            packet[packet_base + k_channel_state_vz] = 0.0f;
+            packet[packet_base + k_channel_state_p] = 0.0f;
+            packet[packet_base + k_channel_thermal_source] = 0.0f;
+        }
+    }
+    apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
+    return true;
+}
+
+bool refresh_region_thermal(
+    ServiceState& service,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float direct_solar_flux_w_m2,
+    float diffuse_solar_flux_w_m2,
+    float ambient_air_temperature_k,
+    float deep_ground_temperature_k,
+    float sky_temperature_k,
+    float precipitation_temperature_k,
+    float precipitation_strength,
+    float sun_x,
+    float sun_y,
+    float sun_z,
+    float surface_delta_seconds
+) {
+    auto static_it = service.static_regions.find(region_key);
+    auto dynamic_it = service.dynamic_regions.find(region_key);
+    auto forcing_it = service.forcing_regions.find(region_key);
+    if (static_it == service.static_regions.end()) {
+        set_simulation_last_error("simulation_refresh_region_thermal: missing static region");
+        return false;
+    }
+    if (dynamic_it == service.dynamic_regions.end()) {
+        set_simulation_last_error("simulation_refresh_region_thermal: missing dynamic region");
+        return false;
+    }
+    if (forcing_it == service.forcing_regions.end()) {
+        set_simulation_last_error("simulation_refresh_region_thermal: missing forcing region");
+        return false;
+    }
+    StaticRegionData& stat = static_it->second;
+    DynamicRegionData& dynamic = dynamic_it->second;
+    ForcingRegionData& forcing = forcing_it->second;
+    if (stat.nx != nx || stat.ny != ny || stat.nz != nz
+        || dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz
+        || forcing.nx != nx || forcing.ny != ny || forcing.nz != nz) {
+        set_simulation_last_error("simulation_refresh_region_thermal: region dimension mismatch");
+        return false;
+    }
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells)) {
+        set_simulation_last_error("simulation_refresh_region_thermal: invalid dimensions");
+        return false;
+    }
+    if (dynamic.surface_temperature.size() != static_cast<size_t>(cells)) {
+        dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
+    }
+    if (dynamic.air_temperature.size() != static_cast<size_t>(cells)) {
+        dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
+    }
+    if (forcing.thermal_source.size() != static_cast<size_t>(cells)) {
+        forcing.thermal_source.assign(static_cast<size_t>(cells), 0.0f);
+    } else {
+        std::fill(forcing.thermal_source.begin(), forcing.thermal_source.end(), 0.0f);
+    }
+
+    static constexpr int dir_x[k_face_count] = {0, 0, 0, 0, -1, 1};
+    static constexpr int dir_y[k_face_count] = {-1, 1, 0, 0, 0, 0};
+    static constexpr int dir_z[k_face_count] = {0, 0, -1, 1, 0, 0};
+    static constexpr float diffuse_weight[k_face_count] = {0.05f, 1.0f, 0.42f, 0.42f, 0.42f, 0.42f};
+    static constexpr float sky_weight[k_face_count] = {0.08f, 1.0f, 0.55f, 0.55f, 0.55f, 0.55f};
+    static constexpr float rain_weight[k_face_count] = {0.0f, 1.0f, 0.35f, 0.35f, 0.35f, 0.35f};
+
+    for (int x = 0; x < nx; ++x) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                const int cell = grid_cell_index(ny, nz, x, y, z);
+                const uint8_t surface_kind = stat.surface_kind[static_cast<size_t>(cell)];
+                const uint16_t open_face_mask = stat.open_face_mask[static_cast<size_t>(cell)];
+                const float emitter_power_watts = stat.emitter_power_watts[static_cast<size_t>(cell)];
+                const ThermalMaterialProperties* material = thermal_material_properties(surface_kind);
+
+                if (!material) {
+                    if (emitter_power_watts > 0.0f && open_face_mask != 0) {
+                        const bool self_blocked = stat.obstacle[static_cast<size_t>(cell)] != 0;
+                        const float self_weight = self_blocked ? 0.0f : 0.30f;
+                        float face_weights[k_face_count] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                        float total_weight = self_weight;
+                        for (int direction = 0; direction < k_face_count; ++direction) {
+                            if (!has_face_bit(open_face_mask, direction)) {
+                                continue;
+                            }
+                            const float weight = direction == 1 ? 0.55f : (direction == 0 ? 0.03f : 0.12f);
+                            face_weights[direction] = weight;
+                            total_weight += weight;
+                        }
+                        if (total_weight > 1.0e-6f) {
+                            const float scalar_source = temperature_source_from_power_watts(emitter_power_watts);
+                            if (self_weight > 0.0f) {
+                                add_thermal_source(forcing.thermal_source, cell, scalar_source * (self_weight / total_weight));
+                            }
+                            for (int direction = 0; direction < k_face_count; ++direction) {
+                                const float weight = face_weights[direction];
+                                if (weight <= 0.0f) {
+                                    continue;
+                                }
+                                const int nx_cell = x + dir_x[direction];
+                                const int ny_cell = y + dir_y[direction];
+                                const int nz_cell = z + dir_z[direction];
+                                if (!in_bounds(nx, ny, nz, nx_cell, ny_cell, nz_cell)) {
+                                    continue;
+                                }
+                                add_thermal_source(
+                                    forcing.thermal_source,
+                                    grid_cell_index(ny, nz, nx_cell, ny_cell, nz_cell),
+                                    scalar_source * (weight / total_weight)
+                                );
+                            }
+                        }
+                    } else {
+                        dynamic.surface_temperature[static_cast<size_t>(cell)] = 0.0f;
+                    }
+                    continue;
+                }
+
+                if (open_face_mask == 0) {
+                    dynamic.surface_temperature[static_cast<size_t>(cell)] = 0.0f;
+                    continue;
+                }
+
+                const int open_faces = count_open_faces(open_face_mask);
+                float current_surface_temperature = dynamic.surface_temperature[static_cast<size_t>(cell)];
+                if (!std::isfinite(current_surface_temperature) || current_surface_temperature <= 0.0f) {
+                    current_surface_temperature = initialize_surface_temperature_kelvin(
+                        *material,
+                        ambient_air_temperature_k,
+                        deep_ground_temperature_k,
+                        emitter_power_watts,
+                        open_faces
+                    );
+                }
+
+                float solar_watts = 0.0f;
+                float longwave_watts = 0.0f;
+                float rain_watts = 0.0f;
+                float convective_watts = 0.0f;
+                for (int direction = 0; direction < k_face_count; ++direction) {
+                    if (!has_face_bit(open_face_mask, direction)) {
+                        continue;
+                    }
+                    const int face_index = local_face_index(cell, direction);
+                    const float diffuse_sky = dequantize_unit_float(stat.face_sky_exposure[static_cast<size_t>(face_index)]);
+                    const float direct_sky = dequantize_unit_float(stat.face_direct_exposure[static_cast<size_t>(face_index)]);
+                    const float sun_dot = std::max(
+                        0.0f,
+                        dir_x[direction] * sun_x + dir_y[direction] * sun_y + dir_z[direction] * sun_z
+                    );
+                    const float air_temperature_kelvin = neighbor_air_temperature_kelvin(
+                        dynamic,
+                        x + dir_x[direction],
+                        y + dir_y[direction],
+                        z + dir_z[direction],
+                        ambient_air_temperature_k
+                    );
+                    solar_watts += material->solar_absorptivity
+                        * k_cell_face_area_square_meters
+                        * (direct_solar_flux_w_m2 * direct_sky * sun_dot
+                            + diffuse_solar_flux_w_m2 * diffuse_sky * diffuse_weight[direction]);
+                    const float surface_temp_sq = current_surface_temperature * current_surface_temperature;
+                    const float sky_temp_sq = sky_temperature_k * sky_temperature_k;
+                    longwave_watts += material->emissivity
+                        * k_thermal_stefan_boltzmann
+                        * k_cell_face_area_square_meters
+                        * (sky_temp_sq * sky_temp_sq - surface_temp_sq * surface_temp_sq)
+                        * diffuse_sky
+                        * sky_weight[direction];
+                    rain_watts += material->rain_exchange_coefficient_wm2k
+                        * k_cell_face_area_square_meters
+                        * precipitation_strength
+                        * rain_weight[direction]
+                        * (precipitation_temperature_k - current_surface_temperature);
+                    convective_watts += material->convective_exchange_coefficient_wm2k
+                        * k_cell_face_area_square_meters
+                        * (air_temperature_kelvin - current_surface_temperature);
+                }
+
+                const float exposed_area = open_faces * k_cell_face_area_square_meters;
+                const float bulk_watts = material->bulk_conductance_wm2k
+                    * exposed_area
+                    * (deep_ground_temperature_k - current_surface_temperature);
+                const float thermal_mass_j_per_k = std::max(1.0f, material->surface_heat_capacity_jm2k * exposed_area);
+                const float updated_surface_temperature = std::clamp(
+                    current_surface_temperature
+                        + (solar_watts + longwave_watts + rain_watts + bulk_watts + convective_watts + emitter_power_watts)
+                            * surface_delta_seconds
+                            / thermal_mass_j_per_k,
+                    k_thermal_surface_init_min_k,
+                    k_thermal_surface_max_k
+                );
+                dynamic.surface_temperature[static_cast<size_t>(cell)] = updated_surface_temperature;
+
+                for (int direction = 0; direction < k_face_count; ++direction) {
+                    if (!has_face_bit(open_face_mask, direction)) {
+                        continue;
+                    }
+                    const int nx_cell = x + dir_x[direction];
+                    const int ny_cell = y + dir_y[direction];
+                    const int nz_cell = z + dir_z[direction];
+                    if (!in_bounds(nx, ny, nz, nx_cell, ny_cell, nz_cell)) {
+                        continue;
+                    }
+                    const float air_temperature_kelvin = neighbor_air_temperature_kelvin(
+                        dynamic,
+                        nx_cell,
+                        ny_cell,
+                        nz_cell,
+                        ambient_air_temperature_k
+                    );
+                    const float convective_power_watts = material->convective_exchange_coefficient_wm2k
+                        * k_cell_face_area_square_meters
+                        * (updated_surface_temperature - air_temperature_kelvin);
+                    add_thermal_source(
+                        forcing.thermal_source,
+                        grid_cell_index(ny, nz, nx_cell, ny_cell, nz_cell),
+                        temperature_source_from_power_watts(convective_power_watts)
+                    );
+                }
+            }
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -263,7 +799,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     const uint8_t* obstacle,
     const uint8_t* surface_kind,
     const uint16_t* open_face_mask,
-    const float* emitter_power_watts
+    const float* emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
 ) {
     int cells = 0;
     if (!checked_cell_count(nx, ny, nz, &cells)) {
@@ -271,7 +809,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
         set_simulation_last_error("simulation_upload_static_region: invalid dimensions");
         return 0;
     }
-    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts) {
+    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts
+        || !face_sky_exposure || !face_direct_exposure) {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
         set_simulation_last_error("simulation_upload_static_region: null region buffers");
         return 0;
@@ -292,6 +831,91 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     region.surface_kind.assign(surface_kind, surface_kind + cells);
     region.open_face_mask.assign(open_face_mask, open_face_mask + cells);
     region.emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
+    region.face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
+    region.face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region_patch(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int patch_nx,
+    int patch_ny,
+    int patch_nz,
+    const uint8_t* obstacle,
+    const uint8_t* surface_kind,
+    const uint16_t* open_face_mask,
+    const float* emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
+) {
+    int patch_cells = 0;
+    if (!checked_cell_count(patch_nx, patch_ny, patch_nz, &patch_cells)) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_upload_static_region_patch: invalid patch dimensions");
+        return 0;
+    }
+    if (offset_x < 0 || offset_y < 0 || offset_z < 0
+        || patch_nx <= 0 || patch_ny <= 0 || patch_nz <= 0
+        || offset_x + patch_nx > nx
+        || offset_y + patch_ny > ny
+        || offset_z + patch_nz > nz) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_upload_static_region_patch: patch out of bounds");
+        return 0;
+    }
+    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts
+        || !face_sky_exposure || !face_direct_exposure) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_upload_static_region_patch: null patch buffers");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_upload_static_region_patch: missing service");
+        return 0;
+    }
+    auto region_it = service->static_regions.find(region_key);
+    if (region_it == service->static_regions.end()) {
+        set_simulation_last_error("simulation_upload_static_region_patch: missing static region");
+        return 0;
+    }
+    StaticRegionData& region = region_it->second;
+    if (region.nx != nx || region.ny != ny || region.nz != nz) {
+        set_simulation_last_error("simulation_upload_static_region_patch: region dimension mismatch");
+        return 0;
+    }
+
+    for (int px = 0; px < patch_nx; ++px) {
+        for (int py = 0; py < patch_ny; ++py) {
+            for (int pz = 0; pz < patch_nz; ++pz) {
+                const int patch_cell = grid_cell_index(patch_ny, patch_nz, px, py, pz);
+                const int cell = grid_cell_index(
+                    region.ny,
+                    region.nz,
+                    offset_x + px,
+                    offset_y + py,
+                    offset_z + pz
+                );
+                region.obstacle[static_cast<size_t>(cell)] = obstacle[patch_cell];
+                region.surface_kind[static_cast<size_t>(cell)] = surface_kind[patch_cell];
+                region.open_face_mask[static_cast<size_t>(cell)] = open_face_mask[patch_cell];
+                region.emitter_power_watts[static_cast<size_t>(cell)] = emitter_power_watts[patch_cell];
+                const size_t face_base = static_cast<size_t>(cell) * k_face_count;
+                const size_t patch_face_base = static_cast<size_t>(patch_cell) * k_face_count;
+                std::copy_n(face_sky_exposure + patch_face_base, k_face_count, region.face_sky_exposure.begin() + static_cast<std::ptrdiff_t>(face_base));
+                std::copy_n(face_direct_exposure + patch_face_base, k_face_count, region.face_direct_exposure.begin() + static_cast<std::ptrdiff_t>(face_base));
+            }
+        }
+    }
     return 1;
 }
 
@@ -393,6 +1017,97 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_has_region_context(long long servic
     return aero_lbm_has_context(region_key);
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_region_forcing(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    const float* thermal_source,
+    const uint8_t* fan_mask,
+    const float* fan_vx,
+    const float* fan_vy,
+    const float* fan_vz
+) {
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells)
+        || !fan_mask
+        || !fan_vx
+        || !fan_vy
+        || !fan_vz) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_upload_region_forcing: invalid arguments");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_upload_region_forcing: missing service");
+        return 0;
+    }
+    ForcingRegionData& forcing = service->forcing_regions[region_key];
+    forcing.nx = nx;
+    forcing.ny = ny;
+    forcing.nz = nz;
+    if (!thermal_source) {
+        if (forcing.thermal_source.size() != static_cast<size_t>(cells)) {
+            forcing.thermal_source.assign(static_cast<size_t>(cells), 0.0f);
+        }
+    } else {
+        forcing.thermal_source.assign(thermal_source, thermal_source + cells);
+    }
+    forcing.fan_mask.assign(fan_mask, fan_mask + cells);
+    forcing.fan_vx.assign(fan_vx, fan_vx + cells);
+    forcing.fan_vy.assign(fan_vy, fan_vy + cells);
+    forcing.fan_vz.assign(fan_vz, fan_vz + cells);
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_refresh_region_thermal(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float direct_solar_flux_w_m2,
+    float diffuse_solar_flux_w_m2,
+    float ambient_air_temperature_k,
+    float deep_ground_temperature_k,
+    float sky_temperature_k,
+    float precipitation_temperature_k,
+    float precipitation_strength,
+    float sun_x,
+    float sun_y,
+    float sun_z,
+    float surface_delta_seconds
+) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_refresh_region_thermal: missing service");
+        return 0;
+    }
+    return refresh_region_thermal(
+        *service,
+        region_key,
+        nx,
+        ny,
+        nz,
+        direct_solar_flux_w_m2,
+        diffuse_solar_flux_w_m2,
+        ambient_air_temperature_k,
+        deep_ground_temperature_k,
+        sky_temperature_k,
+        precipitation_temperature_k,
+        precipitation_strength,
+        sun_x,
+        sun_y,
+        sun_z,
+        surface_delta_seconds
+    ) ? 1 : 0;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
     long long service_key,
     long long region_key,
@@ -449,6 +1164,75 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
     return 1;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z,
+    float* out_max_speed
+) {
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells) || !out_max_speed) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_step_region_stored: invalid arguments");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_step_region_stored: missing service");
+        return 0;
+    }
+    auto lifecycle_it = service->regions.find(region_key);
+    if (lifecycle_it == service->regions.end() || !lifecycle_it->second.active) {
+        set_simulation_last_error("simulation_step_region_stored: inactive region");
+        return 0;
+    }
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+        return 0;
+    }
+    auto dynamic_it = service->dynamic_regions.find(region_key);
+    if (dynamic_it == service->dynamic_regions.end()) {
+        DynamicRegionData& dynamic = service->dynamic_regions[region_key];
+        dynamic.nx = nx;
+        dynamic.ny = ny;
+        dynamic.nz = nz;
+        dynamic.flow_state.assign(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+        dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
+        dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
+        dynamic_it = service->dynamic_regions.find(region_key);
+    }
+    DynamicRegionData& dynamic = dynamic_it->second;
+    if (dynamic.air_temperature.size() == static_cast<size_t>(cells)) {
+        if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic.air_temperature.data())) {
+            set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
+            return 0;
+        }
+    }
+    std::vector<float> packet;
+    if (!build_region_packet(*service, region_key, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z, packet)) {
+        return 0;
+    }
+    std::vector<float> output_flow(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+    if (!aero_lbm_step_rect(packet.data(), nx, ny, nz, region_key, output_flow.data())) {
+        set_simulation_last_error(std::string("simulation_step_region_stored failed: ") + aero_lbm_last_error());
+        return 0;
+    }
+    dynamic.flow_state.swap(output_flow);
+    float max_speed = sync_dynamic_region_from_native(*service, region_key);
+    if (max_speed < 0.0f) {
+        set_simulation_last_error(std::string("simulation_step_region_stored sync failed: ") + aero_lbm_last_error());
+        return 0;
+    }
+    *out_max_speed = max_speed;
+    return 1;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     long long service_key,
     long long first_region_key,
@@ -467,6 +1251,18 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     if (!aero_lbm_exchange_halo(grid_size, first_region_key, second_region_key, offset_x, offset_y, offset_z)) {
         set_simulation_last_error(std::string("simulation_exchange_region_halo failed: ") + aero_lbm_last_error());
         return 0;
+    }
+    if (service->dynamic_regions.find(first_region_key) != service->dynamic_regions.end()) {
+        if (sync_dynamic_region_from_native(*service, first_region_key) < 0.0f) {
+            set_simulation_last_error(std::string("simulation_exchange_region_halo first sync failed: ") + aero_lbm_last_error());
+            return 0;
+        }
+    }
+    if (service->dynamic_regions.find(second_region_key) != service->dynamic_regions.end()) {
+        if (sync_dynamic_region_from_native(*service, second_region_key) < 0.0f) {
+            set_simulation_last_error(std::string("simulation_exchange_region_halo second sync failed: ") + aero_lbm_last_error());
+            return 0;
+        }
     }
     return 1;
 }
@@ -497,6 +1293,37 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_temperature_state(
     }
     if (!aero_lbm_get_temperature_state_rect(nx, ny, nz, region_key, out_temperature)) {
         set_simulation_last_error(std::string("simulation_get_region_temperature_state failed: ") + aero_lbm_last_error());
+        return 0;
+    }
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_flow_state(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float* out_flow_state
+) {
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells) || !out_flow_state) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_get_region_flow_state: invalid arguments");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_get_region_flow_state: missing service");
+        return 0;
+    }
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+        return 0;
+    }
+    if (!aero_lbm_get_flow_state_rect(nx, ny, nz, region_key, out_flow_state)) {
+        set_simulation_last_error(std::string("simulation_get_region_flow_state failed: ") + aero_lbm_last_error());
         return 0;
     }
     return 1;
@@ -682,6 +1509,67 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_poll_packed_flow_atlas(
     return 1;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sample_region_point(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    int sample_x,
+    int sample_y,
+    int sample_z,
+    float* out_probe_values,
+    int value_count
+) {
+    if (value_count != AERO_LBM_SIMULATION_PLAYER_PROBE_CHANNELS || !out_probe_values) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_sample_region_point: invalid output buffer");
+        return 0;
+    }
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells)) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_sample_region_point: invalid dimensions");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_sample_region_point: missing service");
+        return 0;
+    }
+    auto region_it = service->dynamic_regions.find(region_key);
+    if (region_it == service->dynamic_regions.end()) {
+        set_simulation_last_error("simulation_sample_region_point: missing region");
+        return 0;
+    }
+    const DynamicRegionData& region = region_it->second;
+    if (region.nx != nx || region.ny != ny || region.nz != nz) {
+        set_simulation_last_error("simulation_sample_region_point: dimension mismatch");
+        return 0;
+    }
+    if (!in_bounds(nx, ny, nz, sample_x, sample_y, sample_z)) {
+        set_simulation_last_error("simulation_sample_region_point: sample out of bounds");
+        return 0;
+    }
+    const int cell = grid_cell_index(ny, nz, sample_x, sample_y, sample_z);
+    const size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+    if (region.flow_state.size() < flow_base + AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS
+        || region.air_temperature.size() <= static_cast<size_t>(cell)
+        || region.surface_temperature.size() <= static_cast<size_t>(cell)) {
+        set_simulation_last_error("simulation_sample_region_point: region buffers incomplete");
+        return 0;
+    }
+    out_probe_values[0] = region.flow_state[flow_base];
+    out_probe_values[1] = region.flow_state[flow_base + 1];
+    out_probe_values[2] = region.flow_state[flow_base + 2];
+    out_probe_values[3] = region.flow_state[flow_base + 3];
+    out_probe_values[4] = region.air_temperature[static_cast<size_t>(cell)];
+    out_probe_values[5] = region.surface_temperature[static_cast<size_t>(cell)];
+    return 1;
+}
+
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     static std::string text;
     std::lock_guard<SpinMutex> lock(g_simulation_mutex);
@@ -818,20 +1706,37 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     jbyteArray obstacle,
     jbyteArray surface_kind,
     jshortArray open_face_mask,
-    jfloatArray emitter_power_watts
+    jfloatArray emitter_power_watts,
+    jbyteArray face_sky_exposure,
+    jbyteArray face_direct_exposure
 ) {
-    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts) {
+    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts
+        || !face_sky_exposure || !face_direct_exposure) {
+        return JNI_FALSE;
+    }
+    const int cells = nx * ny * nz;
+    if (cells <= 0
+        || env->GetArrayLength(obstacle) != static_cast<jsize>(cells)
+        || env->GetArrayLength(surface_kind) != static_cast<jsize>(cells)
+        || env->GetArrayLength(open_face_mask) != static_cast<jsize>(cells)
+        || env->GetArrayLength(emitter_power_watts) != static_cast<jsize>(cells)
+        || env->GetArrayLength(face_sky_exposure) != static_cast<jsize>(cells * k_face_count)
+        || env->GetArrayLength(face_direct_exposure) != static_cast<jsize>(cells * k_face_count)) {
         return JNI_FALSE;
     }
     jboolean obstacle_copy = JNI_FALSE;
     jboolean surface_copy = JNI_FALSE;
     jboolean open_copy = JNI_FALSE;
     jboolean emitter_copy = JNI_FALSE;
+    jboolean sky_copy = JNI_FALSE;
+    jboolean direct_copy = JNI_FALSE;
     jbyte* obstacle_ptr = env->GetByteArrayElements(obstacle, &obstacle_copy);
     jbyte* surface_ptr = env->GetByteArrayElements(surface_kind, &surface_copy);
     jshort* open_ptr = env->GetShortArrayElements(open_face_mask, &open_copy);
     jfloat* emitter_ptr = env->GetFloatArrayElements(emitter_power_watts, &emitter_copy);
-    if (!obstacle_ptr || !surface_ptr || !open_ptr || !emitter_ptr) {
+    jbyte* sky_ptr = env->GetByteArrayElements(face_sky_exposure, &sky_copy);
+    jbyte* direct_ptr = env->GetByteArrayElements(face_direct_exposure, &direct_copy);
+    if (!obstacle_ptr || !surface_ptr || !open_ptr || !emitter_ptr || !sky_ptr || !direct_ptr) {
         if (obstacle_ptr) {
             env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
         }
@@ -844,6 +1749,12 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         if (emitter_ptr) {
             env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
         }
+        if (sky_ptr) {
+            env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+        }
+        if (direct_ptr) {
+            env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+        }
         return JNI_FALSE;
     }
     const int ok = aero_lbm_simulation_upload_static_region(
@@ -855,12 +1766,112 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         reinterpret_cast<const uint8_t*>(obstacle_ptr),
         reinterpret_cast<const uint8_t*>(surface_ptr),
         reinterpret_cast<const uint16_t*>(open_ptr),
-        emitter_ptr
+        emitter_ptr,
+        reinterpret_cast<const uint8_t*>(sky_ptr),
+        reinterpret_cast<const uint8_t*>(direct_ptr)
     );
     env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
     env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
     env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
     env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeUploadStaticRegionPatch(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint nx,
+    jint ny,
+    jint nz,
+    jint offset_x,
+    jint offset_y,
+    jint offset_z,
+    jint patch_nx,
+    jint patch_ny,
+    jint patch_nz,
+    jbyteArray obstacle,
+    jbyteArray surface_kind,
+    jshortArray open_face_mask,
+    jfloatArray emitter_power_watts,
+    jbyteArray face_sky_exposure,
+    jbyteArray face_direct_exposure
+) {
+    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts
+        || !face_sky_exposure || !face_direct_exposure) {
+        return JNI_FALSE;
+    }
+    const int cells = patch_nx * patch_ny * patch_nz;
+    if (cells <= 0
+        || env->GetArrayLength(obstacle) != static_cast<jsize>(cells)
+        || env->GetArrayLength(surface_kind) != static_cast<jsize>(cells)
+        || env->GetArrayLength(open_face_mask) != static_cast<jsize>(cells)
+        || env->GetArrayLength(emitter_power_watts) != static_cast<jsize>(cells)
+        || env->GetArrayLength(face_sky_exposure) != static_cast<jsize>(cells * k_face_count)
+        || env->GetArrayLength(face_direct_exposure) != static_cast<jsize>(cells * k_face_count)) {
+        return JNI_FALSE;
+    }
+    jboolean obstacle_copy = JNI_FALSE;
+    jboolean surface_copy = JNI_FALSE;
+    jboolean open_copy = JNI_FALSE;
+    jboolean emitter_copy = JNI_FALSE;
+    jboolean sky_copy = JNI_FALSE;
+    jboolean direct_copy = JNI_FALSE;
+    jbyte* obstacle_ptr = env->GetByteArrayElements(obstacle, &obstacle_copy);
+    jbyte* surface_ptr = env->GetByteArrayElements(surface_kind, &surface_copy);
+    jshort* open_ptr = env->GetShortArrayElements(open_face_mask, &open_copy);
+    jfloat* emitter_ptr = env->GetFloatArrayElements(emitter_power_watts, &emitter_copy);
+    jbyte* sky_ptr = env->GetByteArrayElements(face_sky_exposure, &sky_copy);
+    jbyte* direct_ptr = env->GetByteArrayElements(face_direct_exposure, &direct_copy);
+    if (!obstacle_ptr || !surface_ptr || !open_ptr || !emitter_ptr || !sky_ptr || !direct_ptr) {
+        if (obstacle_ptr) {
+            env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
+        }
+        if (surface_ptr) {
+            env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
+        }
+        if (open_ptr) {
+            env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
+        }
+        if (emitter_ptr) {
+            env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+        }
+        if (sky_ptr) {
+            env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+        }
+        if (direct_ptr) {
+            env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+        }
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_upload_static_region_patch(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        nx,
+        ny,
+        nz,
+        offset_x,
+        offset_y,
+        offset_z,
+        patch_nx,
+        patch_ny,
+        patch_nz,
+        reinterpret_cast<const uint8_t*>(obstacle_ptr),
+        reinterpret_cast<const uint8_t*>(surface_ptr),
+        reinterpret_cast<const uint16_t*>(open_ptr),
+        emitter_ptr,
+        reinterpret_cast<const uint8_t*>(sky_ptr),
+        reinterpret_cast<const uint8_t*>(direct_ptr)
+    );
+    env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
+    env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -950,6 +1961,112 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     ) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeUploadRegionForcing(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint nx,
+    jint ny,
+    jint nz,
+    jfloatArray thermal_source,
+    jbyteArray fan_mask,
+    jfloatArray fan_vx,
+    jfloatArray fan_vy,
+    jfloatArray fan_vz
+) {
+    if (!fan_mask || !fan_vx || !fan_vy || !fan_vz) {
+        return JNI_FALSE;
+    }
+    const int cells = nx * ny * nz;
+    if (cells <= 0
+        || (thermal_source && env->GetArrayLength(thermal_source) != static_cast<jsize>(cells))
+        || env->GetArrayLength(fan_mask) != static_cast<jsize>(cells)
+        || env->GetArrayLength(fan_vx) != static_cast<jsize>(cells)
+        || env->GetArrayLength(fan_vy) != static_cast<jsize>(cells)
+        || env->GetArrayLength(fan_vz) != static_cast<jsize>(cells)) {
+        return JNI_FALSE;
+    }
+    jboolean thermal_copy = JNI_FALSE;
+    jboolean mask_copy = JNI_FALSE;
+    jboolean vx_copy = JNI_FALSE;
+    jboolean vy_copy = JNI_FALSE;
+    jboolean vz_copy = JNI_FALSE;
+    jfloat* thermal_ptr = thermal_source ? env->GetFloatArrayElements(thermal_source, &thermal_copy) : nullptr;
+    jbyte* mask_ptr = env->GetByteArrayElements(fan_mask, &mask_copy);
+    jfloat* vx_ptr = env->GetFloatArrayElements(fan_vx, &vx_copy);
+    jfloat* vy_ptr = env->GetFloatArrayElements(fan_vy, &vy_copy);
+    jfloat* vz_ptr = env->GetFloatArrayElements(fan_vz, &vz_copy);
+    if ((thermal_source && !thermal_ptr) || !mask_ptr || !vx_ptr || !vy_ptr || !vz_ptr) {
+        if (thermal_ptr) env->ReleaseFloatArrayElements(thermal_source, thermal_ptr, JNI_ABORT);
+        if (mask_ptr) env->ReleaseByteArrayElements(fan_mask, mask_ptr, JNI_ABORT);
+        if (vx_ptr) env->ReleaseFloatArrayElements(fan_vx, vx_ptr, JNI_ABORT);
+        if (vy_ptr) env->ReleaseFloatArrayElements(fan_vy, vy_ptr, JNI_ABORT);
+        if (vz_ptr) env->ReleaseFloatArrayElements(fan_vz, vz_ptr, JNI_ABORT);
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_upload_region_forcing(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        nx,
+        ny,
+        nz,
+        thermal_ptr,
+        reinterpret_cast<const uint8_t*>(mask_ptr),
+        vx_ptr,
+        vy_ptr,
+        vz_ptr
+    );
+    if (thermal_ptr) {
+        env->ReleaseFloatArrayElements(thermal_source, thermal_ptr, JNI_ABORT);
+    }
+    env->ReleaseByteArrayElements(fan_mask, mask_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(fan_vx, vx_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(fan_vy, vy_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(fan_vz, vz_ptr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeRefreshRegionThermal(
+    JNIEnv*,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint nx,
+    jint ny,
+    jint nz,
+    jfloat direct_solar_flux_w_m2,
+    jfloat diffuse_solar_flux_w_m2,
+    jfloat ambient_air_temperature_k,
+    jfloat deep_ground_temperature_k,
+    jfloat sky_temperature_k,
+    jfloat precipitation_temperature_k,
+    jfloat precipitation_strength,
+    jfloat sun_x,
+    jfloat sun_y,
+    jfloat sun_z,
+    jfloat surface_delta_seconds
+) {
+    return aero_lbm_simulation_refresh_region_thermal(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        nx,
+        ny,
+        nz,
+        direct_solar_flux_w_m2,
+        diffuse_solar_flux_w_m2,
+        ambient_air_temperature_k,
+        deep_ground_temperature_k,
+        sky_temperature_k,
+        precipitation_temperature_k,
+        precipitation_strength,
+        sun_x,
+        sun_y,
+        sun_z,
+        surface_delta_seconds
+    ) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeStepRegion(
     JNIEnv* env,
     jclass,
@@ -987,6 +2104,42 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         flow_ptr
     );
     env->ReleaseFloatArrayElements(output_flow, flow_ptr, ok ? 0 : JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeStepRegionStored(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint nx,
+    jint ny,
+    jint nz,
+    jfloat boundary_wind_x,
+    jfloat boundary_wind_y,
+    jfloat boundary_wind_z,
+    jfloatArray out_max_speed
+) {
+    if (!out_max_speed || env->GetArrayLength(out_max_speed) != 1) {
+        return JNI_FALSE;
+    }
+    jboolean copy = JNI_FALSE;
+    jfloat* max_speed_ptr = env->GetFloatArrayElements(out_max_speed, &copy);
+    if (!max_speed_ptr) {
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_step_region_stored(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        nx,
+        ny,
+        nz,
+        boundary_wind_x,
+        boundary_wind_y,
+        boundary_wind_z,
+        max_speed_ptr
+    );
+    env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -1043,6 +2196,40 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         temperature_ptr
     );
     env->ReleaseFloatArrayElements(out_temperature, temperature_ptr, ok ? 0 : JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeGetRegionFlowState(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint nx,
+    jint ny,
+    jint nz,
+    jfloatArray out_flow
+) {
+    if (!out_flow) {
+        return JNI_FALSE;
+    }
+    const int cells = nx * ny * nz;
+    if (cells <= 0 || env->GetArrayLength(out_flow) != static_cast<jsize>(cells * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS)) {
+        return JNI_FALSE;
+    }
+    jboolean copy = JNI_FALSE;
+    jfloat* flow_ptr = env->GetFloatArrayElements(out_flow, &copy);
+    if (!flow_ptr) {
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_get_region_flow_state(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        nx,
+        ny,
+        nz,
+        flow_ptr
+    );
+    env->ReleaseFloatArrayElements(out_flow, flow_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -1239,6 +2426,44 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         static_cast<int>(length)
     );
     env->ReleaseShortArrayElements(out_atlas_values, values_ptr, 0);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeSampleRegionPoint(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint nx,
+    jint ny,
+    jint nz,
+    jint sample_x,
+    jint sample_y,
+    jint sample_z,
+    jfloatArray out_probe_values
+) {
+    if (!out_probe_values) {
+        return JNI_FALSE;
+    }
+    const jsize length = env->GetArrayLength(out_probe_values);
+    jboolean copy = JNI_FALSE;
+    jfloat* values_ptr = env->GetFloatArrayElements(out_probe_values, &copy);
+    if (!values_ptr) {
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_sample_region_point(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        nx,
+        ny,
+        nz,
+        sample_x,
+        sample_y,
+        sample_z,
+        values_ptr,
+        static_cast<int>(length)
+    );
+    env->ReleaseFloatArrayElements(out_probe_values, values_ptr, 0);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

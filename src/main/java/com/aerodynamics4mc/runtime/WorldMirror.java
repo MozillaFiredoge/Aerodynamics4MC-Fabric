@@ -122,6 +122,8 @@ final class WorldMirror {
         private boolean storeLoadEligible = true;
         private boolean storeLoadInFlight;
         private boolean liveBuildQueued;
+        private boolean liveBuildHighPriority;
+        private boolean storeLoadHighPriority;
         private long generation;
     }
 
@@ -140,7 +142,8 @@ final class WorldMirror {
         thread.setDaemon(true);
         return thread;
     });
-    private final ArrayDeque<BuildRequest> pendingLiveBuilds = new ArrayDeque<>();
+    private final ArrayDeque<BuildRequest> pendingHighPriorityLiveBuilds = new ArrayDeque<>();
+    private final ArrayDeque<BuildRequest> pendingLowPriorityLiveBuilds = new ArrayDeque<>();
     private final Set<BuildRequest> queuedLiveBuilds = new HashSet<>();
 
     synchronized void close() {
@@ -220,20 +223,25 @@ final class WorldMirror {
         }
     }
 
-    synchronized void requestSectionBuild(MinecraftServer server, RegistryKey<World> worldKey, BlockPos sectionOrigin) {
+    synchronized void requestSectionBuild(
+        MinecraftServer server,
+        RegistryKey<World> worldKey,
+        BlockPos sectionOrigin,
+        boolean highPriority
+    ) {
         BlockPos alignedOrigin = alignSectionOrigin(sectionOrigin);
         DimensionMirror dimension = dimension(worldKey);
         SectionEntry entry = dimension.sections.computeIfAbsent(alignedOrigin.asLong(), ignored -> new SectionEntry());
-        requestSectionBuildLocked(server, worldKey, alignedOrigin, entry);
+        requestSectionBuildLocked(server, worldKey, alignedOrigin, entry, highPriority);
     }
 
-    void drainLiveBuilds(MinecraftServer server, int budget, SectionBuilder builder) {
-        for (int i = 0; i < budget; i++) {
+    void drainLiveBuilds(MinecraftServer server, int highPriorityBudget, int lowPriorityBudget, SectionBuilder builder) {
+        for (int i = 0; i < highPriorityBudget; i++) {
             BuildRequest request;
             synchronized (this) {
-                request = pendingLiveBuilds.pollFirst();
+                request = pendingHighPriorityLiveBuilds.pollFirst();
                 if (request == null) {
-                    return;
+                    break;
                 }
                 queuedLiveBuilds.remove(request);
                 DimensionMirror dimension = dimensions.get(request.worldKey());
@@ -241,6 +249,47 @@ final class WorldMirror {
                     SectionEntry entry = dimension.sections.get(request.sectionOrigin().asLong());
                     if (entry != null) {
                         entry.liveBuildQueued = false;
+                        entry.liveBuildHighPriority = false;
+                    }
+                }
+            }
+            ServerWorld world = server.getWorld(request.worldKey());
+            if (world == null) {
+                continue;
+            }
+            SectionSnapshot built = new SectionSnapshot();
+            builder.build(world, request.sectionOrigin(), built);
+            synchronized (this) {
+                DimensionMirror dimension = dimensions.get(request.worldKey());
+                if (dimension == null) {
+                    continue;
+                }
+                SectionEntry entry = dimension.sections.get(request.sectionOrigin().asLong());
+                if (entry == null || !entry.dirty) {
+                    continue;
+                }
+                built.setVersion(entry.snapshot.version() + 1L);
+                copySnapshot(built, entry.snapshot);
+                entry.dirty = false;
+                entry.storeLoadEligible = false;
+                entry.storeLoadInFlight = false;
+                staticStore.storeSection(server, request.worldKey(), request.sectionOrigin(), entry.snapshot);
+            }
+        }
+        for (int i = 0; i < lowPriorityBudget; i++) {
+            BuildRequest request;
+            synchronized (this) {
+                request = pendingLowPriorityLiveBuilds.pollFirst();
+                if (request == null) {
+                    break;
+                }
+                queuedLiveBuilds.remove(request);
+                DimensionMirror dimension = dimensions.get(request.worldKey());
+                if (dimension != null) {
+                    SectionEntry entry = dimension.sections.get(request.sectionOrigin().asLong());
+                    if (entry != null) {
+                        entry.liveBuildQueued = false;
+                        entry.liveBuildHighPriority = false;
                     }
                 }
             }
@@ -468,7 +517,6 @@ final class WorldMirror {
                         world,
                         world.getRegistryKey()
                     );
-                    requestSectionBuild(world.getServer(), world.getRegistryKey(), origin);
                 }
             }
         }
@@ -484,7 +532,6 @@ final class WorldMirror {
                 world,
                 world.getRegistryKey()
             );
-            requestSectionBuild(world.getServer(), world.getRegistryKey(), origin);
         }
     }
 
@@ -512,20 +559,25 @@ final class WorldMirror {
         MinecraftServer server,
         RegistryKey<World> worldKey,
         BlockPos alignedOrigin,
-        SectionEntry entry
+        SectionEntry entry,
+        boolean highPriority
     ) {
         if (!entry.dirty) {
             return;
         }
         if (entry.storeLoadEligible) {
+            if (highPriority) {
+                entry.storeLoadHighPriority = true;
+            }
             if (!entry.storeLoadInFlight) {
                 entry.storeLoadInFlight = true;
+                entry.storeLoadHighPriority = highPriority;
                 long generation = entry.generation;
                 loadExecutor.execute(() -> loadSectionFromStore(server, worldKey, alignedOrigin, generation));
             }
             return;
         }
-        queueLiveBuildLocked(worldKey, alignedOrigin, entry);
+        queueLiveBuildLocked(worldKey, alignedOrigin, entry, highPriority);
     }
 
     private void loadSectionFromStore(
@@ -550,28 +602,45 @@ final class WorldMirror {
                 return;
             }
             if (entry.generation != generation) {
-                requestSectionBuildLocked(server, worldKey, alignedOrigin, entry);
+                requestSectionBuildLocked(server, worldKey, alignedOrigin, entry, entry.storeLoadHighPriority);
                 return;
             }
             if (loaded) {
                 copySnapshot(loadedSnapshot, entry.snapshot);
                 entry.dirty = false;
                 entry.storeLoadEligible = false;
+                entry.storeLoadHighPriority = false;
                 return;
             }
             entry.storeLoadEligible = false;
-            queueLiveBuildLocked(worldKey, alignedOrigin, entry);
+            queueLiveBuildLocked(worldKey, alignedOrigin, entry, entry.storeLoadHighPriority);
+            entry.storeLoadHighPriority = false;
         }
     }
 
-    private void queueLiveBuildLocked(RegistryKey<World> worldKey, BlockPos alignedOrigin, SectionEntry entry) {
+    private void queueLiveBuildLocked(
+        RegistryKey<World> worldKey,
+        BlockPos alignedOrigin,
+        SectionEntry entry,
+        boolean highPriority
+    ) {
+        BuildRequest request = new BuildRequest(worldKey, alignedOrigin);
         if (entry.liveBuildQueued) {
+            if (highPriority && !entry.liveBuildHighPriority) {
+                pendingLowPriorityLiveBuilds.remove(request);
+                pendingHighPriorityLiveBuilds.addLast(request);
+                entry.liveBuildHighPriority = true;
+            }
             return;
         }
-        BuildRequest request = new BuildRequest(worldKey, alignedOrigin);
         if (queuedLiveBuilds.add(request)) {
             entry.liveBuildQueued = true;
-            pendingLiveBuilds.addLast(request);
+            entry.liveBuildHighPriority = highPriority;
+            if (highPriority) {
+                pendingHighPriorityLiveBuilds.addLast(request);
+            } else {
+                pendingLowPriorityLiveBuilds.addLast(request);
+            }
         }
     }
 

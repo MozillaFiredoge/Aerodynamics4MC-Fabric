@@ -37,7 +37,14 @@ final class BackgroundMetGrid {
         this.radiusCells = radiusCells;
     }
 
-    void refresh(ServerWorld world, BlockPos focus, long tickCounter, float dtSeconds, SeedTerrainProvider provider) {
+    synchronized void refresh(
+        ServerWorld world,
+        AeroServerRuntime.WorldEnvironmentSnapshot environmentSnapshot,
+        BlockPos focus,
+        long tickCounter,
+        float dtSeconds,
+        SeedTerrainProvider provider
+    ) {
         currentWorld = world;
         currentProvider = provider;
         centerCellX = Math.floorDiv(focus.getX(), cellSizeBlocks);
@@ -46,11 +53,12 @@ final class BackgroundMetGrid {
         lastRefreshTick = tickCounter;
         currentRefreshTick = tickCounter;
 
-        float dayPhase = (float) Math.floorMod(world.getTimeOfDay(), 24000L) / 24000.0f;
+        long timeOfDay = environmentSnapshot == null ? world.getTimeOfDay() : environmentSnapshot.timeOfDay();
+        float rainGradient = environmentSnapshot == null ? world.getRainGradient(1.0f) : environmentSnapshot.rainGradient();
+        float thunderGradient = environmentSnapshot == null ? world.getThunderGradient(1.0f) : environmentSnapshot.thunderGradient();
+        float dayPhase = (float) Math.floorMod(timeOfDay, 24000L) / 24000.0f;
         currentSolarAltitude = Math.max(0.0f, (float) Math.sin(dayPhase * (float) (Math.PI * 2.0)));
-        float rain = world.getRainGradient(1.0f);
-        float thunder = world.getThunderGradient(1.0f);
-        currentClearSky = MathHelper.clamp(1.0f - 0.65f * rain - 0.25f * thunder, 0.15f, 1.0f);
+        currentClearSky = MathHelper.clamp(1.0f - 0.65f * rainGradient - 0.25f * thunderGradient, 0.15f, 1.0f);
 
         Iterator<Map.Entry<Long, CellState>> it = cells.entrySet().iterator();
         while (it.hasNext()) {
@@ -63,7 +71,7 @@ final class BackgroundMetGrid {
         }
     }
 
-    Sample sample(BlockPos pos) {
+    synchronized Sample sample(BlockPos pos) {
         if (currentWorld == null || currentProvider == null) {
             return null;
         }
@@ -83,7 +91,7 @@ final class BackgroundMetGrid {
         );
     }
 
-    int cellCount() {
+    synchronized int cellCount() {
         return cells.size();
     }
 

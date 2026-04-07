@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 public final class NativeSimulationBridge {
     public static final int FLOW_STATE_CHANNELS = 4;
     public static final int PACKED_ATLAS_CHANNELS = 4;
+    public static final int PLAYER_PROBE_CHANNELS = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
     public static final int WORLD_DELTA_CHUNK_UNLOADED = 3;
@@ -102,7 +103,9 @@ public final class NativeSimulationBridge {
         byte[] obstacle,
         byte[] surfaceKind,
         short[] openFaceMask,
-        float[] emitterPowerWatts
+        float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
     ) {
         if (!LOADED || serviceKey == 0L || regionKey == 0L) {
             return false;
@@ -113,10 +116,14 @@ public final class NativeSimulationBridge {
             || surfaceKind == null
             || openFaceMask == null
             || emitterPowerWatts == null
+            || faceSkyExposure == null
+            || faceDirectExposure == null
             || obstacle.length != cells
             || surfaceKind.length != cells
             || openFaceMask.length != cells
-            || emitterPowerWatts.length != cells) {
+            || emitterPowerWatts.length != cells
+            || faceSkyExposure.length != cells * 6
+            || faceDirectExposure.length != cells * 6) {
             return false;
         }
         return nativeUploadStaticRegion(
@@ -128,7 +135,68 @@ public final class NativeSimulationBridge {
             obstacle,
             surfaceKind,
             openFaceMask,
-            emitterPowerWatts
+            emitterPowerWatts,
+            faceSkyExposure,
+            faceDirectExposure
+        );
+    }
+
+    public boolean uploadStaticRegionPatch(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        int offsetX,
+        int offsetY,
+        int offsetZ,
+        int patchNx,
+        int patchNy,
+        int patchNz,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return false;
+        }
+        int cells = checkedCellCount(patchNx, patchNy, patchNz);
+        if (cells <= 0
+            || obstacle == null
+            || surfaceKind == null
+            || openFaceMask == null
+            || emitterPowerWatts == null
+            || faceSkyExposure == null
+            || faceDirectExposure == null
+            || obstacle.length != cells
+            || surfaceKind.length != cells
+            || openFaceMask.length != cells
+            || emitterPowerWatts.length != cells
+            || faceSkyExposure.length != cells * 6
+            || faceDirectExposure.length != cells * 6) {
+            return false;
+        }
+        return nativeUploadStaticRegionPatch(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            offsetX,
+            offsetY,
+            offsetZ,
+            patchNx,
+            patchNy,
+            patchNz,
+            obstacle,
+            surfaceKind,
+            openFaceMask,
+            emitterPowerWatts,
+            faceSkyExposure,
+            faceDirectExposure
         );
     }
 
@@ -171,6 +239,89 @@ public final class NativeSimulationBridge {
             && nativeHasRegionContext(serviceKey, regionKey);
     }
 
+    public boolean uploadRegionForcing(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] thermalSource,
+        byte[] fanMask,
+        float[] fanVx,
+        float[] fanVy,
+        float[] fanVz
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        if (cells <= 0
+            || fanMask == null
+            || fanVx == null
+            || fanVy == null
+            || fanVz == null
+            || (thermalSource != null && thermalSource.length != cells)
+            || fanMask.length != cells
+            || fanVx.length != cells
+            || fanVy.length != cells
+            || fanVz.length != cells) {
+            return false;
+        }
+        return nativeUploadRegionForcing(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            thermalSource,
+            fanMask,
+            fanVx,
+            fanVy,
+            fanVz
+        );
+    }
+
+    public boolean refreshRegionThermal(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float directSolarFluxWm2,
+        float diffuseSolarFluxWm2,
+        float ambientAirTemperatureKelvin,
+        float deepGroundTemperatureKelvin,
+        float skyTemperatureKelvin,
+        float precipitationTemperatureKelvin,
+        float precipitationStrength,
+        float sunX,
+        float sunY,
+        float sunZ,
+        float surfaceDeltaSeconds
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return false;
+        }
+        return nativeRefreshRegionThermal(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            directSolarFluxWm2,
+            diffuseSolarFluxWm2,
+            ambientAirTemperatureKelvin,
+            deepGroundTemperatureKelvin,
+            skyTemperatureKelvin,
+            precipitationTemperatureKelvin,
+            precipitationStrength,
+            sunX,
+            sunY,
+            sunZ,
+            surfaceDeltaSeconds
+        );
+    }
+
     public float[] stepRegion(
         long serviceKey,
         long regionKey,
@@ -188,6 +339,33 @@ public final class NativeSimulationBridge {
         }
         float[] output = new float[cells * FLOW_STATE_CHANNELS];
         return nativeStepRegion(serviceKey, regionKey, payload, nx, ny, nz, output) ? output : null;
+    }
+
+    public float stepRegionStored(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float boundaryWindX,
+        float boundaryWindY,
+        float boundaryWindZ
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return Float.NaN;
+        }
+        float[] outMaxSpeed = new float[1];
+        return nativeStepRegionStored(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            boundaryWindX,
+            boundaryWindY,
+            boundaryWindZ,
+            outMaxSpeed
+        ) ? outMaxSpeed[0] : Float.NaN;
     }
 
     public boolean exchangeRegionHalo(
@@ -218,6 +396,23 @@ public final class NativeSimulationBridge {
         return cells > 0
             && outTemperature.length == cells
             && nativeGetRegionTemperatureState(serviceKey, regionKey, nx, ny, nz, outTemperature);
+    }
+
+    public boolean getRegionFlowState(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] outFlowState
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || outFlowState == null) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        return cells > 0
+            && outFlowState.length == cells * FLOW_STATE_CHANNELS
+            && nativeGetRegionFlowState(serviceKey, regionKey, nx, ny, nz, outFlowState);
     }
 
     public boolean setRegionTemperatureState(
@@ -326,6 +521,36 @@ public final class NativeSimulationBridge {
         return nativePollPackedFlowAtlas(serviceKey, atlasKey, outPackedValues);
     }
 
+    public boolean sampleRegionPoint(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        int sampleX,
+        int sampleY,
+        int sampleZ,
+        float[] outProbeValues
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || outProbeValues == null) {
+            return false;
+        }
+        if (checkedCellCount(nx, ny, nz) <= 0 || outProbeValues.length != PLAYER_PROBE_CHANNELS) {
+            return false;
+        }
+        return nativeSampleRegionPoint(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            sampleX,
+            sampleY,
+            sampleZ,
+            outProbeValues
+        );
+    }
+
     public String runtimeInfo() {
         if (!LOADED) {
             return "not_loaded";
@@ -381,7 +606,29 @@ public final class NativeSimulationBridge {
         byte[] obstacle,
         byte[] surfaceKind,
         short[] openFaceMask,
-        float[] emitterPowerWatts
+        float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    );
+
+    private static native boolean nativeUploadStaticRegionPatch(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        int offsetX,
+        int offsetY,
+        int offsetZ,
+        int patchNx,
+        int patchNy,
+        int patchNz,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
     );
 
     private static native boolean nativeActivateRegion(long serviceKey, long regionKey, int nx, int ny, int nz);
@@ -403,6 +650,38 @@ public final class NativeSimulationBridge {
 
     private static native boolean nativeHasRegionContext(long serviceKey, long regionKey);
 
+    private static native boolean nativeUploadRegionForcing(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] thermalSource,
+        byte[] fanMask,
+        float[] fanVx,
+        float[] fanVy,
+        float[] fanVz
+    );
+
+    private static native boolean nativeRefreshRegionThermal(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float directSolarFluxWm2,
+        float diffuseSolarFluxWm2,
+        float ambientAirTemperatureKelvin,
+        float deepGroundTemperatureKelvin,
+        float skyTemperatureKelvin,
+        float precipitationTemperatureKelvin,
+        float precipitationStrength,
+        float sunX,
+        float sunY,
+        float sunZ,
+        float surfaceDeltaSeconds
+    );
+
     private static native boolean nativeStepRegion(
         long serviceKey,
         long regionKey,
@@ -411,6 +690,18 @@ public final class NativeSimulationBridge {
         int ny,
         int nz,
         float[] outputFlow
+    );
+
+    private static native boolean nativeStepRegionStored(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float boundaryWindX,
+        float boundaryWindY,
+        float boundaryWindZ,
+        float[] outMaxSpeed
     );
 
     private static native boolean nativeExchangeRegionHalo(
@@ -430,6 +721,15 @@ public final class NativeSimulationBridge {
         int ny,
         int nz,
         float[] outTemperature
+    );
+
+    private static native boolean nativeGetRegionFlowState(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float[] outFlowState
     );
 
     private static native boolean nativeSetRegionTemperatureState(
@@ -468,6 +768,18 @@ public final class NativeSimulationBridge {
     private static native boolean nativeSetPackedFlowAtlas(long serviceKey, long atlasKey, short[] packedValues);
 
     private static native boolean nativePollPackedFlowAtlas(long serviceKey, long atlasKey, short[] outPackedValues);
+
+    private static native boolean nativeSampleRegionPoint(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        int sampleX,
+        int sampleY,
+        int sampleZ,
+        float[] outProbeValues
+    );
 
     private static native String nativeRuntimeInfo();
 
