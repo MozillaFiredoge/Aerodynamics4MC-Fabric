@@ -187,6 +187,7 @@ public final class AeroServerRuntime {
     private final Map<RegistryKey<World>, BackgroundMetGrid> backgroundMetGrids = new HashMap<>();
     private final Map<RegistryKey<World>, MesoscaleGrid> mesoscaleMetGrids = new HashMap<>();
     private final Object simulationStateLock = new Object();
+    private final Object coordinatorLifecycleLock = new Object();
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT, runnable -> {
         Thread thread = new Thread(runnable, "aero-server-solver");
         thread.setDaemon(true);
@@ -2410,7 +2411,7 @@ public final class AeroServerRuntime {
     }
 
     private void ensureSimulationCoordinatorRunning() {
-        synchronized (simulationStateLock) {
+        synchronized (coordinatorLifecycleLock) {
             if (simulationCoordinator != null && simulationCoordinator.running()) {
                 return;
             }
@@ -2421,7 +2422,7 @@ public final class AeroServerRuntime {
 
     private void stopSimulationCoordinator() {
         SimulationCoordinator coordinator;
-        synchronized (simulationStateLock) {
+        synchronized (coordinatorLifecycleLock) {
             coordinator = simulationCoordinator;
             simulationCoordinator = null;
         }
