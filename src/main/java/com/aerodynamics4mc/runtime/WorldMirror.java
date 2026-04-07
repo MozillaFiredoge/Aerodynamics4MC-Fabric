@@ -520,19 +520,6 @@ final class WorldMirror {
                 }
             }
         }
-        for (int sectionY = world.getBottomSectionCoord(); sectionY < world.getTopSectionCoord(); sectionY++) {
-            BlockPos origin = new BlockPos(baseX, sectionY * SECTION_SIZE, baseZ);
-            markSectionDirty(
-                dimension,
-                origin.getX(),
-                origin.getY(),
-                origin.getZ(),
-                false,
-                true,
-                world,
-                world.getRegistryKey()
-            );
-        }
     }
 
     private void markSectionDirty(
