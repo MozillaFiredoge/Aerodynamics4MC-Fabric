@@ -147,6 +147,7 @@ public final class AeroServerRuntime {
     private static final int STATIC_MIRROR_HIGH_PRIORITY_BUILD_BUDGET_PER_TICK = 1;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_INTERVAL_TICKS = TICKS_PER_SECOND;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_BUDGET = 1;
+    private static final boolean ENTITY_SAMPLE_COLLECTION_ENABLED = false;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
     private static final float WINDOW_EDGE_STABILIZATION_MIN_KEEP = 0.15f;
     private static final int REGION_HALO_CELLS = CHUNK_SIZE;
@@ -773,7 +774,9 @@ public final class AeroServerRuntime {
             }
         }
         Set<WindowKey> activeKeys = activeRegionKeys(anchors);
-        List<EntitySampleRequest> entityRequests = collectEntitySampleRequests(server, activeKeys);
+        List<EntitySampleRequest> entityRequests = ENTITY_SAMPLE_COLLECTION_ENABLED
+            ? collectEntitySampleRequests(server, activeKeys)
+            : List.of();
         return new ActiveRegionBatch(
             tickCounter,
             List.copyOf(anchors),
@@ -1580,7 +1583,7 @@ public final class AeroServerRuntime {
         }
         ServerWorld world = resolveWorld(key.worldKey());
         if (world != null) {
-            dynamicStore.storeRegion(
+            dynamicStore.storeCapturedRegion(
                 world,
                 key.worldKey(),
                 key.origin(),
@@ -2512,7 +2515,7 @@ public final class AeroServerRuntime {
     }
 
     private Map<UUID, EntitySample> sampleEntitySamplesLocked() {
-        if (simulationServiceId == 0L || activeEntitySampleRequests.isEmpty()) {
+        if (!ENTITY_SAMPLE_COLLECTION_ENABLED || simulationServiceId == 0L || activeEntitySampleRequests.isEmpty()) {
             return Map.of();
         }
         Map<UUID, EntitySample> samples = new HashMap<>();
