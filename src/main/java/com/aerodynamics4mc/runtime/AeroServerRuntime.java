@@ -285,7 +285,7 @@ public final class AeroServerRuntime {
     }
 
     private void onChunkLoad(ServerWorld world, WorldChunk chunk) {
-        runMainThreadCallbackProfiled(CALLBACK_PHASE_CHUNK_LOAD, () -> {
+        runMainThreadCallbackProfiledUnlocked(CALLBACK_PHASE_CHUNK_LOAD, () -> {
             worldMirror.onChunkLoad(world, chunk);
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
                 NativeSimulationBridge.WORLD_DELTA_CHUNK_LOADED,
@@ -305,7 +305,7 @@ public final class AeroServerRuntime {
     }
 
     private void onChunkUnload(ServerWorld world, WorldChunk chunk) {
-        runMainThreadCallbackProfiled(CALLBACK_PHASE_CHUNK_UNLOAD, () -> {
+        runMainThreadCallbackProfiledUnlocked(CALLBACK_PHASE_CHUNK_UNLOAD, () -> {
             worldMirror.onChunkUnload(world, chunk.getPos());
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
                 NativeSimulationBridge.WORLD_DELTA_CHUNK_UNLOADED,
@@ -325,7 +325,7 @@ public final class AeroServerRuntime {
     }
 
     private void onBlockEntityLoad(BlockEntity blockEntity, ServerWorld world) {
-        runMainThreadCallbackProfiled(CALLBACK_PHASE_BLOCK_ENTITY_LOAD, () -> {
+        runMainThreadCallbackProfiledUnlocked(CALLBACK_PHASE_BLOCK_ENTITY_LOAD, () -> {
             worldMirror.onBlockEntityLoad(blockEntity, world);
             BlockPos pos = blockEntity.getPos();
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
@@ -346,7 +346,7 @@ public final class AeroServerRuntime {
     }
 
     private void onBlockEntityUnload(BlockEntity blockEntity, ServerWorld world) {
-        runMainThreadCallbackProfiled(CALLBACK_PHASE_BLOCK_ENTITY_UNLOAD, () -> {
+        runMainThreadCallbackProfiledUnlocked(CALLBACK_PHASE_BLOCK_ENTITY_UNLOAD, () -> {
             worldMirror.onBlockEntityUnload(blockEntity, world);
             BlockPos pos = blockEntity.getPos();
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
@@ -392,7 +392,7 @@ public final class AeroServerRuntime {
     }
 
     private void onBlockChanged(ServerWorld world, BlockPos pos, BlockState oldState, BlockState newState) {
-        runMainThreadCallbackProfiled(CALLBACK_PHASE_BLOCK_CHANGED, () -> {
+        runMainThreadCallbackProfiledUnlocked(CALLBACK_PHASE_BLOCK_CHANGED, () -> {
             worldMirror.onBlockChanged(world, pos, oldState, newState);
             invalidateDynamicRegionsForBlock(world, pos);
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
@@ -639,6 +639,16 @@ public final class AeroServerRuntime {
                 long endNanos = System.nanoTime();
                 recordCallbackPhase(phaseIndex, endNanos - startNanos, acquiredNanos - startNanos, endNanos - acquiredNanos);
             }
+        }
+    }
+
+    private void runMainThreadCallbackProfiledUnlocked(int phaseIndex, Runnable runnable) {
+        long startNanos = System.nanoTime();
+        try {
+            runnable.run();
+        } finally {
+            long endNanos = System.nanoTime();
+            recordCallbackPhase(phaseIndex, endNanos - startNanos, 0L, endNanos - startNanos);
         }
     }
 
