@@ -550,22 +550,91 @@ final class WorldMirror {
         int baseX = aligned.getX();
         int baseY = aligned.getY();
         int baseZ = aligned.getZ();
-        for (int dx = -SECTION_SIZE; dx <= SECTION_SIZE; dx += SECTION_SIZE) {
-            for (int dy = -SECTION_SIZE; dy <= SECTION_SIZE; dy += SECTION_SIZE) {
-                for (int dz = -SECTION_SIZE; dz <= SECTION_SIZE; dz += SECTION_SIZE) {
-                    BlockPos origin = new BlockPos(baseX + dx, baseY + dy, baseZ + dz);
-                    markSectionDirty(
-                        dimension,
-                        origin.getX(),
-                        origin.getY(),
-                        origin.getZ(),
-                        false,
-                        true,
-                        world,
-                        world.getRegistryKey()
-                    );
-                }
-            }
+        markSectionDirty(
+            dimension,
+            baseX,
+            baseY,
+            baseZ,
+            false,
+            true,
+            world,
+            world.getRegistryKey()
+        );
+
+        int localX = Math.floorMod(pos.getX(), SECTION_SIZE);
+        int localY = Math.floorMod(pos.getY(), SECTION_SIZE);
+        int localZ = Math.floorMod(pos.getZ(), SECTION_SIZE);
+
+        if (localX == 0) {
+            markSectionDirty(
+                dimension,
+                baseX - SECTION_SIZE,
+                baseY,
+                baseZ,
+                false,
+                true,
+                world,
+                world.getRegistryKey()
+            );
+        } else if (localX == SECTION_SIZE - 1) {
+            markSectionDirty(
+                dimension,
+                baseX + SECTION_SIZE,
+                baseY,
+                baseZ,
+                false,
+                true,
+                world,
+                world.getRegistryKey()
+            );
+        }
+
+        if (localY == 0) {
+            markSectionDirty(
+                dimension,
+                baseX,
+                baseY - SECTION_SIZE,
+                baseZ,
+                false,
+                true,
+                world,
+                world.getRegistryKey()
+            );
+        } else if (localY == SECTION_SIZE - 1) {
+            markSectionDirty(
+                dimension,
+                baseX,
+                baseY + SECTION_SIZE,
+                baseZ,
+                false,
+                true,
+                world,
+                world.getRegistryKey()
+            );
+        }
+
+        if (localZ == 0) {
+            markSectionDirty(
+                dimension,
+                baseX,
+                baseY,
+                baseZ - SECTION_SIZE,
+                false,
+                true,
+                world,
+                world.getRegistryKey()
+            );
+        } else if (localZ == SECTION_SIZE - 1) {
+            markSectionDirty(
+                dimension,
+                baseX,
+                baseY,
+                baseZ + SECTION_SIZE,
+                false,
+                true,
+                world,
+                world.getRegistryKey()
+            );
         }
     }
 

@@ -1,6 +1,7 @@
 package com.aerodynamics4mc.runtime;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -148,6 +149,7 @@ public final class AeroServerRuntime {
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_INTERVAL_TICKS = TICKS_PER_SECOND;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_BUDGET = 1;
     private static final int FAN_DUCT_REFRESH_BUDGET_PER_TICK = 1;
+    private static final int WORLD_DELTA_FLUSH_BATCH_SIZE = 256;
     private static final boolean ENTITY_SAMPLE_COLLECTION_ENABLED = false;
     private static final int MAIN_THREAD_PHASE_SERVICE_INIT = 0;
     private static final int MAIN_THREAD_PHASE_FOCUS = 1;
@@ -205,6 +207,8 @@ public final class AeroServerRuntime {
     private final Map<RegistryKey<World>, MesoscaleGrid> mesoscaleMetGrids = new HashMap<>();
     private final Object simulationStateLock = new Object();
     private final Object coordinatorLifecycleLock = new Object();
+    private final Object pendingWorldDeltasLock = new Object();
+    private final ArrayDeque<NativeSimulationBridge.WorldDelta> pendingWorldDeltas = new ArrayDeque<>();
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT, runnable -> {
         Thread thread = new Thread(runnable, "aero-server-solver");
         thread.setDaemon(true);
@@ -727,6 +731,9 @@ public final class AeroServerRuntime {
         publishedFrame.set(null);
         publishedPlayerProbes.set(Map.of());
         publishedEntitySamples.set(Map.of());
+        synchronized (pendingWorldDeltasLock) {
+            pendingWorldDeltas.clear();
+        }
         waitForSolverIdle();
         releaseSimulationService();
     }
@@ -851,7 +858,30 @@ public final class AeroServerRuntime {
         if (simulationServiceId == 0L || delta == null) {
             return;
         }
-        simulationBridge.submitWorldDelta(simulationServiceId, delta);
+        synchronized (pendingWorldDeltasLock) {
+            pendingWorldDeltas.addLast(delta);
+        }
+    }
+
+    private void flushPendingWorldDeltas() {
+        long serviceId = simulationServiceId;
+        if (serviceId == 0L) {
+            return;
+        }
+        while (true) {
+            NativeSimulationBridge.WorldDelta[] batch;
+            synchronized (pendingWorldDeltasLock) {
+                if (pendingWorldDeltas.isEmpty()) {
+                    return;
+                }
+                int batchSize = Math.min(WORLD_DELTA_FLUSH_BATCH_SIZE, pendingWorldDeltas.size());
+                batch = new NativeSimulationBridge.WorldDelta[batchSize];
+                for (int i = 0; i < batchSize; i++) {
+                    batch[i] = pendingWorldDeltas.removeFirst();
+                }
+            }
+            simulationBridge.submitWorldDeltas(serviceId, batch);
+        }
     }
 
     private BackgroundMetGrid.Sample sampleBackgroundMet(RegistryKey<World> worldKey, BlockPos pos) {
@@ -3053,6 +3083,8 @@ public final class AeroServerRuntime {
                     sleepQuietly(20L);
                     continue;
                 }
+
+                flushPendingWorldDeltas();
 
                 int observedTick = tickCounter;
                 if (observedTick != lastSynchronizedTick) {
