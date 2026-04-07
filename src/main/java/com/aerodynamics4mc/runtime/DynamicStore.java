@@ -97,6 +97,24 @@ final class DynamicStore implements AutoCloseable {
         ioExecutor.execute(() -> writeRegion(world.getServer(), worldKey, stored));
     }
 
+    void storeCapturedRegionSync(
+        ServerWorld world,
+        RegistryKey<World> worldKey,
+        BlockPos regionOrigin,
+        int sizeX,
+        int sizeY,
+        int sizeZ,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState
+    ) {
+        if (closed.get()) {
+            return;
+        }
+        StoredRegion stored = StoredRegion.captureOwned(regionOrigin, sizeX, sizeY, sizeZ, flowState, airTemperatureState, surfaceTemperatureState);
+        writeRegion(world.getServer(), worldKey, stored);
+    }
+
     void invalidateRegion(ServerWorld world, RegistryKey<World> worldKey, BlockPos regionOrigin) {
         if (closed.get()) {
             return;

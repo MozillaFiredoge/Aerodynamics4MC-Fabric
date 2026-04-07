@@ -198,7 +198,7 @@ public final class AeroServerRuntime {
     private float simulationTicksPerSecond = 0.0f;
     private float lastMaxFlowSpeed = 0.0f;
     private volatile String lastSolverError = "";
-    private long simulationServiceId = 0L;
+    private volatile long simulationServiceId = 0L;
     private volatile MinecraftServer currentServer;
     private int lastSimulationFocusX = Integer.MIN_VALUE;
     private int lastSimulationFocusY = Integer.MIN_VALUE;
@@ -458,7 +458,7 @@ public final class AeroServerRuntime {
                 }))
             .then(CommandManager.literal("stop")
                 .executes(ctx -> {
-                    stopStreaming(ctx.getSource().getServer());
+                    stopStreaming(ctx.getSource().getServer(), false);
                     feedback(ctx.getSource(), "Streaming disabled");
                     broadcastState(ctx.getSource().getServer());
                     return 1;
@@ -475,10 +475,8 @@ public final class AeroServerRuntime {
             return;
         }
         tickCounter++;
-        synchronized (simulationStateLock) {
-            ensureSimulationServiceInitialized();
-            updateSimulationFocus(server);
-        }
+        ensureSimulationServiceInitialized();
+        updateSimulationFocus(server);
         if (tickCounter == 1 || tickCounter % BACKGROUND_MET_REFRESH_TICKS == 0) {
             pendingBackgroundRefreshBatch = captureBackgroundRefreshBatch(server);
         }
@@ -517,7 +515,7 @@ public final class AeroServerRuntime {
         updateSimulationRate(publishedSteps);
     }
 
-    private void stopStreaming(MinecraftServer server) {
+    private void stopStreaming(MinecraftServer server, boolean persistDynamicRegions) {
         runtimeGeneration.incrementAndGet();
         streamingEnabled = false;
         stopSimulationCoordinator();
@@ -537,7 +535,7 @@ public final class AeroServerRuntime {
                 RegionRecord region = entry.getValue();
                 if (region.attached()) {
                     detachRegionWindow(entry.getKey(), region);
-                    deactivateWindow(entry.getKey(), region);
+                    deactivateWindow(entry.getKey(), region, persistDynamicRegions, persistDynamicRegions);
                 } else {
                     deactivateWindowRegionInSimulation(entry.getKey());
                 }
@@ -740,7 +738,7 @@ public final class AeroServerRuntime {
     }
 
     private void shutdownAll(MinecraftServer server) {
-        stopStreaming(server);
+        stopStreaming(server, true);
         synchronized (simulationStateLock) {
             worldMirror.close();
         }
@@ -864,7 +862,7 @@ public final class AeroServerRuntime {
             }
             RegionRecord region = entry.getValue();
             if (region.attached()) {
-                deactivateWindow(entry.getKey(), region);
+                deactivateWindow(entry.getKey(), region, true, false);
             } else {
                 deactivateWindowRegionInSimulation(entry.getKey());
             }
@@ -1195,9 +1193,11 @@ public final class AeroServerRuntime {
         return uploaded;
     }
 
-    private void deactivateWindow(WindowKey key, RegionRecord region) {
+    private void deactivateWindow(WindowKey key, RegionRecord region, boolean persistDynamicRegion, boolean synchronousPersist) {
         region.markDetached();
-        persistWindowDynamicRegion(key, region);
+        if (persistDynamicRegion) {
+            persistWindowDynamicRegion(key, region, synchronousPersist);
+        }
         deactivateWindowRegionInSimulation(key);
         if (!region.busy.get()) {
             releaseWindow(key, region);
@@ -1561,7 +1561,7 @@ public final class AeroServerRuntime {
         region.detach();
     }
 
-    private void persistWindowDynamicRegion(WindowKey key, RegionRecord region) {
+    private void persistWindowDynamicRegion(WindowKey key, RegionRecord region, boolean synchronousPersist) {
         if (simulationServiceId == 0L) {
             return;
         }
@@ -1583,17 +1583,31 @@ public final class AeroServerRuntime {
         }
         ServerWorld world = resolveWorld(key.worldKey());
         if (world != null) {
-            dynamicStore.storeCapturedRegion(
-                world,
-                key.worldKey(),
-                key.origin(),
-                GRID_SIZE,
-                GRID_SIZE,
-                GRID_SIZE,
-                flowState,
-                airTemperatureState,
-                surfaceTemperatureState
-            );
+            if (synchronousPersist) {
+                dynamicStore.storeCapturedRegionSync(
+                    world,
+                    key.worldKey(),
+                    key.origin(),
+                    GRID_SIZE,
+                    GRID_SIZE,
+                    GRID_SIZE,
+                    flowState,
+                    airTemperatureState,
+                    surfaceTemperatureState
+                );
+            } else {
+                dynamicStore.storeCapturedRegion(
+                    world,
+                    key.worldKey(),
+                    key.origin(),
+                    GRID_SIZE,
+                    GRID_SIZE,
+                    GRID_SIZE,
+                    flowState,
+                    airTemperatureState,
+                    surfaceTemperatureState
+                );
+            }
         }
     }
 
