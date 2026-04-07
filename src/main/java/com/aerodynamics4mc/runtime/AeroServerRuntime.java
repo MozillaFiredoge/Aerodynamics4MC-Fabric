@@ -147,21 +147,24 @@ public final class AeroServerRuntime {
     private static final int STATIC_MIRROR_HIGH_PRIORITY_BUILD_BUDGET_PER_TICK = 1;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_INTERVAL_TICKS = TICKS_PER_SECOND;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_BUDGET = 1;
+    private static final int FAN_DUCT_REFRESH_BUDGET_PER_TICK = 1;
     private static final boolean ENTITY_SAMPLE_COLLECTION_ENABLED = false;
     private static final int MAIN_THREAD_PHASE_SERVICE_INIT = 0;
     private static final int MAIN_THREAD_PHASE_FOCUS = 1;
     private static final int MAIN_THREAD_PHASE_BACKGROUND_BATCH = 2;
     private static final int MAIN_THREAD_PHASE_ACTIVE_BATCH = 3;
     private static final int MAIN_THREAD_PHASE_LIVE_BUILDS = 4;
-    private static final int MAIN_THREAD_PHASE_COORDINATOR = 5;
-    private static final int MAIN_THREAD_PHASE_FLOW_SYNC = 6;
-    private static final int MAIN_THREAD_PHASE_TOTAL = 7;
+    private static final int MAIN_THREAD_PHASE_FAN_REFRESHES = 5;
+    private static final int MAIN_THREAD_PHASE_COORDINATOR = 6;
+    private static final int MAIN_THREAD_PHASE_FLOW_SYNC = 7;
+    private static final int MAIN_THREAD_PHASE_TOTAL = 8;
     private static final String[] MAIN_THREAD_PHASE_NAMES = {
         "serviceInit",
         "focus",
         "bgBatch",
         "activeBatch",
         "liveBuilds",
+        "fanRefreshes",
         "coordinator",
         "flowSync",
         "total"
@@ -557,6 +560,9 @@ public final class AeroServerRuntime {
             this::populateMirrorSectionSnapshot
         );
         recordMainThreadPhase(MAIN_THREAD_PHASE_LIVE_BUILDS, System.nanoTime() - phaseStartNanos);
+        phaseStartNanos = System.nanoTime();
+        worldMirror.drainFanRefreshes(server, FAN_DUCT_REFRESH_BUDGET_PER_TICK);
+        recordMainThreadPhase(MAIN_THREAD_PHASE_FAN_REFRESHES, System.nanoTime() - phaseStartNanos);
         phaseStartNanos = System.nanoTime();
         ensureSimulationCoordinatorRunning();
         recordMainThreadPhase(MAIN_THREAD_PHASE_COORDINATOR, System.nanoTime() - phaseStartNanos);

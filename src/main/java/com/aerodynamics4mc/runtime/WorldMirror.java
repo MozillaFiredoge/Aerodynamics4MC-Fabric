@@ -130,6 +130,9 @@ final class WorldMirror {
     private record BuildRequest(RegistryKey<World> worldKey, BlockPos sectionOrigin) {
     }
 
+    private record FanRefreshRequest(RegistryKey<World> worldKey, BlockPos fanPos) {
+    }
+
     private static final class DimensionMirror {
         private final Map<Long, SectionEntry> sections = new HashMap<>();
         private final Map<Long, FanRecord> fans = new HashMap<>();
@@ -145,6 +148,8 @@ final class WorldMirror {
     private final ArrayDeque<BuildRequest> pendingHighPriorityLiveBuilds = new ArrayDeque<>();
     private final ArrayDeque<BuildRequest> pendingLowPriorityLiveBuilds = new ArrayDeque<>();
     private final Set<BuildRequest> queuedLiveBuilds = new HashSet<>();
+    private final ArrayDeque<FanRefreshRequest> pendingFanRefreshes = new ArrayDeque<>();
+    private final Set<FanRefreshRequest> queuedFanRefreshes = new HashSet<>();
 
     synchronized void close() {
         loadExecutor.shutdown();
@@ -219,7 +224,7 @@ final class WorldMirror {
                 removeFan(world, pos);
             }
         } else if (isDuctState(oldState) || isDuctState(newState)) {
-            refreshNearbyFanDuctLengths(world, dimension, pos);
+            queueNearbyFanDuctRefreshes(world.getRegistryKey(), dimension, pos);
         }
     }
 
@@ -318,6 +323,48 @@ final class WorldMirror {
         }
     }
 
+    void drainFanRefreshes(MinecraftServer server, int budget) {
+        for (int i = 0; i < budget; i++) {
+            FanRefreshRequest request;
+            synchronized (this) {
+                request = pendingFanRefreshes.pollFirst();
+                if (request == null) {
+                    break;
+                }
+                queuedFanRefreshes.remove(request);
+            }
+            ServerWorld world = server.getWorld(request.worldKey());
+            if (world == null) {
+                continue;
+            }
+            Direction facing;
+            BlockPos fanPos = request.fanPos();
+            synchronized (this) {
+                DimensionMirror dimension = dimensions.get(request.worldKey());
+                if (dimension == null) {
+                    continue;
+                }
+                FanRecord fan = dimension.fans.get(fanPos.asLong());
+                if (fan == null) {
+                    continue;
+                }
+                facing = fan.facing();
+            }
+            int ductLength = computeDuctLength(world, fanPos, facing);
+            synchronized (this) {
+                DimensionMirror dimension = dimensions.get(request.worldKey());
+                if (dimension == null) {
+                    continue;
+                }
+                FanRecord fan = dimension.fans.get(fanPos.asLong());
+                if (fan == null || fan.facing() != facing) {
+                    continue;
+                }
+                dimension.fans.put(fanPos.asLong(), new FanRecord(fanPos, facing, ductLength));
+            }
+        }
+    }
+
     synchronized SectionSnapshot peekSection(RegistryKey<World> worldKey, BlockPos sectionOrigin) {
         DimensionMirror dimension = dimensions.get(worldKey);
         if (dimension == null) {
@@ -402,24 +449,24 @@ final class WorldMirror {
         return state != null && state.isOf(ModBlocks.DUCT_BLOCK);
     }
 
-    private void refreshNearbyFanDuctLengths(ServerWorld world, DimensionMirror dimension, BlockPos changedPos) {
+    private void queueNearbyFanDuctRefreshes(RegistryKey<World> worldKey, DimensionMirror dimension, BlockPos changedPos) {
         if (dimension.fans.isEmpty()) {
             return;
         }
-        List<FanRecord> updatedFans = new ArrayList<>();
         for (FanRecord fan : dimension.fans.values()) {
             if (!isPotentiallyRelevantDuctChange(fan.pos(), changedPos)) {
                 continue;
             }
-            updatedFans.add(new FanRecord(
-                fan.pos(),
-                fan.facing(),
-                computeDuctLength(world, fan.pos(), fan.facing())
-            ));
+            queueFanRefreshLocked(worldKey, fan.pos());
         }
-        for (FanRecord fan : updatedFans) {
-            dimension.fans.put(fan.pos().asLong(), fan);
+    }
+
+    private void queueFanRefreshLocked(RegistryKey<World> worldKey, BlockPos fanPos) {
+        FanRefreshRequest request = new FanRefreshRequest(worldKey, fanPos.toImmutable());
+        if (!queuedFanRefreshes.add(request)) {
+            return;
         }
+        pendingFanRefreshes.addLast(request);
     }
 
     private boolean isPotentiallyRelevantDuctChange(BlockPos fanPos, BlockPos changedPos) {
