@@ -760,23 +760,6 @@ public final class AeroServerRuntime {
         lastSimulationFocusX = focusX;
         lastSimulationFocusY = focusY;
         lastSimulationFocusZ = focusZ;
-        simulationBridge.submitWorldDelta(
-            simulationServiceId,
-            new NativeSimulationBridge.WorldDelta(
-                NativeSimulationBridge.WORLD_DELTA_FOCUS_CHANGED,
-                focusX,
-                focusY,
-                focusZ,
-                players.size(),
-                0,
-                0,
-                0,
-                0.0f,
-                0.0f,
-                0.0f,
-                0.0f
-            )
-        );
     }
 
     private void submitWorldDeltaToSimulation(NativeSimulationBridge.WorldDelta delta) {
