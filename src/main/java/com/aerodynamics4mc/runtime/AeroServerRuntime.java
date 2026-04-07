@@ -233,6 +233,7 @@ public final class AeroServerRuntime {
     private int lastWindowRefreshTick = Integer.MIN_VALUE;
     private long simulationTicks = 0L;
     private long lastObservedPublishedFrameId = 0L;
+    private int lastPublishedFrameTick = Integer.MIN_VALUE;
     private int secondWindowTotalTicks = 0;
     private int secondWindowSimulationTicks = 0;
     private float simulationTicksPerSecond = 0.0f;
@@ -501,6 +502,15 @@ public final class AeroServerRuntime {
                     );
                     feedback(
                         ctx.getSource(),
+                        "SimDetail frameId=" + (currentFrame == null ? 0L : currentFrame.frameId())
+                            + " frameAgeTicks=" + currentPublishedFrameAgeTicks()
+                            + " stepBudget=" + simulationStepBudget.get()
+                            + " activeSolveTasks=" + activeSolveTasks.get()
+                            + " busyRegions=" + busyRegionCount()
+                            + " attachedReadyRegions=" + attachedWindowCount()
+                    );
+                    feedback(
+                        ctx.getSource(),
                         "MainThread lastTick=" + format3(nanosToMillis(lastMainThreadPhaseNanos[MAIN_THREAD_PHASE_TOTAL])) + "ms"
                             + " hot=" + hottestMainThreadPhaseSummary(lastMainThreadPhaseNanos)
                             + " maxTick=" + format3(nanosToMillis(maxMainThreadPhaseNanos[MAIN_THREAD_PHASE_TOTAL])) + "ms"
@@ -700,6 +710,7 @@ public final class AeroServerRuntime {
         simulationStepBudget.set(0);
         simulationTicks = 0L;
         lastObservedPublishedFrameId = 0L;
+        lastPublishedFrameTick = Integer.MIN_VALUE;
         secondWindowTotalTicks = 0;
         secondWindowSimulationTicks = 0;
         simulationTicksPerSecond = 0.0f;
@@ -2650,6 +2661,23 @@ public final class AeroServerRuntime {
         return count;
     }
 
+    private int busyRegionCount() {
+        int count = 0;
+        for (RegionRecord region : regions.values()) {
+            if (region.busy.get()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private int currentPublishedFrameAgeTicks() {
+        if (lastPublishedFrameTick == Integer.MIN_VALUE) {
+            return -1;
+        }
+        return Math.max(0, tickCounter - lastPublishedFrameTick);
+    }
+
     private void publishFrame(List<ActiveWindow> activeWindows, float maxSpeedThisCycle) {
         Map<WindowKey, short[]> regionAtlases = snapshotPublishedAtlases(activeWindows, PARTICLE_FLOW_SAMPLE_STRIDE);
         if (regionAtlases.isEmpty()) {
@@ -2658,6 +2686,7 @@ public final class AeroServerRuntime {
         long frameId = publishedFrameCounter.incrementAndGet();
         PublishedFrame frame = new PublishedFrame(frameId, maxSpeedThisCycle, Map.copyOf(regionAtlases));
         publishedFrame.set(frame);
+        lastPublishedFrameTick = tickCounter;
     }
 
     private Map<WindowKey, short[]> snapshotPublishedAtlases(List<ActiveWindow> activeWindows, int stride) {
