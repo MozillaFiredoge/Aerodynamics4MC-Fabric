@@ -2409,7 +2409,20 @@ public final class AeroServerRuntime {
             snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windZ() / NATIVE_VELOCITY_SCALE
         );
         if (!Float.isFinite(maxSpeed)) {
-            throw new IOException("Native backend returned invalid max speed");
+            String nativeError = simulationBridge.lastError();
+            String runtimeInfo = simulationBridge.runtimeInfo();
+            StringBuilder message = new StringBuilder("Native backend returned invalid max speed");
+            if (nativeError != null && !nativeError.isBlank()
+                && !"not_initialized".equals(nativeError)
+                && !"not_loaded".equals(nativeError)) {
+                message.append(": ").append(nativeError);
+            }
+            if (runtimeInfo != null && !runtimeInfo.isBlank()
+                && !"not_initialized".equals(runtimeInfo)
+                && !"not_loaded".equals(runtimeInfo)) {
+                message.append(" [runtime=").append(runtimeInfo).append("]");
+            }
+            throw new IOException(message.toString());
         }
         return maxSpeed * NATIVE_VELOCITY_SCALE;
     }

@@ -161,6 +161,38 @@ bool checked_cell_count(int nx, int ny, int nz, int* out_cells) {
     return true;
 }
 
+void ensure_region_buffers(ServiceState& service, long long region_key, int nx, int ny, int nz, int cells) {
+    DynamicRegionData& dynamic = service.dynamic_regions[region_key];
+    if (dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz
+        || dynamic.flow_state.size() != static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS
+        || dynamic.air_temperature.size() != static_cast<size_t>(cells)
+        || dynamic.surface_temperature.size() != static_cast<size_t>(cells)) {
+        dynamic.nx = nx;
+        dynamic.ny = ny;
+        dynamic.nz = nz;
+        dynamic.flow_state.assign(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+        dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
+        dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
+    }
+
+    ForcingRegionData& forcing = service.forcing_regions[region_key];
+    if (forcing.nx != nx || forcing.ny != ny || forcing.nz != nz
+        || forcing.thermal_source.size() != static_cast<size_t>(cells)
+        || forcing.fan_mask.size() != static_cast<size_t>(cells)
+        || forcing.fan_vx.size() != static_cast<size_t>(cells)
+        || forcing.fan_vy.size() != static_cast<size_t>(cells)
+        || forcing.fan_vz.size() != static_cast<size_t>(cells)) {
+        forcing.nx = nx;
+        forcing.ny = ny;
+        forcing.nz = nz;
+        forcing.thermal_source.assign(static_cast<size_t>(cells), 0.0f);
+        forcing.fan_mask.assign(static_cast<size_t>(cells), 0);
+        forcing.fan_vx.assign(static_cast<size_t>(cells), 0.0f);
+        forcing.fan_vy.assign(static_cast<size_t>(cells), 0.0f);
+        forcing.fan_vz.assign(static_cast<size_t>(cells), 0.0f);
+    }
+}
+
 jstring new_java_string(JNIEnv* env, const char* text) {
     if (!env || !text) {
         return nullptr;
@@ -944,6 +976,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_activate_region(
     region.ny = ny;
     region.nz = nz;
     region.active = true;
+    ensure_region_buffers(*service, region_key, nx, ny, nz, cells);
     return 1;
 }
 
@@ -987,7 +1020,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_is_region_ready(long long service_k
     if (lifecycle_it == service->regions.end() || !lifecycle_it->second.active) {
         return 0;
     }
-    return service->static_regions.find(region_key) != service->static_regions.end();
+    return service->static_regions.find(region_key) != service->static_regions.end()
+        && service->forcing_regions.find(region_key) != service->forcing_regions.end()
+        && service->dynamic_regions.find(region_key) != service->dynamic_regions.end();
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_l2_runtime(
