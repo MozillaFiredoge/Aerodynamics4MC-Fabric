@@ -148,6 +148,24 @@ public final class AeroServerRuntime {
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_INTERVAL_TICKS = TICKS_PER_SECOND;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_BUDGET = 1;
     private static final boolean ENTITY_SAMPLE_COLLECTION_ENABLED = false;
+    private static final int MAIN_THREAD_PHASE_SERVICE_INIT = 0;
+    private static final int MAIN_THREAD_PHASE_FOCUS = 1;
+    private static final int MAIN_THREAD_PHASE_BACKGROUND_BATCH = 2;
+    private static final int MAIN_THREAD_PHASE_ACTIVE_BATCH = 3;
+    private static final int MAIN_THREAD_PHASE_LIVE_BUILDS = 4;
+    private static final int MAIN_THREAD_PHASE_COORDINATOR = 5;
+    private static final int MAIN_THREAD_PHASE_FLOW_SYNC = 6;
+    private static final int MAIN_THREAD_PHASE_TOTAL = 7;
+    private static final String[] MAIN_THREAD_PHASE_NAMES = {
+        "serviceInit",
+        "focus",
+        "bgBatch",
+        "activeBatch",
+        "liveBuilds",
+        "coordinator",
+        "flowSync",
+        "total"
+    };
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
     private static final float WINDOW_EDGE_STABILIZATION_MIN_KEEP = 0.15f;
     private static final int REGION_HALO_CELLS = CHUNK_SIZE;
@@ -204,6 +222,8 @@ public final class AeroServerRuntime {
     private int lastSimulationFocusY = Integer.MIN_VALUE;
     private int lastSimulationFocusZ = Integer.MIN_VALUE;
     private SimulationCoordinator simulationCoordinator;
+    private final long[] lastMainThreadPhaseNanos = new long[MAIN_THREAD_PHASE_NAMES.length];
+    private final long[] maxMainThreadPhaseNanos = new long[MAIN_THREAD_PHASE_NAMES.length];
 
     private AeroServerRuntime() {
     }
@@ -451,6 +471,14 @@ public final class AeroServerRuntime {
                             + " l1Cells=" + mesoscaleMetCellCount()
                             + " simBridge=" + simulationBridge.runtimeInfo()
                     );
+                    feedback(
+                        ctx.getSource(),
+                        "MainThread lastTick=" + format3(nanosToMillis(lastMainThreadPhaseNanos[MAIN_THREAD_PHASE_TOTAL])) + "ms"
+                            + " hot=" + hottestMainThreadPhaseSummary(lastMainThreadPhaseNanos)
+                            + " maxTick=" + format3(nanosToMillis(maxMainThreadPhaseNanos[MAIN_THREAD_PHASE_TOTAL])) + "ms"
+                            + " maxHot=" + hottestMainThreadPhaseSummary(maxMainThreadPhaseNanos)
+                    );
+                    feedback(ctx.getSource(), "MainThread breakdown=" + formatMainThreadPhaseBreakdown(lastMainThreadPhaseNanos));
                     if (!lastSolverError.isEmpty()) {
                         feedback(ctx.getSource(), "Last solver error: " + lastSolverError);
                     }
@@ -467,6 +495,7 @@ public final class AeroServerRuntime {
     }
 
     private void onServerTick(MinecraftServer server) {
+        long tickStartNanos = System.nanoTime();
         currentServer = server;
         if (!streamingEnabled) {
             return;
@@ -475,33 +504,53 @@ public final class AeroServerRuntime {
             return;
         }
         tickCounter++;
+        long phaseStartNanos = System.nanoTime();
         ensureSimulationServiceInitialized();
+        recordMainThreadPhase(MAIN_THREAD_PHASE_SERVICE_INIT, System.nanoTime() - phaseStartNanos);
+        phaseStartNanos = System.nanoTime();
         updateSimulationFocus(server);
+        recordMainThreadPhase(MAIN_THREAD_PHASE_FOCUS, System.nanoTime() - phaseStartNanos);
         if (tickCounter == 1 || tickCounter % BACKGROUND_MET_REFRESH_TICKS == 0) {
+            phaseStartNanos = System.nanoTime();
             pendingBackgroundRefreshBatch = captureBackgroundRefreshBatch(server);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_BACKGROUND_BATCH, System.nanoTime() - phaseStartNanos);
+        } else {
+            recordMainThreadPhase(MAIN_THREAD_PHASE_BACKGROUND_BATCH, 0L);
         }
+        phaseStartNanos = System.nanoTime();
         pendingActiveRegionBatch = captureActiveRegionBatch(server);
+        recordMainThreadPhase(MAIN_THREAD_PHASE_ACTIVE_BATCH, System.nanoTime() - phaseStartNanos);
         int lowPriorityBuildBudget = tickCounter % STATIC_MIRROR_LOW_PRIORITY_BUILD_INTERVAL_TICKS == 0
             ? STATIC_MIRROR_LOW_PRIORITY_BUILD_BUDGET
             : 0;
+        phaseStartNanos = System.nanoTime();
         worldMirror.drainLiveBuilds(
             server,
             STATIC_MIRROR_HIGH_PRIORITY_BUILD_BUDGET_PER_TICK,
             lowPriorityBuildBudget,
             this::populateMirrorSectionSnapshot
         );
+        recordMainThreadPhase(MAIN_THREAD_PHASE_LIVE_BUILDS, System.nanoTime() - phaseStartNanos);
+        phaseStartNanos = System.nanoTime();
         ensureSimulationCoordinatorRunning();
+        recordMainThreadPhase(MAIN_THREAD_PHASE_COORDINATOR, System.nanoTime() - phaseStartNanos);
 
         PublishedFrame frame = publishedFrame.get();
         if (frame == null || frame.regionAtlases().isEmpty()) {
             updateSimulationRate(0);
             lastMaxFlowSpeed = 0.0f;
+            recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_TOTAL, System.nanoTime() - tickStartNanos);
             return;
         }
 
         boolean shouldSyncFlow = tickCounter % PARTICLE_FLOW_SYNC_INTERVAL_TICKS == 0;
         if (shouldSyncFlow) {
+            phaseStartNanos = System.nanoTime();
             syncPublishedFlowToPlayers(server, frame, PARTICLE_FLOW_SAMPLE_STRIDE);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, System.nanoTime() - phaseStartNanos);
+        } else {
+            recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, 0L);
         }
         long frameId = frame.frameId();
         int publishedSteps = 0;
@@ -513,6 +562,44 @@ public final class AeroServerRuntime {
             lastMaxFlowSpeed = frame.maxSpeed();
         }
         updateSimulationRate(publishedSteps);
+        recordMainThreadPhase(MAIN_THREAD_PHASE_TOTAL, System.nanoTime() - tickStartNanos);
+    }
+
+    private void recordMainThreadPhase(int phaseIndex, long nanos) {
+        lastMainThreadPhaseNanos[phaseIndex] = nanos;
+        if (nanos > maxMainThreadPhaseNanos[phaseIndex]) {
+            maxMainThreadPhaseNanos[phaseIndex] = nanos;
+        }
+    }
+
+    private static float nanosToMillis(long nanos) {
+        return nanos / 1_000_000.0f;
+    }
+
+    private String hottestMainThreadPhaseSummary(long[] phaseNanos) {
+        int hottestPhase = MAIN_THREAD_PHASE_SERVICE_INIT;
+        long hottestNanos = phaseNanos[hottestPhase];
+        for (int i = 1; i < MAIN_THREAD_PHASE_TOTAL; i++) {
+            if (phaseNanos[i] > hottestNanos) {
+                hottestNanos = phaseNanos[i];
+                hottestPhase = i;
+            }
+        }
+        return MAIN_THREAD_PHASE_NAMES[hottestPhase] + ":" + format3(nanosToMillis(hottestNanos)) + "ms";
+    }
+
+    private String formatMainThreadPhaseBreakdown(long[] phaseNanos) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < MAIN_THREAD_PHASE_TOTAL; i++) {
+            if (i > 0) {
+                builder.append(' ');
+            }
+            builder.append(MAIN_THREAD_PHASE_NAMES[i])
+                .append('=')
+                .append(format3(nanosToMillis(phaseNanos[i])))
+                .append("ms");
+        }
+        return builder.toString();
     }
 
     private void stopStreaming(MinecraftServer server, boolean persistDynamicRegions) {

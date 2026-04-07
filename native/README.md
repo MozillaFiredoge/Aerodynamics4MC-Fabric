@@ -117,6 +117,37 @@ Compiler env overrides (if defaults are unavailable):
 
 Note: this requires valid cross-compilers/toolchains to be installed on the build machine.
 
+### WSL2 -> Windows x86_64 DLL cross-build
+
+When building `aero_lbm.dll` from WSL2/Linux, the MinGW compiler alone is not enough. JNI must also use
+**Windows** headers (`include/win32/jni_md.h`), not the host Linux JDK headers.
+
+The Windows toolchain now supports:
+
+- `AERO_WINDOWS_X86_64_PREFIX`
+  compiler prefix, defaults to `x86_64-w64-mingw32`
+- `AERO_WINDOWS_X86_64_SYSROOT`
+  optional MinGW/sysroot root passed into `CMAKE_FIND_ROOT_PATH`
+- `AERO_LBM_WINDOWS_JAVA_HOME`
+  path to a Windows JDK root, for example `/mnt/c/Program Files/Java/jdk-21`
+- or explicit JNI include overrides:
+  - `AERO_LBM_WINDOWS_JNI_INCLUDE_DIR`
+  - `AERO_LBM_WINDOWS_JNI_PLATFORM_INCLUDE_DIR`
+
+Example from WSL2:
+
+```bash
+cd fabric-mod/native
+cmake -S . -B build-win \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/windows-x86_64.cmake \
+  -DAERO_LBM_ENABLE_OPENCL=OFF \
+  -DAERO_LBM_WINDOWS_JAVA_HOME="/mnt/c/Program Files/Java/jdk-21"
+cmake --build build-win -j
+```
+
+If you do have a Windows OpenCL SDK/import library path available inside the MinGW sysroot, you can leave
+`AERO_LBM_ENABLE_OPENCL=ON`. Otherwise, CPU-only is the simplest cross-build path from WSL2.
+
 ## GitHub Actions
 
 Workflow: `fabric-mod/.github/workflows/native-matrix.yml`

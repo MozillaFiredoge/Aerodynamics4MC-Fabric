@@ -59,7 +59,47 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(JNI REQUIRED)
+set(AERO_LBM_WINDOWS_JAVA_HOME "" CACHE PATH "Path to a Windows JDK used for JNI headers when cross-compiling aero_lbm.dll from Linux/WSL2")
+set(AERO_LBM_WINDOWS_JNI_INCLUDE_DIR "" CACHE PATH "Override path to the generic JNI include directory for Windows cross builds")
+set(AERO_LBM_WINDOWS_JNI_PLATFORM_INCLUDE_DIR "" CACHE PATH "Override path to the Windows-specific JNI include directory for Windows cross builds")
+
+if (WIN32 AND CMAKE_CROSSCOMPILING)
+    set(_aero_windows_jni_include_dir "${AERO_LBM_WINDOWS_JNI_INCLUDE_DIR}")
+    set(_aero_windows_jni_platform_include_dir "${AERO_LBM_WINDOWS_JNI_PLATFORM_INCLUDE_DIR}")
+
+    if (NOT _aero_windows_jni_include_dir OR NOT _aero_windows_jni_platform_include_dir)
+        set(_aero_windows_java_home "${AERO_LBM_WINDOWS_JAVA_HOME}")
+        if (NOT _aero_windows_java_home AND DEFINED ENV{AERO_WINDOWS_JAVA_HOME})
+            set(_aero_windows_java_home "$ENV{AERO_WINDOWS_JAVA_HOME}")
+        endif()
+        if (_aero_windows_java_home)
+            file(TO_CMAKE_PATH "${_aero_windows_java_home}" _aero_windows_java_home)
+            if (NOT _aero_windows_jni_include_dir)
+                set(_aero_windows_jni_include_dir "${_aero_windows_java_home}/include")
+            endif()
+            if (NOT _aero_windows_jni_platform_include_dir)
+                set(_aero_windows_jni_platform_include_dir "${_aero_windows_java_home}/include/win32")
+            endif()
+        endif()
+    endif()
+
+    if (EXISTS "${_aero_windows_jni_include_dir}/jni.h" AND EXISTS "${_aero_windows_jni_platform_include_dir}/jni_md.h")
+        set(JNI_FOUND TRUE)
+        set(JNI_INCLUDE_DIRS
+            "${_aero_windows_jni_include_dir}"
+            "${_aero_windows_jni_platform_include_dir}"
+        )
+        message(STATUS "Using Windows JNI headers for cross build: ${_aero_windows_jni_include_dir} ; ${_aero_windows_jni_platform_include_dir}")
+    else()
+        message(FATAL_ERROR
+            "Windows x86_64 cross-build requires Windows JNI headers.\n"
+            "Set AERO_LBM_WINDOWS_JAVA_HOME to a Windows JDK root (for example /mnt/c/Program Files/Java/jdk-21),\n"
+            "or provide AERO_LBM_WINDOWS_JNI_INCLUDE_DIR and AERO_LBM_WINDOWS_JNI_PLATFORM_INCLUDE_DIR explicitly."
+        )
+    endif()
+else()
+    find_package(JNI REQUIRED)
+endif()
 
 option(AERO_LBM_ENABLE_OPENCL "Enable OpenCL backend in native solver" ON)
 
