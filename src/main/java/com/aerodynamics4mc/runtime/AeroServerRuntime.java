@@ -12,8 +12,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -2735,7 +2737,7 @@ public final class AeroServerRuntime {
         }
     }
 
-    private void runSolveTask(SolveSnapshot snapshot) {
+    private void runSolveTask(SolveSnapshot snapshot, CountDownLatch completionLatch) {
         WindowState window = snapshot.window();
         try {
             if (snapshot.generation() != runtimeGeneration.get()) {
@@ -2776,6 +2778,9 @@ public final class AeroServerRuntime {
                 releaseWindow(snapshot.key(), window);
             }
             activeSolveTasks.decrementAndGet();
+            if (completionLatch != null) {
+                completionLatch.countDown();
+            }
         }
     }
 
@@ -2843,7 +2848,7 @@ public final class AeroServerRuntime {
         }
     }
 
-    private List<SolveSnapshot> scheduleSolveCycle(List<ActiveWindow> activeWindows) {
+    private CountDownLatch scheduleSolveCycle(List<ActiveWindow> activeWindows) {
         List<SolveSnapshot> scheduled = new ArrayList<>(activeWindows.size());
         for (ActiveWindow active : activeWindows) {
             WindowState window = active.window();
@@ -2857,31 +2862,30 @@ public final class AeroServerRuntime {
                 MAX_RUNTIME_WIND_SPEED,
                 runtimeGeneration.get()
             );
-            activeSolveTasks.incrementAndGet();
-            solverExecutor.execute(() -> runSolveTask(snapshot));
             scheduled.add(snapshot);
         }
-        return scheduled;
+        if (scheduled.isEmpty()) {
+            return null;
+        }
+        CountDownLatch completionLatch = new CountDownLatch(scheduled.size());
+        for (SolveSnapshot snapshot : scheduled) {
+            activeSolveTasks.incrementAndGet();
+            solverExecutor.execute(() -> runSolveTask(snapshot, completionLatch));
+        }
+        return completionLatch;
     }
 
-    private void waitForScheduledSnapshots(List<SolveSnapshot> scheduled) {
-        while (true) {
-            boolean anyBusy = false;
-            for (SolveSnapshot snapshot : scheduled) {
-                if (snapshot.window().busy.get()) {
-                    anyBusy = true;
-                    break;
-                }
+    private void waitForScheduledSnapshots(CountDownLatch completionLatch) {
+        if (completionLatch == null) {
+            return;
+        }
+        try {
+            while (streamingEnabled
+                && !Thread.currentThread().isInterrupted()
+                && !completionLatch.await(5L, TimeUnit.MILLISECONDS)) {
             }
-            if (!anyBusy) {
-                return;
-            }
-            try {
-                Thread.sleep(1L);
-            } catch (InterruptedException ex) {
-                Thread.currentThread().interrupt();
-                return;
-            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -3279,6 +3283,7 @@ public final class AeroServerRuntime {
         private final AtomicBoolean running = new AtomicBoolean(true);
         private final Thread thread = new Thread(this, "aero-sim-coordinator");
         private int lastBudgetTick = Integer.MIN_VALUE;
+        private int lastSynchronizedTick = Integer.MIN_VALUE;
 
         private SimulationCoordinator() {
             thread.setDaemon(true);
@@ -3307,22 +3312,27 @@ public final class AeroServerRuntime {
             while (running.get()) {
                 if (!streamingEnabled) {
                     publishedFrame.set(null);
-                    sleepQuietly(5L);
+                    sleepQuietly(20L);
                     continue;
                 }
 
-                grantStepBudgetForObservedTicks();
-
-                runMesoscaleStepCycle();
+                int observedTick = tickCounter;
+                if (observedTick != lastSynchronizedTick) {
+                    grantStepBudgetForObservedTicks();
+                    runMesoscaleStepCycle();
+                    synchronized (simulationStateLock) {
+                        synchronizeActiveWindowsFromMirror();
+                    }
+                    lastSynchronizedTick = observedTick;
+                }
 
                 List<ActiveWindow> activeWindows;
                 synchronized (simulationStateLock) {
-                    synchronizeActiveWindowsFromMirror();
                     activeWindows = snapshotActiveWindowsForCoordinatorLocked();
                 }
                 if (activeWindows.isEmpty()) {
                     publishedFrame.set(null);
-                    sleepQuietly(2L);
+                    sleepQuietly(10L);
                     continue;
                 }
 
@@ -3333,25 +3343,25 @@ public final class AeroServerRuntime {
                 }
 
                 if (hasBusyWindow(activeWindows)) {
-                    sleepQuietly(1L);
+                    sleepQuietly(5L);
                     continue;
                 }
                 if (!acquireSimulationStepBudget()) {
-                    sleepQuietly(1L);
+                    sleepQuietly(5L);
                     continue;
                 }
 
-                List<SolveSnapshot> scheduled;
+                CountDownLatch completionLatch;
                 synchronized (simulationStateLock) {
-                    scheduled = scheduleSolveCycle(activeWindows);
+                    completionLatch = scheduleSolveCycle(activeWindows);
                 }
-                if (scheduled.isEmpty()) {
+                if (completionLatch == null) {
                     simulationStepBudget.incrementAndGet();
-                    sleepQuietly(1L);
+                    sleepQuietly(5L);
                     continue;
                 }
 
-                waitForScheduledSnapshots(scheduled);
+                waitForScheduledSnapshots(completionLatch);
                 if (!running.get()) {
                     return;
                 }
