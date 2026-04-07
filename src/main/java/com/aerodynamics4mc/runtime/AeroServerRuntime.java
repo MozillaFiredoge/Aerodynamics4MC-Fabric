@@ -166,6 +166,20 @@ public final class AeroServerRuntime {
         "flowSync",
         "total"
     };
+    private static final int CALLBACK_PHASE_CHUNK_LOAD = 0;
+    private static final int CALLBACK_PHASE_CHUNK_UNLOAD = 1;
+    private static final int CALLBACK_PHASE_BLOCK_ENTITY_LOAD = 2;
+    private static final int CALLBACK_PHASE_BLOCK_ENTITY_UNLOAD = 3;
+    private static final int CALLBACK_PHASE_WORLD_UNLOAD = 4;
+    private static final int CALLBACK_PHASE_BLOCK_CHANGED = 5;
+    private static final String[] CALLBACK_PHASE_NAMES = {
+        "chunkLoad",
+        "chunkUnload",
+        "blockEntityLoad",
+        "blockEntityUnload",
+        "worldUnload",
+        "blockChanged"
+    };
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
     private static final float WINDOW_EDGE_STABILIZATION_MIN_KEEP = 0.15f;
     private static final int REGION_HALO_CELLS = CHUNK_SIZE;
@@ -225,6 +239,12 @@ public final class AeroServerRuntime {
     private SimulationCoordinator simulationCoordinator;
     private final long[] lastMainThreadPhaseNanos = new long[MAIN_THREAD_PHASE_NAMES.length];
     private final long[] maxMainThreadPhaseNanos = new long[MAIN_THREAD_PHASE_NAMES.length];
+    private final long[] lastCallbackTotalNanos = new long[CALLBACK_PHASE_NAMES.length];
+    private final long[] lastCallbackLockWaitNanos = new long[CALLBACK_PHASE_NAMES.length];
+    private final long[] lastCallbackLockHeldNanos = new long[CALLBACK_PHASE_NAMES.length];
+    private final long[] maxCallbackTotalNanos = new long[CALLBACK_PHASE_NAMES.length];
+    private final long[] maxCallbackLockWaitNanos = new long[CALLBACK_PHASE_NAMES.length];
+    private final long[] maxCallbackLockHeldNanos = new long[CALLBACK_PHASE_NAMES.length];
 
     private AeroServerRuntime() {
     }
@@ -265,7 +285,7 @@ public final class AeroServerRuntime {
     }
 
     private void onChunkLoad(ServerWorld world, WorldChunk chunk) {
-        synchronized (simulationStateLock) {
+        runMainThreadCallbackProfiled(CALLBACK_PHASE_CHUNK_LOAD, () -> {
             worldMirror.onChunkLoad(world, chunk);
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
                 NativeSimulationBridge.WORLD_DELTA_CHUNK_LOADED,
@@ -281,11 +301,11 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-        }
+        });
     }
 
     private void onChunkUnload(ServerWorld world, WorldChunk chunk) {
-        synchronized (simulationStateLock) {
+        runMainThreadCallbackProfiled(CALLBACK_PHASE_CHUNK_UNLOAD, () -> {
             worldMirror.onChunkUnload(world, chunk.getPos());
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
                 NativeSimulationBridge.WORLD_DELTA_CHUNK_UNLOADED,
@@ -301,11 +321,11 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-        }
+        });
     }
 
     private void onBlockEntityLoad(BlockEntity blockEntity, ServerWorld world) {
-        synchronized (simulationStateLock) {
+        runMainThreadCallbackProfiled(CALLBACK_PHASE_BLOCK_ENTITY_LOAD, () -> {
             worldMirror.onBlockEntityLoad(blockEntity, world);
             BlockPos pos = blockEntity.getPos();
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
@@ -322,11 +342,11 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-        }
+        });
     }
 
     private void onBlockEntityUnload(BlockEntity blockEntity, ServerWorld world) {
-        synchronized (simulationStateLock) {
+        runMainThreadCallbackProfiled(CALLBACK_PHASE_BLOCK_ENTITY_UNLOAD, () -> {
             worldMirror.onBlockEntityUnload(blockEntity, world);
             BlockPos pos = blockEntity.getPos();
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
@@ -343,11 +363,11 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-        }
+        });
     }
 
     private void onWorldUnload(ServerWorld world) {
-        synchronized (simulationStateLock) {
+        runMainThreadCallbackProfiled(CALLBACK_PHASE_WORLD_UNLOAD, () -> {
             worldMirror.onWorldUnload(world);
             backgroundMetGrids.remove(world.getRegistryKey());
             MesoscaleGrid grid = mesoscaleMetGrids.remove(world.getRegistryKey());
@@ -368,11 +388,11 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-        }
+        });
     }
 
     private void onBlockChanged(ServerWorld world, BlockPos pos, BlockState oldState, BlockState newState) {
-        synchronized (simulationStateLock) {
+        runMainThreadCallbackProfiled(CALLBACK_PHASE_BLOCK_CHANGED, () -> {
             worldMirror.onBlockChanged(world, pos, oldState, newState);
             invalidateDynamicRegionsForBlock(world, pos);
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
@@ -389,7 +409,7 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-        }
+        });
     }
 
     private void invalidateDynamicRegionsForBlock(ServerWorld world, BlockPos pos) {
@@ -480,6 +500,11 @@ public final class AeroServerRuntime {
                             + " maxHot=" + hottestMainThreadPhaseSummary(maxMainThreadPhaseNanos)
                     );
                     feedback(ctx.getSource(), "MainThread breakdown=" + formatMainThreadPhaseBreakdown(lastMainThreadPhaseNanos));
+                    feedback(
+                        ctx.getSource(),
+                        "Callbacks lastHot=" + hottestCallbackPhaseSummary(lastCallbackTotalNanos, lastCallbackLockWaitNanos, lastCallbackLockHeldNanos)
+                            + " maxHot=" + hottestCallbackPhaseSummary(maxCallbackTotalNanos, maxCallbackLockWaitNanos, maxCallbackLockHeldNanos)
+                    );
                     if (!lastSolverError.isEmpty()) {
                         feedback(ctx.getSource(), "Last solver error: " + lastSolverError);
                     }
@@ -601,6 +626,50 @@ public final class AeroServerRuntime {
                 .append("ms");
         }
         return builder.toString();
+    }
+
+    private void runMainThreadCallbackProfiled(int phaseIndex, Runnable runnable) {
+        long startNanos = System.nanoTime();
+        long acquiredNanos;
+        synchronized (simulationStateLock) {
+            acquiredNanos = System.nanoTime();
+            try {
+                runnable.run();
+            } finally {
+                long endNanos = System.nanoTime();
+                recordCallbackPhase(phaseIndex, endNanos - startNanos, acquiredNanos - startNanos, endNanos - acquiredNanos);
+            }
+        }
+    }
+
+    private void recordCallbackPhase(int phaseIndex, long totalNanos, long waitNanos, long heldNanos) {
+        lastCallbackTotalNanos[phaseIndex] = totalNanos;
+        lastCallbackLockWaitNanos[phaseIndex] = waitNanos;
+        lastCallbackLockHeldNanos[phaseIndex] = heldNanos;
+        if (totalNanos > maxCallbackTotalNanos[phaseIndex]) {
+            maxCallbackTotalNanos[phaseIndex] = totalNanos;
+        }
+        if (waitNanos > maxCallbackLockWaitNanos[phaseIndex]) {
+            maxCallbackLockWaitNanos[phaseIndex] = waitNanos;
+        }
+        if (heldNanos > maxCallbackLockHeldNanos[phaseIndex]) {
+            maxCallbackLockHeldNanos[phaseIndex] = heldNanos;
+        }
+    }
+
+    private String hottestCallbackPhaseSummary(long[] totalNanos, long[] waitNanos, long[] heldNanos) {
+        int hottestPhase = 0;
+        long hottestTotal = totalNanos[0];
+        for (int i = 1; i < CALLBACK_PHASE_NAMES.length; i++) {
+            if (totalNanos[i] > hottestTotal) {
+                hottestTotal = totalNanos[i];
+                hottestPhase = i;
+            }
+        }
+        return CALLBACK_PHASE_NAMES[hottestPhase]
+            + ":total=" + format3(nanosToMillis(totalNanos[hottestPhase])) + "ms"
+            + ",wait=" + format3(nanosToMillis(waitNanos[hottestPhase])) + "ms"
+            + ",held=" + format3(nanosToMillis(heldNanos[hottestPhase])) + "ms";
     }
 
     private void stopStreaming(MinecraftServer server, boolean persistDynamicRegions) {
