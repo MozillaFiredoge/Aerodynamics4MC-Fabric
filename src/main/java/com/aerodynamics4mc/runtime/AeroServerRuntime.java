@@ -666,29 +666,29 @@ public final class AeroServerRuntime {
         int focusX = MathHelper.floor(sumX / players.size());
         int focusY = MathHelper.floor(sumY / players.size());
         int focusZ = MathHelper.floor(sumZ / players.size());
-        simulationBridge.setFocus(simulationServiceId, focusX, focusY, focusZ, GRID_SIZE);
-        if (focusX != lastSimulationFocusX || focusY != lastSimulationFocusY || focusZ != lastSimulationFocusZ) {
-            lastSimulationFocusX = focusX;
-            lastSimulationFocusY = focusY;
-            lastSimulationFocusZ = focusZ;
-            simulationBridge.submitWorldDelta(
-                simulationServiceId,
-                new NativeSimulationBridge.WorldDelta(
-                    NativeSimulationBridge.WORLD_DELTA_FOCUS_CHANGED,
-                    focusX,
-                    focusY,
-                    focusZ,
-                    players.size(),
-                    0,
-                    0,
-                    0,
-                    0.0f,
-                    0.0f,
-                    0.0f,
-                    0.0f
-                )
-            );
+        if (focusX == lastSimulationFocusX && focusY == lastSimulationFocusY && focusZ == lastSimulationFocusZ) {
+            return;
         }
+        lastSimulationFocusX = focusX;
+        lastSimulationFocusY = focusY;
+        lastSimulationFocusZ = focusZ;
+        simulationBridge.submitWorldDelta(
+            simulationServiceId,
+            new NativeSimulationBridge.WorldDelta(
+                NativeSimulationBridge.WORLD_DELTA_FOCUS_CHANGED,
+                focusX,
+                focusY,
+                focusZ,
+                players.size(),
+                0,
+                0,
+                0,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f
+            )
+        );
     }
 
     private void submitWorldDeltaToSimulation(NativeSimulationBridge.WorldDelta delta) {
