@@ -99,7 +99,7 @@ public final class AeroServerRuntime {
     private static final int RESPONSE_CHANNELS = 4;
     private static final int FLOW_COUNT = GRID_SIZE * GRID_SIZE * GRID_SIZE * RESPONSE_CHANNELS;
 
-    private static final int WINDOW_THERMAL_REFRESH_TICKS = 10;
+    private static final int WINDOW_THERMAL_REFRESH_TICKS = 40;
     private static final int PARTICLE_FLOW_SYNC_INTERVAL_TICKS = 4;
     private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 4;
     private static final int MAX_SIMULATION_STEP_BACKLOG = 2;
@@ -151,7 +151,7 @@ public final class AeroServerRuntime {
     private static final int MESOSCALE_FORCING_REBUILD_TICKS = TICKS_PER_SECOND * 60;
     private static final float MESOSCALE_STEP_SECONDS = MESOSCALE_MET_CELL_SIZE_BLOCKS * SOLVER_STEP_SECONDS;
     private static final int BACKGROUND_MET_REFRESH_TICKS = TICKS_PER_SECOND * 60 * 3;
-    private static final int STATIC_MIRROR_BUILD_BUDGET_PER_TICK = 8;
+    private static final int STATIC_MIRROR_BUILD_BUDGET_PER_TICK = 1;
     private static final int WINDOW_EDGE_STABILIZATION_LAYERS = 8;
     private static final float WINDOW_EDGE_STABILIZATION_MIN_KEEP = 0.15f;
     private static final int REGION_HALO_CELLS = CHUNK_SIZE;
@@ -725,7 +725,7 @@ public final class AeroServerRuntime {
             if (window == null) {
                 continue;
             }
-            region.fans = queryFanSources(key.worldKey(), key.origin());
+            refreshRegionFansIfNeeded(key, region);
             if (!window.busy.get() && shouldRefreshWindowThermal(region, window)) {
                 refreshWindowThermalFields(key, region, window);
             }
@@ -819,6 +819,14 @@ public final class AeroServerRuntime {
             result.add(new FanSource(fan.pos(), fan.facing(), fan.ductLength()));
         }
         return List.copyOf(result);
+    }
+
+    private void refreshRegionFansIfNeeded(WindowKey key, RegionRecord region) {
+        if (!region.fansDirty) {
+            return;
+        }
+        region.fans = queryFanSources(key.worldKey(), key.origin());
+        region.fansDirty = false;
     }
 
     private boolean initializeWindowFromMirror(WindowKey key, RegionRecord region, WindowState window) {
@@ -1460,6 +1468,7 @@ public final class AeroServerRuntime {
         if (uploaded) {
             region.staticUploaded = true;
             region.staticSignature = staticSignature;
+            region.fansDirty = true;
         }
         return uploaded;
     }
@@ -3077,6 +3086,7 @@ public final class AeroServerRuntime {
         private boolean serviceReady;
         private boolean staticUploaded;
         private boolean dynamicRestoreAttempted;
+        private boolean fansDirty = true;
         private long staticSignature = Long.MIN_VALUE;
         private WindowState attachedWindow;
         private WindowSection[] sections;
