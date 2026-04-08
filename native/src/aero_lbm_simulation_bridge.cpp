@@ -339,21 +339,14 @@ bool ensure_l2_runtime(ServiceState& service, int nx, int ny, int nz, int input_
     return true;
 }
 
-void rebuild_default_packed_atlas(ServiceState& service, long long region_key) {
-    auto region_it = service.dynamic_regions.find(region_key);
-    if (region_it == service.dynamic_regions.end()) {
-        service.atlases.erase(region_key);
-        return;
-    }
-    const DynamicRegionData& region = region_it->second;
+void rebuild_default_packed_atlas(const DynamicRegionData& region, AtlasData& atlas) {
     if (region.nx <= 0 || region.ny <= 0 || region.nz <= 0 || region.flow_state.empty()) {
-        service.atlases.erase(region_key);
+        atlas.values.clear();
         return;
     }
     const int sx = (region.nx + k_default_packed_atlas_stride - 1) / k_default_packed_atlas_stride;
     const int sy = (region.ny + k_default_packed_atlas_stride - 1) / k_default_packed_atlas_stride;
     const int sz = (region.nz + k_default_packed_atlas_stride - 1) / k_default_packed_atlas_stride;
-    AtlasData& atlas = service.atlases[region_key];
     atlas.values.assign(
         static_cast<size_t>(sx) * static_cast<size_t>(sy) * static_cast<size_t>(sz)
             * AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS,
@@ -378,12 +371,16 @@ void rebuild_default_packed_atlas(ServiceState& service, long long region_key) {
     }
 }
 
-float sync_dynamic_region_from_native(ServiceState& service, long long region_key) {
-    auto dynamic_it = service.dynamic_regions.find(region_key);
-    if (dynamic_it == service.dynamic_regions.end()) {
-        return 0.0f;
+void rebuild_default_packed_atlas(ServiceState& service, long long region_key) {
+    auto region_it = service.dynamic_regions.find(region_key);
+    if (region_it == service.dynamic_regions.end()) {
+        service.atlases.erase(region_key);
+        return;
     }
-    DynamicRegionData& dynamic = dynamic_it->second;
+    rebuild_default_packed_atlas(region_it->second, service.atlases[region_key]);
+}
+
+float sync_dynamic_region_from_native(long long region_key, DynamicRegionData& dynamic, AtlasData* atlas) {
     int cells = 0;
     if (!checked_cell_count(dynamic.nx, dynamic.ny, dynamic.nz, &cells)) {
         return 0.0f;
@@ -411,8 +408,18 @@ float sync_dynamic_region_from_native(ServiceState& service, long long region_ke
             max_speed = speed;
         }
     }
-    rebuild_default_packed_atlas(service, region_key);
+    if (atlas) {
+        rebuild_default_packed_atlas(dynamic, *atlas);
+    }
     return max_speed;
+}
+
+float sync_dynamic_region_from_native(ServiceState& service, long long region_key) {
+    auto dynamic_it = service.dynamic_regions.find(region_key);
+    if (dynamic_it == service.dynamic_regions.end()) {
+        return 0.0f;
+    }
+    return sync_dynamic_region_from_native(region_key, dynamic_it->second, &service.atlases[region_key]);
 }
 
 void apply_boundary_wind(
@@ -456,9 +463,10 @@ void apply_boundary_wind(
     }
 }
 
-bool build_region_packet(
-    ServiceState& service,
-    long long region_key,
+bool build_region_packet_from_data(
+    const StaticRegionData& stat,
+    const DynamicRegionData& dynamic,
+    const ForcingRegionData& forcing,
     int nx,
     int ny,
     int nz,
@@ -467,24 +475,6 @@ bool build_region_packet(
     float boundary_wind_z,
     std::vector<float>& packet
 ) {
-    auto static_it = service.static_regions.find(region_key);
-    auto dynamic_it = service.dynamic_regions.find(region_key);
-    auto forcing_it = service.forcing_regions.find(region_key);
-    if (static_it == service.static_regions.end()) {
-        set_simulation_last_error("simulation_step_region_stored: missing static region");
-        return false;
-    }
-    if (dynamic_it == service.dynamic_regions.end()) {
-        set_simulation_last_error("simulation_step_region_stored: missing dynamic region");
-        return false;
-    }
-    if (forcing_it == service.forcing_regions.end()) {
-        set_simulation_last_error("simulation_step_region_stored: missing forcing region");
-        return false;
-    }
-    const StaticRegionData& stat = static_it->second;
-    const DynamicRegionData& dynamic = dynamic_it->second;
-    const ForcingRegionData& forcing = forcing_it->second;
     if (stat.nx != nx || stat.ny != ny || stat.nz != nz
         || dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz
         || forcing.nx != nx || forcing.ny != ny || forcing.nz != nz) {
@@ -524,6 +514,46 @@ bool build_region_packet(
     }
     apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
     return true;
+}
+
+bool build_region_packet(
+    ServiceState& service,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z,
+    std::vector<float>& packet
+) {
+    auto static_it = service.static_regions.find(region_key);
+    auto dynamic_it = service.dynamic_regions.find(region_key);
+    auto forcing_it = service.forcing_regions.find(region_key);
+    if (static_it == service.static_regions.end()) {
+        set_simulation_last_error("simulation_step_region_stored: missing static region");
+        return false;
+    }
+    if (dynamic_it == service.dynamic_regions.end()) {
+        set_simulation_last_error("simulation_step_region_stored: missing dynamic region");
+        return false;
+    }
+    if (forcing_it == service.forcing_regions.end()) {
+        set_simulation_last_error("simulation_step_region_stored: missing forcing region");
+        return false;
+    }
+    return build_region_packet_from_data(
+        static_it->second,
+        dynamic_it->second,
+        forcing_it->second,
+        nx,
+        ny,
+        nz,
+        boundary_wind_x,
+        boundary_wind_y,
+        boundary_wind_z,
+        packet
+    );
 }
 
 bool refresh_region_thermal(
@@ -1217,40 +1247,68 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         return 0;
     }
 
-    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
-    ServiceState* service = lookup_service(service_key);
-    if (!service) {
-        set_simulation_last_error("simulation_step_region_stored: missing service");
-        return 0;
+    StaticRegionData static_region;
+    DynamicRegionData dynamic_region;
+    ForcingRegionData forcing_region;
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_step_region_stored: missing service");
+            return 0;
+        }
+        auto lifecycle_it = service->regions.find(region_key);
+        if (lifecycle_it == service->regions.end() || !lifecycle_it->second.active) {
+            set_simulation_last_error("simulation_step_region_stored: inactive region");
+            return 0;
+        }
+        if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+            return 0;
+        }
+        auto static_it = service->static_regions.find(region_key);
+        auto forcing_it = service->forcing_regions.find(region_key);
+        if (static_it == service->static_regions.end()) {
+            set_simulation_last_error("simulation_step_region_stored: missing static region");
+            return 0;
+        }
+        if (forcing_it == service->forcing_regions.end()) {
+            set_simulation_last_error("simulation_step_region_stored: missing forcing region");
+            return 0;
+        }
+        auto dynamic_it = service->dynamic_regions.find(region_key);
+        if (dynamic_it == service->dynamic_regions.end()) {
+            DynamicRegionData& dynamic = service->dynamic_regions[region_key];
+            dynamic.nx = nx;
+            dynamic.ny = ny;
+            dynamic.nz = nz;
+            dynamic.flow_state.assign(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+            dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
+            dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
+            dynamic_it = service->dynamic_regions.find(region_key);
+        }
+        static_region = static_it->second;
+        dynamic_region = dynamic_it->second;
+        forcing_region = forcing_it->second;
     }
-    auto lifecycle_it = service->regions.find(region_key);
-    if (lifecycle_it == service->regions.end() || !lifecycle_it->second.active) {
-        set_simulation_last_error("simulation_step_region_stored: inactive region");
-        return 0;
-    }
-    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
-        return 0;
-    }
-    auto dynamic_it = service->dynamic_regions.find(region_key);
-    if (dynamic_it == service->dynamic_regions.end()) {
-        DynamicRegionData& dynamic = service->dynamic_regions[region_key];
-        dynamic.nx = nx;
-        dynamic.ny = ny;
-        dynamic.nz = nz;
-        dynamic.flow_state.assign(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
-        dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
-        dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
-        dynamic_it = service->dynamic_regions.find(region_key);
-    }
-    DynamicRegionData& dynamic = dynamic_it->second;
-    if (dynamic.air_temperature.size() == static_cast<size_t>(cells)) {
-        if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic.air_temperature.data())) {
+    if (dynamic_region.air_temperature.size() == static_cast<size_t>(cells)) {
+        if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic_region.air_temperature.data())) {
             set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
             return 0;
         }
     }
     std::vector<float> packet;
-    if (!build_region_packet(*service, region_key, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z, packet)) {
+    if (!build_region_packet_from_data(
+        static_region,
+        dynamic_region,
+        forcing_region,
+        nx,
+        ny,
+        nz,
+        boundary_wind_x,
+        boundary_wind_y,
+        boundary_wind_z,
+        packet
+    )) {
         return 0;
     }
     std::vector<float> output_flow(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
@@ -1258,11 +1316,22 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         set_simulation_last_error(std::string("simulation_step_region_stored failed: ") + aero_lbm_last_error());
         return 0;
     }
-    dynamic.flow_state.swap(output_flow);
-    float max_speed = sync_dynamic_region_from_native(*service, region_key);
+    dynamic_region.flow_state.swap(output_flow);
+    AtlasData atlas;
+    float max_speed = sync_dynamic_region_from_native(region_key, dynamic_region, &atlas);
     if (max_speed < 0.0f) {
         set_simulation_last_error(std::string("simulation_step_region_stored sync failed: ") + aero_lbm_last_error());
         return 0;
+    }
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_step_region_stored: missing service after step");
+            return 0;
+        }
+        service->dynamic_regions[region_key] = std::move(dynamic_region);
+        service->atlases[region_key] = std::move(atlas);
     }
     *out_max_speed = max_speed;
     return 1;
@@ -1277,11 +1346,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     int offset_y,
     int offset_z
 ) {
-    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
-    ServiceState* service = lookup_service(service_key);
-    if (!service) {
-        set_simulation_last_error("simulation_exchange_region_halo: missing service");
-        return 0;
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_exchange_region_halo: missing service");
+            return 0;
+        }
     }
     if (!aero_lbm_exchange_halo(grid_size, first_region_key, second_region_key, offset_x, offset_y, offset_z)) {
         set_simulation_last_error(std::string("simulation_exchange_region_halo failed: ") + aero_lbm_last_error());
@@ -1301,20 +1372,36 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_state(
         return 0;
     }
 
-    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
-    ServiceState* service = lookup_service(service_key);
-    if (!service) {
-        set_simulation_last_error("simulation_sync_region_state: missing service");
-        return 0;
+    DynamicRegionData dynamic_region;
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_sync_region_state: missing service");
+            return 0;
+        }
+        auto dynamic_it = service->dynamic_regions.find(region_key);
+        if (dynamic_it == service->dynamic_regions.end()) {
+            set_simulation_last_error("simulation_sync_region_state: missing dynamic region");
+            return 0;
+        }
+        dynamic_region = dynamic_it->second;
     }
-    if (service->dynamic_regions.find(region_key) == service->dynamic_regions.end()) {
-        set_simulation_last_error("simulation_sync_region_state: missing dynamic region");
-        return 0;
-    }
-    float max_speed = sync_dynamic_region_from_native(*service, region_key);
+    AtlasData atlas;
+    float max_speed = sync_dynamic_region_from_native(region_key, dynamic_region, &atlas);
     if (max_speed < 0.0f) {
         set_simulation_last_error(std::string("simulation_sync_region_state failed: ") + aero_lbm_last_error());
         return 0;
+    }
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_sync_region_state: missing service after sync");
+            return 0;
+        }
+        service->dynamic_regions[region_key] = std::move(dynamic_region);
+        service->atlases[region_key] = std::move(atlas);
     }
     *out_max_speed = max_speed;
     return 1;

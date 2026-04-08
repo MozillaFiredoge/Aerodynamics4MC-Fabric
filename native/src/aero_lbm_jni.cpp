@@ -6,6 +6,7 @@
 #include "aero_lbm_thermal_core.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cctype>
@@ -14,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -482,7 +485,21 @@ struct Config {
     std::string runtime_info;
 };
 
+struct SpinMutex {
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+
+    void lock() noexcept {
+        while (flag.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+
+    void unlock() noexcept {
+        flag.clear(std::memory_order_release);
+    }
+};
+
 struct ContextState {
+    std::unique_ptr<SpinMutex> mutex = std::make_unique<SpinMutex>();
     int nx = 0;
     int ny = 0;
     int nz = 0;
@@ -533,6 +550,7 @@ struct ContextState {
 
 Config g_cfg;
 std::unordered_map<jlong, ContextState> g_contexts;
+SpinMutex g_contexts_mutex;
 std::string g_last_native_error;
 
 struct StepTiming {
@@ -5038,6 +5056,69 @@ void disable_opencl_runtime(const std::string& reason) {
     g_cfg.runtime_info = "cpu|cumulant-d3q27+sgs+bouss (" + reason + ")";
 }
 
+struct LockedContext {
+    ContextState* ctx = nullptr;
+
+    LockedContext(jlong context_key, bool create_if_missing) {
+        g_contexts_mutex.lock();
+        if (create_if_missing) {
+            ctx = &g_contexts[context_key];
+        } else {
+            auto it = g_contexts.find(context_key);
+            if (it != g_contexts.end()) {
+                ctx = &it->second;
+            }
+        }
+        if (ctx) {
+            ctx->mutex->lock();
+        }
+        g_contexts_mutex.unlock();
+    }
+
+    ~LockedContext() {
+        if (ctx) {
+            ctx->mutex->unlock();
+        }
+    }
+};
+
+struct LockedContextPair {
+    ContextState* first = nullptr;
+    ContextState* second = nullptr;
+
+    LockedContextPair(jlong first_key, jlong second_key) {
+        g_contexts_mutex.lock();
+        auto first_it = g_contexts.find(first_key);
+        auto second_it = g_contexts.find(second_key);
+        if (first_it == g_contexts.end() || second_it == g_contexts.end()) {
+            g_contexts_mutex.unlock();
+            return;
+        }
+        first = &first_it->second;
+        second = &second_it->second;
+        if (first_key == second_key) {
+            first->mutex->lock();
+        } else if (first_key < second_key) {
+            first->mutex->lock();
+            second->mutex->lock();
+        } else {
+            second->mutex->lock();
+            first->mutex->lock();
+        }
+        g_contexts_mutex.unlock();
+    }
+
+    ~LockedContextPair() {
+        if (!first) {
+            return;
+        }
+        if (second && second != first) {
+            second->mutex->unlock();
+        }
+        first->mutex->unlock();
+    }
+};
+
 bool should_force_cpu_backend() {
 #if defined(_MSC_VER)
     char* env_buf = nullptr;
@@ -5565,7 +5646,9 @@ static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jin
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
-    ContextState& ctx = g_contexts[context_key];
+    LockedContext locked_context(context_key, true);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, nx, ny, nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
 
@@ -5597,7 +5680,12 @@ static jboolean native_step_impl(
     jfloat* out = env->GetFloatArrayElements(output_flow, nullptr);
     if (!out) return JNI_FALSE;
 
-    ContextState& ctx = g_contexts[context_key];
+    LockedContext locked_context(context_key, true);
+    if (!locked_context.ctx) {
+        env->ReleaseFloatArrayElements(output_flow, out, 0);
+        return JNI_FALSE;
+    }
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     // Ensure CPU-side buffers exist and reuse packet buffer to avoid per-step allocations
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
@@ -5639,7 +5727,12 @@ static jboolean native_step_direct_impl(
     jfloat* out = env->GetFloatArrayElements(output_flow, nullptr);
     if (!out) return JNI_FALSE;
 
-    ContextState& ctx = g_contexts[context_key];
+    LockedContext locked_context(context_key, true);
+    if (!locked_context.ctx) {
+        env->ReleaseFloatArrayElements(output_flow, out, 0);
+        return JNI_FALSE;
+    }
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
 
@@ -5660,9 +5753,9 @@ static bool native_get_temperature_state_raw_dims_impl(jint nx, jint ny, jint nz
     if (!g_cfg.initialized || !temperature_out) return false;
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
-    auto it = g_contexts.find(context_key);
-    if (it == g_contexts.end()) return false;
-    ContextState& ctx = it->second;
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_temperature_from_gpu(ctx)) return false;
     if (ctx.temperature.size() != cells) return false;
@@ -5674,9 +5767,9 @@ static bool native_get_flow_state_raw_dims_impl(jint nx, jint ny, jint nz, jlong
     if (!g_cfg.initialized || !flow_out) return false;
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
-    auto it = g_contexts.find(context_key);
-    if (it == g_contexts.end()) return false;
-    ContextState& ctx = it->second;
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return false;
     if (ctx.f.empty() || ctx.cells == 0) return false;
@@ -5691,9 +5784,9 @@ static jboolean native_get_temperature_state_impl(
     const std::size_t cells = configured_cells();
     if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
 
-    auto it = g_contexts.find(context_key);
-    if (it == g_contexts.end()) return JNI_FALSE;
-    ContextState& ctx = it->second;
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return JNI_FALSE;
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_temperature_from_gpu(ctx)) return JNI_FALSE;
     if (ctx.temperature.size() != cells) return JNI_FALSE;
@@ -5709,7 +5802,9 @@ static jboolean native_set_temperature_state_impl(
     const std::size_t cells = configured_cells();
     if (env->GetArrayLength(temperature_state) != static_cast<jsize>(cells)) return JNI_FALSE;
 
-    ContextState& ctx = g_contexts[context_key];
+    LockedContext locked_context(context_key, true);
+    if (!locked_context.ctx) return JNI_FALSE;
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     jfloat* temperature_ptr = env->GetFloatArrayElements(temperature_state, nullptr);
@@ -5731,7 +5826,9 @@ static bool native_set_temperature_state_raw_dims_impl(
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
-    ContextState& ctx = g_contexts[context_key];
+    LockedContext locked_context(context_key, true);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     assign_temperature_state(ctx, temperature_state);
@@ -5741,9 +5838,9 @@ static bool native_set_temperature_state_raw_dims_impl(
 
 static jboolean native_shift_context_impl(jint grid_size, jlong context_key, jint dx, jint dy, jint dz) {
     if (!g_cfg.initialized || grid_size != g_cfg.grid_size) return JNI_FALSE;
-    auto it = g_contexts.find(context_key);
-    if (it == g_contexts.end()) return JNI_FALSE;
-    ContextState& ctx = it->second;
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return JNI_FALSE;
+    ContextState& ctx = *locked_context.ctx;
     const std::size_t cells = configured_cells();
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     if (ctx.cells == 0) return JNI_TRUE;
@@ -5755,6 +5852,7 @@ static jboolean native_shift_context_impl(jint grid_size, jlong context_key, jin
 }
 
 static jboolean native_has_context_impl(jlong context_key) {
+    std::lock_guard<SpinMutex> lock(g_contexts_mutex);
     return g_contexts.find(context_key) != g_contexts.end() ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -5788,9 +5886,11 @@ static jboolean native_exchange_halo_impl(
         set_last_native_error("native_exchange_halo: zero offset is invalid");
         return JNI_FALSE;
     }
-    auto first_it = g_contexts.find(first_context_key);
-    auto second_it = g_contexts.find(second_context_key);
-    if (first_it == g_contexts.end() || second_it == g_contexts.end()) {
+    LockedContextPair locked_contexts(first_context_key, second_context_key);
+    if (!locked_contexts.first || !locked_contexts.second) {
+        std::lock_guard<SpinMutex> lock(g_contexts_mutex);
+        auto first_it = g_contexts.find(first_context_key);
+        auto second_it = g_contexts.find(second_context_key);
         std::ostringstream oss;
         oss << "native_exchange_halo: missing context(s) first=" << static_cast<long long>(first_context_key)
             << (first_it == g_contexts.end() ? " [missing]" : "")
@@ -5799,8 +5899,8 @@ static jboolean native_exchange_halo_impl(
         set_last_native_error(oss.str());
         return JNI_FALSE;
     }
-    ContextState& first = first_it->second;
-    ContextState& second = second_it->second;
+    ContextState& first = *locked_contexts.first;
+    ContextState& second = *locked_contexts.second;
     const std::size_t cells = configured_cells();
     ensure_context_shape(first, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
     ensure_context_shape(second, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
@@ -5827,8 +5927,14 @@ static jboolean native_exchange_halo_impl(
 }
 
 static void native_release_context_impl(jlong context_key) {
+    std::lock_guard<SpinMutex> lock(g_contexts_mutex);
     auto it = g_contexts.find(context_key);
-    if (it != g_contexts.end()) { clear_context(it->second); g_contexts.erase(it); }
+    if (it != g_contexts.end()) {
+        it->second.mutex->lock();
+        clear_context(it->second);
+        it->second.mutex->unlock();
+        g_contexts.erase(it);
+    }
 }
 
 static void native_shutdown_impl() { reset_runtime_state(); }
@@ -5928,9 +6034,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_get_flow_state_rect(int nx, int ny, int nz, lo
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return 0;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
-    auto it = g_contexts.find(static_cast<jlong>(context_key));
-    if (it == g_contexts.end()) return 0;
-    ContextState& ctx = it->second;
+    LockedContext locked_context(static_cast<jlong>(context_key), false);
+    if (!locked_context.ctx) return 0;
+    ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, nx, ny, nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return 0;
     if (ctx.f.empty() || ctx.cells == 0) return 0;
@@ -5955,9 +6061,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_set_temperature_state_rect(
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz) {
-    const auto it = g_contexts.find(static_cast<jlong>(context_key));
-    if (it == g_contexts.end()) return 0;
-    const ContextState& ctx = it->second;
+    LockedContext locked_context(static_cast<jlong>(context_key), false);
+    if (!locked_context.ctx) return 0;
+    const ContextState& ctx = *locked_context.ctx;
     if (out_fx) *out_fx = ctx.last_force[0];
     if (out_fy) *out_fy = ctx.last_force[1];
     if (out_fz) *out_fz = ctx.last_force[2];

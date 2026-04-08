@@ -2579,6 +2579,7 @@ public final class AeroServerRuntime {
                 region.completedMaxSpeed = maxSpeed;
                 lastCoordinatorSolveCompleteTick = tickCounter;
                 lastSolverError = "";
+                publishPlayerProbesForSolvedRegion(snapshot);
             }
         } catch (IOException ex) {
             if (snapshot.generation() == runtimeGeneration.get()) {
@@ -2842,20 +2843,7 @@ public final class AeroServerRuntime {
             if (sample == null) {
                 continue;
             }
-            probes.put(
-                request.playerId(),
-                new PlayerProbe(
-                    request.playerId(),
-                    request.worldKey(),
-                    request.blockPos(),
-                    sample.velocityX(),
-                    sample.velocityY(),
-                    sample.velocityZ(),
-                    sample.pressure(),
-                    sample.airTemperatureKelvin(),
-                    sample.surfaceTemperatureKelvin()
-                )
-            );
+            probes.put(request.playerId(), buildPlayerProbe(request, sample));
         }
         return probes.isEmpty() ? Map.of() : Map.copyOf(probes);
     }
@@ -2895,6 +2883,11 @@ public final class AeroServerRuntime {
         if (region == null || !region.serviceReady) {
             return null;
         }
+        return sampleRegionPointForKey(key, probePos, rawProbe);
+    }
+
+    private SampledPoint sampleRegionPointForKey(WindowKey key, BlockPos probePos, float[] rawProbe) {
+        RegistryKey<World> worldKey = key.worldKey();
         int localX = probePos.getX() - key.origin().getX();
         int localY = probePos.getY() - key.origin().getY();
         int localZ = probePos.getZ() - key.origin().getZ();
@@ -2928,6 +2921,53 @@ public final class AeroServerRuntime {
             environment.ambientAirTemperatureKelvin() + rawProbe[4] * RUNTIME_TEMPERATURE_SCALE_KELVIN,
             rawProbe[5]
         );
+    }
+
+    private PlayerProbe buildPlayerProbe(PlayerProbeRequest request, SampledPoint sample) {
+        return new PlayerProbe(
+            request.playerId(),
+            request.worldKey(),
+            request.blockPos(),
+            sample.velocityX(),
+            sample.velocityY(),
+            sample.velocityZ(),
+            sample.pressure(),
+            sample.airTemperatureKelvin(),
+            sample.surfaceTemperatureKelvin()
+        );
+    }
+
+    private void publishPlayerProbesForSolvedRegion(SolveSnapshot snapshot) {
+        if (simulationServiceId == 0L) {
+            return;
+        }
+        List<PlayerProbeRequest> requests = activePlayerProbeRequests;
+        if (requests.isEmpty()) {
+            return;
+        }
+        float[] rawProbe = new float[NativeSimulationBridge.PLAYER_PROBE_CHANNELS];
+        Map<UUID, PlayerProbe> updates = new HashMap<>();
+        for (PlayerProbeRequest request : requests) {
+            if (!snapshot.key().worldKey().equals(request.worldKey())) {
+                continue;
+            }
+            SampledPoint sample = sampleRegionPointForKey(snapshot.key(), request.blockPos(), rawProbe);
+            if (sample == null) {
+                continue;
+            }
+            updates.put(request.playerId(), buildPlayerProbe(request, sample));
+        }
+        if (updates.isEmpty()) {
+            return;
+        }
+        while (true) {
+            Map<UUID, PlayerProbe> current = publishedPlayerProbes.get();
+            Map<UUID, PlayerProbe> next = new HashMap<>(current);
+            next.putAll(updates);
+            if (publishedPlayerProbes.compareAndSet(current, Map.copyOf(next))) {
+                return;
+            }
+        }
     }
 
     private void releaseWindow(WindowKey key, RegionRecord region) {
