@@ -218,6 +218,7 @@ public final class AeroServerRuntime {
     private final AtomicInteger simulationStepBudget = new AtomicInteger(0);
     private final AtomicLong runtimeGeneration = new AtomicLong(0L);
     private final AtomicLong publishedFrameCounter = new AtomicLong(0L);
+    private final AtomicLong completedSolveCounter = new AtomicLong(0L);
     private final AtomicReference<PublishedFrame> publishedFrame = new AtomicReference<>(null);
     private final AtomicReference<Map<UUID, PlayerProbe>> publishedPlayerProbes = new AtomicReference<>(Map.of());
     private final AtomicReference<Map<UUID, EntitySample>> publishedEntitySamples = new AtomicReference<>(Map.of());
@@ -233,7 +234,8 @@ public final class AeroServerRuntime {
     private int lastWindowRefreshTick = Integer.MIN_VALUE;
     private long simulationTicks = 0L;
     private long lastObservedPublishedFrameId = 0L;
-    private int lastPublishedFrameTick = Integer.MIN_VALUE;
+    private long lastObservedCompletedSolveCount = 0L;
+    private volatile int lastPublishedFrameTick = Integer.MIN_VALUE;
     private int secondWindowTotalTicks = 0;
     private int secondWindowSimulationTicks = 0;
     private float simulationTicksPerSecond = 0.0f;
@@ -631,10 +633,14 @@ public final class AeroServerRuntime {
         }
         long frameId = frame.frameId();
         int publishedSteps = 0;
-        if (frameId > lastObservedPublishedFrameId) {
-            long delta = frameId - lastObservedPublishedFrameId;
+        long completedSolveCount = completedSolveCounter.get();
+        if (completedSolveCount > lastObservedCompletedSolveCount) {
+            long delta = completedSolveCount - lastObservedCompletedSolveCount;
             simulationTicks += delta;
             publishedSteps = (int) Math.min(Integer.MAX_VALUE, delta);
+            lastObservedCompletedSolveCount = completedSolveCount;
+        }
+        if (frameId > lastObservedPublishedFrameId) {
             lastObservedPublishedFrameId = frameId;
             lastMaxFlowSpeed = frame.maxSpeed();
         }
@@ -741,6 +747,8 @@ public final class AeroServerRuntime {
         simulationStepBudget.set(0);
         simulationTicks = 0L;
         lastObservedPublishedFrameId = 0L;
+        lastObservedCompletedSolveCount = 0L;
+        completedSolveCounter.set(0L);
         lastPublishedFrameTick = Integer.MIN_VALUE;
         secondWindowTotalTicks = 0;
         secondWindowSimulationTicks = 0;
@@ -1411,7 +1419,9 @@ public final class AeroServerRuntime {
                 lastSolverError = message.toString();
                 continue;
             }
-            maxSpeed = Math.max(maxSpeed, syncedMax * NATIVE_VELOCITY_SCALE);
+            float syncedMaxSpeed = syncedMax * NATIVE_VELOCITY_SCALE;
+            maxSpeed = Math.max(maxSpeed, syncedMaxSpeed);
+            publishRegionAtlas(key, syncedMaxSpeed);
         }
         return maxSpeed;
     }
@@ -1459,6 +1469,7 @@ public final class AeroServerRuntime {
 
     private void deactivateWindow(WindowKey key, RegionRecord region, boolean persistDynamicRegion, boolean synchronousPersist) {
         region.markDetached();
+        removePublishedRegionAtlas(key);
         if (persistDynamicRegion) {
             persistWindowDynamicRegion(key, region, synchronousPersist);
         }
@@ -2577,9 +2588,11 @@ public final class AeroServerRuntime {
             float maxSpeed = runSolverStep(snapshot);
             if (snapshot.generation() == runtimeGeneration.get()) {
                 region.completedMaxSpeed = maxSpeed;
+                completedSolveCounter.incrementAndGet();
                 lastCoordinatorSolveCompleteTick = tickCounter;
                 lastSolverError = "";
                 publishPlayerProbesForSolvedRegion(snapshot);
+                publishRegionAtlas(snapshot.key(), maxSpeed);
             }
         } catch (IOException ex) {
             if (snapshot.generation() == runtimeGeneration.get()) {
@@ -2713,23 +2726,6 @@ public final class AeroServerRuntime {
         }
     }
 
-    private boolean activeSetStillMatches(List<ActiveWindow> snapshot) {
-        synchronized (simulationStateLock) {
-            if (attachedWindowCount() != snapshot.size()) {
-                return false;
-            }
-            for (ActiveWindow active : snapshot) {
-                RegionRecord region = regions.get(active.key());
-                if (region == null
-                    || !region.serviceReady
-                    || !region.attached()) {
-                    return false;
-                }
-            }
-            return true;
-        }
-    }
-
     private int attachedWindowCount() {
         int count = 0;
         for (RegionRecord region : regions.values()) {
@@ -2751,6 +2747,9 @@ public final class AeroServerRuntime {
     }
 
     private int currentPublishedFrameAgeTicks() {
+        if (publishedFrame.get() == null) {
+            return -1;
+        }
         if (lastPublishedFrameTick == Integer.MIN_VALUE) {
             return -1;
         }
@@ -2783,26 +2782,72 @@ public final class AeroServerRuntime {
         return coordinator != null && coordinator.running();
     }
 
-    private void publishFrame(List<ActiveWindow> activeWindows, float maxSpeedThisCycle) {
-        Map<WindowKey, short[]> regionAtlases = snapshotPublishedAtlases(activeWindows, PARTICLE_FLOW_SAMPLE_STRIDE);
-        if (regionAtlases.isEmpty()) {
+    private void publishRegionAtlas(WindowKey key, float regionMaxSpeed) {
+        if (simulationServiceId == 0L) {
             return;
         }
-        long frameId = publishedFrameCounter.incrementAndGet();
-        PublishedFrame frame = new PublishedFrame(frameId, maxSpeedThisCycle, Map.copyOf(regionAtlases));
-        publishedFrame.set(frame);
-        lastPublishedFrameTick = tickCounter;
+        short[] packed = pollPackedFlowForNetwork(key, PARTICLE_FLOW_SAMPLE_STRIDE);
+        if (packed == null) {
+            return;
+        }
+        while (true) {
+            PublishedFrame current = publishedFrame.get();
+            Map<WindowKey, short[]> nextAtlases = new HashMap<>(current == null ? Map.of() : current.regionAtlases());
+            Map<WindowKey, Float> nextRegionMaxSpeeds = new HashMap<>(current == null ? Map.of() : current.regionMaxSpeeds());
+            nextAtlases.put(key, packed);
+            nextRegionMaxSpeeds.put(key, Math.max(0.0f, regionMaxSpeed));
+            float nextMaxSpeed = computePublishedMaxSpeed(nextRegionMaxSpeeds);
+            PublishedFrame next = new PublishedFrame(
+                publishedFrameCounter.incrementAndGet(),
+                nextMaxSpeed,
+                Map.copyOf(nextAtlases),
+                Map.copyOf(nextRegionMaxSpeeds)
+            );
+            if (publishedFrame.compareAndSet(current, next)) {
+                lastPublishedFrameTick = tickCounter;
+                lastCoordinatorPublishedMaxSpeed = nextMaxSpeed;
+                lastCoordinatorPublishTick = tickCounter;
+                return;
+            }
+        }
     }
 
-    private Map<WindowKey, short[]> snapshotPublishedAtlases(List<ActiveWindow> activeWindows, int stride) {
-        Map<WindowKey, short[]> regionAtlases = new HashMap<>(activeWindows.size());
-        for (ActiveWindow active : activeWindows) {
-            if (active.region().sections == null) {
-                continue;
+    private void removePublishedRegionAtlas(WindowKey key) {
+        while (true) {
+            PublishedFrame current = publishedFrame.get();
+            if (current == null || !current.regionAtlases().containsKey(key)) {
+                return;
             }
-            regionAtlases.put(active.key(), packedFlowForNetwork(active.key(), stride));
+            Map<WindowKey, short[]> nextAtlases = new HashMap<>(current.regionAtlases());
+            Map<WindowKey, Float> nextRegionMaxSpeeds = new HashMap<>(current.regionMaxSpeeds());
+            nextAtlases.remove(key);
+            nextRegionMaxSpeeds.remove(key);
+            PublishedFrame next = nextAtlases.isEmpty()
+                ? null
+                : new PublishedFrame(
+                    publishedFrameCounter.incrementAndGet(),
+                    computePublishedMaxSpeed(nextRegionMaxSpeeds),
+                    Map.copyOf(nextAtlases),
+                    Map.copyOf(nextRegionMaxSpeeds)
+                );
+            if (publishedFrame.compareAndSet(current, next)) {
+                if (next == null) {
+                    lastPublishedFrameTick = Integer.MIN_VALUE;
+                    lastCoordinatorPublishedMaxSpeed = 0.0f;
+                }
+                return;
+            }
         }
-        return regionAtlases;
+    }
+
+    private float computePublishedMaxSpeed(Map<WindowKey, Float> regionMaxSpeeds) {
+        float maxSpeed = 0.0f;
+        for (float value : regionMaxSpeeds.values()) {
+            if (Float.isFinite(value) && value > maxSpeed) {
+                maxSpeed = value;
+            }
+        }
+        return maxSpeed;
     }
 
     private void syncPublishedFlowToPlayers(MinecraftServer server, PublishedFrame frame, int stride) {
@@ -2821,7 +2866,7 @@ public final class AeroServerRuntime {
         }
     }
 
-    private short[] packedFlowForNetwork(WindowKey key, int stride) {
+    private short[] pollPackedFlowForNetwork(WindowKey key, int stride) {
         int sampleStride = sanitizeStride(stride);
         int n = (GRID_SIZE + sampleStride - 1) / sampleStride;
         short[] packed = new short[n * n * n * NativeSimulationBridge.PACKED_ATLAS_CHANNELS];
@@ -2829,7 +2874,7 @@ public final class AeroServerRuntime {
             && simulationBridge.pollPackedFlowAtlas(simulationServiceId, simulationRegionKey(key), packed)) {
             return packed;
         }
-        return packed;
+        return null;
     }
 
     private Map<UUID, PlayerProbe> samplePlayerProbesLocked() {
@@ -3142,7 +3187,12 @@ public final class AeroServerRuntime {
     ) {
     }
 
-    private record PublishedFrame(long frameId, float maxSpeed, Map<WindowKey, short[]> regionAtlases) {
+    private record PublishedFrame(
+        long frameId,
+        float maxSpeed,
+        Map<WindowKey, short[]> regionAtlases,
+        Map<WindowKey, Float> regionMaxSpeeds
+    ) {
     }
 
     private static final class RegionRecord {
@@ -3359,16 +3409,13 @@ public final class AeroServerRuntime {
                         lastCoordinatorState = "sampleProbes";
                         publishedPlayerProbes.set(samplePlayerProbesLocked());
                         publishedEntitySamples.set(sampleEntitySamplesLocked());
-                        lastCoordinatorState = "publishCandidate";
-                        if (activeSetStillMatches(activeWindows)) {
-                            lastCoordinatorState = "published";
-                            lastCoordinatorNoPublishReason = "";
-                            publishFrame(activeWindows, maxSpeedThisCycle);
-                            lastCoordinatorPublishedMaxSpeed = maxSpeedThisCycle;
-                            lastCoordinatorPublishTick = tickCounter;
+                        lastCoordinatorState = "published";
+                        lastCoordinatorNoPublishReason = "";
+                        PublishedFrame currentFrame = publishedFrame.get();
+                        if (currentFrame != null) {
+                            lastCoordinatorPublishedMaxSpeed = currentFrame.maxSpeed();
                         } else {
-                            lastCoordinatorState = "activeSetMismatch";
-                            lastCoordinatorNoPublishReason = "activeSetMismatch";
+                            lastCoordinatorPublishedMaxSpeed = 0.0f;
                         }
                     }
                     lastCoordinatorPostSolveNanos = System.nanoTime() - postSolveStartNanos;

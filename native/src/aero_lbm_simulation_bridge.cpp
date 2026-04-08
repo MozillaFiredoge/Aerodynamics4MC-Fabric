@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -50,6 +51,13 @@ struct AtlasData {
     std::vector<int16_t> values;
 };
 
+struct RegionPacketTemplateData {
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    std::vector<float> values;
+};
+
 struct RegionLifecycleData {
     int nx = 0;
     int ny = 0;
@@ -70,10 +78,11 @@ struct ServiceState {
     int l2_output_channels = 0;
     std::vector<AeroLbmWorldDelta> world_deltas;
     std::unordered_map<long long, RegionLifecycleData> regions;
-    std::unordered_map<long long, StaticRegionData> static_regions;
+    std::unordered_map<long long, std::shared_ptr<const StaticRegionData>> static_regions;
     std::unordered_map<long long, DynamicRegionData> dynamic_regions;
-    std::unordered_map<long long, ForcingRegionData> forcing_regions;
+    std::unordered_map<long long, std::shared_ptr<const ForcingRegionData>> forcing_regions;
     std::unordered_map<long long, AtlasData> atlases;
+    std::unordered_map<long long, std::shared_ptr<const RegionPacketTemplateData>> packet_templates;
 };
 
 struct SpinMutex {
@@ -161,6 +170,8 @@ bool checked_cell_count(int nx, int ny, int nz, int* out_cells) {
     return true;
 }
 
+void rebuild_region_packet_template(ServiceState& service, long long region_key);
+
 void ensure_region_buffers(ServiceState& service, long long region_key, int nx, int ny, int nz, int cells) {
     DynamicRegionData& dynamic = service.dynamic_regions[region_key];
     if (dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz
@@ -175,21 +186,87 @@ void ensure_region_buffers(ServiceState& service, long long region_key, int nx, 
         dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
     }
 
-    ForcingRegionData& forcing = service.forcing_regions[region_key];
-    if (forcing.nx != nx || forcing.ny != ny || forcing.nz != nz
-        || forcing.thermal_source.size() != static_cast<size_t>(cells)
-        || forcing.fan_mask.size() != static_cast<size_t>(cells)
-        || forcing.fan_vx.size() != static_cast<size_t>(cells)
-        || forcing.fan_vy.size() != static_cast<size_t>(cells)
-        || forcing.fan_vz.size() != static_cast<size_t>(cells)) {
-        forcing.nx = nx;
-        forcing.ny = ny;
-        forcing.nz = nz;
-        forcing.thermal_source.assign(static_cast<size_t>(cells), 0.0f);
-        forcing.fan_mask.assign(static_cast<size_t>(cells), 0);
-        forcing.fan_vx.assign(static_cast<size_t>(cells), 0.0f);
-        forcing.fan_vy.assign(static_cast<size_t>(cells), 0.0f);
-        forcing.fan_vz.assign(static_cast<size_t>(cells), 0.0f);
+    auto forcing_it = service.forcing_regions.find(region_key);
+    if (forcing_it == service.forcing_regions.end()
+        || !forcing_it->second
+        || forcing_it->second->nx != nx || forcing_it->second->ny != ny || forcing_it->second->nz != nz
+        || forcing_it->second->thermal_source.size() != static_cast<size_t>(cells)
+        || forcing_it->second->fan_mask.size() != static_cast<size_t>(cells)
+        || forcing_it->second->fan_vx.size() != static_cast<size_t>(cells)
+        || forcing_it->second->fan_vy.size() != static_cast<size_t>(cells)
+        || forcing_it->second->fan_vz.size() != static_cast<size_t>(cells)) {
+        auto forcing = std::make_shared<ForcingRegionData>();
+        forcing->nx = nx;
+        forcing->ny = ny;
+        forcing->nz = nz;
+        forcing->thermal_source.assign(static_cast<size_t>(cells), 0.0f);
+        forcing->fan_mask.assign(static_cast<size_t>(cells), 0);
+        forcing->fan_vx.assign(static_cast<size_t>(cells), 0.0f);
+        forcing->fan_vy.assign(static_cast<size_t>(cells), 0.0f);
+        forcing->fan_vz.assign(static_cast<size_t>(cells), 0.0f);
+        service.forcing_regions[region_key] = std::move(forcing);
+    }
+    rebuild_region_packet_template(service, region_key);
+}
+
+std::shared_ptr<const RegionPacketTemplateData> build_region_packet_template(
+    const StaticRegionData& stat,
+    const ForcingRegionData& forcing,
+    int nx,
+    int ny,
+    int nz
+) {
+    if (stat.nx != nx || stat.ny != ny || stat.nz != nz
+        || forcing.nx != nx || forcing.ny != ny || forcing.nz != nz) {
+        set_simulation_last_error("simulation_packet_template: region dimension mismatch");
+        return nullptr;
+    }
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells)) {
+        set_simulation_last_error("simulation_packet_template: invalid dimensions");
+        return nullptr;
+    }
+    auto packet = std::make_shared<RegionPacketTemplateData>();
+    packet->nx = nx;
+    packet->ny = ny;
+    packet->nz = nz;
+    packet->values.assign(static_cast<size_t>(cells) * k_packet_channels, 0.0f);
+    for (int cell = 0; cell < cells; ++cell) {
+        size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
+        const bool obstacle = stat.obstacle[static_cast<size_t>(cell)] != 0;
+        packet->values[packet_base + k_channel_obstacle] = obstacle ? 1.0f : 0.0f;
+        if (obstacle) {
+            continue;
+        }
+        packet->values[packet_base + k_channel_fan_mask] = forcing.fan_mask[static_cast<size_t>(cell)] != 0 ? 1.0f : 0.0f;
+        packet->values[packet_base + k_channel_fan_vx] = forcing.fan_vx[static_cast<size_t>(cell)];
+        packet->values[packet_base + k_channel_fan_vy] = forcing.fan_vy[static_cast<size_t>(cell)];
+        packet->values[packet_base + k_channel_fan_vz] = forcing.fan_vz[static_cast<size_t>(cell)];
+        packet->values[packet_base + k_channel_thermal_source] = forcing.thermal_source[static_cast<size_t>(cell)];
+    }
+    return packet;
+}
+
+void rebuild_region_packet_template(ServiceState& service, long long region_key) {
+    auto static_it = service.static_regions.find(region_key);
+    auto forcing_it = service.forcing_regions.find(region_key);
+    if (static_it == service.static_regions.end() || forcing_it == service.forcing_regions.end()) {
+        service.packet_templates.erase(region_key);
+        return;
+    }
+    const StaticRegionData& stat = *static_it->second;
+    const ForcingRegionData& forcing = *forcing_it->second;
+    std::shared_ptr<const RegionPacketTemplateData> packet = build_region_packet_template(
+        stat,
+        forcing,
+        stat.nx,
+        stat.ny,
+        stat.nz
+    );
+    if (packet) {
+        service.packet_templates[region_key] = std::move(packet);
+    } else {
+        service.packet_templates.erase(region_key);
     }
 }
 
@@ -510,10 +587,9 @@ void apply_boundary_wind(
     }
 }
 
-bool build_region_packet_from_data(
-    const StaticRegionData& stat,
+bool build_region_packet_from_template(
+    const RegionPacketTemplateData& packet_template,
     const DynamicRegionData& dynamic,
-    const ForcingRegionData& forcing,
     int nx,
     int ny,
     int nz,
@@ -522,9 +598,8 @@ bool build_region_packet_from_data(
     float boundary_wind_z,
     std::vector<float>& packet
 ) {
-    if (stat.nx != nx || stat.ny != ny || stat.nz != nz
-        || dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz
-        || forcing.nx != nx || forcing.ny != ny || forcing.nz != nz) {
+    if (packet_template.nx != nx || packet_template.ny != ny || packet_template.nz != nz
+        || dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz) {
         set_simulation_last_error("simulation_step_region_stored: region dimension mismatch");
         return false;
     }
@@ -533,74 +608,21 @@ bool build_region_packet_from_data(
         set_simulation_last_error("simulation_step_region_stored: invalid dimensions");
         return false;
     }
-    packet.assign(static_cast<size_t>(cells) * k_packet_channels, 0.0f);
+    const size_t packet_values = static_cast<size_t>(cells) * k_packet_channels;
+    if (packet.size() != packet_values) {
+        packet.resize(packet_values);
+    }
+    std::copy(packet_template.values.begin(), packet_template.values.end(), packet.begin());
     for (int cell = 0; cell < cells; ++cell) {
         size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
         size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-        packet[packet_base + k_channel_obstacle] = stat.obstacle[cell] != 0 ? 1.0f : 0.0f;
-        packet[packet_base + k_channel_fan_mask] = forcing.fan_mask[cell] != 0 ? 1.0f : 0.0f;
-        packet[packet_base + k_channel_fan_vx] = forcing.fan_vx[cell];
-        packet[packet_base + k_channel_fan_vy] = forcing.fan_vy[cell];
-        packet[packet_base + k_channel_fan_vz] = forcing.fan_vz[cell];
         packet[packet_base + k_channel_state_vx] = dynamic.flow_state[flow_base];
         packet[packet_base + k_channel_state_vy] = dynamic.flow_state[flow_base + 1];
         packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
         packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
-        packet[packet_base + k_channel_thermal_source] = forcing.thermal_source[cell];
-        if (stat.obstacle[cell] != 0) {
-            packet[packet_base + k_channel_fan_mask] = 0.0f;
-            packet[packet_base + k_channel_fan_vx] = 0.0f;
-            packet[packet_base + k_channel_fan_vy] = 0.0f;
-            packet[packet_base + k_channel_fan_vz] = 0.0f;
-            packet[packet_base + k_channel_state_vx] = 0.0f;
-            packet[packet_base + k_channel_state_vy] = 0.0f;
-            packet[packet_base + k_channel_state_vz] = 0.0f;
-            packet[packet_base + k_channel_state_p] = 0.0f;
-            packet[packet_base + k_channel_thermal_source] = 0.0f;
-        }
     }
     apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
     return true;
-}
-
-bool build_region_packet(
-    ServiceState& service,
-    long long region_key,
-    int nx,
-    int ny,
-    int nz,
-    float boundary_wind_x,
-    float boundary_wind_y,
-    float boundary_wind_z,
-    std::vector<float>& packet
-) {
-    auto static_it = service.static_regions.find(region_key);
-    auto dynamic_it = service.dynamic_regions.find(region_key);
-    auto forcing_it = service.forcing_regions.find(region_key);
-    if (static_it == service.static_regions.end()) {
-        set_simulation_last_error("simulation_step_region_stored: missing static region");
-        return false;
-    }
-    if (dynamic_it == service.dynamic_regions.end()) {
-        set_simulation_last_error("simulation_step_region_stored: missing dynamic region");
-        return false;
-    }
-    if (forcing_it == service.forcing_regions.end()) {
-        set_simulation_last_error("simulation_step_region_stored: missing forcing region");
-        return false;
-    }
-    return build_region_packet_from_data(
-        static_it->second,
-        dynamic_it->second,
-        forcing_it->second,
-        nx,
-        ny,
-        nz,
-        boundary_wind_x,
-        boundary_wind_y,
-        boundary_wind_z,
-        packet
-    );
 }
 
 bool refresh_region_thermal(
@@ -636,9 +658,9 @@ bool refresh_region_thermal(
         set_simulation_last_error("simulation_refresh_region_thermal: missing forcing region");
         return false;
     }
-    StaticRegionData& stat = static_it->second;
+    const StaticRegionData& stat = *static_it->second;
     DynamicRegionData& dynamic = dynamic_it->second;
-    ForcingRegionData& forcing = forcing_it->second;
+    ForcingRegionData forcing = *forcing_it->second;
     if (stat.nx != nx || stat.ny != ny || stat.nz != nz
         || dynamic.nx != nx || dynamic.ny != ny || dynamic.nz != nz
         || forcing.nx != nx || forcing.ny != ny || forcing.nz != nz) {
@@ -826,6 +848,8 @@ bool refresh_region_thermal(
             }
         }
     }
+    service.forcing_regions[region_key] = std::make_shared<ForcingRegionData>(std::move(forcing));
+    rebuild_region_packet_template(service, region_key);
     return true;
 }
 
@@ -932,16 +956,18 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
         return 0;
     }
 
-    StaticRegionData& region = service->static_regions[region_key];
-    region.nx = nx;
-    region.ny = ny;
-    region.nz = nz;
-    region.obstacle.assign(obstacle, obstacle + cells);
-    region.surface_kind.assign(surface_kind, surface_kind + cells);
-    region.open_face_mask.assign(open_face_mask, open_face_mask + cells);
-    region.emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
-    region.face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
-    region.face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
+    auto region = std::make_shared<StaticRegionData>();
+    region->nx = nx;
+    region->ny = ny;
+    region->nz = nz;
+    region->obstacle.assign(obstacle, obstacle + cells);
+    region->surface_kind.assign(surface_kind, surface_kind + cells);
+    region->open_face_mask.assign(open_face_mask, open_face_mask + cells);
+    region->emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
+    region->face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
+    region->face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
+    service->static_regions[region_key] = std::move(region);
+    rebuild_region_packet_template(*service, region_key);
     return 1;
 }
 
@@ -997,7 +1023,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region_patch(
         set_simulation_last_error("simulation_upload_static_region_patch: missing static region");
         return 0;
     }
-    StaticRegionData& region = region_it->second;
+    StaticRegionData region = *region_it->second;
     if (region.nx != nx || region.ny != ny || region.nz != nz) {
         set_simulation_last_error("simulation_upload_static_region_patch: region dimension mismatch");
         return 0;
@@ -1025,6 +1051,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region_patch(
             }
         }
     }
+    service->static_regions[region_key] = std::make_shared<StaticRegionData>(std::move(region));
+    rebuild_region_packet_template(*service, region_key);
     return 1;
 }
 
@@ -1158,21 +1186,21 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_region_forcing(
         set_simulation_last_error("simulation_upload_region_forcing: missing service");
         return 0;
     }
-    ForcingRegionData& forcing = service->forcing_regions[region_key];
-    forcing.nx = nx;
-    forcing.ny = ny;
-    forcing.nz = nz;
+    auto forcing = std::make_shared<ForcingRegionData>();
+    forcing->nx = nx;
+    forcing->ny = ny;
+    forcing->nz = nz;
     if (!thermal_source) {
-        if (forcing.thermal_source.size() != static_cast<size_t>(cells)) {
-            forcing.thermal_source.assign(static_cast<size_t>(cells), 0.0f);
-        }
+        forcing->thermal_source.assign(static_cast<size_t>(cells), 0.0f);
     } else {
-        forcing.thermal_source.assign(thermal_source, thermal_source + cells);
+        forcing->thermal_source.assign(thermal_source, thermal_source + cells);
     }
-    forcing.fan_mask.assign(fan_mask, fan_mask + cells);
-    forcing.fan_vx.assign(fan_vx, fan_vx + cells);
-    forcing.fan_vy.assign(fan_vy, fan_vy + cells);
-    forcing.fan_vz.assign(fan_vz, fan_vz + cells);
+    forcing->fan_mask.assign(fan_mask, fan_mask + cells);
+    forcing->fan_vx.assign(fan_vx, fan_vx + cells);
+    forcing->fan_vy.assign(fan_vy, fan_vy + cells);
+    forcing->fan_vz.assign(fan_vz, fan_vz + cells);
+    service->forcing_regions[region_key] = std::move(forcing);
+    rebuild_region_packet_template(*service, region_key);
     return 1;
 }
 
@@ -1294,9 +1322,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         return 0;
     }
 
-    StaticRegionData static_region;
     DynamicRegionData dynamic_region;
-    ForcingRegionData forcing_region;
+    std::shared_ptr<const RegionPacketTemplateData> packet_template;
     {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
         ServiceState* service = lookup_service(service_key);
@@ -1312,14 +1339,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
             return 0;
         }
-        auto static_it = service->static_regions.find(region_key);
-        auto forcing_it = service->forcing_regions.find(region_key);
-        if (static_it == service->static_regions.end()) {
-            set_simulation_last_error("simulation_step_region_stored: missing static region");
-            return 0;
-        }
-        if (forcing_it == service->forcing_regions.end()) {
-            set_simulation_last_error("simulation_step_region_stored: missing forcing region");
+        auto packet_it = service->packet_templates.find(region_key);
+        if (packet_it == service->packet_templates.end()) {
+            set_simulation_last_error("simulation_step_region_stored: missing packet template");
             return 0;
         }
         auto dynamic_it = service->dynamic_regions.find(region_key);
@@ -1333,9 +1355,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
             dynamic_it = service->dynamic_regions.find(region_key);
         }
-        static_region = static_it->second;
+        packet_template = packet_it->second;
         dynamic_region = dynamic_it->second;
-        forcing_region = forcing_it->second;
     }
     if (dynamic_region.air_temperature.size() == static_cast<size_t>(cells)) {
         if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic_region.air_temperature.data())) {
@@ -1343,11 +1364,10 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             return 0;
         }
     }
-    std::vector<float> packet;
-    if (!build_region_packet_from_data(
-        static_region,
+    thread_local std::vector<float> packet;
+    if (!packet_template || !build_region_packet_from_template(
+        *packet_template,
         dynamic_region,
-        forcing_region,
         nx,
         ny,
         nz,
