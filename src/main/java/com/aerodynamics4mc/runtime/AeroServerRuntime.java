@@ -1392,7 +1392,7 @@ public final class AeroServerRuntime {
         }
         float maxSpeed = 0.0f;
         for (WindowKey key : touchedKeys) {
-            float syncedMax = simulationBridge.syncRegionState(simulationServiceId, simulationRegionKey(key));
+            float syncedMax = simulationBridge.syncRegionFlowState(simulationServiceId, simulationRegionKey(key));
             if (!Float.isFinite(syncedMax)) {
                 String nativeError = simulationBridge.lastError();
                 String runtimeInfo = simulationBridge.runtimeInfo();

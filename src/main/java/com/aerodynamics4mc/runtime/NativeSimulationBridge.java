@@ -389,6 +389,14 @@ public final class NativeSimulationBridge {
         return nativeSyncRegionState(serviceKey, regionKey, outMaxSpeed) ? outMaxSpeed[0] : Float.NaN;
     }
 
+    public float syncRegionFlowState(long serviceKey, long regionKey) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return Float.NaN;
+        }
+        float[] outMaxSpeed = new float[1];
+        return nativeSyncRegionFlowState(serviceKey, regionKey, outMaxSpeed) ? outMaxSpeed[0] : Float.NaN;
+    }
+
     public boolean getRegionTemperatureState(
         long serviceKey,
         long regionKey,
@@ -723,6 +731,12 @@ public final class NativeSimulationBridge {
     );
 
     private static native boolean nativeSyncRegionState(
+        long serviceKey,
+        long regionKey,
+        float[] outMaxSpeed
+    );
+
+    private static native boolean nativeSyncRegionFlowState(
         long serviceKey,
         long regionKey,
         float[] outMaxSpeed

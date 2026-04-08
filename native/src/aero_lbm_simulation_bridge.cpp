@@ -441,6 +441,26 @@ float compute_max_speed_from_flow_state(const DynamicRegionData& dynamic) {
     return max_speed;
 }
 
+bool sync_dynamic_region_flow_from_native(long long region_key, DynamicRegionData& dynamic, AtlasData* atlas, float* out_max_speed) {
+    int cells = 0;
+    if (!checked_cell_count(dynamic.nx, dynamic.ny, dynamic.nz, &cells)) {
+        return false;
+    }
+    if (dynamic.flow_state.size() != static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS) {
+        dynamic.flow_state.assign(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+    }
+    if (!aero_lbm_get_flow_state_rect(dynamic.nx, dynamic.ny, dynamic.nz, region_key, dynamic.flow_state.data())) {
+        return false;
+    }
+    if (atlas) {
+        rebuild_default_packed_atlas(dynamic, *atlas);
+    }
+    if (out_max_speed) {
+        *out_max_speed = compute_max_speed_from_flow_state(dynamic);
+    }
+    return true;
+}
+
 float sync_dynamic_region_from_native(ServiceState& service, long long region_key) {
     auto dynamic_it = service.dynamic_regions.find(region_key);
     if (dynamic_it == service.dynamic_regions.end()) {
@@ -1435,6 +1455,52 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_state(
     return 1;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_flow_state(
+    long long service_key,
+    long long region_key,
+    float* out_max_speed
+) {
+    if (!out_max_speed) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_sync_region_flow_state: out_max_speed is null");
+        return 0;
+    }
+
+    DynamicRegionData dynamic_region;
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_sync_region_flow_state: missing service");
+            return 0;
+        }
+        auto dynamic_it = service->dynamic_regions.find(region_key);
+        if (dynamic_it == service->dynamic_regions.end()) {
+            set_simulation_last_error("simulation_sync_region_flow_state: missing dynamic region");
+            return 0;
+        }
+        dynamic_region = dynamic_it->second;
+    }
+    AtlasData atlas;
+    float max_speed = 0.0f;
+    if (!sync_dynamic_region_flow_from_native(region_key, dynamic_region, &atlas, &max_speed)) {
+        set_simulation_last_error(std::string("simulation_sync_region_flow_state failed: ") + aero_lbm_last_error());
+        return 0;
+    }
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_sync_region_flow_state: missing service after sync");
+            return 0;
+        }
+        service->dynamic_regions[region_key].flow_state = std::move(dynamic_region.flow_state);
+        service->atlases[region_key] = std::move(atlas);
+    }
+    *out_max_speed = max_speed;
+    return 1;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_temperature_state(
     long long service_key,
     long long region_key,
@@ -2349,6 +2415,30 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         return JNI_FALSE;
     }
     const int ok = aero_lbm_simulation_sync_region_state(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        max_speed_ptr
+    );
+    env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, ok ? 0 : JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeSyncRegionFlowState(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jfloatArray out_max_speed
+) {
+    if (!out_max_speed || env->GetArrayLength(out_max_speed) != 1) {
+        return JNI_FALSE;
+    }
+    jboolean copy = JNI_FALSE;
+    jfloat* max_speed_ptr = env->GetFloatArrayElements(out_max_speed, &copy);
+    if (!max_speed_ptr) {
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_sync_region_flow_state(
         static_cast<long long>(service_key),
         static_cast<long long>(region_key),
         max_speed_ptr
