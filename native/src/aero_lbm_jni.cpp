@@ -5678,6 +5678,7 @@ static bool native_get_flow_state_raw_dims_impl(jint nx, jint ny, jint nz, jlong
     if (it == g_contexts.end()) return false;
     ContextState& ctx = it->second;
     ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return false;
     if (ctx.f.empty() || ctx.cells == 0) return false;
     write_output(ctx, flow_out, 4);
     return true;
@@ -5931,6 +5932,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_get_flow_state_rect(int nx, int ny, int nz, lo
     if (it == g_contexts.end()) return 0;
     ContextState& ctx = it->second;
     ensure_context_shape(ctx, nx, ny, nz, cells);
+    if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return 0;
     if (ctx.f.empty() || ctx.cells == 0) return 0;
     write_output(ctx, out_flow, 4);
     return 1;

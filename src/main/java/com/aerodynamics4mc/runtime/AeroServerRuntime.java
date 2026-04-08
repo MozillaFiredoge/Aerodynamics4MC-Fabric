@@ -228,8 +228,8 @@ public final class AeroServerRuntime {
     private volatile ActiveRegionBatch pendingActiveRegionBatch;
     private volatile BackgroundRefreshBatch pendingBackgroundRefreshBatch;
 
-    private boolean streamingEnabled = false;
-    private int tickCounter = 0;
+    private volatile boolean streamingEnabled = false;
+    private volatile int tickCounter = 0;
     private int lastWindowRefreshTick = Integer.MIN_VALUE;
     private long simulationTicks = 0L;
     private long lastObservedPublishedFrameId = 0L;
@@ -239,6 +239,20 @@ public final class AeroServerRuntime {
     private float simulationTicksPerSecond = 0.0f;
     private float lastMaxFlowSpeed = 0.0f;
     private volatile String lastSolverError = "";
+    private volatile String lastCoordinatorError = "";
+    private volatile int lastCoordinatorObservedTick = Integer.MIN_VALUE;
+    private volatile int lastCoordinatorActiveWindowCount = 0;
+    private volatile int lastCoordinatorScheduledWindowCount = 0;
+    private volatile int lastCoordinatorBusyWindowCount = 0;
+    private volatile int lastCoordinatorPublishTick = Integer.MIN_VALUE;
+    private volatile int lastCoordinatorScheduleTick = Integer.MIN_VALUE;
+    private volatile int lastCoordinatorSolveCompleteTick = Integer.MIN_VALUE;
+    private volatile String lastCoordinatorState = "init";
+    private volatile String lastCoordinatorNoPublishReason = "";
+    private volatile float lastCoordinatorPublishedMaxSpeed = 0.0f;
+    private volatile float lastCoordinatorAppliedMaxSpeed = 0.0f;
+    private volatile long lastCoordinatorWaitNanos = 0L;
+    private volatile long lastCoordinatorPostSolveNanos = 0L;
     private volatile long simulationServiceId = 0L;
     private volatile MinecraftServer currentServer;
     private int lastSimulationFocusX = Integer.MIN_VALUE;
@@ -508,6 +522,20 @@ public final class AeroServerRuntime {
                             + " activeSolveTasks=" + activeSolveTasks.get()
                             + " busyRegions=" + busyRegionCount()
                             + " attachedReadyRegions=" + attachedWindowCount()
+                            + " coordinatorAlive=" + isCoordinatorAlive()
+                            + " coordTick=" + lastCoordinatorObservedTick
+                            + " coordState=" + lastCoordinatorState
+                            + " coordWindows=" + lastCoordinatorActiveWindowCount
+                            + " coordScheduled=" + lastCoordinatorScheduledWindowCount
+                            + " coordBusy=" + lastCoordinatorBusyWindowCount
+                            + " coordPublishAge=" + currentCoordinatorPublishAgeTicks()
+                            + " coordScheduleAge=" + currentCoordinatorScheduleAgeTicks()
+                            + " coordSolveAge=" + currentCoordinatorSolveCompleteAgeTicks()
+                            + " coordWaitMs=" + format3(nanosToMillis(lastCoordinatorWaitNanos))
+                            + " coordPostMs=" + format3(nanosToMillis(lastCoordinatorPostSolveNanos))
+                            + " coordAppliedMax=" + format3(lastCoordinatorAppliedMaxSpeed)
+                            + " coordPublishedMax=" + format3(lastCoordinatorPublishedMaxSpeed)
+                            + " coordNoPublish=" + (lastCoordinatorNoPublishReason.isEmpty() ? "-" : lastCoordinatorNoPublishReason)
                     );
                     feedback(
                         ctx.getSource(),
@@ -524,6 +552,9 @@ public final class AeroServerRuntime {
                     );
                     if (!lastSolverError.isEmpty()) {
                         feedback(ctx.getSource(), "Last solver error: " + lastSolverError);
+                    }
+                    if (!lastCoordinatorError.isEmpty()) {
+                        feedback(ctx.getSource(), "Last coordinator error: " + lastCoordinatorError);
                     }
                     return 1;
                 }))
@@ -2510,6 +2541,7 @@ public final class AeroServerRuntime {
             float maxSpeed = runSolverStep(snapshot);
             if (snapshot.generation() == runtimeGeneration.get()) {
                 region.completedMaxSpeed = maxSpeed;
+                lastCoordinatorSolveCompleteTick = tickCounter;
                 lastSolverError = "";
             }
         } catch (IOException ex) {
@@ -2537,6 +2569,7 @@ public final class AeroServerRuntime {
             if (simulationCoordinator != null && simulationCoordinator.running()) {
                 return;
             }
+            lastCoordinatorError = "";
             simulationCoordinator = new SimulationCoordinator();
             simulationCoordinator.start();
         }
@@ -2617,6 +2650,7 @@ public final class AeroServerRuntime {
             activeSolveTasks.incrementAndGet();
             solverExecutor.execute(() -> runSolveTask(snapshot, completionLatch));
         }
+        lastCoordinatorScheduleTick = tickCounter;
         return completionLatch;
     }
 
@@ -2628,6 +2662,14 @@ public final class AeroServerRuntime {
             while (streamingEnabled
                 && !Thread.currentThread().isInterrupted()
                 && !completionLatch.await(5L, TimeUnit.MILLISECONDS)) {
+                if (activeSolveTasks.get() == 0) {
+                    long remaining = completionLatch.getCount();
+                    if (remaining > 0L) {
+                        lastCoordinatorNoPublishReason = "latchDesync:" + remaining;
+                        log("Simulation coordinator detected latch desync, remaining=" + remaining);
+                    }
+                    break;
+                }
             }
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
@@ -2676,6 +2718,32 @@ public final class AeroServerRuntime {
             return -1;
         }
         return Math.max(0, tickCounter - lastPublishedFrameTick);
+    }
+
+    private int currentCoordinatorPublishAgeTicks() {
+        if (lastCoordinatorPublishTick == Integer.MIN_VALUE) {
+            return -1;
+        }
+        return Math.max(0, tickCounter - lastCoordinatorPublishTick);
+    }
+
+    private int currentCoordinatorScheduleAgeTicks() {
+        if (lastCoordinatorScheduleTick == Integer.MIN_VALUE) {
+            return -1;
+        }
+        return Math.max(0, tickCounter - lastCoordinatorScheduleTick);
+    }
+
+    private int currentCoordinatorSolveCompleteAgeTicks() {
+        if (lastCoordinatorSolveCompleteTick == Integer.MIN_VALUE) {
+            return -1;
+        }
+        return Math.max(0, tickCounter - lastCoordinatorSolveCompleteTick);
+    }
+
+    private boolean isCoordinatorAlive() {
+        SimulationCoordinator coordinator = simulationCoordinator;
+        return coordinator != null && coordinator.running();
     }
 
     private void publishFrame(List<ActiveWindow> activeWindows, float maxSpeedThisCycle) {
@@ -3104,7 +3172,7 @@ public final class AeroServerRuntime {
         }
 
         private boolean running() {
-            return running.get();
+            return running.get() && thread.isAlive();
         }
 
         private void shutdown() {
@@ -3119,89 +3187,132 @@ public final class AeroServerRuntime {
 
         @Override
         public void run() {
-            while (running.get()) {
-                if (!streamingEnabled) {
-                    publishedFrame.set(null);
-                    sleepQuietly(20L);
-                    continue;
-                }
+            try {
+                while (running.get()) {
+                    if (!streamingEnabled) {
+                        lastCoordinatorState = "streamingDisabled";
+                        publishedFrame.set(null);
+                        sleepQuietly(20L);
+                        continue;
+                    }
 
-                flushPendingWorldDeltas();
+                    flushPendingWorldDeltas();
 
-                int observedTick = tickCounter;
-                if (observedTick != lastSynchronizedTick) {
-                    grantStepBudgetForObservedTicks();
+                    int observedTick = tickCounter;
+                    lastCoordinatorObservedTick = observedTick;
+                    if (observedTick != lastSynchronizedTick) {
+                        grantStepBudgetForObservedTicks();
+                        synchronized (simulationStateLock) {
+                            applyPendingActiveRegionBatchIfNeeded();
+                            applyPendingBackgroundRefreshIfNeeded();
+                        }
+                        runMesoscaleStepCycle();
+                        synchronized (simulationStateLock) {
+                            synchronizeActiveWindowsFromMirror();
+                        }
+                        lastSynchronizedTick = observedTick;
+                    }
+
+                    List<ActiveWindow> activeWindows;
                     synchronized (simulationStateLock) {
-                        applyPendingActiveRegionBatchIfNeeded();
-                        applyPendingBackgroundRefreshIfNeeded();
+                        activeWindows = snapshotActiveWindowsForCoordinatorLocked();
                     }
-                    runMesoscaleStepCycle();
+                    lastCoordinatorActiveWindowCount = activeWindows.size();
+                    if (activeWindows.isEmpty()) {
+                        lastCoordinatorState = "noActiveWindows";
+                        lastCoordinatorNoPublishReason = "noActiveWindows";
+                        lastCoordinatorBusyWindowCount = 0;
+                        publishedFrame.set(null);
+                        sleepQuietly(10L);
+                        continue;
+                    }
+
                     synchronized (simulationStateLock) {
-                        synchronizeActiveWindowsFromMirror();
+                        applyCompletedResults(activeWindows);
+                        synchronizeRegionSeams(activeWindows);
+                        resetPendingBackends(activeWindows);
                     }
-                    lastSynchronizedTick = observedTick;
-                }
 
-                List<ActiveWindow> activeWindows;
-                synchronized (simulationStateLock) {
-                    activeWindows = snapshotActiveWindowsForCoordinatorLocked();
-                }
-                if (activeWindows.isEmpty()) {
-                    publishedFrame.set(null);
-                    sleepQuietly(10L);
-                    continue;
-                }
-
-                synchronized (simulationStateLock) {
-                    applyCompletedResults(activeWindows);
-                synchronizeRegionSeams(activeWindows);
-                    resetPendingBackends(activeWindows);
-                }
-
-                if (hasBusyWindow(activeWindows)) {
-                    sleepQuietly(5L);
-                    continue;
-                }
-                if (!acquireSimulationStepBudget()) {
-                    sleepQuietly(5L);
-                    continue;
-                }
-
-                CountDownLatch completionLatch;
-                synchronized (simulationStateLock) {
-                    completionLatch = scheduleSolveCycle(activeWindows);
-                }
-                if (completionLatch == null) {
-                    simulationStepBudget.incrementAndGet();
-                    sleepQuietly(5L);
-                    continue;
-                }
-
-                waitForScheduledSnapshots(completionLatch);
-                if (!running.get()) {
-                    return;
-                }
-
-                synchronized (simulationStateLock) {
-                    float maxSpeedThisCycle = applyCompletedResults(activeWindows);
-                    synchronizeRegionSeams(activeWindows);
-                    resetPendingBackends(activeWindows);
-                    publishedPlayerProbes.set(samplePlayerProbesLocked());
-                    publishedEntitySamples.set(sampleEntitySamplesLocked());
-                    if (activeSetStillMatches(activeWindows)) {
-                        publishFrame(activeWindows, maxSpeedThisCycle);
+                    int busyWindowCount = busyWindowCount(activeWindows);
+                    lastCoordinatorBusyWindowCount = busyWindowCount;
+                    if (busyWindowCount > 0) {
+                        lastCoordinatorState = "busyWindows";
+                        lastCoordinatorNoPublishReason = "busyWindows:" + busyWindowCount;
+                        sleepQuietly(5L);
+                        continue;
                     }
+                    if (!acquireSimulationStepBudget()) {
+                        lastCoordinatorState = "noBudget";
+                        lastCoordinatorNoPublishReason = "noBudget";
+                        sleepQuietly(5L);
+                        continue;
+                    }
+
+                    CountDownLatch completionLatch;
+                    synchronized (simulationStateLock) {
+                        completionLatch = scheduleSolveCycle(activeWindows);
+                    }
+                    lastCoordinatorScheduledWindowCount = completionLatch == null ? 0 : (int) completionLatch.getCount();
+                    if (completionLatch == null) {
+                        lastCoordinatorState = "scheduleNull";
+                        lastCoordinatorNoPublishReason = "scheduleNull";
+                        simulationStepBudget.incrementAndGet();
+                        sleepQuietly(5L);
+                        continue;
+                    }
+
+                    lastCoordinatorState = "waitingSolve";
+                    long waitStartNanos = System.nanoTime();
+                    waitForScheduledSnapshots(completionLatch);
+                    lastCoordinatorWaitNanos = System.nanoTime() - waitStartNanos;
+                    if (!running.get()) {
+                        return;
+                    }
+
+                    lastCoordinatorState = "postSolve";
+                    long postSolveStartNanos = System.nanoTime();
+                    synchronized (simulationStateLock) {
+                        lastCoordinatorState = "applyResults";
+                        float maxSpeedThisCycle = applyCompletedResults(activeWindows);
+                        lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
+                        lastCoordinatorState = "syncSeams";
+                        synchronizeRegionSeams(activeWindows);
+                        lastCoordinatorState = "resetBackends";
+                        resetPendingBackends(activeWindows);
+                        lastCoordinatorState = "sampleProbes";
+                        publishedPlayerProbes.set(samplePlayerProbesLocked());
+                        publishedEntitySamples.set(sampleEntitySamplesLocked());
+                        lastCoordinatorState = "publishCandidate";
+                        if (activeSetStillMatches(activeWindows)) {
+                            lastCoordinatorState = "published";
+                            lastCoordinatorNoPublishReason = "";
+                            publishFrame(activeWindows, maxSpeedThisCycle);
+                            lastCoordinatorPublishedMaxSpeed = maxSpeedThisCycle;
+                            lastCoordinatorPublishTick = tickCounter;
+                        } else {
+                            lastCoordinatorState = "activeSetMismatch";
+                            lastCoordinatorNoPublishReason = "activeSetMismatch";
+                        }
+                    }
+                    lastCoordinatorPostSolveNanos = System.nanoTime() - postSolveStartNanos;
                 }
+            } catch (Throwable ex) {
+                running.set(false);
+                lastCoordinatorError = ex.getClass().getSimpleName() + ": " + (ex.getMessage() == null ? "" : ex.getMessage());
+                log("Simulation coordinator crashed: " + ex);
+            } finally {
+                running.set(false);
             }
         }
 
-        private boolean hasBusyWindow(List<ActiveWindow> activeWindows) {
+        private int busyWindowCount(List<ActiveWindow> activeWindows) {
+            int count = 0;
             for (ActiveWindow active : activeWindows) {
                 if (active.region().busy.get()) {
-                    return true;
+                    count++;
                 }
             }
-            return false;
+            return count;
         }
 
         private boolean acquireSimulationStepBudget() {
