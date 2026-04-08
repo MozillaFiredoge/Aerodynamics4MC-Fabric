@@ -414,6 +414,33 @@ float sync_dynamic_region_from_native(long long region_key, DynamicRegionData& d
     return max_speed;
 }
 
+bool sync_dynamic_region_temperature_from_native(long long region_key, DynamicRegionData& dynamic) {
+    int cells = 0;
+    if (!checked_cell_count(dynamic.nx, dynamic.ny, dynamic.nz, &cells)) {
+        return false;
+    }
+    if (dynamic.air_temperature.size() != static_cast<size_t>(cells)) {
+        dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
+    }
+    return aero_lbm_get_temperature_state_rect(dynamic.nx, dynamic.ny, dynamic.nz, region_key, dynamic.air_temperature.data()) != 0;
+}
+
+float compute_max_speed_from_flow_state(const DynamicRegionData& dynamic) {
+    const size_t cells = dynamic.flow_state.size() / AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+    float max_speed = 0.0f;
+    for (size_t cell = 0; cell < cells; ++cell) {
+        size_t base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        float vx = dynamic.flow_state[base];
+        float vy = dynamic.flow_state[base + 1];
+        float vz = dynamic.flow_state[base + 2];
+        float speed = std::sqrt(vx * vx + vy * vy + vz * vz);
+        if (std::isfinite(speed) && speed > max_speed) {
+            max_speed = speed;
+        }
+    }
+    return max_speed;
+}
+
 float sync_dynamic_region_from_native(ServiceState& service, long long region_key) {
     auto dynamic_it = service.dynamic_regions.find(region_key);
     if (dynamic_it == service.dynamic_regions.end()) {
@@ -1221,11 +1248,11 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
     if (dynamic.surface_temperature.size() != static_cast<size_t>(cells)) {
         dynamic.surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
     }
-    if (!aero_lbm_get_temperature_state_rect(nx, ny, nz, region_key, dynamic.air_temperature.data())) {
+    if (!sync_dynamic_region_temperature_from_native(region_key, dynamic)) {
         set_simulation_last_error(std::string("simulation_step_region temperature sync failed: ") + aero_lbm_last_error());
         return 0;
     }
-    rebuild_default_packed_atlas(*service, region_key);
+    rebuild_default_packed_atlas(dynamic, service->atlases[region_key]);
     return 1;
 }
 
@@ -1317,12 +1344,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         return 0;
     }
     dynamic_region.flow_state.swap(output_flow);
-    AtlasData atlas;
-    float max_speed = sync_dynamic_region_from_native(region_key, dynamic_region, &atlas);
-    if (max_speed < 0.0f) {
-        set_simulation_last_error(std::string("simulation_step_region_stored sync failed: ") + aero_lbm_last_error());
+    if (!sync_dynamic_region_temperature_from_native(region_key, dynamic_region)) {
+        set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
         return 0;
     }
+    AtlasData atlas;
+    rebuild_default_packed_atlas(dynamic_region, atlas);
+    float max_speed = compute_max_speed_from_flow_state(dynamic_region);
     {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
         ServiceState* service = lookup_service(service_key);
