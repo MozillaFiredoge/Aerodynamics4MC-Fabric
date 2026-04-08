@@ -321,6 +321,11 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     int offset_y,
     int offset_z
 );
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_state(
+    long long service_key,
+    long long region_key,
+    float* out_max_speed
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_temperature_state(
     long long service_key,
     long long region_key,

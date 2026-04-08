@@ -1290,11 +1290,12 @@ public final class AeroServerRuntime {
         }
     }
 
-    private void synchronizeRegionSeams(List<ActiveWindow> activeWindows) {
+    private float synchronizeRegionSeams(List<ActiveWindow> activeWindows) {
         if (activeWindows.isEmpty()) {
-            return;
+            return 0.0f;
         }
         Map<WindowKey, ActiveWindow> activeByKey = new HashMap<>(activeWindows.size());
+        Set<WindowKey> touchedKeys = new HashSet<>();
         for (ActiveWindow active : activeWindows) {
             activeByKey.put(active.key(), active);
         }
@@ -1302,10 +1303,11 @@ public final class AeroServerRuntime {
             if (active.region().sections == null || active.region().busy.get()) {
                 continue;
             }
-            synchronizePositiveNeighbor(activeByKey, active, 1, 0, 0);
-            synchronizePositiveNeighbor(activeByKey, active, 0, 1, 0);
-            synchronizePositiveNeighbor(activeByKey, active, 0, 0, 1);
+            synchronizePositiveNeighbor(activeByKey, active, 1, 0, 0, touchedKeys);
+            synchronizePositiveNeighbor(activeByKey, active, 0, 1, 0, touchedKeys);
+            synchronizePositiveNeighbor(activeByKey, active, 0, 0, 1, touchedKeys);
         }
+        return syncTouchedRegionsAfterSeams(touchedKeys);
     }
 
     private void synchronizePositiveNeighbor(
@@ -1313,7 +1315,8 @@ public final class AeroServerRuntime {
         ActiveWindow active,
         int dx,
         int dy,
-        int dz
+        int dz,
+        Set<WindowKey> touchedKeys
     ) {
         WindowKey key = active.key();
         BlockPos neighborOrigin = key.origin().add(
@@ -1330,7 +1333,10 @@ public final class AeroServerRuntime {
             || neighborActive.region().backendResetPending()) {
             return;
         }
-        synchronizeNeighborHalo(key, active.region(), neighborKey, neighborActive.region(), dx, dy, dz);
+        if (synchronizeNeighborHalo(key, active.region(), neighborKey, neighborActive.region(), dx, dy, dz)) {
+            touchedKeys.add(key);
+            touchedKeys.add(neighborKey);
+        }
     }
 
     private boolean synchronizeNeighborHalo(
@@ -1378,6 +1384,36 @@ public final class AeroServerRuntime {
             }
         }
         return nativeHaloSynced;
+    }
+
+    private float syncTouchedRegionsAfterSeams(Set<WindowKey> touchedKeys) {
+        if (touchedKeys.isEmpty() || simulationServiceId == 0L) {
+            return 0.0f;
+        }
+        float maxSpeed = 0.0f;
+        for (WindowKey key : touchedKeys) {
+            float syncedMax = simulationBridge.syncRegionState(simulationServiceId, simulationRegionKey(key));
+            if (!Float.isFinite(syncedMax)) {
+                String nativeError = simulationBridge.lastError();
+                String runtimeInfo = simulationBridge.runtimeInfo();
+                StringBuilder message = new StringBuilder("Native region sync failed after seams for ")
+                    .append(formatPos(key.origin()));
+                if (nativeError != null && !nativeError.isBlank()
+                    && !"not_initialized".equals(nativeError)
+                    && !"not_loaded".equals(nativeError)) {
+                    message.append(": ").append(nativeError);
+                }
+                if (runtimeInfo != null && !runtimeInfo.isBlank()
+                    && !"not_initialized".equals(runtimeInfo)
+                    && !"not_loaded".equals(runtimeInfo)) {
+                    message.append(" [runtime=").append(runtimeInfo).append("]");
+                }
+                lastSolverError = message.toString();
+                continue;
+            }
+            maxSpeed = Math.max(maxSpeed, syncedMax * NATIVE_VELOCITY_SCALE);
+        }
+        return maxSpeed;
     }
 
     private boolean shouldRefreshWindowThermal(RegionRecord region) {
@@ -3276,7 +3312,8 @@ public final class AeroServerRuntime {
                         float maxSpeedThisCycle = applyCompletedResults(activeWindows);
                         lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
                         lastCoordinatorState = "syncSeams";
-                        synchronizeRegionSeams(activeWindows);
+                        maxSpeedThisCycle = Math.max(maxSpeedThisCycle, synchronizeRegionSeams(activeWindows));
+                        lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
                         lastCoordinatorState = "resetBackends";
                         resetPendingBackends(activeWindows);
                         lastCoordinatorState = "sampleProbes";

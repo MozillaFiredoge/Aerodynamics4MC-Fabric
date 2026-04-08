@@ -1287,18 +1287,36 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
         set_simulation_last_error(std::string("simulation_exchange_region_halo failed: ") + aero_lbm_last_error());
         return 0;
     }
-    if (service->dynamic_regions.find(first_region_key) != service->dynamic_regions.end()) {
-        if (sync_dynamic_region_from_native(*service, first_region_key) < 0.0f) {
-            set_simulation_last_error(std::string("simulation_exchange_region_halo first sync failed: ") + aero_lbm_last_error());
-            return 0;
-        }
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_state(
+    long long service_key,
+    long long region_key,
+    float* out_max_speed
+) {
+    if (!out_max_speed) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_sync_region_state: out_max_speed is null");
+        return 0;
     }
-    if (service->dynamic_regions.find(second_region_key) != service->dynamic_regions.end()) {
-        if (sync_dynamic_region_from_native(*service, second_region_key) < 0.0f) {
-            set_simulation_last_error(std::string("simulation_exchange_region_halo second sync failed: ") + aero_lbm_last_error());
-            return 0;
-        }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_sync_region_state: missing service");
+        return 0;
     }
+    if (service->dynamic_regions.find(region_key) == service->dynamic_regions.end()) {
+        set_simulation_last_error("simulation_sync_region_state: missing dynamic region");
+        return 0;
+    }
+    float max_speed = sync_dynamic_region_from_native(*service, region_key);
+    if (max_speed < 0.0f) {
+        set_simulation_last_error(std::string("simulation_sync_region_state failed: ") + aero_lbm_last_error());
+        return 0;
+    }
+    *out_max_speed = max_speed;
     return 1;
 }
 
@@ -2198,6 +2216,30 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         offset_y,
         offset_z
     ) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeSyncRegionState(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jfloatArray out_max_speed
+) {
+    if (!out_max_speed || env->GetArrayLength(out_max_speed) != 1) {
+        return JNI_FALSE;
+    }
+    jboolean copy = JNI_FALSE;
+    jfloat* max_speed_ptr = env->GetFloatArrayElements(out_max_speed, &copy);
+    if (!max_speed_ptr) {
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_sync_region_state(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        max_speed_ptr
+    );
+    env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, ok ? 0 : JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeGetRegionTemperatureState(
