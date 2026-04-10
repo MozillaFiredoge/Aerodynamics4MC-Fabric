@@ -690,10 +690,10 @@ public final class AeroServerRuntime {
             appendJsonField(builder, "planetary_wave_phase", driver.planetaryWavePhase(), true, 4);
             appendJsonField(builder, "storm_activity", driver.stormActivity(), true, 4);
             appendJsonField(builder, "season_phase", driver.seasonPhase(), true, 4);
-            builder.append("    \"pressure_cells\": [\n");
-            List<WorldScaleDriver.PressureCellSnapshot> pressureCells = driver.pressureCells();
-            for (int i = 0; i < pressureCells.size(); i++) {
-                WorldScaleDriver.PressureCellSnapshot cell = pressureCells.get(i);
+            builder.append("    \"cyclone_cells\": [\n");
+            List<WorldScaleDriver.CycloneCellSnapshot> cycloneCells = driver.cycloneCells();
+            for (int i = 0; i < cycloneCells.size(); i++) {
+                WorldScaleDriver.CycloneCellSnapshot cell = cycloneCells.get(i);
                 builder.append("      {\n");
                 appendJsonField(builder, "center_cell_x", cell.centerCellX(), true, 8);
                 appendJsonField(builder, "center_cell_z", cell.centerCellZ(), true, 8);
@@ -702,9 +702,11 @@ public final class AeroServerRuntime {
                 appendJsonField(builder, "pressure_sign", cell.pressureSign(), true, 8);
                 appendJsonField(builder, "drift_x_cells_per_second", cell.driftCellsPerSecondX(), true, 8);
                 appendJsonField(builder, "drift_z_cells_per_second", cell.driftCellsPerSecondZ(), true, 8);
-                appendJsonField(builder, "lifecycle_phase", cell.lifecyclePhase(), false, 8);
+                appendJsonField(builder, "lifecycle_phase", cell.lifecyclePhase(), true, 8);
+                appendJsonField(builder, "warm_core_bias_kelvin", cell.warmCoreBiasKelvin(), true, 8);
+                appendJsonField(builder, "moisture_core_bias", cell.moistureCoreBias(), false, 8);
                 builder.append("      }");
-                if (i + 1 < pressureCells.size()) {
+                if (i + 1 < cycloneCells.size()) {
                     builder.append(',');
                 }
                 builder.append('\n');
@@ -721,7 +723,10 @@ public final class AeroServerRuntime {
         appendJsonArray(builder, "surface_temperature_kelvin", snapshot.surfaceTemperatureKelvin(), true);
         appendJsonArray(builder, "wind_x", snapshot.windX(), true);
         appendJsonArray(builder, "wind_z", snapshot.windZ(), true);
-        appendJsonArray(builder, "humidity", snapshot.humidity(), false);
+        appendJsonArray(builder, "humidity", snapshot.humidity(), true);
+        appendJsonArray(builder, "vorticity", snapshot.vorticity(), true);
+        appendJsonArray(builder, "divergence", snapshot.divergence(), true);
+        appendJsonArray(builder, "temperature_anomaly", snapshot.temperatureAnomaly(), false);
         builder.append("\n}\n");
         return builder.toString();
     }

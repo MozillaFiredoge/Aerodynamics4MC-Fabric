@@ -23,20 +23,18 @@ final class WorldScaleDriver {
     private static final float DRIVER_SPATIAL_SCALE_Z = 0.09f;
     private static final float MAX_DRIVER_WIND_MPS = 12.0f;
 
-    private static final int DEFAULT_PRESSURE_CELL_COUNT = 3;
+    private static final int DEFAULT_CYCLONE_CELL_COUNT = 3;
     private static final float PRESSURE_DOMAIN_CELLS = 384.0f;
     private static final float DRIVER_CELL_SIZE_BLOCKS = 256.0f;
-    private static final float PRESSURE_CELL_MIN_RADIUS = 9.0f;
-    private static final float PRESSURE_CELL_MAX_RADIUS = 18.0f;
-    private static final float PRESSURE_CELL_MAX_SWIRL_MPS = 7.5f;
-    private static final float PRESSURE_CELL_MAX_RADIAL_MPS = 2.0f;
-    private static final float PRESSURE_CELL_MAX_TEMPERATURE_BIAS_K = 3.2f;
-    private static final float PRESSURE_CELL_MAX_MOISTURE_BIAS = 0.12f;
-    private static final float PRESSURE_CELL_BASE_FLOW_ADVECTION = 0.30f;
-    private static final float PRESSURE_CELL_LIFECYCLE_RADIANS_PER_SECOND = TAU / (24000.0f * 2.0f / 20.0f);
+    private static final float CYCLONE_CELL_MIN_RADIUS = 9.0f;
+    private static final float CYCLONE_CELL_MAX_RADIUS = 18.0f;
+    private static final float CYCLONE_CELL_MAX_SWIRL_MPS = 7.5f;
+    private static final float CYCLONE_CELL_MAX_RADIAL_MPS = 2.0f;
+    private static final float CYCLONE_CELL_BASE_FLOW_ADVECTION = 0.30f;
+    private static final float CYCLONE_CELL_LIFECYCLE_RADIANS_PER_SECOND = TAU / (24000.0f * 2.0f / 20.0f);
 
     private final long worldSeed;
-    private final List<PressureCell> pressureCells;
+    private final List<CycloneCell> cycloneCells;
     private long lastTickUpdated = Long.MIN_VALUE;
     private float driverTimeSeconds;
     private float baseFlowX;
@@ -57,7 +55,7 @@ final class WorldScaleDriver {
         float planetaryWavePhase,
         float stormActivity,
         float seasonPhase,
-        List<PressureCell> pressureCells
+        List<CycloneCell> cycloneCells
     ) {
         this.worldSeed = worldSeed;
         this.driverTimeSeconds = driverTimeSeconds;
@@ -68,7 +66,7 @@ final class WorldScaleDriver {
         this.planetaryWavePhase = planetaryWavePhase;
         this.stormActivity = stormActivity;
         this.seasonPhase = seasonPhase;
-        this.pressureCells = new ArrayList<>(pressureCells);
+        this.cycloneCells = new ArrayList<>(cycloneCells);
     }
 
     static WorldScaleDriver loadOrCreate(Path path, ServerWorld world) {
@@ -110,7 +108,7 @@ final class WorldScaleDriver {
             planetaryWavePhase,
             stormActivity,
             seasonPhase,
-            createDefaultPressureCells(worldSeed)
+            createDefaultCycloneCells(worldSeed)
         );
     }
 
@@ -147,8 +145,8 @@ final class WorldScaleDriver {
                 // Ignore malformed entries and keep deterministic defaults.
             }
         }
-        driver.pressureCells.clear();
-        driver.pressureCells.addAll(parsePressureCells(worldSeed, lines));
+        driver.cycloneCells.clear();
+        driver.cycloneCells.addAll(parseCycloneCells(worldSeed, lines));
         driver.airmassMoistureBias = MathHelper.clamp(driver.airmassMoistureBias, 0.0f, 1.0f);
         driver.stormActivity = MathHelper.clamp(driver.stormActivity, 0.0f, 1.0f);
         driver.seasonPhase = wrap01(driver.seasonPhase);
@@ -170,17 +168,19 @@ final class WorldScaleDriver {
         appendProperty(builder, "planetary_wave_phase", planetaryWavePhase);
         appendProperty(builder, "storm_activity", stormActivity);
         appendProperty(builder, "season_phase", seasonPhase);
-        builder.append("pressure_cell_count=").append(pressureCells.size()).append('\n');
-        for (int i = 0; i < pressureCells.size(); i++) {
-            PressureCell cell = pressureCells.get(i);
-            appendProperty(builder, "pressure_cell_" + i + "_center_x", cell.centerCellX);
-            appendProperty(builder, "pressure_cell_" + i + "_center_z", cell.centerCellZ);
-            appendProperty(builder, "pressure_cell_" + i + "_radius_cells", cell.radiusCells);
-            appendProperty(builder, "pressure_cell_" + i + "_intensity", cell.intensity);
-            appendProperty(builder, "pressure_cell_" + i + "_pressure_sign", cell.pressureSign);
-            appendProperty(builder, "pressure_cell_" + i + "_drift_x_cells_per_second", cell.driftCellsPerSecondX);
-            appendProperty(builder, "pressure_cell_" + i + "_drift_z_cells_per_second", cell.driftCellsPerSecondZ);
-            appendProperty(builder, "pressure_cell_" + i + "_lifecycle_phase", cell.lifecyclePhase);
+        builder.append("cyclone_cell_count=").append(cycloneCells.size()).append('\n');
+        for (int i = 0; i < cycloneCells.size(); i++) {
+            CycloneCell cell = cycloneCells.get(i);
+            appendProperty(builder, "cyclone_cell_" + i + "_center_x", cell.centerCellX);
+            appendProperty(builder, "cyclone_cell_" + i + "_center_z", cell.centerCellZ);
+            appendProperty(builder, "cyclone_cell_" + i + "_radius_cells", cell.radiusCells);
+            appendProperty(builder, "cyclone_cell_" + i + "_intensity", cell.intensity);
+            appendProperty(builder, "cyclone_cell_" + i + "_pressure_sign", cell.pressureSign);
+            appendProperty(builder, "cyclone_cell_" + i + "_drift_x_cells_per_second", cell.driftCellsPerSecondX);
+            appendProperty(builder, "cyclone_cell_" + i + "_drift_z_cells_per_second", cell.driftCellsPerSecondZ);
+            appendProperty(builder, "cyclone_cell_" + i + "_lifecycle_phase", cell.lifecyclePhase);
+            appendProperty(builder, "cyclone_cell_" + i + "_warm_core_bias_kelvin", cell.warmCoreBiasKelvin);
+            appendProperty(builder, "cyclone_cell_" + i + "_moisture_core_bias", cell.moistureCoreBias);
         }
         Files.writeString(path, builder.toString(), StandardCharsets.UTF_8);
     }
@@ -253,7 +253,7 @@ final class WorldScaleDriver {
             1.0f
         );
 
-        for (PressureCell cell : pressureCells) {
+        for (CycloneCell cell : cycloneCells) {
             cell.advance(elapsedSeconds, baseFlowX, baseFlowZ);
         }
     }
@@ -270,8 +270,8 @@ final class WorldScaleDriver {
         float temperatureBiasKelvin = airmassTemperatureBias + 1.4f * waveA + 0.8f * waveB;
         float humidity = MathHelper.clamp(airmassMoistureBias + 0.08f * waveB - 0.05f * eddy, 0.0f, 1.0f);
 
-        for (PressureCell cell : pressureCells) {
-            PressureContribution contribution = cell.sample(cellX, cellZ, stormActivity);
+        for (CycloneCell cell : cycloneCells) {
+            CycloneContribution contribution = cell.sample(cellX, cellZ, stormActivity);
             targetWindX += contribution.windX();
             targetWindZ += contribution.windZ();
             temperatureBiasKelvin += contribution.temperatureBiasKelvin();
@@ -285,8 +285,8 @@ final class WorldScaleDriver {
     }
 
     synchronized Snapshot snapshot() {
-        List<PressureCellSnapshot> systems = new ArrayList<>(pressureCells.size());
-        for (PressureCell cell : pressureCells) {
+        List<CycloneCellSnapshot> systems = new ArrayList<>(cycloneCells.size());
+        for (CycloneCell cell : cycloneCells) {
             systems.add(cell.snapshot());
         }
         return new Snapshot(
@@ -302,16 +302,16 @@ final class WorldScaleDriver {
         );
     }
 
-    private static List<PressureCell> createDefaultPressureCells(long worldSeed) {
-        List<PressureCell> cells = new ArrayList<>(DEFAULT_PRESSURE_CELL_COUNT);
-        for (int i = 0; i < DEFAULT_PRESSURE_CELL_COUNT; i++) {
+    private static List<CycloneCell> createDefaultCycloneCells(long worldSeed) {
+        List<CycloneCell> cells = new ArrayList<>(DEFAULT_CYCLONE_CELL_COUNT);
+        for (int i = 0; i < DEFAULT_CYCLONE_CELL_COUNT; i++) {
             long salt = 0x632be59bd9b4e019L + (long) i * 0x9e3779b97f4a7c15L;
             float centerX = seededUnit(worldSeed, salt ^ 0x94d049bb133111ebL) * PRESSURE_DOMAIN_CELLS;
             float centerZ = seededUnit(worldSeed, salt ^ 0x2545f4914f6cdd1dL) * PRESSURE_DOMAIN_CELLS;
             float radiusCells = MathHelper.lerp(
                 seededUnit(worldSeed, salt ^ 0x4cf5ad432745937fL),
-                PRESSURE_CELL_MIN_RADIUS,
-                PRESSURE_CELL_MAX_RADIUS
+                CYCLONE_CELL_MIN_RADIUS,
+                CYCLONE_CELL_MAX_RADIUS
             );
             float intensity = MathHelper.lerp(
                 seededUnit(worldSeed, salt ^ 0x6c8e9cf570932bd5L),
@@ -319,6 +319,12 @@ final class WorldScaleDriver {
                 0.95f
             );
             float pressureSign = (i & 1) == 0 ? -1.0f : 1.0f;
+            float warmCoreBiasKelvin = pressureSign < 0.0f
+                ? MathHelper.lerp(seededUnit(worldSeed, salt ^ 0xcbbb9d5dc1059ed8L), 1.0f, 3.6f)
+                : -MathHelper.lerp(seededUnit(worldSeed, salt ^ 0x629a292a367cd507L), 0.6f, 2.2f);
+            float moistureCoreBias = pressureSign < 0.0f
+                ? MathHelper.lerp(seededUnit(worldSeed, salt ^ 0x9159015a3070dd17L), 0.04f, 0.14f)
+                : -MathHelper.lerp(seededUnit(worldSeed, salt ^ 0x152fecd8f70e5939L), 0.03f, 0.10f);
             float driftDirection = seededUnit(worldSeed, salt ^ 0xa4093822299f31d0L) * TAU;
             float driftSpeedCellsPerSecond = MathHelper.lerp(
                 seededUnit(worldSeed, salt ^ 0x082efa98ec4e6c89L),
@@ -328,7 +334,7 @@ final class WorldScaleDriver {
             float driftX = MathHelper.cos(driftDirection) * driftSpeedCellsPerSecond;
             float driftZ = MathHelper.sin(driftDirection) * driftSpeedCellsPerSecond;
             float lifecyclePhase = seededUnit(worldSeed, salt ^ 0x452821e638d01377L) * TAU;
-            cells.add(new PressureCell(
+            cells.add(new CycloneCell(
                 centerX,
                 centerZ,
                 radiusCells,
@@ -336,14 +342,16 @@ final class WorldScaleDriver {
                 pressureSign,
                 driftX,
                 driftZ,
-                lifecyclePhase
+                lifecyclePhase,
+                warmCoreBiasKelvin,
+                moistureCoreBias
             ));
         }
         return cells;
     }
 
-    private static List<PressureCell> parsePressureCells(long worldSeed, List<String> lines) {
-        int count = DEFAULT_PRESSURE_CELL_COUNT;
+    private static List<CycloneCell> parseCycloneCells(long worldSeed, List<String> lines) {
+        int count = DEFAULT_CYCLONE_CELL_COUNT;
         for (String rawLine : lines) {
             if (rawLine == null) {
                 continue;
@@ -354,20 +362,20 @@ final class WorldScaleDriver {
                 continue;
             }
             String key = line.substring(0, separator).trim();
-            if ("pressure_cell_count".equals(key)) {
+            if ("cyclone_cell_count".equals(key) || "pressure_cell_count".equals(key)) {
                 try {
                     count = Math.max(0, Integer.parseInt(line.substring(separator + 1).trim()));
                 } catch (NumberFormatException ignored) {
-                    count = DEFAULT_PRESSURE_CELL_COUNT;
+                    count = DEFAULT_CYCLONE_CELL_COUNT;
                 }
                 break;
             }
         }
 
-        List<PressureCell> defaults = createDefaultPressureCells(worldSeed);
-        List<PressureCell> cells = new ArrayList<>(count);
+        List<CycloneCell> defaults = createDefaultCycloneCells(worldSeed);
+        List<CycloneCell> cells = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            PressureCell fallback = defaults.get(i % defaults.size());
+            CycloneCell fallback = defaults.get(i % defaults.size());
             cells.add(fallback.copy());
         }
         if (count == 0) {
@@ -387,10 +395,12 @@ final class WorldScaleDriver {
                 continue;
             }
             String key = line.substring(0, separator).trim();
-            if (!key.startsWith("pressure_cell_")) {
+            if (!key.startsWith("pressure_cell_") && !key.startsWith("cyclone_cell_")) {
                 continue;
             }
-            String suffix = key.substring("pressure_cell_".length());
+            String suffix = key.startsWith("cyclone_cell_")
+                ? key.substring("cyclone_cell_".length())
+                : key.substring("pressure_cell_".length());
             int nextSeparator = suffix.indexOf('_');
             if (nextSeparator <= 0 || nextSeparator == suffix.length() - 1) {
                 continue;
@@ -453,7 +463,7 @@ final class WorldScaleDriver {
     }
 
     private static float shortestWrappedDelta(float sample, float center) {
-        float delta = wrapDomain(sample) - center;
+        float delta = wrapDomain(sample) - wrapDomain(center);
         if (delta > PRESSURE_DOMAIN_CELLS * 0.5f) {
             delta -= PRESSURE_DOMAIN_CELLS;
         } else if (delta < -PRESSURE_DOMAIN_CELLS * 0.5f) {
@@ -480,11 +490,11 @@ final class WorldScaleDriver {
         float planetaryWavePhase,
         float stormActivity,
         float seasonPhase,
-        List<PressureCellSnapshot> pressureCells
+        List<CycloneCellSnapshot> cycloneCells
     ) {
     }
 
-    record PressureCellSnapshot(
+    record CycloneCellSnapshot(
         float centerCellX,
         float centerCellZ,
         float radiusCells,
@@ -492,20 +502,22 @@ final class WorldScaleDriver {
         float pressureSign,
         float driftCellsPerSecondX,
         float driftCellsPerSecondZ,
-        float lifecyclePhase
+        float lifecyclePhase,
+        float warmCoreBiasKelvin,
+        float moistureCoreBias
     ) {
     }
 
-    private record PressureContribution(
+    private record CycloneContribution(
         float windX,
         float windZ,
         float temperatureBiasKelvin,
         float humidityBias
     ) {
-        private static final PressureContribution ZERO = new PressureContribution(0.0f, 0.0f, 0.0f, 0.0f);
+        private static final CycloneContribution ZERO = new CycloneContribution(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    private static final class PressureCell {
+    private static final class CycloneCell {
         private float centerCellX;
         private float centerCellZ;
         private float radiusCells;
@@ -514,8 +526,10 @@ final class WorldScaleDriver {
         private float driftCellsPerSecondX;
         private float driftCellsPerSecondZ;
         private float lifecyclePhase;
+        private float warmCoreBiasKelvin;
+        private float moistureCoreBias;
 
-        private PressureCell(
+        private CycloneCell(
             float centerCellX,
             float centerCellZ,
             float radiusCells,
@@ -523,7 +537,9 @@ final class WorldScaleDriver {
             float pressureSign,
             float driftCellsPerSecondX,
             float driftCellsPerSecondZ,
-            float lifecyclePhase
+            float lifecyclePhase,
+            float warmCoreBiasKelvin,
+            float moistureCoreBias
         ) {
             this.centerCellX = centerCellX;
             this.centerCellZ = centerCellZ;
@@ -533,10 +549,12 @@ final class WorldScaleDriver {
             this.driftCellsPerSecondX = driftCellsPerSecondX;
             this.driftCellsPerSecondZ = driftCellsPerSecondZ;
             this.lifecyclePhase = lifecyclePhase;
+            this.warmCoreBiasKelvin = warmCoreBiasKelvin;
+            this.moistureCoreBias = moistureCoreBias;
         }
 
-        private PressureCell copy() {
-            return new PressureCell(
+        private CycloneCell copy() {
+            return new CycloneCell(
                 centerCellX,
                 centerCellZ,
                 radiusCells,
@@ -544,25 +562,27 @@ final class WorldScaleDriver {
                 pressureSign,
                 driftCellsPerSecondX,
                 driftCellsPerSecondZ,
-                lifecyclePhase
+                lifecyclePhase,
+                warmCoreBiasKelvin,
+                moistureCoreBias
             );
         }
 
         private void advance(float elapsedSeconds, float baseFlowX, float baseFlowZ) {
-            lifecyclePhase = wrapTau(lifecyclePhase + elapsedSeconds * PRESSURE_CELL_LIFECYCLE_RADIANS_PER_SECOND);
-            float baseDriftX = (baseFlowX / DRIVER_CELL_SIZE_BLOCKS) * PRESSURE_CELL_BASE_FLOW_ADVECTION;
-            float baseDriftZ = (baseFlowZ / DRIVER_CELL_SIZE_BLOCKS) * PRESSURE_CELL_BASE_FLOW_ADVECTION;
+            lifecyclePhase = wrapTau(lifecyclePhase + elapsedSeconds * CYCLONE_CELL_LIFECYCLE_RADIANS_PER_SECOND);
+            float baseDriftX = (baseFlowX / DRIVER_CELL_SIZE_BLOCKS) * CYCLONE_CELL_BASE_FLOW_ADVECTION;
+            float baseDriftZ = (baseFlowZ / DRIVER_CELL_SIZE_BLOCKS) * CYCLONE_CELL_BASE_FLOW_ADVECTION;
             centerCellX = wrapDomain(centerCellX + elapsedSeconds * (driftCellsPerSecondX + baseDriftX));
             centerCellZ = wrapDomain(centerCellZ + elapsedSeconds * (driftCellsPerSecondZ + baseDriftZ));
         }
 
-        private PressureContribution sample(float cellX, float cellZ, float stormActivity) {
+        private CycloneContribution sample(float cellX, float cellZ, float stormActivity) {
             float dx = shortestWrappedDelta(cellX, centerCellX);
             float dz = shortestWrappedDelta(cellZ, centerCellZ);
             float distanceSquared = dx * dx + dz * dz;
             float influenceRadius = radiusCells * 2.0f;
             if (distanceSquared >= influenceRadius * influenceRadius) {
-                return PressureContribution.ZERO;
+                return CycloneContribution.ZERO;
             }
 
             float distance = Math.max(1.0e-3f, MathHelper.sqrt(distanceSquared));
@@ -580,19 +600,19 @@ final class WorldScaleDriver {
             float tangentZ = (dx / distance) * rotationSign;
             float radialX = dx / distance;
             float radialZ = dz / distance;
-            float swirlSpeed = PRESSURE_CELL_MAX_SWIRL_MPS * effectiveIntensity * envelope * coreSuppression;
-            float radialSpeed = PRESSURE_CELL_MAX_RADIAL_MPS * effectiveIntensity * envelope;
+            float swirlSpeed = CYCLONE_CELL_MAX_SWIRL_MPS * effectiveIntensity * envelope * coreSuppression;
+            float radialSpeed = CYCLONE_CELL_MAX_RADIAL_MPS * effectiveIntensity * envelope;
             float radialSign = pressureSign < 0.0f ? -1.0f : 1.0f;
 
             float windX = tangentX * swirlSpeed + radialX * radialSpeed * radialSign;
             float windZ = tangentZ * swirlSpeed + radialZ * radialSpeed * radialSign;
-            float temperatureBias = -pressureSign * PRESSURE_CELL_MAX_TEMPERATURE_BIAS_K * effectiveIntensity * envelope;
-            float humidityBias = -pressureSign * PRESSURE_CELL_MAX_MOISTURE_BIAS * effectiveIntensity * envelope;
-            return new PressureContribution(windX, windZ, temperatureBias, humidityBias);
+            float temperatureBias = warmCoreBiasKelvin * effectiveIntensity * envelope;
+            float humidityBias = moistureCoreBias * effectiveIntensity * envelope;
+            return new CycloneContribution(windX, windZ, temperatureBias, humidityBias);
         }
 
-        private PressureCellSnapshot snapshot() {
-            return new PressureCellSnapshot(
+        private CycloneCellSnapshot snapshot() {
+            return new CycloneCellSnapshot(
                 centerCellX,
                 centerCellZ,
                 radiusCells,
@@ -600,7 +620,9 @@ final class WorldScaleDriver {
                 pressureSign,
                 driftCellsPerSecondX,
                 driftCellsPerSecondZ,
-                lifecyclePhase
+                lifecyclePhase,
+                warmCoreBiasKelvin,
+                moistureCoreBias
             );
         }
 
@@ -614,6 +636,8 @@ final class WorldScaleDriver {
                 case "drift_x_cells_per_second" -> driftCellsPerSecondX = value;
                 case "drift_z_cells_per_second" -> driftCellsPerSecondZ = value;
                 case "lifecycle_phase" -> lifecyclePhase = wrapTau(value);
+                case "warm_core_bias_kelvin" -> warmCoreBiasKelvin = value;
+                case "moisture_core_bias" -> moistureCoreBias = value;
                 default -> {
                 }
             }

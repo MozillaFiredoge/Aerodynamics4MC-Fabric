@@ -150,6 +150,9 @@ final class BackgroundMetGrid {
         float[] windX = new float[cellCount];
         float[] windZ = new float[cellCount];
         float[] humidity = new float[cellCount];
+        float[] vorticity = new float[cellCount];
+        float[] divergence = new float[cellCount];
+        float[] temperatureAnomaly = new float[cellCount];
 
         for (int cx = centerCellX - radiusCells; cx <= centerCellX + radiusCells; cx++) {
             int localX = cx - (centerCellX - radiusCells);
@@ -172,6 +175,17 @@ final class BackgroundMetGrid {
                 humidity[cellIndex] = cell.humidity;
             }
         }
+
+        populateDiagnostics(
+            gridWidth,
+            cellSizeBlocks,
+            ambientAirTemperatureKelvin,
+            windX,
+            windZ,
+            vorticity,
+            divergence,
+            temperatureAnomaly
+        );
 
         WorldScaleDriver.Snapshot driverSnapshot = currentDriver == null ? null : currentDriver.snapshot();
         return new Snapshot(
@@ -196,8 +210,48 @@ final class BackgroundMetGrid {
             surfaceTemperatureKelvin,
             windX,
             windZ,
-            humidity
+            humidity,
+            vorticity,
+            divergence,
+            temperatureAnomaly
         );
+    }
+
+    private void populateDiagnostics(
+        int gridWidth,
+        int cellSizeBlocks,
+        float[] ambientAirTemperatureKelvin,
+        float[] windX,
+        float[] windZ,
+        float[] vorticity,
+        float[] divergence,
+        float[] temperatureAnomaly
+    ) {
+        float meanAmbient = 0.0f;
+        for (float value : ambientAirTemperatureKelvin) {
+            meanAmbient += value;
+        }
+        meanAmbient /= Math.max(1, ambientAirTemperatureKelvin.length);
+        float dxMeters = Math.max(1.0f, cellSizeBlocks);
+
+        for (int x = 0; x < gridWidth; x++) {
+            int west = Math.max(0, x - 1);
+            int east = Math.min(gridWidth - 1, x + 1);
+            float xSpanMeters = Math.max(1.0f, (east - west) * dxMeters);
+            for (int z = 0; z < gridWidth; z++) {
+                int north = Math.max(0, z - 1);
+                int south = Math.min(gridWidth - 1, z + 1);
+                float zSpanMeters = Math.max(1.0f, (south - north) * dxMeters);
+                int index = x * gridWidth + z;
+                float dWindXdx = (windX[east * gridWidth + z] - windX[west * gridWidth + z]) / xSpanMeters;
+                float dWindZdx = (windZ[east * gridWidth + z] - windZ[west * gridWidth + z]) / xSpanMeters;
+                float dWindXdz = (windX[x * gridWidth + south] - windX[x * gridWidth + north]) / zSpanMeters;
+                float dWindZdz = (windZ[x * gridWidth + south] - windZ[x * gridWidth + north]) / zSpanMeters;
+                divergence[index] = dWindXdx + dWindZdz;
+                vorticity[index] = dWindZdx - dWindXdz;
+                temperatureAnomaly[index] = ambientAirTemperatureKelvin[index] - meanAmbient;
+            }
+        }
     }
 
     RegistryKey<World> worldKey(ServerWorld world) {
@@ -496,7 +550,10 @@ final class BackgroundMetGrid {
         float[] surfaceTemperatureKelvin,
         float[] windX,
         float[] windZ,
-        float[] humidity
+        float[] humidity,
+        float[] vorticity,
+        float[] divergence,
+        float[] temperatureAnomaly
     ) {
     }
 
