@@ -144,6 +144,8 @@ public final class AeroServerRuntime {
     private static final int MESOSCALE_MET_MAX_LAYERS = Math.max(1, 320 / MESOSCALE_MET_LAYER_HEIGHT_BLOCKS);
     private static final int MESOSCALE_FORCING_REBUILD_TICKS = TICKS_PER_SECOND * 60;
     private static final float MESOSCALE_STEP_SECONDS = MESOSCALE_MET_CELL_SIZE_BLOCKS * SOLVER_STEP_SECONDS;
+    private static final int NESTED_BOUNDARY_FACE_RESOLUTION = 6;
+    private static final float NESTED_BOUNDARY_MAX_VY_RATIO = 0.60f;
     private static final int BACKGROUND_MET_REFRESH_TICKS = TICKS_PER_SECOND * 60 * 3;
     private static final int STATIC_MIRROR_HIGH_PRIORITY_BUILD_BUDGET_PER_TICK = 1;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_INTERVAL_TICKS = TICKS_PER_SECOND;
@@ -2147,8 +2149,10 @@ public final class AeroServerRuntime {
         WindowKey key,
         RegionRecord region,
         float speedCap,
-        long generation
+        long generation,
+        Set<WindowKey> activeKeys
     ) {
+        NestedBoundaryCoupler.BoundarySample boundarySample = sampleNestedBoundaryAtWindow(key);
         return new SolveSnapshot(
             key,
             region,
@@ -2156,7 +2160,8 @@ public final class AeroServerRuntime {
             List.copyOf(region.fans),
             speedCap,
             generation,
-            sampleNestedBoundaryAtWindow(key)
+            boundarySample,
+            sampleNestedBoundaryFieldAtWindow(key, activeKeys, boundarySample)
         );
     }
 
@@ -2182,6 +2187,241 @@ public final class AeroServerRuntime {
             return nestedBoundaryCoupler.fromMesoscaleSample(mesoscaleSample);
         }
         return nestedBoundaryCoupler.fromBackgroundSample(sampleBackgroundMetAtWindow(key));
+    }
+
+    private BoundaryFieldData sampleNestedBoundaryFieldAtWindow(
+        WindowKey key,
+        Set<WindowKey> activeKeys,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        int externalFaceMask = computeExternalFaceMask(key, activeKeys);
+        if (externalFaceMask == 0) {
+            return null;
+        }
+        int res = NESTED_BOUNDARY_FACE_RESOLUTION;
+        int faceCells = FACE_COUNT * res * res;
+        float[] windX = new float[faceCells];
+        float[] windY = new float[faceCells];
+        float[] windZ = new float[faceCells];
+        float[] airTemperature = new float[faceCells];
+        BlockPos origin = key.origin();
+        double minX = origin.getX();
+        double minY = origin.getY();
+        double minZ = origin.getZ();
+        double maxX = minX + GRID_SIZE;
+        double maxY = minY + GRID_SIZE;
+        double maxZ = minZ + GRID_SIZE;
+
+        if ((externalFaceMask & (1 << Direction.WEST.ordinal())) != 0) {
+            fillVerticalBoundaryFace(key.worldKey(), Direction.WEST.ordinal(), minX + 0.5, minZ, maxZ, minY, maxY, res, windX, windY, windZ, airTemperature, fallback);
+        }
+        if ((externalFaceMask & (1 << Direction.EAST.ordinal())) != 0) {
+            fillVerticalBoundaryFace(key.worldKey(), Direction.EAST.ordinal(), maxX - 0.5, minZ, maxZ, minY, maxY, res, windX, windY, windZ, airTemperature, fallback);
+        }
+        if ((externalFaceMask & (1 << Direction.NORTH.ordinal())) != 0) {
+            fillVerticalBoundaryFace(key.worldKey(), Direction.NORTH.ordinal(), minZ + 0.5, minX, maxX, minY, maxY, res, windX, windY, windZ, airTemperature, fallback);
+        }
+        if ((externalFaceMask & (1 << Direction.SOUTH.ordinal())) != 0) {
+            fillVerticalBoundaryFace(key.worldKey(), Direction.SOUTH.ordinal(), maxZ - 0.5, minX, maxX, minY, maxY, res, windX, windY, windZ, airTemperature, fallback);
+        }
+        if ((externalFaceMask & (1 << Direction.DOWN.ordinal())) != 0) {
+            fillHorizontalBoundaryFace(key.worldKey(), Direction.DOWN.ordinal(), minX, maxX, minZ, maxZ, minY + 0.5, res, windX, windY, windZ, airTemperature, minY, maxY, fallback);
+        }
+        if ((externalFaceMask & (1 << Direction.UP.ordinal())) != 0) {
+            fillHorizontalBoundaryFace(key.worldKey(), Direction.UP.ordinal(), minX, maxX, minZ, maxZ, maxY - 0.5, res, windX, windY, windZ, airTemperature, minY, maxY, fallback);
+        }
+        return new BoundaryFieldData(res, externalFaceMask, windX, windY, windZ, airTemperature);
+    }
+
+    private int computeExternalFaceMask(WindowKey key, Set<WindowKey> activeKeys) {
+        int mask = 0;
+        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(-REGION_LATTICE_STRIDE, 0, 0)))) {
+            mask |= 1 << Direction.WEST.ordinal();
+        }
+        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(REGION_LATTICE_STRIDE, 0, 0)))) {
+            mask |= 1 << Direction.EAST.ordinal();
+        }
+        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, -REGION_LATTICE_STRIDE, 0)))) {
+            mask |= 1 << Direction.DOWN.ordinal();
+        }
+        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, REGION_LATTICE_STRIDE, 0)))) {
+            mask |= 1 << Direction.UP.ordinal();
+        }
+        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, 0, -REGION_LATTICE_STRIDE)))) {
+            mask |= 1 << Direction.NORTH.ordinal();
+        }
+        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, 0, REGION_LATTICE_STRIDE)))) {
+            mask |= 1 << Direction.SOUTH.ordinal();
+        }
+        return mask;
+    }
+
+    private void fillVerticalBoundaryFace(
+        RegistryKey<World> worldKey,
+        int face,
+        double fixedAxis,
+        double horizontalMin,
+        double horizontalMax,
+        double minY,
+        double maxY,
+        int resolution,
+        float[] windX,
+        float[] windY,
+        float[] windZ,
+        float[] airTemperature,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        for (int u = 0; u < resolution; u++) {
+            float[] vxColumn = new float[resolution];
+            float[] vzColumn = new float[resolution];
+            float[] tempColumn = new float[resolution];
+            float[] divColumn = new float[resolution];
+            float maxHorizontalSpeed = 0.0f;
+            for (int v = 0; v < resolution; v++) {
+                double horizontal = lerp(horizontalMin, horizontalMax, (u + 0.5) / resolution);
+                double y = lerp(minY, maxY, (v + 0.5) / resolution);
+                BlockPos samplePos = switch (face) {
+                    case 4, 5 -> BlockPos.ofFloored(fixedAxis, y, horizontal);
+                    case 2, 3 -> BlockPos.ofFloored(horizontal, y, fixedAxis);
+                    default -> BlockPos.ORIGIN;
+                };
+                NestedMetState state = sampleNestedMetState(worldKey, samplePos, fallback);
+                vxColumn[v] = state.windX();
+                vzColumn[v] = state.windZ();
+                tempColumn[v] = state.airTemperatureKelvin();
+                divColumn[v] = sampleHorizontalDivergence(worldKey, samplePos, fallback);
+                maxHorizontalSpeed = Math.max(maxHorizontalSpeed, (float) Math.sqrt(state.windX() * state.windX() + state.windZ() * state.windZ()));
+            }
+            float[] vyColumn = integrateVerticalVelocity(divColumn, maxHorizontalSpeed, (float) ((maxY - minY) / Math.max(1, resolution - 1)));
+            for (int v = 0; v < resolution; v++) {
+                int index = boundaryFaceIndex(face, u, v, resolution);
+                windX[index] = vxColumn[v] / NATIVE_VELOCITY_SCALE;
+                windY[index] = vyColumn[v] / NATIVE_VELOCITY_SCALE;
+                windZ[index] = vzColumn[v] / NATIVE_VELOCITY_SCALE;
+                airTemperature[index] = tempColumn[v];
+            }
+        }
+    }
+
+    private void fillHorizontalBoundaryFace(
+        RegistryKey<World> worldKey,
+        int face,
+        double minX,
+        double maxX,
+        double minZ,
+        double maxZ,
+        double fixedY,
+        int resolution,
+        float[] windX,
+        float[] windY,
+        float[] windZ,
+        float[] airTemperature,
+        double columnMinY,
+        double columnMaxY,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        for (int u = 0; u < resolution; u++) {
+            for (int v = 0; v < resolution; v++) {
+                double x = lerp(minX, maxX, (u + 0.5) / resolution);
+                double z = lerp(minZ, maxZ, (v + 0.5) / resolution);
+                BlockPos samplePos = BlockPos.ofFloored(x, fixedY, z);
+                NestedMetState state = sampleNestedMetState(worldKey, samplePos, fallback);
+                float vy = sampleColumnVerticalVelocity(worldKey, x, z, columnMinY, columnMaxY, face == Direction.DOWN.ordinal() ? 0 : resolution - 1, resolution, fallback);
+                int index = boundaryFaceIndex(face, u, v, resolution);
+                windX[index] = state.windX() / NATIVE_VELOCITY_SCALE;
+                windY[index] = vy / NATIVE_VELOCITY_SCALE;
+                windZ[index] = state.windZ() / NATIVE_VELOCITY_SCALE;
+                airTemperature[index] = state.airTemperatureKelvin();
+            }
+        }
+    }
+
+    private float sampleColumnVerticalVelocity(
+        RegistryKey<World> worldKey,
+        double x,
+        double z,
+        double minY,
+        double maxY,
+        int targetIndex,
+        int resolution,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        float[] divColumn = new float[resolution];
+        float maxHorizontalSpeed = 0.0f;
+        for (int i = 0; i < resolution; i++) {
+            double y = lerp(minY, maxY, (i + 0.5) / resolution);
+            BlockPos samplePos = BlockPos.ofFloored(x, y, z);
+            NestedMetState state = sampleNestedMetState(worldKey, samplePos, fallback);
+            divColumn[i] = sampleHorizontalDivergence(worldKey, samplePos, fallback);
+            maxHorizontalSpeed = Math.max(maxHorizontalSpeed, (float) Math.sqrt(state.windX() * state.windX() + state.windZ() * state.windZ()));
+        }
+        float[] vyColumn = integrateVerticalVelocity(divColumn, maxHorizontalSpeed, (float) ((maxY - minY) / Math.max(1, resolution - 1)));
+        return vyColumn[MathHelper.clamp(targetIndex, 0, resolution - 1)];
+    }
+
+    private float[] integrateVerticalVelocity(float[] divergenceColumn, float maxHorizontalSpeed, float dyMeters) {
+        float[] vy = new float[divergenceColumn.length];
+        for (int i = 1; i < divergenceColumn.length; i++) {
+            vy[i] = vy[i - 1] - 0.5f * (divergenceColumn[i - 1] + divergenceColumn[i]) * dyMeters;
+        }
+        float mean = 0.0f;
+        for (float value : vy) {
+            mean += value;
+        }
+        mean /= Math.max(1, vy.length);
+        float clamp = Math.max(0.15f, maxHorizontalSpeed * NESTED_BOUNDARY_MAX_VY_RATIO);
+        for (int i = 0; i < vy.length; i++) {
+            vy[i] = MathHelper.clamp(vy[i] - mean, -clamp, clamp);
+        }
+        return vy;
+    }
+
+    private float sampleHorizontalDivergence(
+        RegistryKey<World> worldKey,
+        BlockPos samplePos,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        BlockPos xMinus = samplePos.add(-MESOSCALE_MET_CELL_SIZE_BLOCKS, 0, 0);
+        BlockPos xPlus = samplePos.add(MESOSCALE_MET_CELL_SIZE_BLOCKS, 0, 0);
+        BlockPos zMinus = samplePos.add(0, 0, -MESOSCALE_MET_CELL_SIZE_BLOCKS);
+        BlockPos zPlus = samplePos.add(0, 0, MESOSCALE_MET_CELL_SIZE_BLOCKS);
+        NestedMetState sxMinus = sampleNestedMetState(worldKey, xMinus, fallback);
+        NestedMetState sxPlus = sampleNestedMetState(worldKey, xPlus, fallback);
+        NestedMetState szMinus = sampleNestedMetState(worldKey, zMinus, fallback);
+        NestedMetState szPlus = sampleNestedMetState(worldKey, zPlus, fallback);
+        float dxMeters = MESOSCALE_MET_CELL_SIZE_BLOCKS;
+        float dzMeters = MESOSCALE_MET_CELL_SIZE_BLOCKS;
+        float dudx = (sxPlus.windX() - sxMinus.windX()) / (2.0f * dxMeters);
+        float dwdz = (szPlus.windZ() - szMinus.windZ()) / (2.0f * dzMeters);
+        return dudx + dwdz;
+    }
+
+    private NestedMetState sampleNestedMetState(
+        RegistryKey<World> worldKey,
+        BlockPos pos,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        MesoscaleGrid.Sample mesoscale = sampleMesoscaleMet(worldKey, pos);
+        if (mesoscale != null) {
+            return new NestedMetState(mesoscale.windX(), mesoscale.windZ(), mesoscale.ambientAirTemperatureKelvin());
+        }
+        BackgroundMetGrid.Sample background = sampleBackgroundMet(worldKey, pos);
+        if (background != null) {
+            return new NestedMetState(background.backgroundWindX(), background.backgroundWindZ(), background.ambientAirTemperatureKelvin());
+        }
+        return new NestedMetState(
+            fallback == null ? 0.0f : fallback.windX(),
+            fallback == null ? 0.0f : fallback.windZ(),
+            fallback == null ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K : fallback.ambientAirTemperatureKelvin()
+        );
+    }
+
+    private int boundaryFaceIndex(int face, int u, int v, int resolution) {
+        return (face * resolution + u) * resolution + v;
+    }
+
+    private double lerp(double min, double max, double t) {
+        return min + (max - min) * t;
     }
 
     private boolean isSolidObstacle(ServerWorld world, BlockPos pos) {
@@ -2495,7 +2735,14 @@ public final class AeroServerRuntime {
             GRID_SIZE,
             snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windX() / NATIVE_VELOCITY_SCALE,
             snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windY() / NATIVE_VELOCITY_SCALE,
-            snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windZ() / NATIVE_VELOCITY_SCALE
+            snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windZ() / NATIVE_VELOCITY_SCALE,
+            snapshot.boundarySample() == null ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K : snapshot.boundarySample().ambientAirTemperatureKelvin(),
+            snapshot.boundaryField() == null ? 0 : snapshot.boundaryField().externalFaceMask(),
+            snapshot.boundaryField() == null ? 0 : snapshot.boundaryField().faceResolution(),
+            snapshot.boundaryField() == null ? null : snapshot.boundaryField().windX(),
+            snapshot.boundaryField() == null ? null : snapshot.boundaryField().windY(),
+            snapshot.boundaryField() == null ? null : snapshot.boundaryField().windZ(),
+            snapshot.boundaryField() == null ? null : snapshot.boundaryField().airTemperatureKelvin()
         );
         if (!Float.isFinite(maxSpeed)) {
             String nativeError = simulationBridge.lastError();
@@ -2679,6 +2926,10 @@ public final class AeroServerRuntime {
 
     private CountDownLatch scheduleSolveCycle(List<ActiveWindow> activeWindows) {
         List<SolveSnapshot> scheduled = new ArrayList<>(activeWindows.size());
+        Set<WindowKey> activeKeys = new HashSet<>(activeWindows.size());
+        for (ActiveWindow active : activeWindows) {
+            activeKeys.add(active.key());
+        }
         for (ActiveWindow active : activeWindows) {
             RegionRecord region = active.region();
             if (!region.busy.compareAndSet(false, true)) {
@@ -2688,7 +2939,8 @@ public final class AeroServerRuntime {
                 active.key(),
                 region,
                 MAX_RUNTIME_WIND_SPEED,
-                runtimeGeneration.get()
+                runtimeGeneration.get(),
+                activeKeys
             );
             scheduled.add(snapshot);
         }
@@ -3183,7 +3435,25 @@ public final class AeroServerRuntime {
         List<FanSource> fans,
         float speedCap,
         long generation,
-        NestedBoundaryCoupler.BoundarySample boundarySample
+        NestedBoundaryCoupler.BoundarySample boundarySample,
+        BoundaryFieldData boundaryField
+    ) {
+    }
+
+    private record BoundaryFieldData(
+        int faceResolution,
+        int externalFaceMask,
+        float[] windX,
+        float[] windY,
+        float[] windZ,
+        float[] airTemperatureKelvin
+    ) {
+    }
+
+    private record NestedMetState(
+        float windX,
+        float windZ,
+        float airTemperatureKelvin
     ) {
     }
 

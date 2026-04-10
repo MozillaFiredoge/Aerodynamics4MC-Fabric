@@ -6,6 +6,7 @@ public final class NativeSimulationBridge {
     public static final int FLOW_STATE_CHANNELS = 4;
     public static final int PACKED_ATLAS_CHANNELS = 4;
     public static final int PLAYER_PROBE_CHANNELS = 6;
+    private static final int FACE_COUNT = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
     public static final int WORLD_DELTA_CHUNK_UNLOADED = 3;
@@ -349,9 +350,28 @@ public final class NativeSimulationBridge {
         int nz,
         float boundaryWindX,
         float boundaryWindY,
-        float boundaryWindZ
+        float boundaryWindZ,
+        float fallbackBoundaryAirTemperatureKelvin,
+        int externalFaceMask,
+        int boundaryFaceResolution,
+        float[] boundaryWindFaceX,
+        float[] boundaryWindFaceY,
+        float[] boundaryWindFaceZ,
+        float[] boundaryAirTemperatureKelvin
     ) {
         if (!LOADED || serviceKey == 0L || regionKey == 0L) {
+            return Float.NaN;
+        }
+        int faceCells = boundaryFaceResolution <= 0 ? 0 : FACE_COUNT * boundaryFaceResolution * boundaryFaceResolution;
+        if (faceCells > 0
+            && (boundaryWindFaceX == null
+                || boundaryWindFaceY == null
+                || boundaryWindFaceZ == null
+                || boundaryAirTemperatureKelvin == null
+                || boundaryWindFaceX.length != faceCells
+                || boundaryWindFaceY.length != faceCells
+                || boundaryWindFaceZ.length != faceCells
+                || boundaryAirTemperatureKelvin.length != faceCells)) {
             return Float.NaN;
         }
         float[] outMaxSpeed = new float[1];
@@ -364,6 +384,13 @@ public final class NativeSimulationBridge {
             boundaryWindX,
             boundaryWindY,
             boundaryWindZ,
+            fallbackBoundaryAirTemperatureKelvin,
+            externalFaceMask,
+            boundaryFaceResolution,
+            boundaryWindFaceX,
+            boundaryWindFaceY,
+            boundaryWindFaceZ,
+            boundaryAirTemperatureKelvin,
             outMaxSpeed
         ) ? outMaxSpeed[0] : Float.NaN;
     }
@@ -717,6 +744,13 @@ public final class NativeSimulationBridge {
         float boundaryWindX,
         float boundaryWindY,
         float boundaryWindZ,
+        float fallbackBoundaryAirTemperatureKelvin,
+        int externalFaceMask,
+        int boundaryFaceResolution,
+        float[] boundaryWindFaceX,
+        float[] boundaryWindFaceY,
+        float[] boundaryWindFaceZ,
+        float[] boundaryAirTemperatureKelvin,
         float[] outMaxSpeed
     );
 

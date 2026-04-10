@@ -121,6 +121,8 @@ constexpr int k_channel_state_p = 8;
 constexpr int k_channel_thermal_source = 9;
 constexpr int k_window_edge_stabilization_layers = 8;
 constexpr float k_window_edge_stabilization_min_keep = 0.15f;
+constexpr int k_nested_boundary_layers = 3;
+constexpr float k_nested_boundary_min_keep = 0.25f;
 constexpr float k_runtime_temperature_scale_kelvin = 20.0f;
 constexpr float k_cell_face_area_square_meters = 1.0f;
 constexpr float k_cell_volume_cubic_meters = 1.0f;
@@ -345,6 +347,37 @@ bool in_bounds(int nx, int ny, int nz, int x, int y, int z) {
 
 int grid_cell_index(int ny, int nz, int x, int y, int z) {
     return (x * ny + y) * nz + z;
+}
+
+int boundary_face_index(int face, int u, int v, int resolution) {
+    return (face * resolution + u) * resolution + v;
+}
+
+float sample_boundary_face_scalar(
+    const float* values,
+    int face,
+    int resolution,
+    double u,
+    double v
+) {
+    if (!values || resolution <= 0) {
+        return 0.0f;
+    }
+    double clamped_u = std::clamp(u, 0.0, static_cast<double>(resolution - 1));
+    double clamped_v = std::clamp(v, 0.0, static_cast<double>(resolution - 1));
+    int u0 = static_cast<int>(std::floor(clamped_u));
+    int v0 = static_cast<int>(std::floor(clamped_v));
+    int u1 = std::min(resolution - 1, u0 + 1);
+    int v1 = std::min(resolution - 1, v0 + 1);
+    float fu = static_cast<float>(clamped_u - u0);
+    float fv = static_cast<float>(clamped_v - v0);
+    float c00 = values[boundary_face_index(face, u0, v0, resolution)];
+    float c10 = values[boundary_face_index(face, u1, v0, resolution)];
+    float c01 = values[boundary_face_index(face, u0, v1, resolution)];
+    float c11 = values[boundary_face_index(face, u1, v1, resolution)];
+    float c0 = c00 + (c10 - c00) * fu;
+    float c1 = c01 + (c11 - c01) * fu;
+    return c0 + (c1 - c0) * fv;
 }
 
 float neighbor_air_temperature_kelvin(
@@ -587,6 +620,80 @@ void apply_boundary_wind(
     }
 }
 
+void apply_nested_boundary_fields(
+    std::vector<float>& packet,
+    std::vector<float>& air_temperature,
+    int nx,
+    int ny,
+    int nz,
+    float fallback_boundary_wind_x,
+    float fallback_boundary_wind_y,
+    float fallback_boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k
+) {
+    if (packet.empty() || nx <= 0 || ny <= 0 || nz <= 0) {
+        return;
+    }
+    if (air_temperature.size() != static_cast<size_t>(nx * ny * nz)) {
+        return;
+    }
+    auto apply_face = [&](int face, int x, int y, int z, int layer_index, double u, double v) {
+        int cell = grid_cell_index(ny, nz, x, y, z);
+        size_t base = static_cast<size_t>(cell) * k_packet_channels;
+        if (packet[base + k_channel_obstacle] > 0.5f) {
+            return;
+        }
+        float eta = (k_nested_boundary_layers - layer_index) / static_cast<float>(k_nested_boundary_layers);
+        float keep = k_nested_boundary_min_keep + (1.0f - k_nested_boundary_min_keep) * (1.0f - eta * eta);
+        float relax = 1.0f - keep;
+        bool use_face = boundary_face_resolution > 0 && (external_face_mask & (1 << face)) != 0
+            && boundary_wind_face_x && boundary_wind_face_y && boundary_wind_face_z && boundary_air_temperature_k;
+        float vx = use_face ? sample_boundary_face_scalar(boundary_wind_face_x, face, boundary_face_resolution, u, v) : fallback_boundary_wind_x;
+        float vy = use_face ? sample_boundary_face_scalar(boundary_wind_face_y, face, boundary_face_resolution, u, v) : fallback_boundary_wind_y;
+        float vz = use_face ? sample_boundary_face_scalar(boundary_wind_face_z, face, boundary_face_resolution, u, v) : fallback_boundary_wind_z;
+        float air_k = use_face ? sample_boundary_face_scalar(boundary_air_temperature_k, face, boundary_face_resolution, u, v) : fallback_boundary_air_temperature_k;
+        packet[base + k_channel_state_vx] = packet[base + k_channel_state_vx] * keep + vx * relax;
+        packet[base + k_channel_state_vy] = packet[base + k_channel_state_vy] * keep + vy * relax;
+        packet[base + k_channel_state_vz] = packet[base + k_channel_state_vz] * keep + vz * relax;
+        packet[base + k_channel_state_p] *= keep;
+        air_temperature[static_cast<size_t>(cell)] = air_temperature[static_cast<size_t>(cell)] * keep
+            + ((air_k - fallback_boundary_air_temperature_k) / k_runtime_temperature_scale_kelvin) * relax;
+    };
+
+    for (int layer = 0; layer < k_nested_boundary_layers; ++layer) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                double u = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                apply_face(4, layer, y, z, layer, u, v);
+                apply_face(5, nx - 1 - layer, y, z, layer, u, v);
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int y = 0; y < ny; ++y) {
+                double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                double v = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                apply_face(2, x, y, layer, layer, u, v);
+                apply_face(3, x, y, nz - 1 - layer, layer, u, v);
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int z = 0; z < nz; ++z) {
+                double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                apply_face(0, x, layer, z, layer, u, v);
+                apply_face(1, x, ny - 1 - layer, z, layer, u, v);
+            }
+        }
+    }
+}
+
 bool build_region_packet_from_template(
     const RegionPacketTemplateData& packet_template,
     const DynamicRegionData& dynamic,
@@ -596,6 +703,13 @@ bool build_region_packet_from_template(
     float boundary_wind_x,
     float boundary_wind_y,
     float boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
     std::vector<float>& packet
 ) {
     if (packet_template.nx != nx || packet_template.ny != ny || packet_template.nz != nz
@@ -1313,6 +1427,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     float boundary_wind_x,
     float boundary_wind_y,
     float boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
     float* out_max_speed
 ) {
     int cells = 0;
@@ -1358,12 +1479,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         packet_template = packet_it->second;
         dynamic_region = dynamic_it->second;
     }
-    if (dynamic_region.air_temperature.size() == static_cast<size_t>(cells)) {
-        if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic_region.air_temperature.data())) {
-            set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
-            return 0;
-        }
-    }
     thread_local std::vector<float> packet;
     if (!packet_template || !build_region_packet_from_template(
         *packet_template,
@@ -1374,9 +1489,41 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         boundary_wind_x,
         boundary_wind_y,
         boundary_wind_z,
+        fallback_boundary_air_temperature_k,
+        external_face_mask,
+        boundary_face_resolution,
+        boundary_wind_face_x,
+        boundary_wind_face_y,
+        boundary_wind_face_z,
+        boundary_air_temperature_k,
         packet
     )) {
         return 0;
+    }
+    if (boundary_face_resolution > 0 && external_face_mask != 0) {
+        apply_nested_boundary_fields(
+            packet,
+            dynamic_region.air_temperature,
+            nx,
+            ny,
+            nz,
+            boundary_wind_x,
+            boundary_wind_y,
+            boundary_wind_z,
+            fallback_boundary_air_temperature_k,
+            external_face_mask,
+            boundary_face_resolution,
+            boundary_wind_face_x,
+            boundary_wind_face_y,
+            boundary_wind_face_z,
+            boundary_air_temperature_k
+        );
+    }
+    if (dynamic_region.air_temperature.size() == static_cast<size_t>(cells)) {
+        if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic_region.air_temperature.data())) {
+            set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
+            return 0;
+        }
     }
     std::vector<float> output_flow(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
     if (!aero_lbm_step_rect(packet.data(), nx, ny, nz, region_key, output_flow.data())) {
@@ -2372,14 +2519,59 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     jfloat boundary_wind_x,
     jfloat boundary_wind_y,
     jfloat boundary_wind_z,
+    jfloat fallback_boundary_air_temperature_k,
+    jint external_face_mask,
+    jint boundary_face_resolution,
+    jfloatArray boundary_wind_face_x,
+    jfloatArray boundary_wind_face_y,
+    jfloatArray boundary_wind_face_z,
+    jfloatArray boundary_air_temperature_k,
     jfloatArray out_max_speed
 ) {
     if (!out_max_speed || env->GetArrayLength(out_max_speed) != 1) {
         return JNI_FALSE;
     }
+    const int face_cells = boundary_face_resolution <= 0
+        ? 0
+        : k_face_count * boundary_face_resolution * boundary_face_resolution;
+    if (face_cells > 0
+        && (!boundary_wind_face_x
+            || !boundary_wind_face_y
+            || !boundary_wind_face_z
+            || !boundary_air_temperature_k
+            || env->GetArrayLength(boundary_wind_face_x) != static_cast<jsize>(face_cells)
+            || env->GetArrayLength(boundary_wind_face_y) != static_cast<jsize>(face_cells)
+            || env->GetArrayLength(boundary_wind_face_z) != static_cast<jsize>(face_cells)
+            || env->GetArrayLength(boundary_air_temperature_k) != static_cast<jsize>(face_cells))) {
+        return JNI_FALSE;
+    }
     jboolean copy = JNI_FALSE;
     jfloat* max_speed_ptr = env->GetFloatArrayElements(out_max_speed, &copy);
     if (!max_speed_ptr) {
+        return JNI_FALSE;
+    }
+    jboolean face_x_copy = JNI_FALSE;
+    jboolean face_y_copy = JNI_FALSE;
+    jboolean face_z_copy = JNI_FALSE;
+    jboolean face_temp_copy = JNI_FALSE;
+    jfloat* face_x_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_x, &face_x_copy) : nullptr;
+    jfloat* face_y_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_y, &face_y_copy) : nullptr;
+    jfloat* face_z_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_z, &face_z_copy) : nullptr;
+    jfloat* face_temp_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_air_temperature_k, &face_temp_copy) : nullptr;
+    if (face_cells > 0 && (!face_x_ptr || !face_y_ptr || !face_z_ptr || !face_temp_ptr)) {
+        if (face_x_ptr) {
+            env->ReleaseFloatArrayElements(boundary_wind_face_x, face_x_ptr, JNI_ABORT);
+        }
+        if (face_y_ptr) {
+            env->ReleaseFloatArrayElements(boundary_wind_face_y, face_y_ptr, JNI_ABORT);
+        }
+        if (face_z_ptr) {
+            env->ReleaseFloatArrayElements(boundary_wind_face_z, face_z_ptr, JNI_ABORT);
+        }
+        if (face_temp_ptr) {
+            env->ReleaseFloatArrayElements(boundary_air_temperature_k, face_temp_ptr, JNI_ABORT);
+        }
+        env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, JNI_ABORT);
         return JNI_FALSE;
     }
     const int ok = aero_lbm_simulation_step_region_stored(
@@ -2391,8 +2583,27 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         boundary_wind_x,
         boundary_wind_y,
         boundary_wind_z,
+        fallback_boundary_air_temperature_k,
+        external_face_mask,
+        boundary_face_resolution,
+        face_x_ptr,
+        face_y_ptr,
+        face_z_ptr,
+        face_temp_ptr,
         max_speed_ptr
     );
+    if (face_x_ptr) {
+        env->ReleaseFloatArrayElements(boundary_wind_face_x, face_x_ptr, JNI_ABORT);
+    }
+    if (face_y_ptr) {
+        env->ReleaseFloatArrayElements(boundary_wind_face_y, face_y_ptr, JNI_ABORT);
+    }
+    if (face_z_ptr) {
+        env->ReleaseFloatArrayElements(boundary_wind_face_z, face_z_ptr, JNI_ABORT);
+    }
+    if (face_temp_ptr) {
+        env->ReleaseFloatArrayElements(boundary_air_temperature_k, face_temp_ptr, JNI_ABORT);
+    }
     env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }

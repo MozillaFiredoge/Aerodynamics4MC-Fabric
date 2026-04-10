@@ -310,6 +310,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     float boundary_wind_x,
     float boundary_wind_y,
     float boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
     float* out_max_speed
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
