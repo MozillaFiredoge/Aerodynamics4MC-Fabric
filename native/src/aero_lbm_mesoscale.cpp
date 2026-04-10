@@ -117,6 +117,7 @@ constexpr int kChRoughness = 5;
 constexpr int kChBackgroundWindX = 6;
 constexpr int kChBackgroundWindZ = 7;
 constexpr int kChSurfaceClass = 8;
+constexpr int kChHumidity = 9;
 constexpr int kOutAmbient = 0;
 constexpr int kOutDeepGround = 1;
 constexpr int kOutSurface = 2;
@@ -362,6 +363,7 @@ CellTargets compute_cell_targets(
     const float roughness = std::max(0.0f, forcing[base + kChRoughness]);
     const float bg_wind_x = forcing[base + kChBackgroundWindX];
     const float bg_wind_z = forcing[base + kChBackgroundWindZ];
+    const float humidity = std::clamp(forcing[base + kChHumidity], 0.0f, 1.0f);
     const float slope_x = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 0);
     const float slope_z = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 1);
 
@@ -374,8 +376,9 @@ CellTargets compute_cell_targets(
     const float next_deep = ctx.deep_ground[i]
         + deep_relax * (deep_target - ctx.deep_ground[i])
         + 0.01f * deep_v_lap;
+    const float humidity_surface_damping = 1.0f - 0.12f * humidity;
     const float next_surface = ctx.surface[i]
-        + surface_relax * (surface_target - ctx.surface[i])
+        + surface_relax * humidity_surface_damping * (surface_target - ctx.surface[i])
         + 0.10f * (next_deep - ctx.surface[i])
         + 0.05f * surface_h_lap
         + 0.025f * surface_v_lap;
@@ -400,7 +403,7 @@ CellTargets compute_cell_targets(
     const float relax_uz = clamp_lattice_speed((1.0f - wind_relax) * uz + wind_relax * target_uz);
 
     const float thermal_source = ambient_relax * (ambient_target - ambient)
-        + 0.02f * (next_surface - ambient)
+        + (0.018f + 0.004f * humidity) * (next_surface - ambient)
         + 0.01f * (next_deep - ambient)
         + 0.01f * ambient_h_lap
         + 0.02f * ambient_v_lap;
@@ -664,12 +667,12 @@ inline float terrain_gradient_component(__global const float* forcing, int x, in
     int zp = min(nz - 1, z + 1);
     int zm = max(0, z - 1);
     if (axis == 0) {
-        float hp = forcing[mesoscale_index(xp, y, z, ny, nz) * 9 + 0];
-        float hm = forcing[mesoscale_index(xm, y, z, ny, nz) * 9 + 0];
+        float hp = forcing[mesoscale_index(xp, y, z, ny, nz) * kForcingChannels + 0];
+        float hm = forcing[mesoscale_index(xm, y, z, ny, nz) * kForcingChannels + 0];
         return 0.5f * (hp - hm);
     }
-    float hp = forcing[mesoscale_index(x, y, zp, ny, nz) * 9 + 0];
-    float hm = forcing[mesoscale_index(x, y, zm, ny, nz) * 9 + 0];
+    float hp = forcing[mesoscale_index(x, y, zp, ny, nz) * kForcingChannels + 0];
+    float hm = forcing[mesoscale_index(x, y, zm, ny, nz) * kForcingChannels + 0];
     return 0.5f * (hp - hm);
 }
 
@@ -695,7 +698,7 @@ inline void compute_cell_targets(
     float* next_deep_out
 ) {
     int cell = mesoscale_index(x, y, z, ny, nz);
-    int base = cell * 9;
+    int base = cell * kForcingChannels;
     float rho;
     float ux;
     float uz;
@@ -708,6 +711,7 @@ inline void compute_cell_targets(
     float roughness = fmax(0.0f, forcing[base + 5]);
     float bg_wind_x = forcing[base + 6];
     float bg_wind_z = forcing[base + 7];
+    float humidity = clamp(forcing[base + 9], 0.0f, 1.0f);
     float slope_x = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 0);
     float slope_z = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 1);
 
@@ -722,11 +726,12 @@ inline void compute_cell_targets(
     float ambient_h_lap = ambient_horizontal_laplacian(g_in, x, y, z, nx, ny, nz);
     float ambient_v_lap = ambient_vertical_laplacian(g_in, x, y, z, ny, nz);
 
+    float humidity_surface_damping = 1.0f - 0.12f * humidity;
     float next_deep = deep_in[cell]
         + deep_relax * (deep_target - deep_in[cell])
         + 0.01f * deep_v_lap;
     float next_surface = surface_in[cell]
-        + surface_relax * (surface_target - surface_in[cell])
+        + surface_relax * humidity_surface_damping * (surface_target - surface_in[cell])
         + 0.10f * (next_deep - surface_in[cell])
         + 0.05f * surface_h_lap
         + 0.025f * surface_v_lap;
@@ -743,7 +748,7 @@ inline void compute_cell_targets(
     float relax_uz = clamp_lattice_speed((1.0f - wind_relax) * uz + wind_relax * target_uz);
 
     float thermal_source = ambient_relax * (ambient_target - ambient)
-        + 0.02f * (next_surface - ambient)
+        + (0.018f + 0.004f * humidity) * (next_surface - ambient)
         + 0.01f * (next_deep - ambient)
         + 0.01f * ambient_h_lap
         + 0.02f * ambient_v_lap;
@@ -802,7 +807,7 @@ __kernel void mesoscale_step(
     deep_out[gid] = next_deep_self;
     surface_out[gid] = next_surface_self;
 
-    int base = gid * 9;
+    int base = gid * kForcingChannels;
     float boundary_bg_x = clamp_lattice_speed(forcing[base + 6] / fmax(1.0e-6f, velocity_scale));
     float boundary_bg_z = clamp_lattice_speed(forcing[base + 7] / fmax(1.0e-6f, velocity_scale));
     float boundary_temp = forcing[base + 2];

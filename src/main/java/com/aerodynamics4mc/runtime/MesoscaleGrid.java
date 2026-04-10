@@ -16,7 +16,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final float DEFAULT_MOLECULAR_NU_M2_S = 1.5e-5f;
     private static final float DEFAULT_PRANDTL_AIR = 0.71f;
     private static final float DEFAULT_TURBULENT_PRANDTL = 0.85f;
-    private static final int NATIVE_FORCING_CHANNELS = 9;
+    private static final int NATIVE_FORCING_CHANNELS = 10;
     private static final int NATIVE_STATE_CHANNELS = 5;
     private static final int CH_TERRAIN_HEIGHT = 0;
     private static final int CH_BIOME_TEMPERATURE = 1;
@@ -27,6 +27,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final int CH_BACKGROUND_WIND_X = 6;
     private static final int CH_BACKGROUND_WIND_Z = 7;
     private static final int CH_SURFACE_CLASS = 8;
+    private static final int CH_HUMIDITY = 9;
     private static final int OUT_AMBIENT = 0;
     private static final int OUT_DEEP_GROUND = 1;
     private static final int OUT_SURFACE = 2;
@@ -146,12 +147,78 @@ final class MesoscaleGrid implements AutoCloseable {
             state.roughnessLengthMeters,
             state.windX[layer],
             state.windZ[layer],
+            state.humidity[layer],
             state.surfaceClass
         );
     }
 
     synchronized int cellCount() {
         return cells.size() * activeLayers;
+    }
+
+    synchronized Snapshot snapshot() {
+        int gridWidth = radiusCells * 2 + 1;
+        int columnCount = gridWidth * gridWidth;
+        int stateCount = columnCount * activeLayers;
+        float[] terrainHeightBlocks = new float[columnCount];
+        float[] biomeTemperature = new float[columnCount];
+        float[] roughnessLengthMeters = new float[columnCount];
+        byte[] surfaceClass = new byte[columnCount];
+        float[] ambientAirTemperatureKelvin = new float[stateCount];
+        float[] deepGroundTemperatureKelvin = new float[stateCount];
+        float[] surfaceTemperatureKelvin = new float[stateCount];
+        float[] windX = new float[stateCount];
+        float[] windZ = new float[stateCount];
+        float[] humidity = new float[stateCount];
+
+        for (int cx = centerCellX - radiusCells; cx <= centerCellX + radiusCells; cx++) {
+            int localX = cx - (centerCellX - radiusCells);
+            for (int cz = centerCellZ - radiusCells; cz <= centerCellZ + radiusCells; cz++) {
+                int localZ = cz - (centerCellZ - radiusCells);
+                int columnIndex = localX * gridWidth + localZ;
+                CellColumnState cell = cells.get(pack(cx, cz));
+                if (cell == null) {
+                    continue;
+                }
+                terrainHeightBlocks[columnIndex] = cell.terrainHeightBlocks;
+                biomeTemperature[columnIndex] = cell.biomeTemperature;
+                roughnessLengthMeters[columnIndex] = cell.roughnessLengthMeters;
+                surfaceClass[columnIndex] = cell.surfaceClass;
+                int layers = Math.min(activeLayers, cell.layerCount());
+                for (int layer = 0; layer < layers; layer++) {
+                    int stateIndex = (localX * activeLayers + layer) * gridWidth + localZ;
+                    ambientAirTemperatureKelvin[stateIndex] = cell.ambientAirTemperatureKelvin[layer];
+                    deepGroundTemperatureKelvin[stateIndex] = cell.deepGroundTemperatureKelvin[layer];
+                    surfaceTemperatureKelvin[stateIndex] = cell.surfaceTemperatureKelvin[layer];
+                    windX[stateIndex] = cell.windX[layer];
+                    windZ[stateIndex] = cell.windZ[layer];
+                    humidity[stateIndex] = cell.humidity[layer];
+                }
+            }
+        }
+
+        return new Snapshot(
+            gridWidth,
+            activeLayers,
+            cellSizeBlocks,
+            layerHeightBlocks,
+            radiusCells,
+            centerCellX,
+            centerCellZ,
+            verticalBaseY,
+            stepSeconds,
+            lastTickProcessed,
+            terrainHeightBlocks,
+            biomeTemperature,
+            roughnessLengthMeters,
+            surfaceClass,
+            ambientAirTemperatureKelvin,
+            deepGroundTemperatureKelvin,
+            surfaceTemperatureKelvin,
+            windX,
+            windZ,
+            humidity
+        );
     }
 
     @Override
@@ -230,6 +297,7 @@ final class MesoscaleGrid implements AutoCloseable {
                 float terrainSteer = MathHelper.clamp(terrainDelta / 96.0f, -1.0f, 1.0f);
                 float bgWindX = bg != null ? bg.backgroundWindX() : 0.0f;
                 float bgWindZ = bg != null ? bg.backgroundWindZ() : 0.0f;
+                float bgHumidity = bg != null ? bg.humidity() : 0.50f;
                 float targetWindX = bgWindX * (1.0f - Math.abs(terrainSteer) * 0.25f) - terrainSteer * TERRAIN_WIND_DEFLECTION * bgWindZ;
                 float targetWindZ = bgWindZ * (1.0f - Math.abs(terrainSteer) * 0.25f) + terrainSteer * TERRAIN_WIND_DEFLECTION * bgWindX;
                 targetWindX = MathHelper.clamp(targetWindX, -maxBackgroundWind, maxBackgroundWind);
@@ -247,6 +315,8 @@ final class MesoscaleGrid implements AutoCloseable {
                         * (((bg != null ? bg.surfaceTemperatureKelvin() : ambientAirTemperatureKelvin) + temperatureAdjustment) - layerAmbient);
                     float shearFactor = 0.75f + 0.45f * (float) Math.sqrt(MathHelper.clamp(layerHeightAboveBase / 320.0f, 0.0f, 1.0f));
                     float roughnessDecay = 1.0f / (1.0f + aboveGround / 64.0f);
+                    float humidityDecay = 0.85f + 0.15f * surfaceInfluence;
+                    float layerHumidity = MathHelper.clamp(bgHumidity * humidityDecay, 0.0f, 1.0f);
                     int base = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS;
                     forcingBuffer[base + CH_TERRAIN_HEIGHT] = cell.terrainHeightBlocks;
                     forcingBuffer[base + CH_BIOME_TEMPERATURE] = cell.biomeTemperature;
@@ -257,6 +327,8 @@ final class MesoscaleGrid implements AutoCloseable {
                     forcingBuffer[base + CH_BACKGROUND_WIND_X] = targetWindX * shearFactor;
                     forcingBuffer[base + CH_BACKGROUND_WIND_Z] = targetWindZ * shearFactor;
                     forcingBuffer[base + CH_SURFACE_CLASS] = cell.surfaceClass;
+                    forcingBuffer[base + CH_HUMIDITY] = layerHumidity;
+                    cell.humidity[layer] = layerHumidity;
                 }
             }
         }
@@ -332,6 +404,7 @@ final class MesoscaleGrid implements AutoCloseable {
                     cell.surfaceTemperatureKelvin[layer] = stateBuffer[base + OUT_SURFACE];
                     cell.windX[layer] = stateBuffer[base + OUT_WIND_X];
                     cell.windZ[layer] = stateBuffer[base + OUT_WIND_Z];
+                    cell.humidity[layer] = forcingBuffer[forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS + CH_HUMIDITY];
                 }
             }
         }
@@ -366,6 +439,7 @@ final class MesoscaleGrid implements AutoCloseable {
                     );
                     cell.windX[layer] = relax(cell.windX[layer], forcingBuffer[base + CH_BACKGROUND_WIND_X], deltaSeconds * 0.5f);
                     cell.windZ[layer] = relax(cell.windZ[layer], forcingBuffer[base + CH_BACKGROUND_WIND_Z], deltaSeconds * 0.5f);
+                    cell.humidity[layer] = relax(cell.humidity[layer], forcingBuffer[base + CH_HUMIDITY], deltaSeconds * 0.5f);
                 }
             }
         }
@@ -441,7 +515,32 @@ final class MesoscaleGrid implements AutoCloseable {
         float roughnessLengthMeters,
         float windX,
         float windZ,
+        float humidity,
         byte surfaceClass
+    ) {
+    }
+
+    record Snapshot(
+        int gridWidth,
+        int activeLayers,
+        int cellSizeBlocks,
+        int layerHeightBlocks,
+        int radiusCells,
+        int centerCellX,
+        int centerCellZ,
+        int verticalBaseY,
+        float stepSeconds,
+        long lastTickProcessed,
+        float[] terrainHeightBlocks,
+        float[] biomeTemperature,
+        float[] roughnessLengthMeters,
+        byte[] surfaceClass,
+        float[] ambientAirTemperatureKelvin,
+        float[] deepGroundTemperatureKelvin,
+        float[] surfaceTemperatureKelvin,
+        float[] windX,
+        float[] windZ,
+        float[] humidity
     ) {
     }
 
@@ -456,6 +555,7 @@ final class MesoscaleGrid implements AutoCloseable {
         private float[] surfaceTemperatureKelvin;
         private float[] windX;
         private float[] windZ;
+        private float[] humidity;
 
         private CellColumnState(int layers) {
             ensureLayers(layers);
@@ -468,6 +568,7 @@ final class MesoscaleGrid implements AutoCloseable {
                 surfaceTemperatureKelvin = new float[layers];
                 windX = new float[layers];
                 windZ = new float[layers];
+                humidity = new float[layers];
             }
         }
 

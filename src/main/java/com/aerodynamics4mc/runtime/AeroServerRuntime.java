@@ -1,6 +1,9 @@
 package com.aerodynamics4mc.runtime;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -57,6 +60,7 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.LightType;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.util.WorldSavePath;
 
 public final class AeroServerRuntime {
     private static final String LOG_PREFIX = "[aerodynamics4mc] ";
@@ -144,9 +148,10 @@ public final class AeroServerRuntime {
     private static final int MESOSCALE_MET_MAX_LAYERS = Math.max(1, 320 / MESOSCALE_MET_LAYER_HEIGHT_BLOCKS);
     private static final int MESOSCALE_FORCING_REBUILD_TICKS = TICKS_PER_SECOND * 60;
     private static final float MESOSCALE_STEP_SECONDS = MESOSCALE_MET_CELL_SIZE_BLOCKS * SOLVER_STEP_SECONDS;
+    private static final int MESOSCALE_REFRESH_TICKS = Math.max(1, Math.round(MESOSCALE_STEP_SECONDS / SOLVER_STEP_SECONDS));
     private static final int NESTED_BOUNDARY_FACE_RESOLUTION = 6;
     private static final float NESTED_BOUNDARY_MAX_VY_RATIO = 0.60f;
-    private static final int BACKGROUND_MET_REFRESH_TICKS = TICKS_PER_SECOND * 60 * 3;
+    private static final int BACKGROUND_MET_REFRESH_TICKS = MESOSCALE_REFRESH_TICKS * 4;
     private static final int STATIC_MIRROR_HIGH_PRIORITY_BUILD_BUDGET_PER_TICK = 1;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_INTERVAL_TICKS = TICKS_PER_SECOND;
     private static final int STATIC_MIRROR_LOW_PRIORITY_BUILD_BUDGET = 1;
@@ -206,6 +211,7 @@ public final class AeroServerRuntime {
     private final WorldMirror worldMirror = new WorldMirror();
     private final DynamicStore dynamicStore = new DynamicStore();
     private final Map<RegistryKey<World>, BackgroundMetGrid> backgroundMetGrids = new HashMap<>();
+    private final Map<RegistryKey<World>, WorldScaleDriver> worldScaleDrivers = new HashMap<>();
     private final Map<RegistryKey<World>, MesoscaleGrid> mesoscaleMetGrids = new HashMap<>();
     private final Object simulationStateLock = new Object();
     private final Object coordinatorLifecycleLock = new Object();
@@ -396,6 +402,8 @@ public final class AeroServerRuntime {
         runMainThreadCallbackProfiled(CALLBACK_PHASE_WORLD_UNLOAD, () -> {
             worldMirror.onWorldUnload(world);
             backgroundMetGrids.remove(world.getRegistryKey());
+            WorldScaleDriver driver = worldScaleDrivers.remove(world.getRegistryKey());
+            saveWorldScaleDriver(world, driver);
             MesoscaleGrid grid = mesoscaleMetGrids.remove(world.getRegistryKey());
             if (grid != null) {
                 grid.close();
@@ -569,7 +577,330 @@ public final class AeroServerRuntime {
                     broadcastState(ctx.getSource().getServer());
                     return 1;
                 }))
+            .then(CommandManager.literal("dumpdata")
+                .executes(ctx -> dumpRuntimeData(ctx.getSource()))
+                )
+            .then(CommandManager.literal("dump_l1")
+                .executes(ctx -> dumpMesoscaleSnapshot(ctx.getSource()))
+                )
         );
+    }
+
+    private int dumpRuntimeData(ServerCommandSource source) {
+        ServerWorld world = source.getWorld();
+        BackgroundMetGrid l0Grid = backgroundMetGrids.get(world.getRegistryKey());
+        MesoscaleGrid l1Grid = mesoscaleMetGrids.get(world.getRegistryKey());
+        if (l0Grid == null && l1Grid == null) {
+            feedback(source, "No L0 or L1 grid is active for " + world.getRegistryKey().getValue());
+            return 0;
+        }
+        String worldId = storageSafeWorldId(world.getRegistryKey());
+        Path baseOutputDir = source.getServer()
+            .getSavePath(WorldSavePath.ROOT)
+            .resolve("aerodynamics4mc")
+            .resolve("diagnostics");
+        Path l0OutputPath = baseOutputDir.resolve("l0").resolve("l0_" + worldId + "_tick" + tickCounter + ".json");
+        Path l1OutputPath = baseOutputDir.resolve("l1").resolve("l1_" + worldId + "_tick" + tickCounter + ".json");
+        try {
+            if (l0Grid != null) {
+                Files.createDirectories(l0OutputPath.getParent());
+                Files.writeString(
+                    l0OutputPath,
+                    encodeBackgroundSnapshot(world.getRegistryKey(), l0Grid.snapshot()),
+                    StandardCharsets.UTF_8
+                );
+            }
+            if (l1Grid != null) {
+                Files.createDirectories(l1OutputPath.getParent());
+                Files.writeString(
+                    l1OutputPath,
+                    encodeMesoscaleSnapshot(world.getRegistryKey(), l1Grid.snapshot()),
+                    StandardCharsets.UTF_8
+                );
+            }
+        } catch (IOException e) {
+            feedback(source, "Failed to dump runtime snapshots: " + e.getMessage());
+            return 0;
+        }
+        if (l0Grid != null) {
+            feedback(source, "Dumped L0 snapshot to " + l0OutputPath);
+            feedback(source, "View L0 with: python3 eval_background_snapshot.py --input \"" + l0OutputPath + "\"");
+        }
+        if (l1Grid != null) {
+            feedback(source, "Dumped L1 snapshot to " + l1OutputPath);
+            feedback(source, "View L1 with: python3 eval_mesoscale_snapshot.py --input \"" + l1OutputPath + "\"");
+        }
+        return 1;
+    }
+
+    private int dumpMesoscaleSnapshot(ServerCommandSource source) {
+        ServerWorld world = source.getWorld();
+        MesoscaleGrid grid = mesoscaleMetGrids.get(world.getRegistryKey());
+        if (grid == null) {
+            feedback(source, "No mesoscale grid is active for " + world.getRegistryKey().getValue());
+            return 0;
+        }
+        MesoscaleGrid.Snapshot snapshot = grid.snapshot();
+        String worldId = storageSafeWorldId(world.getRegistryKey());
+        Path outputDir = source.getServer()
+            .getSavePath(WorldSavePath.ROOT)
+            .resolve("aerodynamics4mc")
+            .resolve("diagnostics")
+            .resolve("mesoscale");
+        Path outputPath = outputDir.resolve("l1_" + worldId + "_tick" + tickCounter + ".json");
+        try {
+            Files.createDirectories(outputDir);
+            Files.writeString(
+                outputPath,
+                encodeMesoscaleSnapshot(world.getRegistryKey(), snapshot),
+                StandardCharsets.UTF_8
+            );
+        } catch (IOException e) {
+            feedback(source, "Failed to dump L1 snapshot: " + e.getMessage());
+            return 0;
+        }
+        feedback(source, "Dumped L1 snapshot to " + outputPath);
+        feedback(source, "View with: python3 eval_mesoscale_snapshot.py --input \"" + outputPath + "\"");
+        return 1;
+    }
+
+    private String encodeBackgroundSnapshot(RegistryKey<World> worldKey, BackgroundMetGrid.Snapshot snapshot) {
+        StringBuilder builder = new StringBuilder(1 << 18);
+        builder.append("{\n");
+        appendJsonField(builder, "dimension_id", worldKey.getValue().toString(), true);
+        appendJsonField(builder, "grid_width", snapshot.gridWidth(), true);
+        appendJsonField(builder, "cell_size_blocks", snapshot.cellSizeBlocks(), true);
+        appendJsonField(builder, "radius_cells", snapshot.radiusCells(), true);
+        appendJsonField(builder, "center_cell_x", snapshot.centerCellX(), true);
+        appendJsonField(builder, "center_cell_z", snapshot.centerCellZ(), true);
+        appendJsonField(builder, "tick", snapshot.tick(), true);
+        appendJsonField(builder, "delta_seconds", snapshot.deltaSeconds(), true);
+        appendJsonField(builder, "solar_altitude", snapshot.solarAltitude(), true);
+        appendJsonField(builder, "clear_sky", snapshot.clearSky(), true);
+        appendJsonField(builder, "rain_gradient", snapshot.rainGradient(), true);
+        appendJsonField(builder, "thunder_gradient", snapshot.thunderGradient(), true);
+        WorldScaleDriver.Snapshot driver = snapshot.driver();
+        if (driver != null) {
+            builder.append("  \"driver\": {\n");
+            appendJsonField(builder, "driver_time_seconds", driver.driverTimeSeconds(), true, 4);
+            appendJsonField(builder, "base_flow_x", driver.baseFlowX(), true, 4);
+            appendJsonField(builder, "base_flow_z", driver.baseFlowZ(), true, 4);
+            appendJsonField(builder, "airmass_temperature_bias", driver.airmassTemperatureBias(), true, 4);
+            appendJsonField(builder, "airmass_moisture_bias", driver.airmassMoistureBias(), true, 4);
+            appendJsonField(builder, "planetary_wave_phase", driver.planetaryWavePhase(), true, 4);
+            appendJsonField(builder, "storm_activity", driver.stormActivity(), true, 4);
+            appendJsonField(builder, "season_phase", driver.seasonPhase(), true, 4);
+            builder.append("    \"pressure_cells\": [\n");
+            List<WorldScaleDriver.PressureCellSnapshot> pressureCells = driver.pressureCells();
+            for (int i = 0; i < pressureCells.size(); i++) {
+                WorldScaleDriver.PressureCellSnapshot cell = pressureCells.get(i);
+                builder.append("      {\n");
+                appendJsonField(builder, "center_cell_x", cell.centerCellX(), true, 8);
+                appendJsonField(builder, "center_cell_z", cell.centerCellZ(), true, 8);
+                appendJsonField(builder, "radius_cells", cell.radiusCells(), true, 8);
+                appendJsonField(builder, "intensity", cell.intensity(), true, 8);
+                appendJsonField(builder, "pressure_sign", cell.pressureSign(), true, 8);
+                appendJsonField(builder, "drift_x_cells_per_second", cell.driftCellsPerSecondX(), true, 8);
+                appendJsonField(builder, "drift_z_cells_per_second", cell.driftCellsPerSecondZ(), true, 8);
+                appendJsonField(builder, "lifecycle_phase", cell.lifecyclePhase(), false, 8);
+                builder.append("      }");
+                if (i + 1 < pressureCells.size()) {
+                    builder.append(',');
+                }
+                builder.append('\n');
+            }
+            builder.append("    ]\n");
+            builder.append("  },\n");
+        }
+        appendJsonArray(builder, "terrain_height_blocks", snapshot.terrainHeightBlocks(), true);
+        appendJsonArray(builder, "biome_temperature", snapshot.biomeTemperature(), true);
+        appendJsonArray(builder, "roughness_length_meters", snapshot.roughnessLengthMeters(), true);
+        appendJsonByteArray(builder, "surface_class", snapshot.surfaceClass(), true);
+        appendJsonArray(builder, "ambient_air_temperature_kelvin", snapshot.ambientAirTemperatureKelvin(), true);
+        appendJsonArray(builder, "deep_ground_temperature_kelvin", snapshot.deepGroundTemperatureKelvin(), true);
+        appendJsonArray(builder, "surface_temperature_kelvin", snapshot.surfaceTemperatureKelvin(), true);
+        appendJsonArray(builder, "wind_x", snapshot.windX(), true);
+        appendJsonArray(builder, "wind_z", snapshot.windZ(), true);
+        appendJsonArray(builder, "humidity", snapshot.humidity(), false);
+        builder.append("\n}\n");
+        return builder.toString();
+    }
+
+    private String encodeMesoscaleSnapshot(RegistryKey<World> worldKey, MesoscaleGrid.Snapshot snapshot) {
+        StringBuilder builder = new StringBuilder(1 << 20);
+        builder.append("{\n");
+        appendJsonField(builder, "dimension_id", worldKey.getValue().toString(), true);
+        appendJsonField(builder, "grid_width", snapshot.gridWidth(), true);
+        appendJsonField(builder, "active_layers", snapshot.activeLayers(), true);
+        appendJsonField(builder, "cell_size_blocks", snapshot.cellSizeBlocks(), true);
+        appendJsonField(builder, "layer_height_blocks", snapshot.layerHeightBlocks(), true);
+        appendJsonField(builder, "radius_cells", snapshot.radiusCells(), true);
+        appendJsonField(builder, "center_cell_x", snapshot.centerCellX(), true);
+        appendJsonField(builder, "center_cell_z", snapshot.centerCellZ(), true);
+        appendJsonField(builder, "vertical_base_y", snapshot.verticalBaseY(), true);
+        appendJsonField(builder, "step_seconds", snapshot.stepSeconds(), true);
+        appendJsonField(builder, "tick", snapshot.lastTickProcessed(), true);
+        appendJsonArray(builder, "terrain_height_blocks", snapshot.terrainHeightBlocks(), true);
+        appendJsonArray(builder, "biome_temperature", snapshot.biomeTemperature(), true);
+        appendJsonArray(builder, "roughness_length_meters", snapshot.roughnessLengthMeters(), true);
+        appendJsonByteArray(builder, "surface_class", snapshot.surfaceClass(), true);
+        appendJsonArray(builder, "ambient_air_temperature_kelvin", snapshot.ambientAirTemperatureKelvin(), true);
+        appendJsonArray(builder, "deep_ground_temperature_kelvin", snapshot.deepGroundTemperatureKelvin(), true);
+        appendJsonArray(builder, "surface_temperature_kelvin", snapshot.surfaceTemperatureKelvin(), true);
+        appendJsonArray(builder, "wind_x", snapshot.windX(), true);
+        appendJsonArray(builder, "wind_z", snapshot.windZ(), true);
+        appendJsonArray(builder, "humidity", snapshot.humidity(), false);
+        builder.append("\n}\n");
+        return builder.toString();
+    }
+
+    private String storageSafeWorldId(RegistryKey<World> worldKey) {
+        return worldKey.getValue().toString()
+            .replace(':', '_')
+            .replace('/', '_');
+    }
+
+    private Path worldScaleDriverPath(ServerWorld world) {
+        return world.getServer()
+            .getSavePath(WorldSavePath.ROOT)
+            .resolve("aerodynamics4mc")
+            .resolve("weather")
+            .resolve("driver_" + storageSafeWorldId(world.getRegistryKey()) + ".properties");
+    }
+
+    private WorldScaleDriver loadWorldScaleDriver(ServerWorld world) {
+        return WorldScaleDriver.loadOrCreate(worldScaleDriverPath(world), world);
+    }
+
+    private void saveWorldScaleDriver(ServerWorld world, WorldScaleDriver driver) {
+        if (world == null || driver == null) {
+            return;
+        }
+        try {
+            driver.save(worldScaleDriverPath(world));
+        } catch (IOException ignored) {
+            // Keep runtime alive if a diagnostics/persistence write fails.
+        }
+    }
+
+    private void saveAllWorldScaleDrivers(MinecraftServer server) {
+        if (server == null) {
+            return;
+        }
+        for (Map.Entry<RegistryKey<World>, WorldScaleDriver> entry : worldScaleDrivers.entrySet()) {
+            ServerWorld world = server.getWorld(entry.getKey());
+            if (world == null) {
+                continue;
+            }
+            saveWorldScaleDriver(world, entry.getValue());
+        }
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, String value, boolean trailingComma) {
+        builder.append("  \"")
+            .append(key)
+            .append("\": \"")
+            .append(value.replace("\\", "\\\\").replace("\"", "\\\""))
+            .append("\"");
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, int value, boolean trailingComma) {
+        appendJsonField(builder, key, value, trailingComma, 2);
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, int value, boolean trailingComma, int indentSpaces) {
+        appendIndent(builder, indentSpaces);
+        builder.append('"')
+            .append(key)
+            .append("\": ")
+            .append(value);
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, long value, boolean trailingComma) {
+        appendJsonField(builder, key, value, trailingComma, 2);
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, long value, boolean trailingComma, int indentSpaces) {
+        appendIndent(builder, indentSpaces);
+        builder.append('"')
+            .append(key)
+            .append("\": ")
+            .append(value);
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, float value, boolean trailingComma) {
+        appendJsonField(builder, key, value, trailingComma, 2);
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, float value, boolean trailingComma, int indentSpaces) {
+        appendIndent(builder, indentSpaces);
+        builder.append('"')
+            .append(key)
+            .append("\": ")
+            .append(Float.toString(value));
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
+    }
+
+    private void appendIndent(StringBuilder builder, int indentSpaces) {
+        for (int i = 0; i < indentSpaces; i++) {
+            builder.append(' ');
+        }
+    }
+
+    private void appendJsonFieldLegacyContextOnly(StringBuilder builder, String key, int value, boolean trailingComma) {
+        builder.append("  \"")
+            .append(key)
+            .append("\": ")
+            .append(value);
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
+    }
+
+    private void appendJsonArray(StringBuilder builder, String key, float[] values, boolean trailingComma) {
+        builder.append("  \"").append(key).append("\": [");
+        for (int i = 0; i < values.length; i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(Float.toString(values[i]));
+        }
+        builder.append(']');
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
+    }
+
+    private void appendJsonByteArray(StringBuilder builder, String key, byte[] values, boolean trailingComma) {
+        builder.append("  \"").append(key).append("\": [");
+        for (int i = 0; i < values.length; i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(Byte.toUnsignedInt(values[i]));
+        }
+        builder.append(']');
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
     }
 
     private void onServerTick(MinecraftServer server) {
@@ -588,7 +919,7 @@ public final class AeroServerRuntime {
         phaseStartNanos = System.nanoTime();
         updateSimulationFocus(server);
         recordMainThreadPhase(MAIN_THREAD_PHASE_FOCUS, System.nanoTime() - phaseStartNanos);
-        if (tickCounter == 1 || tickCounter % BACKGROUND_MET_REFRESH_TICKS == 0) {
+        if (tickCounter == 1 || tickCounter % MESOSCALE_REFRESH_TICKS == 0) {
             phaseStartNanos = System.nanoTime();
             pendingBackgroundRefreshBatch = captureBackgroundRefreshBatch(server);
             recordMainThreadPhase(MAIN_THREAD_PHASE_BACKGROUND_BATCH, System.nanoTime() - phaseStartNanos);
@@ -745,6 +1076,7 @@ public final class AeroServerRuntime {
         runtimeGeneration.incrementAndGet();
         streamingEnabled = false;
         stopSimulationCoordinator();
+        saveAllWorldScaleDrivers(server);
         tickCounter = 0;
         simulationStepBudget.set(0);
         simulationTicks = 0L;
@@ -838,11 +1170,28 @@ public final class AeroServerRuntime {
         for (Map.Entry<RegistryKey<World>, BackgroundRefreshRequest> entry : batch.requests().entrySet()) {
             RegistryKey<World> worldKey = entry.getKey();
             BackgroundRefreshRequest request = entry.getValue();
+            WorldScaleDriver driver = worldScaleDrivers.computeIfAbsent(
+                worldKey,
+                ignored -> loadWorldScaleDriver(request.world())
+            );
+            driver.advance(request.world(), request.environmentSnapshot(), batch.tickCounter(), SOLVER_STEP_SECONDS);
             BackgroundMetGrid grid = backgroundMetGrids.computeIfAbsent(
                 worldKey,
-                ignored -> new BackgroundMetGrid(BACKGROUND_MET_CELL_SIZE_BLOCKS, BACKGROUND_MET_RADIUS_CELLS)
+                ignored -> new BackgroundMetGrid(
+                    BACKGROUND_MET_CELL_SIZE_BLOCKS,
+                    BACKGROUND_MET_RADIUS_CELLS,
+                    BACKGROUND_MET_REFRESH_TICKS
+                )
             );
-            grid.refresh(request.world(), request.environmentSnapshot(), request.focus(), batch.tickCounter(), SOLVER_STEP_SECONDS, seedTerrainProvider);
+            grid.refresh(
+                request.world(),
+                request.environmentSnapshot(),
+                request.focus(),
+                batch.tickCounter(),
+                SOLVER_STEP_SECONDS,
+                seedTerrainProvider,
+                driver
+            );
             MesoscaleGrid mesoscale = mesoscaleMetGrids.computeIfAbsent(
                 worldKey,
                 ignored -> new MesoscaleGrid(
