@@ -29,6 +29,9 @@ final class BackgroundMetGrid {
     private static final float MAX_DYNAMIC_WIND_MPS = 18.0f;
     private static final float MAX_HUMIDITY_RESPONSE = 0.20f;
     private static final float EVAPORATION_SURFACE_DELTA_SCALE = 0.01f;
+    private static final float BASE_ROUGHNESS_DRAG_PER_SECOND = 0.0025f;
+    private static final float ROUGHNESS_DRAG_SCALE_PER_SECOND = 0.010f;
+    private static final float MAX_ROUGHNESS_DRAG = 0.22f;
 
     private final int cellSizeBlocks;
     private final int radiusCells;
@@ -129,6 +132,11 @@ final class BackgroundMetGrid {
             state.backgroundWindX,
             state.backgroundWindZ,
             state.humidity,
+            state.convectiveHeatingKelvin,
+            state.convectiveMoistening,
+            state.convectiveInflowX,
+            state.convectiveInflowZ,
+            state.convectiveEnvelope,
             state.surfaceClass
         );
     }
@@ -313,9 +321,9 @@ final class BackgroundMetGrid {
                 StateSample neighborMean = sampleNeighborMean(previous, cx, cz);
 
                 float roughnessDrag = MathHelper.clamp(
-                    currentDeltaSeconds * (0.010f + cell.roughnessLengthMeters * 0.035f),
+                    currentDeltaSeconds * (BASE_ROUGHNESS_DRAG_PER_SECOND + cell.roughnessLengthMeters * ROUGHNESS_DRAG_SCALE_PER_SECOND),
                     0.0f,
-                    0.55f
+                    MAX_ROUGHNESS_DRAG
                 );
                 float nextWindX = mix(advected.windX, neighborMean.windX, FLOW_DIFFUSION_BLEND);
                 float nextWindZ = mix(advected.windZ, neighborMean.windZ, FLOW_DIFFUSION_BLEND);
@@ -358,6 +366,11 @@ final class BackgroundMetGrid {
                 cell.backgroundWindX = nextWindX;
                 cell.backgroundWindZ = nextWindZ;
                 cell.humidity = nextHumidity;
+                cell.convectiveHeatingKelvin = target.convectiveHeatingKelvin;
+                cell.convectiveMoistening = target.convectiveMoistening;
+                cell.convectiveInflowX = target.convectiveInflowX;
+                cell.convectiveInflowZ = target.convectiveInflowZ;
+                cell.convectiveEnvelope = target.convectiveEnvelope;
                 cell.lastUpdatedTick = currentRefreshTick;
             }
         }
@@ -385,6 +398,11 @@ final class BackgroundMetGrid {
         if (!Float.isFinite(cell.humidity) || cell.humidity < 0.0f || cell.humidity > 1.0f) {
             cell.humidity = target.targetHumidity;
         }
+        cell.convectiveHeatingKelvin = target.convectiveHeatingKelvin;
+        cell.convectiveMoistening = target.convectiveMoistening;
+        cell.convectiveInflowX = target.convectiveInflowX;
+        cell.convectiveInflowZ = target.convectiveInflowZ;
+        cell.convectiveEnvelope = target.convectiveEnvelope;
     }
 
     private StateSample sampleNeighborMean(Map<Long, StateSample> previous, int cellX, int cellZ) {
@@ -470,7 +488,17 @@ final class BackgroundMetGrid {
             0.0f,
             1.0f
         );
-        return new WorldScaleTarget(targetWindX, targetWindZ, targetAmbient, humidity);
+        return new WorldScaleTarget(
+            targetWindX,
+            targetWindZ,
+            targetAmbient,
+            humidity,
+            driverSample == null ? 0.0f : driverSample.convectiveHeatingKelvin(),
+            driverSample == null ? 0.0f : driverSample.convectiveMoistening(),
+            driverSample == null ? 0.0f : driverSample.convectiveInflowX(),
+            driverSample == null ? 0.0f : driverSample.convectiveInflowZ(),
+            driverSample == null ? 0.0f : driverSample.convectiveEnvelope()
+        );
     }
 
     private float relax(float current, float target, float deltaSeconds) {
@@ -524,6 +552,11 @@ final class BackgroundMetGrid {
         float backgroundWindX,
         float backgroundWindZ,
         float humidity,
+        float convectiveHeatingKelvin,
+        float convectiveMoistening,
+        float convectiveInflowX,
+        float convectiveInflowZ,
+        float convectiveEnvelope,
         byte surfaceClass
     ) {
     }
@@ -567,6 +600,11 @@ final class BackgroundMetGrid {
         private float backgroundWindX = Float.NaN;
         private float backgroundWindZ = Float.NaN;
         private float humidity = Float.NaN;
+        private float convectiveHeatingKelvin;
+        private float convectiveMoistening;
+        private float convectiveInflowX;
+        private float convectiveInflowZ;
+        private float convectiveEnvelope;
         private byte surfaceClass;
         private long lastUpdatedTick = Long.MIN_VALUE;
     }
@@ -583,7 +621,12 @@ final class BackgroundMetGrid {
         float targetWindX,
         float targetWindZ,
         float targetAmbientAirTemperatureKelvin,
-        float targetHumidity
+        float targetHumidity,
+        float convectiveHeatingKelvin,
+        float convectiveMoistening,
+        float convectiveInflowX,
+        float convectiveInflowZ,
+        float convectiveEnvelope
     ) {
     }
 }

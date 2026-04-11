@@ -690,6 +690,9 @@ public final class AeroServerRuntime {
             appendJsonField(builder, "planetary_wave_phase", driver.planetaryWavePhase(), true, 4);
             appendJsonField(builder, "storm_activity", driver.stormActivity(), true, 4);
             appendJsonField(builder, "season_phase", driver.seasonPhase(), true, 4);
+            appendJsonField(builder, "mesoscale_convective_support", driver.mesoscaleConvectiveSupport(), true, 4);
+            appendJsonField(builder, "mesoscale_lift_support", driver.mesoscaleLiftSupport(), true, 4);
+            appendJsonField(builder, "mesoscale_shear_support", driver.mesoscaleShearSupport(), true, 4);
             builder.append("    \"cyclone_cells\": [\n");
             List<WorldScaleDriver.CycloneCellSnapshot> cycloneCells = driver.cycloneCells();
             for (int i = 0; i < cycloneCells.size(); i++) {
@@ -707,6 +710,28 @@ public final class AeroServerRuntime {
                 appendJsonField(builder, "moisture_core_bias", cell.moistureCoreBias(), false, 8);
                 builder.append("      }");
                 if (i + 1 < cycloneCells.size()) {
+                    builder.append(',');
+                }
+                builder.append('\n');
+            }
+            builder.append("    ],\n");
+            builder.append("    \"convective_clusters\": [\n");
+            List<WorldScaleDriver.ConvectiveClusterSnapshot> convectiveClusters = driver.convectiveClusters();
+            for (int i = 0; i < convectiveClusters.size(); i++) {
+                WorldScaleDriver.ConvectiveClusterSnapshot cluster = convectiveClusters.get(i);
+                builder.append("      {\n");
+                appendJsonField(builder, "center_cell_x", cluster.centerCellX(), true, 8);
+                appendJsonField(builder, "center_cell_z", cluster.centerCellZ(), true, 8);
+                appendJsonField(builder, "radius_cells", cluster.radiusCells(), true, 8);
+                appendJsonField(builder, "intensity", cluster.intensity(), true, 8);
+                appendJsonField(builder, "drift_x_cells_per_second", cluster.driftCellsPerSecondX(), true, 8);
+                appendJsonField(builder, "drift_z_cells_per_second", cluster.driftCellsPerSecondZ(), true, 8);
+                appendJsonField(builder, "lifecycle_phase", cluster.lifecyclePhase(), true, 8);
+                appendJsonField(builder, "warm_bias_kelvin", cluster.warmBiasKelvin(), true, 8);
+                appendJsonField(builder, "moisture_bias", cluster.moistureBias(), true, 8);
+                appendJsonField(builder, "convergence_mps", cluster.convergenceMps(), false, 8);
+                builder.append("      }");
+                if (i + 1 < convectiveClusters.size()) {
                     builder.append(',');
                 }
                 builder.append('\n');
@@ -754,7 +779,11 @@ public final class AeroServerRuntime {
         appendJsonArray(builder, "surface_temperature_kelvin", snapshot.surfaceTemperatureKelvin(), true);
         appendJsonArray(builder, "wind_x", snapshot.windX(), true);
         appendJsonArray(builder, "wind_z", snapshot.windZ(), true);
-        appendJsonArray(builder, "humidity", snapshot.humidity(), false);
+        appendJsonArray(builder, "humidity", snapshot.humidity(), true);
+        appendJsonArray(builder, "instability_proxy", snapshot.instabilityProxy(), true);
+        appendJsonArray(builder, "low_level_shear", snapshot.lowLevelShear(), true);
+        appendJsonArray(builder, "moisture_convergence", snapshot.moistureConvergence(), true);
+        appendJsonArray(builder, "lift_proxy", snapshot.liftProxy(), false);
         builder.append("\n}\n");
         return builder.toString();
     }
@@ -1175,11 +1204,21 @@ public final class AeroServerRuntime {
         for (Map.Entry<RegistryKey<World>, BackgroundRefreshRequest> entry : batch.requests().entrySet()) {
             RegistryKey<World> worldKey = entry.getKey();
             BackgroundRefreshRequest request = entry.getValue();
+            MesoscaleGrid existingMesoscale = mesoscaleMetGrids.get(worldKey);
+            MesoscaleGrid.DiagnosticsSummary diagnosticsSummary = existingMesoscale == null
+                ? null
+                : existingMesoscale.diagnosticsSummary(request.focus());
             WorldScaleDriver driver = worldScaleDrivers.computeIfAbsent(
                 worldKey,
                 ignored -> loadWorldScaleDriver(request.world())
             );
-            driver.advance(request.world(), request.environmentSnapshot(), batch.tickCounter(), SOLVER_STEP_SECONDS);
+            driver.advance(
+                request.world(),
+                request.environmentSnapshot(),
+                batch.tickCounter(),
+                SOLVER_STEP_SECONDS,
+                diagnosticsSummary
+            );
             BackgroundMetGrid grid = backgroundMetGrids.computeIfAbsent(
                 worldKey,
                 ignored -> new BackgroundMetGrid(

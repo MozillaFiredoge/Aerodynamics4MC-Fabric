@@ -23,18 +23,32 @@ final class WorldScaleDriver {
     private static final float DRIVER_SPATIAL_SCALE_Z = 0.09f;
     private static final float MAX_DRIVER_WIND_MPS = 12.0f;
 
-    private static final int DEFAULT_CYCLONE_CELL_COUNT = 3;
+    private static final int DEFAULT_CYCLONE_CELL_COUNT = 6;
     private static final float PRESSURE_DOMAIN_CELLS = 384.0f;
     private static final float DRIVER_CELL_SIZE_BLOCKS = 256.0f;
-    private static final float CYCLONE_CELL_MIN_RADIUS = 9.0f;
-    private static final float CYCLONE_CELL_MAX_RADIUS = 18.0f;
-    private static final float CYCLONE_CELL_MAX_SWIRL_MPS = 7.5f;
-    private static final float CYCLONE_CELL_MAX_RADIAL_MPS = 2.0f;
+    private static final float CYCLONE_CELL_MIN_RADIUS = 14.0f;
+    private static final float CYCLONE_CELL_MAX_RADIUS = 30.0f;
+    private static final float CYCLONE_CELL_MAX_SWIRL_MPS = 10.0f;
+    private static final float CYCLONE_CELL_MAX_RADIAL_MPS = 3.0f;
     private static final float CYCLONE_CELL_BASE_FLOW_ADVECTION = 0.30f;
     private static final float CYCLONE_CELL_LIFECYCLE_RADIANS_PER_SECOND = TAU / (24000.0f * 2.0f / 20.0f);
+    private static final float CYCLONE_CELL_OUTER_STEERING_WEIGHT = 0.55f;
+    private static final float CYCLONE_CELL_CORE_SWIRL_WEIGHT = 1.40f;
+    private static final float CYCLONE_CELL_CORE_RADIAL_WEIGHT = 1.20f;
+    private static final float CYCLONE_CELL_CORE_RADIUS_FACTOR = 0.55f;
+    private static final int DEFAULT_CONVECTIVE_CLUSTER_COUNT = 6;
+    private static final float CONVECTIVE_CLUSTER_MIN_RADIUS = 5.0f;
+    private static final float CONVECTIVE_CLUSTER_MAX_RADIUS = 12.0f;
+    private static final float CONVECTIVE_CLUSTER_MAX_CONVERGENCE_MPS = 4.0f;
+    private static final float CONVECTIVE_CLUSTER_MAX_SWIRL_MPS = 2.2f;
+    private static final float CONVECTIVE_CLUSTER_BASE_FLOW_ADVECTION = 0.60f;
+    private static final float CONVECTIVE_CLUSTER_LIFECYCLE_RADIANS_PER_SECOND = TAU / (24000.0f / 20.0f);
+    private static final float CONVECTIVE_CLUSTER_MIN_EFFECTIVE_ENVELOPE = 0.03f;
+    private static final float CONVECTIVE_CLUSTER_MIN_STORM_ACTIVITY = 0.12f;
 
     private final long worldSeed;
     private final List<CycloneCell> cycloneCells;
+    private final List<ConvectiveCluster> convectiveClusters;
     private long lastTickUpdated = Long.MIN_VALUE;
     private float driverTimeSeconds;
     private float baseFlowX;
@@ -44,6 +58,9 @@ final class WorldScaleDriver {
     private float planetaryWavePhase;
     private float stormActivity;
     private float seasonPhase;
+    private float mesoscaleConvectiveSupport;
+    private float mesoscaleLiftSupport;
+    private float mesoscaleShearSupport;
 
     private WorldScaleDriver(
         long worldSeed,
@@ -55,7 +72,8 @@ final class WorldScaleDriver {
         float planetaryWavePhase,
         float stormActivity,
         float seasonPhase,
-        List<CycloneCell> cycloneCells
+        List<CycloneCell> cycloneCells,
+        List<ConvectiveCluster> convectiveClusters
     ) {
         this.worldSeed = worldSeed;
         this.driverTimeSeconds = driverTimeSeconds;
@@ -67,6 +85,7 @@ final class WorldScaleDriver {
         this.stormActivity = stormActivity;
         this.seasonPhase = seasonPhase;
         this.cycloneCells = new ArrayList<>(cycloneCells);
+        this.convectiveClusters = new ArrayList<>(convectiveClusters);
     }
 
     static WorldScaleDriver loadOrCreate(Path path, ServerWorld world) {
@@ -81,6 +100,7 @@ final class WorldScaleDriver {
     }
 
     private static WorldScaleDriver createDefault(long worldSeed) {
+        List<CycloneCell> defaultCycloneCells = createDefaultCycloneCells(worldSeed);
         float baseDirection = seededUnit(worldSeed, 0x15f11f73d3e4a5b1L) * TAU;
         float baseSpeed = 1.8f + seededUnit(worldSeed, 0x6a09e667f3bcc909L) * 2.2f;
         float baseFlowX = MathHelper.cos(baseDirection) * baseSpeed;
@@ -108,7 +128,8 @@ final class WorldScaleDriver {
             planetaryWavePhase,
             stormActivity,
             seasonPhase,
-            createDefaultCycloneCells(worldSeed)
+            defaultCycloneCells,
+            createDefaultConvectiveClusters(worldSeed, defaultCycloneCells)
         );
     }
 
@@ -147,6 +168,8 @@ final class WorldScaleDriver {
         }
         driver.cycloneCells.clear();
         driver.cycloneCells.addAll(parseCycloneCells(worldSeed, lines));
+        driver.convectiveClusters.clear();
+        driver.convectiveClusters.addAll(parseConvectiveClusters(worldSeed, lines, driver.cycloneCells));
         driver.airmassMoistureBias = MathHelper.clamp(driver.airmassMoistureBias, 0.0f, 1.0f);
         driver.stormActivity = MathHelper.clamp(driver.stormActivity, 0.0f, 1.0f);
         driver.seasonPhase = wrap01(driver.seasonPhase);
@@ -182,6 +205,20 @@ final class WorldScaleDriver {
             appendProperty(builder, "cyclone_cell_" + i + "_warm_core_bias_kelvin", cell.warmCoreBiasKelvin);
             appendProperty(builder, "cyclone_cell_" + i + "_moisture_core_bias", cell.moistureCoreBias);
         }
+        builder.append("convective_cluster_count=").append(convectiveClusters.size()).append('\n');
+        for (int i = 0; i < convectiveClusters.size(); i++) {
+            ConvectiveCluster cluster = convectiveClusters.get(i);
+            appendProperty(builder, "convective_cluster_" + i + "_center_x", cluster.centerCellX);
+            appendProperty(builder, "convective_cluster_" + i + "_center_z", cluster.centerCellZ);
+            appendProperty(builder, "convective_cluster_" + i + "_radius_cells", cluster.radiusCells);
+            appendProperty(builder, "convective_cluster_" + i + "_intensity", cluster.intensity);
+            appendProperty(builder, "convective_cluster_" + i + "_drift_x_cells_per_second", cluster.driftCellsPerSecondX);
+            appendProperty(builder, "convective_cluster_" + i + "_drift_z_cells_per_second", cluster.driftCellsPerSecondZ);
+            appendProperty(builder, "convective_cluster_" + i + "_lifecycle_phase", cluster.lifecyclePhase);
+            appendProperty(builder, "convective_cluster_" + i + "_warm_bias_kelvin", cluster.warmBiasKelvin);
+            appendProperty(builder, "convective_cluster_" + i + "_moisture_bias", cluster.moistureBias);
+            appendProperty(builder, "convective_cluster_" + i + "_convergence_mps", cluster.convergenceMps);
+        }
         Files.writeString(path, builder.toString(), StandardCharsets.UTF_8);
     }
 
@@ -189,7 +226,8 @@ final class WorldScaleDriver {
         ServerWorld world,
         AeroServerRuntime.WorldEnvironmentSnapshot environmentSnapshot,
         long tickCounter,
-        float dtSeconds
+        float dtSeconds,
+        MesoscaleGrid.DiagnosticsSummary mesoscaleSummary
     ) {
         float elapsedSeconds = lastTickUpdated == Long.MIN_VALUE
             ? Math.max(1.0e-3f, dtSeconds)
@@ -247,6 +285,15 @@ final class WorldScaleDriver {
             0.0f,
             1.0f
         );
+        updateMesoscaleSupport(mesoscaleSummary);
+        targetStormActivity = MathHelper.clamp(
+            targetStormActivity
+                + 0.18f * mesoscaleConvectiveSupport
+                + 0.10f * mesoscaleLiftSupport
+                + 0.05f * mesoscaleShearSupport,
+            0.0f,
+            1.0f
+        );
         stormActivity = MathHelper.clamp(
             relax(stormActivity, targetStormActivity, elapsedSeconds, STORM_RELAX_PER_SECOND),
             0.0f,
@@ -255,6 +302,21 @@ final class WorldScaleDriver {
 
         for (CycloneCell cell : cycloneCells) {
             cell.advance(elapsedSeconds, baseFlowX, baseFlowZ);
+        }
+        for (int i = 0; i < convectiveClusters.size(); i++) {
+            convectiveClusters.get(i).advance(
+                elapsedSeconds,
+                baseFlowX,
+                baseFlowZ,
+                stormActivity,
+                worldSeed,
+                driverTimeSeconds,
+                cycloneCells,
+                i,
+                mesoscaleConvectiveSupport,
+                mesoscaleLiftSupport,
+                mesoscaleShearSupport
+            );
         }
     }
 
@@ -269,6 +331,11 @@ final class WorldScaleDriver {
         float targetWindZ = baseFlowZ + 0.90f * waveB - 0.35f * eddy;
         float temperatureBiasKelvin = airmassTemperatureBias + 1.4f * waveA + 0.8f * waveB;
         float humidity = MathHelper.clamp(airmassMoistureBias + 0.08f * waveB - 0.05f * eddy, 0.0f, 1.0f);
+        float convectiveHeatingKelvin = 0.0f;
+        float convectiveMoistening = 0.0f;
+        float convectiveInflowX = 0.0f;
+        float convectiveInflowZ = 0.0f;
+        float convectiveEnvelope = 0.0f;
 
         for (CycloneCell cell : cycloneCells) {
             CycloneContribution contribution = cell.sample(cellX, cellZ, stormActivity);
@@ -277,17 +344,44 @@ final class WorldScaleDriver {
             temperatureBiasKelvin += contribution.temperatureBiasKelvin();
             humidity += contribution.humidityBias();
         }
+        for (ConvectiveCluster cluster : convectiveClusters) {
+            ConvectiveContribution contribution = cluster.sample(cellX, cellZ, stormActivity);
+            targetWindX += contribution.windX();
+            targetWindZ += contribution.windZ();
+            temperatureBiasKelvin += contribution.temperatureBiasKelvin();
+            humidity += contribution.humidityBias();
+            convectiveHeatingKelvin += contribution.heatingKelvin();
+            convectiveMoistening += contribution.moistening();
+            convectiveInflowX += contribution.inflowX();
+            convectiveInflowZ += contribution.inflowZ();
+            convectiveEnvelope = Math.max(convectiveEnvelope, contribution.envelope());
+        }
 
         targetWindX = MathHelper.clamp(targetWindX, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
         targetWindZ = MathHelper.clamp(targetWindZ, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
         humidity = MathHelper.clamp(humidity, 0.0f, 1.0f);
-        return new Sample(targetWindX, targetWindZ, temperatureBiasKelvin, humidity, stormActivity);
+        return new Sample(
+            targetWindX,
+            targetWindZ,
+            temperatureBiasKelvin,
+            humidity,
+            stormActivity,
+            convectiveHeatingKelvin,
+            convectiveMoistening,
+            convectiveInflowX,
+            convectiveInflowZ,
+            convectiveEnvelope
+        );
     }
 
     synchronized Snapshot snapshot() {
         List<CycloneCellSnapshot> systems = new ArrayList<>(cycloneCells.size());
         for (CycloneCell cell : cycloneCells) {
             systems.add(cell.snapshot());
+        }
+        List<ConvectiveClusterSnapshot> convectiveSystems = new ArrayList<>(convectiveClusters.size());
+        for (ConvectiveCluster cluster : convectiveClusters) {
+            convectiveSystems.add(cluster.snapshot());
         }
         return new Snapshot(
             driverTimeSeconds,
@@ -298,7 +392,36 @@ final class WorldScaleDriver {
             planetaryWavePhase,
             stormActivity,
             seasonPhase,
-            List.copyOf(systems)
+            mesoscaleConvectiveSupport,
+            mesoscaleLiftSupport,
+            mesoscaleShearSupport,
+            List.copyOf(systems),
+            List.copyOf(convectiveSystems)
+        );
+    }
+
+    private void updateMesoscaleSupport(MesoscaleGrid.DiagnosticsSummary summary) {
+        if (summary == null || summary.sampledStateCount() <= 0) {
+            mesoscaleConvectiveSupport = 0.0f;
+            mesoscaleLiftSupport = 0.0f;
+            mesoscaleShearSupport = 0.0f;
+            return;
+        }
+        float instabilitySupport = Math.min(1.5f, summary.maxInstabilityProxy() / 8.0f);
+        float liftSupport = Math.min(1.5f, summary.maxLiftProxy());
+        float shearSupport = Math.min(1.5f, summary.meanLowLevelShear() / 6.0f);
+        float humiditySupport = MathHelper.clamp(summary.meanHumidity(), 0.0f, 1.0f);
+        float convergenceSupport = Math.min(1.5f, summary.maxPositiveMoistureConvergence() * 256.0f * 8.0f);
+        mesoscaleLiftSupport = liftSupport;
+        mesoscaleShearSupport = shearSupport;
+        mesoscaleConvectiveSupport = MathHelper.clamp(
+            0.30f * instabilitySupport
+                + 0.22f * liftSupport
+                + 0.18f * shearSupport
+                + 0.18f * humiditySupport
+                + 0.12f * convergenceSupport,
+            0.0f,
+            1.75f
         );
     }
 
@@ -350,6 +473,91 @@ final class WorldScaleDriver {
         return cells;
     }
 
+    private static List<ConvectiveCluster> createDefaultConvectiveClusters(long worldSeed, List<CycloneCell> cycloneCells) {
+        List<CycloneCell> lowPressureCells = new ArrayList<>();
+        for (CycloneCell cell : cycloneCells) {
+            if (cell.pressureSign < 0.0f) {
+                lowPressureCells.add(cell);
+            }
+        }
+        List<ConvectiveCluster> clusters = new ArrayList<>(DEFAULT_CONVECTIVE_CLUSTER_COUNT);
+        for (int i = 0; i < DEFAULT_CONVECTIVE_CLUSTER_COUNT; i++) {
+            long salt = 0x0d7e1f3a5b79c2e1L + (long) i * 0x9e3779b97f4a7c15L;
+            CycloneCell host = lowPressureCells.isEmpty()
+                ? cycloneCells.get(i % cycloneCells.size())
+                : lowPressureCells.get(i % lowPressureCells.size());
+            float offsetAngle = seededUnit(worldSeed, salt ^ 0x6eed0e9da4d94a4fL) * TAU;
+            float offsetRadius = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0x1f83d9abfb41bd6bL),
+                host.radiusCells * 0.15f,
+                host.radiusCells * 0.65f
+            );
+            float centerX = wrapDomain(host.centerCellX + MathHelper.cos(offsetAngle) * offsetRadius);
+            float centerZ = wrapDomain(host.centerCellZ + MathHelper.sin(offsetAngle) * offsetRadius);
+            float radiusCells = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0x5be0cd19137e2179L),
+                CONVECTIVE_CLUSTER_MIN_RADIUS,
+                CONVECTIVE_CLUSTER_MAX_RADIUS
+            );
+            float intensity = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0xcbbb9d5dc1059ed8L),
+                0.45f,
+                1.00f
+            );
+            float driftDirection = seededUnit(worldSeed, salt ^ 0x428a2f98d728ae22L) * TAU;
+            float driftSpeedCellsPerSecond = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0x7137449123ef65cdL),
+                0.0015f,
+                0.0065f
+            );
+            float warmBiasKelvin = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0xb5c0fbcfec4d3b2fL),
+                1.0f,
+                3.8f
+            );
+            float moistureBias = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0xe9b5dba58189dbbcL),
+                0.05f,
+                0.18f
+            );
+            float convergenceMps = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0x3956c25bf348b538L),
+                1.2f,
+                CONVECTIVE_CLUSTER_MAX_CONVERGENCE_MPS
+            );
+            float lifecyclePhase = seededUnit(worldSeed, salt ^ 0x59f111f1b605d019L) * TAU;
+            clusters.add(new ConvectiveCluster(
+                centerX,
+                centerZ,
+                radiusCells,
+                intensity,
+                MathHelper.cos(driftDirection) * driftSpeedCellsPerSecond,
+                MathHelper.sin(driftDirection) * driftSpeedCellsPerSecond,
+                lifecyclePhase,
+                warmBiasKelvin,
+                moistureBias,
+                convergenceMps
+            ));
+        }
+        return clusters;
+    }
+
+    private static CycloneCell preferredCycloneHost(List<CycloneCell> cycloneCells, int clusterIndex, long worldSeed, int cycleOrdinal) {
+        List<CycloneCell> lowPressureCells = new ArrayList<>();
+        for (CycloneCell cell : cycloneCells) {
+            if (cell.pressureSign < 0.0f) {
+                lowPressureCells.add(cell);
+            }
+        }
+        List<CycloneCell> pool = lowPressureCells.isEmpty() ? cycloneCells : lowPressureCells;
+        if (pool.isEmpty()) {
+            return null;
+        }
+        int baseIndex = Math.floorMod(clusterIndex + cycleOrdinal, pool.size());
+        int jitter = Math.round(seededSigned(worldSeed, 0x7f4a7c159e3779b9L + (long) clusterIndex * 1315423911L + cycleOrdinal) * (pool.size() - 1));
+        return pool.get(Math.floorMod(baseIndex + jitter, pool.size()));
+    }
+
     private static List<CycloneCell> parseCycloneCells(long worldSeed, List<String> lines) {
         int count = DEFAULT_CYCLONE_CELL_COUNT;
         for (String rawLine : lines) {
@@ -364,7 +572,7 @@ final class WorldScaleDriver {
             String key = line.substring(0, separator).trim();
             if ("cyclone_cell_count".equals(key) || "pressure_cell_count".equals(key)) {
                 try {
-                    count = Math.max(0, Integer.parseInt(line.substring(separator + 1).trim()));
+                    count = Math.max(DEFAULT_CYCLONE_CELL_COUNT, Integer.parseInt(line.substring(separator + 1).trim()));
                 } catch (NumberFormatException ignored) {
                     count = DEFAULT_CYCLONE_CELL_COUNT;
                 }
@@ -425,6 +633,83 @@ final class WorldScaleDriver {
         return cells;
     }
 
+    private static List<ConvectiveCluster> parseConvectiveClusters(
+        long worldSeed,
+        List<String> lines,
+        List<CycloneCell> cycloneCells
+    ) {
+        int count = DEFAULT_CONVECTIVE_CLUSTER_COUNT;
+        for (String rawLine : lines) {
+            if (rawLine == null) {
+                continue;
+            }
+            String line = rawLine.trim();
+            int separator = line.indexOf('=');
+            if (separator <= 0 || separator == line.length() - 1) {
+                continue;
+            }
+            String key = line.substring(0, separator).trim();
+            if ("convective_cluster_count".equals(key)) {
+                try {
+                    count = Math.max(DEFAULT_CONVECTIVE_CLUSTER_COUNT, Integer.parseInt(line.substring(separator + 1).trim()));
+                } catch (NumberFormatException ignored) {
+                    count = DEFAULT_CONVECTIVE_CLUSTER_COUNT;
+                }
+                break;
+            }
+        }
+
+        List<ConvectiveCluster> defaults = createDefaultConvectiveClusters(worldSeed, cycloneCells);
+        List<ConvectiveCluster> clusters = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            ConvectiveCluster fallback = defaults.get(i % defaults.size());
+            clusters.add(fallback.copy());
+        }
+        if (count == 0) {
+            return clusters;
+        }
+
+        for (String rawLine : lines) {
+            if (rawLine == null) {
+                continue;
+            }
+            String line = rawLine.trim();
+            if (line.isEmpty() || line.startsWith("#")) {
+                continue;
+            }
+            int separator = line.indexOf('=');
+            if (separator <= 0 || separator == line.length() - 1) {
+                continue;
+            }
+            String key = line.substring(0, separator).trim();
+            if (!key.startsWith("convective_cluster_")) {
+                continue;
+            }
+            String suffix = key.substring("convective_cluster_".length());
+            int nextSeparator = suffix.indexOf('_');
+            if (nextSeparator <= 0 || nextSeparator == suffix.length() - 1) {
+                continue;
+            }
+            int index;
+            try {
+                index = Integer.parseInt(suffix.substring(0, nextSeparator));
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            if (index < 0 || index >= clusters.size()) {
+                continue;
+            }
+            String field = suffix.substring(nextSeparator + 1);
+            String value = line.substring(separator + 1).trim();
+            try {
+                clusters.get(index).set(field, Float.parseFloat(value));
+            } catch (NumberFormatException ignored) {
+                // Ignore malformed entries and keep defaults.
+            }
+        }
+        return clusters;
+    }
+
     private static void appendProperty(StringBuilder builder, String key, float value) {
         builder.append(key)
             .append('=')
@@ -440,6 +725,10 @@ final class WorldScaleDriver {
         h *= 0xc4ceb9fe1a85ec53L;
         h ^= h >>> 33;
         return ((h >>> 40) & 0xFFFF) / 65535.0f;
+    }
+
+    private static float seededSigned(long seed, long salt) {
+        return seededUnit(seed, salt) * 2.0f - 1.0f;
     }
 
     private static float relax(float current, float target, float deltaSeconds, float ratePerSecond) {
@@ -477,7 +766,12 @@ final class WorldScaleDriver {
         float targetWindZ,
         float temperatureBiasKelvin,
         float humidity,
-        float stormActivity
+        float stormActivity,
+        float convectiveHeatingKelvin,
+        float convectiveMoistening,
+        float convectiveInflowX,
+        float convectiveInflowZ,
+        float convectiveEnvelope
     ) {
     }
 
@@ -490,7 +784,11 @@ final class WorldScaleDriver {
         float planetaryWavePhase,
         float stormActivity,
         float seasonPhase,
-        List<CycloneCellSnapshot> cycloneCells
+        float mesoscaleConvectiveSupport,
+        float mesoscaleLiftSupport,
+        float mesoscaleShearSupport,
+        List<CycloneCellSnapshot> cycloneCells,
+        List<ConvectiveClusterSnapshot> convectiveClusters
     ) {
     }
 
@@ -508,6 +806,20 @@ final class WorldScaleDriver {
     ) {
     }
 
+    record ConvectiveClusterSnapshot(
+        float centerCellX,
+        float centerCellZ,
+        float radiusCells,
+        float intensity,
+        float driftCellsPerSecondX,
+        float driftCellsPerSecondZ,
+        float lifecyclePhase,
+        float warmBiasKelvin,
+        float moistureBias,
+        float convergenceMps
+    ) {
+    }
+
     private record CycloneContribution(
         float windX,
         float windZ,
@@ -515,6 +827,30 @@ final class WorldScaleDriver {
         float humidityBias
     ) {
         private static final CycloneContribution ZERO = new CycloneContribution(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    private record ConvectiveContribution(
+        float windX,
+        float windZ,
+        float temperatureBiasKelvin,
+        float humidityBias,
+        float heatingKelvin,
+        float moistening,
+        float inflowX,
+        float inflowZ,
+        float envelope
+    ) {
+        private static final ConvectiveContribution ZERO = new ConvectiveContribution(
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f
+        );
     }
 
     private static final class CycloneCell {
@@ -580,15 +916,19 @@ final class WorldScaleDriver {
             float dx = shortestWrappedDelta(cellX, centerCellX);
             float dz = shortestWrappedDelta(cellZ, centerCellZ);
             float distanceSquared = dx * dx + dz * dz;
-            float influenceRadius = radiusCells * 2.0f;
+            float influenceRadius = radiusCells * 4.0f;
             if (distanceSquared >= influenceRadius * influenceRadius) {
                 return CycloneContribution.ZERO;
             }
 
             float distance = Math.max(1.0e-3f, MathHelper.sqrt(distanceSquared));
             float radiusNorm = distance / Math.max(1.0f, radiusCells);
-            float envelope = (float) Math.exp(-radiusNorm * radiusNorm * 1.6f);
-            float coreSuppression = MathHelper.clamp(distance / Math.max(1.0f, radiusCells * 0.35f), 0.0f, 1.0f);
+            float outerNorm = distance / Math.max(1.0f, radiusCells * 2.5f);
+            float outerEnvelope = (float) Math.exp(-outerNorm * outerNorm * 0.95f);
+            float coreRadius = Math.max(1.0f, radiusCells * CYCLONE_CELL_CORE_RADIUS_FACTOR);
+            float coreNorm = distance / coreRadius;
+            float coreEnvelope = (float) Math.exp(-coreNorm * coreNorm * 1.8f);
+            float coreSuppression = MathHelper.clamp(distance / Math.max(1.0f, coreRadius * 0.25f), 0.0f, 1.0f);
             float stormScale = pressureSign < 0.0f
                 ? MathHelper.lerp(stormActivity, 0.80f, 1.25f)
                 : MathHelper.lerp(stormActivity, 1.05f, 0.90f);
@@ -600,14 +940,31 @@ final class WorldScaleDriver {
             float tangentZ = (dx / distance) * rotationSign;
             float radialX = dx / distance;
             float radialZ = dz / distance;
-            float swirlSpeed = CYCLONE_CELL_MAX_SWIRL_MPS * effectiveIntensity * envelope * coreSuppression;
-            float radialSpeed = CYCLONE_CELL_MAX_RADIAL_MPS * effectiveIntensity * envelope;
+            float outerSwirlSpeed = CYCLONE_CELL_MAX_SWIRL_MPS
+                * effectiveIntensity
+                * CYCLONE_CELL_OUTER_STEERING_WEIGHT
+                * outerEnvelope;
+            float coreSwirlSpeed = CYCLONE_CELL_MAX_SWIRL_MPS
+                * effectiveIntensity
+                * CYCLONE_CELL_CORE_SWIRL_WEIGHT
+                * coreEnvelope
+                * coreSuppression;
+            float outerRadialSpeed = CYCLONE_CELL_MAX_RADIAL_MPS
+                * effectiveIntensity
+                * 0.70f
+                * outerEnvelope;
+            float coreRadialSpeed = CYCLONE_CELL_MAX_RADIAL_MPS
+                * effectiveIntensity
+                * CYCLONE_CELL_CORE_RADIAL_WEIGHT
+                * coreEnvelope;
             float radialSign = pressureSign < 0.0f ? -1.0f : 1.0f;
 
-            float windX = tangentX * swirlSpeed + radialX * radialSpeed * radialSign;
-            float windZ = tangentZ * swirlSpeed + radialZ * radialSpeed * radialSign;
-            float temperatureBias = warmCoreBiasKelvin * effectiveIntensity * envelope;
-            float humidityBias = moistureCoreBias * effectiveIntensity * envelope;
+            float windX = tangentX * (outerSwirlSpeed + coreSwirlSpeed)
+                + radialX * (outerRadialSpeed + coreRadialSpeed) * radialSign;
+            float windZ = tangentZ * (outerSwirlSpeed + coreSwirlSpeed)
+                + radialZ * (outerRadialSpeed + coreRadialSpeed) * radialSign;
+            float temperatureBias = warmCoreBiasKelvin * effectiveIntensity * (0.35f * outerEnvelope + 0.95f * coreEnvelope);
+            float humidityBias = moistureCoreBias * effectiveIntensity * (0.35f * outerEnvelope + 0.95f * coreEnvelope);
             return new CycloneContribution(windX, windZ, temperatureBias, humidityBias);
         }
 
@@ -638,6 +995,247 @@ final class WorldScaleDriver {
                 case "lifecycle_phase" -> lifecyclePhase = wrapTau(value);
                 case "warm_core_bias_kelvin" -> warmCoreBiasKelvin = value;
                 case "moisture_core_bias" -> moistureCoreBias = value;
+                default -> {
+                }
+            }
+        }
+    }
+
+    private static final class ConvectiveCluster {
+        private float centerCellX;
+        private float centerCellZ;
+        private float radiusCells;
+        private float intensity;
+        private float driftCellsPerSecondX;
+        private float driftCellsPerSecondZ;
+        private float lifecyclePhase;
+        private float warmBiasKelvin;
+        private float moistureBias;
+        private float convergenceMps;
+
+        private ConvectiveCluster(
+            float centerCellX,
+            float centerCellZ,
+            float radiusCells,
+            float intensity,
+            float driftCellsPerSecondX,
+            float driftCellsPerSecondZ,
+            float lifecyclePhase,
+            float warmBiasKelvin,
+            float moistureBias,
+            float convergenceMps
+        ) {
+            this.centerCellX = centerCellX;
+            this.centerCellZ = centerCellZ;
+            this.radiusCells = radiusCells;
+            this.intensity = intensity;
+            this.driftCellsPerSecondX = driftCellsPerSecondX;
+            this.driftCellsPerSecondZ = driftCellsPerSecondZ;
+            this.lifecyclePhase = lifecyclePhase;
+            this.warmBiasKelvin = warmBiasKelvin;
+            this.moistureBias = moistureBias;
+            this.convergenceMps = convergenceMps;
+        }
+
+        private ConvectiveCluster copy() {
+            return new ConvectiveCluster(
+                centerCellX,
+                centerCellZ,
+                radiusCells,
+                intensity,
+                driftCellsPerSecondX,
+                driftCellsPerSecondZ,
+                lifecyclePhase,
+                warmBiasKelvin,
+                moistureBias,
+                convergenceMps
+            );
+        }
+
+        private void advance(float elapsedSeconds, float baseFlowX, float baseFlowZ) {
+            advance(elapsedSeconds, baseFlowX, baseFlowZ, 1.0f, 0L, 0.0f, List.of(), 0, 0.0f, 0.0f, 0.0f);
+        }
+
+        private void advance(
+            float elapsedSeconds,
+            float baseFlowX,
+            float baseFlowZ,
+            float stormActivity,
+            long worldSeed,
+            float driverTimeSeconds,
+            List<CycloneCell> cycloneCells,
+            int clusterIndex,
+            float mesoscaleConvectiveSupport,
+            float mesoscaleLiftSupport,
+            float mesoscaleShearSupport
+        ) {
+            float previousPhase = lifecyclePhase;
+            lifecyclePhase = wrapTau(lifecyclePhase + elapsedSeconds * CONVECTIVE_CLUSTER_LIFECYCLE_RADIANS_PER_SECOND);
+            if (stormActivity < CONVECTIVE_CLUSTER_MIN_STORM_ACTIVITY) {
+                intensity = Math.min(intensity, 0.20f);
+                lifecyclePhase = Math.min(lifecyclePhase, TAU * 0.12f);
+            } else if (lifecyclePhase < previousPhase) {
+                respawn(
+                    worldSeed,
+                    driverTimeSeconds,
+                    cycloneCells,
+                    clusterIndex,
+                    stormActivity,
+                    mesoscaleConvectiveSupport,
+                    mesoscaleLiftSupport,
+                    mesoscaleShearSupport
+                );
+            }
+            float baseDriftX = (baseFlowX / DRIVER_CELL_SIZE_BLOCKS) * CONVECTIVE_CLUSTER_BASE_FLOW_ADVECTION;
+            float baseDriftZ = (baseFlowZ / DRIVER_CELL_SIZE_BLOCKS) * CONVECTIVE_CLUSTER_BASE_FLOW_ADVECTION;
+            centerCellX = wrapDomain(centerCellX + elapsedSeconds * (driftCellsPerSecondX + baseDriftX));
+            centerCellZ = wrapDomain(centerCellZ + elapsedSeconds * (driftCellsPerSecondZ + baseDriftZ));
+        }
+
+        private void respawn(
+            long worldSeed,
+            float driverTimeSeconds,
+            List<CycloneCell> cycloneCells,
+            int clusterIndex,
+            float stormActivity,
+            float mesoscaleConvectiveSupport,
+            float mesoscaleLiftSupport,
+            float mesoscaleShearSupport
+        ) {
+            int cycleOrdinal = Math.max(0, (int) Math.floor(driverTimeSeconds / (24000.0f / 20.0f)));
+            CycloneCell host = preferredCycloneHost(cycloneCells, clusterIndex, worldSeed, cycleOrdinal);
+            long salt = 0x4f1bbcdc676f3a29L
+                + (long) clusterIndex * 0x9e3779b97f4a7c15L
+                + (long) cycleOrdinal * 0x94d049bb133111ebL;
+            float hostCenterX = host == null ? seededUnit(worldSeed, salt ^ 0x2e1b21385c26c926L) * PRESSURE_DOMAIN_CELLS : host.centerCellX;
+            float hostCenterZ = host == null ? seededUnit(worldSeed, salt ^ 0x27d4eb2f165667c5L) * PRESSURE_DOMAIN_CELLS : host.centerCellZ;
+            float hostRadius = host == null ? 18.0f : host.radiusCells;
+            float offsetAngle = seededUnit(worldSeed, salt ^ 0x7137449123ef65cdL) * TAU;
+            float offsetRadius = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0xb5c0fbcfec4d3b2fL),
+                hostRadius * 0.10f,
+                hostRadius * 0.55f
+            );
+            centerCellX = wrapDomain(hostCenterX + MathHelper.cos(offsetAngle) * offsetRadius);
+            centerCellZ = wrapDomain(hostCenterZ + MathHelper.sin(offsetAngle) * offsetRadius);
+            radiusCells = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0xe9b5dba58189dbbcL),
+                CONVECTIVE_CLUSTER_MIN_RADIUS,
+                CONVECTIVE_CLUSTER_MAX_RADIUS
+            );
+            float supportGain = MathHelper.clamp(
+                0.60f + 0.40f * mesoscaleConvectiveSupport + 0.20f * mesoscaleLiftSupport,
+                0.40f,
+                1.80f
+            );
+            intensity = MathHelper.lerp(
+                MathHelper.clamp(stormActivity, 0.0f, 1.0f),
+                0.35f,
+                MathHelper.lerp(seededUnit(worldSeed, salt ^ 0x3956c25bf348b538L), 0.85f, 1.20f)
+            ) * supportGain;
+            float driftDirection = seededUnit(worldSeed, salt ^ 0x59f111f1b605d019L) * TAU;
+            float driftSpeedCellsPerSecond = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0x923f82a4af194f9bL),
+                0.0010f,
+                0.0060f
+            );
+            driftCellsPerSecondX = MathHelper.cos(driftDirection) * driftSpeedCellsPerSecond;
+            driftCellsPerSecondZ = MathHelper.sin(driftDirection) * driftSpeedCellsPerSecond;
+            warmBiasKelvin = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0xab1c5ed5da6d8118L),
+                0.8f,
+                4.2f
+            ) * MathHelper.lerp(stormActivity, 0.75f, 1.15f) * MathHelper.lerp(mesoscaleLiftSupport, 0.85f, 1.25f);
+            moistureBias = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0xd807aa98a3030242L),
+                0.04f,
+                0.20f
+            ) * MathHelper.lerp(stormActivity, 0.70f, 1.20f) * MathHelper.lerp(mesoscaleConvectiveSupport, 0.80f, 1.30f);
+            convergenceMps = MathHelper.lerp(
+                seededUnit(worldSeed, salt ^ 0x12835b0145706fbeL),
+                1.0f,
+                CONVECTIVE_CLUSTER_MAX_CONVERGENCE_MPS
+            ) * MathHelper.lerp(stormActivity, 0.70f, 1.25f) * MathHelper.lerp(mesoscaleShearSupport, 0.90f, 1.20f);
+            lifecyclePhase = 0.0f;
+        }
+
+        private ConvectiveContribution sample(float cellX, float cellZ, float stormActivity) {
+            float dx = shortestWrappedDelta(cellX, centerCellX);
+            float dz = shortestWrappedDelta(cellZ, centerCellZ);
+            float distanceSquared = dx * dx + dz * dz;
+            float influenceRadius = radiusCells * 3.0f;
+            if (distanceSquared >= influenceRadius * influenceRadius) {
+                return ConvectiveContribution.ZERO;
+            }
+
+            float distance = Math.max(1.0e-3f, MathHelper.sqrt(distanceSquared));
+            float coreNorm = distance / Math.max(1.0f, radiusCells);
+            float anvilNorm = distance / Math.max(1.0f, radiusCells * 1.8f);
+            float coreEnvelope = (float) Math.exp(-coreNorm * coreNorm * 1.6f);
+            float anvilEnvelope = (float) Math.exp(-anvilNorm * anvilNorm * 0.7f);
+            float lifeProgress = MathHelper.clamp(lifecyclePhase / TAU, 0.0f, 1.0f);
+            float lifecycleEnvelope = MathHelper.sin(lifeProgress * (float) Math.PI);
+            if (lifecycleEnvelope <= CONVECTIVE_CLUSTER_MIN_EFFECTIVE_ENVELOPE) {
+                return ConvectiveContribution.ZERO;
+            }
+            float lifecycleScale = (0.35f + 0.65f * lifecycleEnvelope) * (0.80f + 0.20f * MathHelper.sin(lifecyclePhase));
+            float effectiveIntensity = intensity * MathHelper.lerp(stormActivity, 0.70f, 1.35f) * lifecycleScale;
+
+            float radialX = -dx / distance;
+            float radialZ = -dz / distance;
+            float tangentX = -dz / distance;
+            float tangentZ = dx / distance;
+            float convergence = convergenceMps * effectiveIntensity * (0.55f * coreEnvelope + 0.20f * anvilEnvelope);
+            float swirl = CONVECTIVE_CLUSTER_MAX_SWIRL_MPS * effectiveIntensity * 0.25f * coreEnvelope;
+            float windX = radialX * convergence + tangentX * swirl;
+            float windZ = radialZ * convergence + tangentZ * swirl;
+            float temperatureBias = warmBiasKelvin * effectiveIntensity * (0.80f * coreEnvelope + 0.30f * anvilEnvelope);
+            float humidityBias = moistureBias * effectiveIntensity * (0.90f * coreEnvelope + 0.55f * anvilEnvelope);
+            float envelope = MathHelper.clamp(0.85f * coreEnvelope + 0.25f * anvilEnvelope, 0.0f, 1.0f);
+            float heatingKelvin = Math.max(0.0f, warmBiasKelvin) * effectiveIntensity * (0.65f * coreEnvelope + 0.20f * anvilEnvelope);
+            float moistening = Math.max(0.0f, moistureBias) * effectiveIntensity * (0.75f * coreEnvelope + 0.35f * anvilEnvelope);
+            float inflowX = radialX * convergence;
+            float inflowZ = radialZ * convergence;
+            return new ConvectiveContribution(
+                windX,
+                windZ,
+                temperatureBias,
+                humidityBias,
+                heatingKelvin,
+                moistening,
+                inflowX,
+                inflowZ,
+                envelope
+            );
+        }
+
+        private ConvectiveClusterSnapshot snapshot() {
+            return new ConvectiveClusterSnapshot(
+                centerCellX,
+                centerCellZ,
+                radiusCells,
+                intensity,
+                driftCellsPerSecondX,
+                driftCellsPerSecondZ,
+                lifecyclePhase,
+                warmBiasKelvin,
+                moistureBias,
+                convergenceMps
+            );
+        }
+
+        private void set(String field, float value) {
+            switch (field) {
+                case "center_x" -> centerCellX = wrapDomain(value);
+                case "center_z" -> centerCellZ = wrapDomain(value);
+                case "radius_cells" -> radiusCells = Math.max(1.0f, value);
+                case "intensity" -> intensity = MathHelper.clamp(value, 0.05f, 2.0f);
+                case "drift_x_cells_per_second" -> driftCellsPerSecondX = value;
+                case "drift_z_cells_per_second" -> driftCellsPerSecondZ = value;
+                case "lifecycle_phase" -> lifecyclePhase = wrapTau(value);
+                case "warm_bias_kelvin" -> warmBiasKelvin = value;
+                case "moisture_bias" -> moistureBias = MathHelper.clamp(value, -0.40f, 0.40f);
+                case "convergence_mps" -> convergenceMps = MathHelper.clamp(value, 0.1f, 8.0f);
                 default -> {
                 }
             }
