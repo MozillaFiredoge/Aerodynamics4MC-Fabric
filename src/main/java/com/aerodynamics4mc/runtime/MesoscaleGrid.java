@@ -16,7 +16,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final float DEFAULT_MOLECULAR_NU_M2_S = 1.5e-5f;
     private static final float DEFAULT_PRANDTL_AIR = 0.71f;
     private static final float DEFAULT_TURBULENT_PRANDTL = 0.85f;
-    private static final int NATIVE_FORCING_CHANNELS = 14;
+    private static final int NATIVE_FORCING_CHANNELS = 19;
     private static final int NATIVE_STATE_CHANNELS = 5;
     private static final int CH_TERRAIN_HEIGHT = 0;
     private static final int CH_BIOME_TEMPERATURE = 1;
@@ -32,6 +32,11 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final int CH_CONVECTIVE_MOISTENING = 11;
     private static final int CH_CONVECTIVE_INFLOW_X = 12;
     private static final int CH_CONVECTIVE_INFLOW_Z = 13;
+    private static final int CH_TORNADO_WIND_X = 14;
+    private static final int CH_TORNADO_WIND_Z = 15;
+    private static final int CH_TORNADO_HEATING = 16;
+    private static final int CH_TORNADO_MOISTENING = 17;
+    private static final int CH_TORNADO_UPDRAFT = 18;
     private static final int OUT_AMBIENT = 0;
     private static final int OUT_DEEP_GROUND = 1;
     private static final int OUT_SURFACE = 2;
@@ -166,100 +171,30 @@ final class MesoscaleGrid implements AutoCloseable {
         }
         int centerX = Math.floorDiv(focus.getX(), cellSizeBlocks);
         int centerZ = Math.floorDiv(focus.getZ(), cellSizeBlocks);
-        int sampleRadius = 2;
-        int sampledStates = 0;
-        float meanInstability = 0.0f;
-        float maxInstability = 0.0f;
-        float meanShear = 0.0f;
-        float meanHumidity = 0.0f;
-        float meanPositiveConvergence = 0.0f;
-        float maxPositiveConvergence = 0.0f;
-        float meanLift = 0.0f;
-        float maxLift = 0.0f;
-        float horizontalScaleMeters = Math.max(1.0f, cellSizeBlocks);
-        int sampledLayers = Math.max(1, Math.min(activeLayers, 3));
-        int gridWidth = radiusCells * 2 + 1;
-
-        for (int cx = centerX - sampleRadius; cx <= centerX + sampleRadius; cx++) {
-            for (int cz = centerZ - sampleRadius; cz <= centerZ + sampleRadius; cz++) {
-                CellColumnState column = cells.get(pack(cx, cz));
-                if (column == null || column.layerCount() <= 0) {
-                    continue;
-                }
-                float surfaceReferenceKelvin = column.surfaceTemperatureKelvin[0];
-                float deepGroundReferenceKelvin = column.deepGroundTemperatureKelvin[0];
-                float surfaceAmbientKelvin = column.ambientAirTemperatureKelvin[0];
-                float surfaceWindX = column.windX[0];
-                float surfaceWindZ = column.windZ[0];
-                for (int layer = 0; layer < sampledLayers; layer++) {
-                    float q = MathHelper.clamp(column.humidity[layer], 0.0f, 1.0f);
-                    float convectiveHeating = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_HEATING);
-                    float convectiveMoistening = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_MOISTENING);
-                    float convectiveInflowX = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_INFLOW_X);
-                    float convectiveInflowZ = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_INFLOW_Z);
-                    float instability = computeInstabilityProxy(
-                        surfaceReferenceKelvin,
-                        deepGroundReferenceKelvin,
-                        surfaceAmbientKelvin,
-                        column.ambientAirTemperatureKelvin[layer],
-                        q,
-                        convectiveHeating,
-                        convectiveMoistening,
-                        layer
-                    );
-                    float du = column.windX[layer] - surfaceWindX;
-                    float dv = column.windZ[layer] - surfaceWindZ;
-                    float shear = MathHelper.sqrt(du * du + dv * dv);
-
-                    float leftFlux = humidityFluxX(cx - 1, cz, layer);
-                    float rightFlux = humidityFluxX(cx + 1, cz, layer);
-                    float southFlux = humidityFluxZ(cx, cz - 1, layer);
-                    float northFlux = humidityFluxZ(cx, cz + 1, layer);
-                    float convergence = -((rightFlux - leftFlux) / (2.0f * horizontalScaleMeters)
-                        + (northFlux - southFlux) / (2.0f * horizontalScaleMeters));
-                    float positiveConvergence = Math.max(0.0f, convergence);
-                    float lift = computeLiftProxy(
-                        instability,
-                        q,
-                        positiveConvergence,
-                        shear,
-                        convectiveHeating,
-                        convectiveMoistening,
-                        convectiveInflowX,
-                        convectiveInflowZ,
-                        layer,
-                        sampledLayers,
-                        horizontalScaleMeters
-                    );
-
-                    meanInstability += instability;
-                    maxInstability = Math.max(maxInstability, instability);
-                    meanShear += shear;
-                    meanHumidity += q;
-                    meanPositiveConvergence += positiveConvergence;
-                    maxPositiveConvergence = Math.max(maxPositiveConvergence, positiveConvergence);
-                    meanLift += lift;
-                    maxLift = Math.max(maxLift, lift);
-                    sampledStates++;
-                }
-            }
-        }
-
-        if (sampledStates <= 0) {
+        TornadoEnvironment environment = sampleEnvironment(centerX, centerZ, 2);
+        if (environment.sampledStateCount() <= 0) {
             return DiagnosticsSummary.EMPTY;
         }
-        float inverseCount = 1.0f / sampledStates;
         return new DiagnosticsSummary(
-            meanInstability * inverseCount,
-            maxInstability,
-            meanShear * inverseCount,
-            meanHumidity * inverseCount,
-            meanPositiveConvergence * inverseCount,
-            maxPositiveConvergence,
-            meanLift * inverseCount,
-            maxLift,
-            sampledStates
+            environment.meanInstabilityProxy(),
+            environment.maxInstabilityProxy(),
+            environment.meanLowLevelShear(),
+            environment.meanHumidity(),
+            environment.meanPositiveMoistureConvergence(),
+            environment.maxPositiveMoistureConvergence(),
+            environment.meanLiftProxy(),
+            environment.maxLiftProxy(),
+            environment.sampledStateCount()
         );
+    }
+
+    synchronized TornadoEnvironment sampleTornadoEnvironment(BlockPos pos, int radiusCells) {
+        if (cells.isEmpty() || activeLayers <= 0) {
+            return TornadoEnvironment.EMPTY;
+        }
+        int centerX = Math.floorDiv(pos.getX(), cellSizeBlocks);
+        int centerZ = Math.floorDiv(pos.getZ(), cellSizeBlocks);
+        return sampleEnvironment(centerX, centerZ, Math.max(0, radiusCells));
     }
 
     synchronized Snapshot snapshot() {
@@ -280,6 +215,11 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] convectiveMoistening = new float[stateCount];
         float[] convectiveInflowX = new float[stateCount];
         float[] convectiveInflowZ = new float[stateCount];
+        float[] tornadoHeating = new float[stateCount];
+        float[] tornadoMoistening = new float[stateCount];
+        float[] tornadoWindX = new float[stateCount];
+        float[] tornadoWindZ = new float[stateCount];
+        float[] tornadoUpdraft = new float[stateCount];
         float[] instabilityProxy = new float[stateCount];
         float[] lowLevelShear = new float[stateCount];
         float[] moistureConvergence = new float[stateCount];
@@ -320,6 +260,21 @@ final class MesoscaleGrid implements AutoCloseable {
                     convectiveInflowZ[stateIndex] = forcingBase >= 0 && forcingBase + CH_CONVECTIVE_INFLOW_Z < forcingBuffer.length
                         ? forcingBuffer[forcingBase + CH_CONVECTIVE_INFLOW_Z]
                         : 0.0f;
+                    tornadoWindX[stateIndex] = forcingBase >= 0 && forcingBase + CH_TORNADO_WIND_X < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_TORNADO_WIND_X]
+                        : 0.0f;
+                    tornadoWindZ[stateIndex] = forcingBase >= 0 && forcingBase + CH_TORNADO_WIND_Z < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_TORNADO_WIND_Z]
+                        : 0.0f;
+                    tornadoHeating[stateIndex] = forcingBase >= 0 && forcingBase + CH_TORNADO_HEATING < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_TORNADO_HEATING]
+                        : 0.0f;
+                    tornadoMoistening[stateIndex] = forcingBase >= 0 && forcingBase + CH_TORNADO_MOISTENING < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_TORNADO_MOISTENING]
+                        : 0.0f;
+                    tornadoUpdraft[stateIndex] = forcingBase >= 0 && forcingBase + CH_TORNADO_UPDRAFT < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_TORNADO_UPDRAFT]
+                        : 0.0f;
                 }
             }
         }
@@ -337,6 +292,11 @@ final class MesoscaleGrid implements AutoCloseable {
             convectiveMoistening,
             convectiveInflowX,
             convectiveInflowZ,
+            tornadoHeating,
+            tornadoMoistening,
+            tornadoWindX,
+            tornadoWindZ,
+            tornadoUpdraft,
             instabilityProxy,
             lowLevelShear,
             moistureConvergence,
@@ -453,6 +413,11 @@ final class MesoscaleGrid implements AutoCloseable {
                 float bgConvectiveInflowX = bg != null ? bg.convectiveInflowX() : 0.0f;
                 float bgConvectiveInflowZ = bg != null ? bg.convectiveInflowZ() : 0.0f;
                 float bgConvectiveEnvelope = bg != null ? bg.convectiveEnvelope() : 0.0f;
+                float bgTornadoWindX = bg != null ? bg.tornadoWindX() : 0.0f;
+                float bgTornadoWindZ = bg != null ? bg.tornadoWindZ() : 0.0f;
+                float bgTornadoHeating = bg != null ? bg.tornadoHeatingKelvin() : 0.0f;
+                float bgTornadoMoistening = bg != null ? bg.tornadoMoistening() : 0.0f;
+                float bgTornadoUpdraft = bg != null ? bg.tornadoUpdraftProxy() : 0.0f;
                 float targetWindX = bgWindX * (1.0f - Math.abs(terrainSteer) * 0.25f) - terrainSteer * TERRAIN_WIND_DEFLECTION * bgWindZ;
                 float targetWindZ = bgWindZ * (1.0f - Math.abs(terrainSteer) * 0.25f) + terrainSteer * TERRAIN_WIND_DEFLECTION * bgWindX;
                 targetWindX = MathHelper.clamp(targetWindX, -maxBackgroundWind, maxBackgroundWind);
@@ -475,6 +440,8 @@ final class MesoscaleGrid implements AutoCloseable {
                     float convectiveLayerWeight = bgConvectiveEnvelope
                         * surfaceInfluence
                         * (1.0f - 0.60f * (layer / (float) Math.max(1, activeLayers - 1)));
+                    float tornadoLayerWeight = surfaceInfluence
+                        * (1.0f - 0.75f * (layer / (float) Math.max(1, activeLayers - 1)));
                     int base = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS;
                     forcingBuffer[base + CH_TERRAIN_HEIGHT] = cell.terrainHeightBlocks;
                     forcingBuffer[base + CH_BIOME_TEMPERATURE] = cell.biomeTemperature;
@@ -490,6 +457,11 @@ final class MesoscaleGrid implements AutoCloseable {
                     forcingBuffer[base + CH_CONVECTIVE_MOISTENING] = bgConvectiveMoistening * convectiveLayerWeight;
                     forcingBuffer[base + CH_CONVECTIVE_INFLOW_X] = bgConvectiveInflowX * convectiveLayerWeight;
                     forcingBuffer[base + CH_CONVECTIVE_INFLOW_Z] = bgConvectiveInflowZ * convectiveLayerWeight;
+                    forcingBuffer[base + CH_TORNADO_WIND_X] = bgTornadoWindX * tornadoLayerWeight;
+                    forcingBuffer[base + CH_TORNADO_WIND_Z] = bgTornadoWindZ * tornadoLayerWeight;
+                    forcingBuffer[base + CH_TORNADO_HEATING] = bgTornadoHeating * tornadoLayerWeight;
+                    forcingBuffer[base + CH_TORNADO_MOISTENING] = bgTornadoMoistening * tornadoLayerWeight;
+                    forcingBuffer[base + CH_TORNADO_UPDRAFT] = bgTornadoUpdraft * tornadoLayerWeight;
                     cell.humidity[layer] = layerHumidity;
                 }
             }
@@ -683,6 +655,11 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] convectiveMoistening,
         float[] convectiveInflowX,
         float[] convectiveInflowZ,
+        float[] tornadoHeating,
+        float[] tornadoMoistening,
+        float[] tornadoWindX,
+        float[] tornadoWindZ,
+        float[] tornadoUpdraft,
         float[] instabilityProxy,
         float[] lowLevelShear,
         float[] moistureConvergence,
@@ -710,8 +687,8 @@ final class MesoscaleGrid implements AutoCloseable {
                         surfaceAmbientKelvin,
                         ambientAirTemperatureKelvin[stateIndex],
                         q,
-                        convectiveHeating[stateIndex],
-                        convectiveMoistening[stateIndex],
+                        convectiveHeating[stateIndex] + tornadoHeating[stateIndex],
+                        convectiveMoistening[stateIndex] + tornadoMoistening[stateIndex],
                         layer
                     );
                     instabilityProxy[stateIndex] = instability;
@@ -733,10 +710,10 @@ final class MesoscaleGrid implements AutoCloseable {
                         q,
                         Math.max(0.0f, convergence),
                         lowLevelShear[stateIndex],
-                        convectiveHeating[stateIndex],
-                        convectiveMoistening[stateIndex],
-                        convectiveInflowX[stateIndex],
-                        convectiveInflowZ[stateIndex],
+                        convectiveHeating[stateIndex] + tornadoHeating[stateIndex] + tornadoUpdraft[stateIndex] * 0.35f,
+                        convectiveMoistening[stateIndex] + tornadoMoistening[stateIndex],
+                        convectiveInflowX[stateIndex] + tornadoWindX[stateIndex],
+                        convectiveInflowZ[stateIndex] + tornadoWindZ[stateIndex],
                         layer,
                         layers,
                         horizontalScaleMeters
@@ -803,6 +780,110 @@ final class MesoscaleGrid implements AutoCloseable {
         }
         float value = forcingBuffer[base];
         return Float.isFinite(value) ? value : 0.0f;
+    }
+
+    private TornadoEnvironment sampleEnvironment(int centerX, int centerZ, int sampleRadius) {
+        int sampledStates = 0;
+        float meanInstability = 0.0f;
+        float maxInstability = 0.0f;
+        float meanShear = 0.0f;
+        float maxShear = 0.0f;
+        float meanHumidity = 0.0f;
+        float meanPositiveConvergence = 0.0f;
+        float maxPositiveConvergence = 0.0f;
+        float meanLift = 0.0f;
+        float maxLift = 0.0f;
+        float horizontalScaleMeters = Math.max(1.0f, cellSizeBlocks);
+        int sampledLayers = Math.max(1, Math.min(activeLayers, 3));
+        int gridWidth = radiusCells * 2 + 1;
+
+        for (int cx = centerX - sampleRadius; cx <= centerX + sampleRadius; cx++) {
+            for (int cz = centerZ - sampleRadius; cz <= centerZ + sampleRadius; cz++) {
+                CellColumnState column = cells.get(pack(cx, cz));
+                if (column == null || column.layerCount() <= 0) {
+                    continue;
+                }
+                float surfaceReferenceKelvin = column.surfaceTemperatureKelvin[0];
+                float deepGroundReferenceKelvin = column.deepGroundTemperatureKelvin[0];
+                float surfaceAmbientKelvin = column.ambientAirTemperatureKelvin[0];
+                float surfaceWindX = column.windX[0];
+                float surfaceWindZ = column.windZ[0];
+                for (int layer = 0; layer < sampledLayers; layer++) {
+                    float q = MathHelper.clamp(column.humidity[layer], 0.0f, 1.0f);
+                    float convectiveHeating = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_HEATING);
+                    float convectiveMoistening = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_MOISTENING);
+                    float convectiveInflowX = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_INFLOW_X);
+                    float convectiveInflowZ = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_INFLOW_Z);
+                    float tornadoHeating = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_HEATING);
+                    float tornadoMoistening = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_MOISTENING);
+                    float tornadoWindX = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_WIND_X);
+                    float tornadoWindZ = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_WIND_Z);
+                    float tornadoUpdraft = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_UPDRAFT);
+                    float instability = computeInstabilityProxy(
+                        surfaceReferenceKelvin,
+                        deepGroundReferenceKelvin,
+                        surfaceAmbientKelvin,
+                        column.ambientAirTemperatureKelvin[layer],
+                        q,
+                        convectiveHeating + tornadoHeating,
+                        convectiveMoistening + tornadoMoistening,
+                        layer
+                    );
+                    float du = column.windX[layer] - surfaceWindX;
+                    float dv = column.windZ[layer] - surfaceWindZ;
+                    float shear = MathHelper.sqrt(du * du + dv * dv);
+
+                    float leftFlux = humidityFluxX(cx - 1, cz, layer);
+                    float rightFlux = humidityFluxX(cx + 1, cz, layer);
+                    float southFlux = humidityFluxZ(cx, cz - 1, layer);
+                    float northFlux = humidityFluxZ(cx, cz + 1, layer);
+                    float convergence = -((rightFlux - leftFlux) / (2.0f * horizontalScaleMeters)
+                        + (northFlux - southFlux) / (2.0f * horizontalScaleMeters));
+                    float positiveConvergence = Math.max(0.0f, convergence);
+                    float lift = computeLiftProxy(
+                        instability,
+                        q,
+                        positiveConvergence,
+                        shear,
+                        convectiveHeating + tornadoHeating + tornadoUpdraft * 0.35f,
+                        convectiveMoistening + tornadoMoistening,
+                        convectiveInflowX + tornadoWindX,
+                        convectiveInflowZ + tornadoWindZ,
+                        layer,
+                        sampledLayers,
+                        horizontalScaleMeters
+                    );
+
+                    meanInstability += instability;
+                    maxInstability = Math.max(maxInstability, instability);
+                    meanShear += shear;
+                    maxShear = Math.max(maxShear, shear);
+                    meanHumidity += q;
+                    meanPositiveConvergence += positiveConvergence;
+                    maxPositiveConvergence = Math.max(maxPositiveConvergence, positiveConvergence);
+                    meanLift += lift;
+                    maxLift = Math.max(maxLift, lift);
+                    sampledStates++;
+                }
+            }
+        }
+
+        if (sampledStates <= 0) {
+            return TornadoEnvironment.EMPTY;
+        }
+        float inverseCount = 1.0f / sampledStates;
+        return new TornadoEnvironment(
+            meanInstability * inverseCount,
+            maxInstability,
+            meanShear * inverseCount,
+            maxShear,
+            meanHumidity * inverseCount,
+            meanPositiveConvergence * inverseCount,
+            maxPositiveConvergence,
+            meanLift * inverseCount,
+            maxLift,
+            sampledStates
+        );
     }
 
     private float relax(float current, float target, float deltaSeconds) {
@@ -879,6 +960,21 @@ final class MesoscaleGrid implements AutoCloseable {
         int sampledStateCount
     ) {
         private static final DiagnosticsSummary EMPTY = new DiagnosticsSummary(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0);
+    }
+
+    record TornadoEnvironment(
+        float meanInstabilityProxy,
+        float maxInstabilityProxy,
+        float meanLowLevelShear,
+        float maxLowLevelShear,
+        float meanHumidity,
+        float meanPositiveMoistureConvergence,
+        float maxPositiveMoistureConvergence,
+        float meanLiftProxy,
+        float maxLiftProxy,
+        int sampledStateCount
+    ) {
+        private static final TornadoEnvironment EMPTY = new TornadoEnvironment(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0);
     }
 
     private static final class CellColumnState {

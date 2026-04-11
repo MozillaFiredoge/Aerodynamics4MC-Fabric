@@ -124,6 +124,23 @@ constexpr float k_window_edge_stabilization_min_keep = 0.15f;
 constexpr int k_nested_boundary_layers = 3;
 constexpr float k_nested_boundary_min_keep = 0.25f;
 constexpr float k_runtime_temperature_scale_kelvin = 20.0f;
+constexpr int k_tornado_descriptor_floats = 17;
+constexpr int k_tornado_desc_center_x = 0;
+constexpr int k_tornado_desc_center_y = 1;
+constexpr int k_tornado_desc_center_z = 2;
+constexpr int k_tornado_desc_translation_x = 3;
+constexpr int k_tornado_desc_translation_z = 4;
+constexpr int k_tornado_desc_core_radius = 5;
+constexpr int k_tornado_desc_influence_radius = 6;
+constexpr int k_tornado_desc_tangential_lattice = 7;
+constexpr int k_tornado_desc_radial_lattice = 8;
+constexpr int k_tornado_desc_updraft_lattice = 9;
+constexpr int k_tornado_desc_condensation_bias = 10;
+constexpr int k_tornado_desc_intensity = 11;
+constexpr int k_tornado_desc_rotation_sign = 12;
+constexpr int k_tornado_desc_state_ordinal = 13;
+constexpr int k_tornado_desc_lifecycle_envelope = 14;
+constexpr float k_tornado_lattice_speed_cap = 0.24f;
 constexpr float k_cell_face_area_square_meters = 1.0f;
 constexpr float k_cell_volume_cubic_meters = 1.0f;
 constexpr float k_air_density_kg_per_cubic_meter = 1.225f;
@@ -694,6 +711,114 @@ void apply_nested_boundary_fields(
     }
 }
 
+void apply_tornado_vortex_descriptors(
+    std::vector<float>& packet,
+    int nx,
+    int ny,
+    int nz,
+    int tornado_descriptor_count,
+    const float* tornado_descriptors
+) {
+    if (packet.empty() || nx <= 0 || ny <= 0 || nz <= 0 || tornado_descriptor_count <= 0 || !tornado_descriptors) {
+        return;
+    }
+    for (int descriptor_index = 0; descriptor_index < tornado_descriptor_count; ++descriptor_index) {
+        const float* descriptor = tornado_descriptors + descriptor_index * k_tornado_descriptor_floats;
+        const float center_x = descriptor[k_tornado_desc_center_x];
+        const float center_y = descriptor[k_tornado_desc_center_y];
+        const float center_z = descriptor[k_tornado_desc_center_z];
+        const float core_radius = std::max(1.0f, descriptor[k_tornado_desc_core_radius]);
+        const float influence_radius = std::max(core_radius, descriptor[k_tornado_desc_influence_radius]);
+        const float tangential_lattice = descriptor[k_tornado_desc_tangential_lattice];
+        const float radial_lattice = descriptor[k_tornado_desc_radial_lattice];
+        const float updraft_lattice = descriptor[k_tornado_desc_updraft_lattice];
+        const float condensation_bias = descriptor[k_tornado_desc_condensation_bias];
+        const float intensity = std::max(0.0f, descriptor[k_tornado_desc_intensity]);
+        const float rotation_sign = descriptor[k_tornado_desc_rotation_sign] >= 0.0f ? 1.0f : -1.0f;
+        const float lifecycle_envelope = std::clamp(descriptor[k_tornado_desc_lifecycle_envelope], 0.0f, 1.0f);
+        const float effective_intensity = intensity * lifecycle_envelope;
+        if (effective_intensity <= 1.0e-4f) {
+            continue;
+        }
+
+        const int min_x = std::max(0, static_cast<int>(std::floor(center_x - influence_radius - 1.0f)));
+        const int max_x = std::min(nx - 1, static_cast<int>(std::ceil(center_x + influence_radius + 1.0f)));
+        const int min_z = std::max(0, static_cast<int>(std::floor(center_z - influence_radius - 1.0f)));
+        const int max_z = std::min(nz - 1, static_cast<int>(std::ceil(center_z + influence_radius + 1.0f)));
+        const int min_y = std::max(0, static_cast<int>(std::floor(center_y - core_radius * 0.75f - 1.0f)));
+        const int max_y = std::min(ny - 1, static_cast<int>(std::ceil(center_y + influence_radius * 1.25f + 1.0f)));
+
+        for (int x = min_x; x <= max_x; ++x) {
+            for (int y = min_y; y <= max_y; ++y) {
+                for (int z = min_z; z <= max_z; ++z) {
+                    const int cell = grid_cell_index(ny, nz, x, y, z);
+                    const size_t base = static_cast<size_t>(cell) * k_packet_channels;
+                    if (packet[base + k_channel_obstacle] > 0.5f) {
+                        continue;
+                    }
+                    const float px = static_cast<float>(x) + 0.5f;
+                    const float py = static_cast<float>(y) + 0.5f;
+                    const float pz = static_cast<float>(z) + 0.5f;
+                    const float dx = px - center_x;
+                    const float dy = py - center_y;
+                    const float dz = pz - center_z;
+                    const float horizontal_distance_sq = dx * dx + dz * dz;
+                    if (horizontal_distance_sq >= influence_radius * influence_radius) {
+                        continue;
+                    }
+
+                    const float horizontal_distance = std::max(1.0e-3f, std::sqrt(horizontal_distance_sq));
+                    const float outer_norm = horizontal_distance / std::max(1.0f, influence_radius);
+                    const float core_norm = horizontal_distance / std::max(1.0f, core_radius);
+                    const float outer_envelope = std::exp(-outer_norm * outer_norm * 1.2f);
+                    const float core_envelope = std::exp(-core_norm * core_norm * 2.2f);
+                    const float above_envelope = dy <= 0.0f
+                        ? 1.0f
+                        : std::exp(-(dy / std::max(1.0f, influence_radius * 0.80f)) * (dy / std::max(1.0f, influence_radius * 0.80f)));
+                    const float below_envelope = dy >= 0.0f
+                        ? 1.0f
+                        : std::exp(-(dy / std::max(1.0f, core_radius * 0.75f)) * (dy / std::max(1.0f, core_radius * 0.75f)));
+                    const float vertical_envelope = above_envelope * below_envelope;
+                    const float envelope = effective_intensity * vertical_envelope;
+                    if (envelope <= 1.0e-4f) {
+                        continue;
+                    }
+
+                    const float tangent_x = (-dz / horizontal_distance) * rotation_sign;
+                    const float tangent_z = (dx / horizontal_distance) * rotation_sign;
+                    const float radial_x = -dx / horizontal_distance;
+                    const float radial_z = -dz / horizontal_distance;
+                    const float swirl = tangential_lattice * envelope * (0.30f * outer_envelope + 1.10f * core_envelope);
+                    const float inflow = radial_lattice * envelope * (0.55f * outer_envelope + 0.35f * core_envelope);
+                    const float updraft = updraft_lattice * envelope * (0.30f * outer_envelope + 0.90f * core_envelope);
+                    const float heating = 0.0012f * condensation_bias * envelope * (0.20f * outer_envelope + 0.65f * core_envelope);
+
+                    packet[base + k_channel_state_vx] = std::clamp(
+                        packet[base + k_channel_state_vx] + tangent_x * swirl + radial_x * inflow,
+                        -k_tornado_lattice_speed_cap,
+                        k_tornado_lattice_speed_cap
+                    );
+                    packet[base + k_channel_state_vy] = std::clamp(
+                        packet[base + k_channel_state_vy] + updraft,
+                        -k_tornado_lattice_speed_cap,
+                        k_tornado_lattice_speed_cap
+                    );
+                    packet[base + k_channel_state_vz] = std::clamp(
+                        packet[base + k_channel_state_vz] + tangent_z * swirl + radial_z * inflow,
+                        -k_tornado_lattice_speed_cap,
+                        k_tornado_lattice_speed_cap
+                    );
+                    packet[base + k_channel_thermal_source] = std::clamp(
+                        packet[base + k_channel_thermal_source] + heating,
+                        -k_native_thermal_source_max,
+                        k_native_thermal_source_max
+                    );
+                }
+            }
+        }
+    }
+}
+
 bool build_region_packet_from_template(
     const RegionPacketTemplateData& packet_template,
     const DynamicRegionData& dynamic,
@@ -710,6 +835,8 @@ bool build_region_packet_from_template(
     const float* boundary_wind_face_y,
     const float* boundary_wind_face_z,
     const float* boundary_air_temperature_k,
+    int tornado_descriptor_count,
+    const float* tornado_descriptors,
     std::vector<float>& packet
 ) {
     if (packet_template.nx != nx || packet_template.ny != ny || packet_template.nz != nz
@@ -736,6 +863,7 @@ bool build_region_packet_from_template(
         packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
     }
     apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
+    apply_tornado_vortex_descriptors(packet, nx, ny, nz, tornado_descriptor_count, tornado_descriptors);
     return true;
 }
 
@@ -1434,6 +1562,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     const float* boundary_wind_face_y,
     const float* boundary_wind_face_z,
     const float* boundary_air_temperature_k,
+    int tornado_descriptor_count,
+    const float* tornado_descriptors,
     float* out_max_speed
 ) {
     int cells = 0;
@@ -1496,6 +1626,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         boundary_wind_face_y,
         boundary_wind_face_z,
         boundary_air_temperature_k,
+        tornado_descriptor_count,
+        tornado_descriptors,
         packet
     )) {
         return 0;
@@ -2526,6 +2658,8 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     jfloatArray boundary_wind_face_y,
     jfloatArray boundary_wind_face_z,
     jfloatArray boundary_air_temperature_k,
+    jint tornado_descriptor_count,
+    jfloatArray tornado_descriptors,
     jfloatArray out_max_speed
 ) {
     if (!out_max_speed || env->GetArrayLength(out_max_speed) != 1) {
@@ -2545,6 +2679,12 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
             || env->GetArrayLength(boundary_air_temperature_k) != static_cast<jsize>(face_cells))) {
         return JNI_FALSE;
     }
+    if (tornado_descriptor_count < 0
+        || (tornado_descriptor_count > 0
+            && (!tornado_descriptors
+                || env->GetArrayLength(tornado_descriptors) != static_cast<jsize>(tornado_descriptor_count * k_tornado_descriptor_floats)))) {
+        return JNI_FALSE;
+    }
     jboolean copy = JNI_FALSE;
     jfloat* max_speed_ptr = env->GetFloatArrayElements(out_max_speed, &copy);
     if (!max_speed_ptr) {
@@ -2554,11 +2694,14 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     jboolean face_y_copy = JNI_FALSE;
     jboolean face_z_copy = JNI_FALSE;
     jboolean face_temp_copy = JNI_FALSE;
+    jboolean tornado_copy = JNI_FALSE;
     jfloat* face_x_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_x, &face_x_copy) : nullptr;
     jfloat* face_y_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_y, &face_y_copy) : nullptr;
     jfloat* face_z_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_z, &face_z_copy) : nullptr;
     jfloat* face_temp_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_air_temperature_k, &face_temp_copy) : nullptr;
-    if (face_cells > 0 && (!face_x_ptr || !face_y_ptr || !face_z_ptr || !face_temp_ptr)) {
+    jfloat* tornado_ptr = tornado_descriptor_count > 0 ? env->GetFloatArrayElements(tornado_descriptors, &tornado_copy) : nullptr;
+    if ((face_cells > 0 && (!face_x_ptr || !face_y_ptr || !face_z_ptr || !face_temp_ptr))
+        || (tornado_descriptor_count > 0 && !tornado_ptr)) {
         if (face_x_ptr) {
             env->ReleaseFloatArrayElements(boundary_wind_face_x, face_x_ptr, JNI_ABORT);
         }
@@ -2570,6 +2713,9 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         }
         if (face_temp_ptr) {
             env->ReleaseFloatArrayElements(boundary_air_temperature_k, face_temp_ptr, JNI_ABORT);
+        }
+        if (tornado_ptr) {
+            env->ReleaseFloatArrayElements(tornado_descriptors, tornado_ptr, JNI_ABORT);
         }
         env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, JNI_ABORT);
         return JNI_FALSE;
@@ -2590,6 +2736,8 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         face_y_ptr,
         face_z_ptr,
         face_temp_ptr,
+        tornado_descriptor_count,
+        tornado_ptr,
         max_speed_ptr
     );
     if (face_x_ptr) {
@@ -2603,6 +2751,9 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     }
     if (face_temp_ptr) {
         env->ReleaseFloatArrayElements(boundary_air_temperature_k, face_temp_ptr, JNI_ABORT);
+    }
+    if (tornado_ptr) {
+        env->ReleaseFloatArrayElements(tornado_descriptors, tornado_ptr, JNI_ABORT);
     }
     env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;

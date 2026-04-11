@@ -17,7 +17,7 @@ enum {
     AERO_LBM_BENCHMARK_ABI_VERSION = 1,
     AERO_LBM_MESOSCALE_ABI_VERSION = 1,
     AERO_LBM_SIMULATION_ABI_VERSION = 1,
-    AERO_LBM_MESOSCALE_FORCING_CHANNELS = 14,
+    AERO_LBM_MESOSCALE_FORCING_CHANNELS = 19,
     AERO_LBM_MESOSCALE_STATE_CHANNELS = 5,
     AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS = 4,
     AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS = 4,
@@ -317,6 +317,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     const float* boundary_wind_face_y,
     const float* boundary_wind_face_z,
     const float* boundary_air_temperature_k,
+    int tornado_descriptor_count,
+    const float* tornado_descriptors,
     float* out_max_speed
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(

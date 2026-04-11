@@ -6,6 +6,7 @@ public final class NativeSimulationBridge {
     public static final int FLOW_STATE_CHANNELS = 4;
     public static final int PACKED_ATLAS_CHANNELS = 4;
     public static final int PLAYER_PROBE_CHANNELS = 6;
+    public static final int TORNADO_DESCRIPTOR_FLOATS = 17;
     private static final int FACE_COUNT = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
@@ -357,7 +358,9 @@ public final class NativeSimulationBridge {
         float[] boundaryWindFaceX,
         float[] boundaryWindFaceY,
         float[] boundaryWindFaceZ,
-        float[] boundaryAirTemperatureKelvin
+        float[] boundaryAirTemperatureKelvin,
+        int tornadoDescriptorCount,
+        float[] tornadoDescriptors
     ) {
         if (!LOADED || serviceKey == 0L || regionKey == 0L) {
             return Float.NaN;
@@ -372,6 +375,12 @@ public final class NativeSimulationBridge {
                 || boundaryWindFaceY.length != faceCells
                 || boundaryWindFaceZ.length != faceCells
                 || boundaryAirTemperatureKelvin.length != faceCells)) {
+            return Float.NaN;
+        }
+        if (tornadoDescriptorCount < 0
+            || (tornadoDescriptorCount > 0
+                && (tornadoDescriptors == null
+                    || tornadoDescriptors.length != tornadoDescriptorCount * TORNADO_DESCRIPTOR_FLOATS))) {
             return Float.NaN;
         }
         float[] outMaxSpeed = new float[1];
@@ -391,6 +400,8 @@ public final class NativeSimulationBridge {
             boundaryWindFaceY,
             boundaryWindFaceZ,
             boundaryAirTemperatureKelvin,
+            tornadoDescriptorCount,
+            tornadoDescriptors,
             outMaxSpeed
         ) ? outMaxSpeed[0] : Float.NaN;
     }
@@ -751,6 +762,8 @@ public final class NativeSimulationBridge {
         float[] boundaryWindFaceY,
         float[] boundaryWindFaceZ,
         float[] boundaryAirTemperatureKelvin,
+        int tornadoDescriptorCount,
+        float[] tornadoDescriptors,
         float[] outMaxSpeed
     );
 

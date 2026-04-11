@@ -736,6 +736,36 @@ public final class AeroServerRuntime {
                 }
                 builder.append('\n');
             }
+            builder.append("    ],\n");
+            builder.append("    \"tornado_vortices\": [\n");
+            List<WorldScaleDriver.TornadoVortexSnapshot> tornadoVortices = driver.tornadoVortices();
+            for (int i = 0; i < tornadoVortices.size(); i++) {
+                WorldScaleDriver.TornadoVortexSnapshot vortex = tornadoVortices.get(i);
+                builder.append("      {\n");
+                appendJsonField(builder, "id", vortex.id(), true, 8);
+                appendJsonField(builder, "parent_convective_cluster_id", vortex.parentConvectiveClusterId(), true, 8);
+                appendJsonField(builder, "age_seconds", vortex.ageSeconds(), true, 8);
+                appendJsonField(builder, "lifetime_seconds", vortex.lifetimeSeconds(), true, 8);
+                appendJsonField(builder, "state_ordinal", vortex.stateOrdinal(), true, 8);
+                appendJsonField(builder, "center_block_x", vortex.centerBlockX(), true, 8);
+                appendJsonField(builder, "center_block_z", vortex.centerBlockZ(), true, 8);
+                appendJsonField(builder, "base_y", vortex.baseY(), true, 8);
+                appendJsonField(builder, "translation_x_blocks_per_second", vortex.translationXBlocksPerSecond(), true, 8);
+                appendJsonField(builder, "translation_z_blocks_per_second", vortex.translationZBlocksPerSecond(), true, 8);
+                appendJsonField(builder, "core_radius_blocks", vortex.coreRadiusBlocks(), true, 8);
+                appendJsonField(builder, "influence_radius_blocks", vortex.influenceRadiusBlocks(), true, 8);
+                appendJsonField(builder, "tangential_wind_scale_mps", vortex.tangentialWindScaleMps(), true, 8);
+                appendJsonField(builder, "radial_inflow_scale_mps", vortex.radialInflowScaleMps(), true, 8);
+                appendJsonField(builder, "updraft_scale", vortex.updraftScale(), true, 8);
+                appendJsonField(builder, "condensation_bias", vortex.condensationBias(), true, 8);
+                appendJsonField(builder, "intensity", vortex.intensity(), true, 8);
+                appendJsonField(builder, "rotation_sign", vortex.rotationSign(), false, 8);
+                builder.append("      }");
+                if (i + 1 < tornadoVortices.size()) {
+                    builder.append(',');
+                }
+                builder.append('\n');
+            }
             builder.append("    ]\n");
             builder.append("  },\n");
         }
@@ -1217,7 +1247,9 @@ public final class AeroServerRuntime {
                 request.environmentSnapshot(),
                 batch.tickCounter(),
                 SOLVER_STEP_SECONDS,
-                diagnosticsSummary
+                diagnosticsSummary,
+                existingMesoscale,
+                request.focus()
             );
             BackgroundMetGrid grid = backgroundMetGrids.computeIfAbsent(
                 worldKey,
@@ -2554,7 +2586,8 @@ public final class AeroServerRuntime {
             speedCap,
             generation,
             boundarySample,
-            sampleNestedBoundaryFieldAtWindow(key, activeKeys, boundarySample)
+            sampleNestedBoundaryFieldAtWindow(key, activeKeys, boundarySample),
+            collectTornadoRegionDescriptors(key)
         );
     }
 
@@ -2624,6 +2657,74 @@ public final class AeroServerRuntime {
             fillHorizontalBoundaryFace(key.worldKey(), Direction.UP.ordinal(), minX, maxX, minZ, maxZ, maxY - 0.5, res, windX, windY, windZ, airTemperature, minY, maxY, fallback);
         }
         return new BoundaryFieldData(res, externalFaceMask, windX, windY, windZ, airTemperature);
+    }
+
+    private List<TornadoRegionDescriptor> collectTornadoRegionDescriptors(WindowKey key) {
+        WorldScaleDriver driver = worldScaleDrivers.get(key.worldKey());
+        if (driver == null) {
+            return List.of();
+        }
+        WorldScaleDriver.Snapshot snapshot = driver.snapshot();
+        if (snapshot.tornadoVortices().isEmpty()) {
+            return List.of();
+        }
+        BlockPos origin = key.origin();
+        double minX = origin.getX();
+        double minZ = origin.getZ();
+        double maxX = minX + GRID_SIZE;
+        double maxZ = minZ + GRID_SIZE;
+        List<TornadoRegionDescriptor> descriptors = new ArrayList<>();
+        for (WorldScaleDriver.TornadoVortexSnapshot vortex : snapshot.tornadoVortices()) {
+            if (!intersectsRegionHorizontally(vortex, minX, minZ, maxX, maxZ)) {
+                continue;
+            }
+            descriptors.add(new TornadoRegionDescriptor(
+                vortex.id(),
+                vortex.parentConvectiveClusterId(),
+                vortex.centerBlockX() - origin.getX(),
+                vortex.baseY() - origin.getY(),
+                vortex.centerBlockZ() - origin.getZ(),
+                vortex.translationXBlocksPerSecond(),
+                vortex.translationZBlocksPerSecond(),
+                vortex.coreRadiusBlocks(),
+                vortex.influenceRadiusBlocks(),
+                vortex.tangentialWindScaleMps(),
+                vortex.radialInflowScaleMps(),
+                vortex.updraftScale(),
+                vortex.condensationBias(),
+                vortex.intensity(),
+                vortex.rotationSign(),
+                vortex.stateOrdinal(),
+                tornadoLifecycleEnvelope(vortex)
+            ));
+        }
+        return descriptors.isEmpty() ? List.of() : List.copyOf(descriptors);
+    }
+
+    private boolean intersectsRegionHorizontally(
+        WorldScaleDriver.TornadoVortexSnapshot vortex,
+        double minX,
+        double minZ,
+        double maxX,
+        double maxZ
+    ) {
+        double closestX = MathHelper.clamp(vortex.centerBlockX(), minX, maxX);
+        double closestZ = MathHelper.clamp(vortex.centerBlockZ(), minZ, maxZ);
+        double dx = vortex.centerBlockX() - closestX;
+        double dz = vortex.centerBlockZ() - closestZ;
+        double radius = Math.max(vortex.influenceRadiusBlocks(), vortex.coreRadiusBlocks());
+        return dx * dx + dz * dz <= radius * radius;
+    }
+
+    private float tornadoLifecycleEnvelope(WorldScaleDriver.TornadoVortexSnapshot vortex) {
+        float lifetime = Math.max(1.0f, vortex.lifetimeSeconds());
+        float progress = MathHelper.clamp(vortex.ageSeconds() / lifetime, 0.0f, 1.0f);
+        return switch (vortex.stateOrdinal()) {
+            case 0 -> MathHelper.clamp(progress / 0.25f, 0.0f, 1.0f);
+            case 1 -> 1.0f;
+            case 2 -> MathHelper.clamp((1.0f - progress) / 0.25f, 0.0f, 1.0f);
+            default -> 0.0f;
+        };
     }
 
     private int computeExternalFaceMask(WindowKey key, Set<WindowKey> activeKeys) {
@@ -3120,6 +3221,7 @@ public final class AeroServerRuntime {
         if (!ensureSimulationL2Runtime()) {
             throw new IOException("Native backend initialization failed");
         }
+        float[] tornadoDescriptors = flattenTornadoDescriptors(snapshot.tornadoDescriptors());
         float maxSpeed = simulationBridge.stepRegionStored(
             simulationServiceId,
             simulationRegionKey(snapshot.key()),
@@ -3135,7 +3237,9 @@ public final class AeroServerRuntime {
             snapshot.boundaryField() == null ? null : snapshot.boundaryField().windX(),
             snapshot.boundaryField() == null ? null : snapshot.boundaryField().windY(),
             snapshot.boundaryField() == null ? null : snapshot.boundaryField().windZ(),
-            snapshot.boundaryField() == null ? null : snapshot.boundaryField().airTemperatureKelvin()
+            snapshot.boundaryField() == null ? null : snapshot.boundaryField().airTemperatureKelvin(),
+            snapshot.tornadoDescriptors().size(),
+            tornadoDescriptors
         );
         if (!Float.isFinite(maxSpeed)) {
             String nativeError = simulationBridge.lastError();
@@ -3154,6 +3258,35 @@ public final class AeroServerRuntime {
             throw new IOException(message.toString());
         }
         return maxSpeed * NATIVE_VELOCITY_SCALE;
+    }
+
+    private float[] flattenTornadoDescriptors(List<TornadoRegionDescriptor> descriptors) {
+        if (descriptors == null || descriptors.isEmpty()) {
+            return null;
+        }
+        float[] flat = new float[descriptors.size() * NativeSimulationBridge.TORNADO_DESCRIPTOR_FLOATS];
+        int base = 0;
+        for (TornadoRegionDescriptor descriptor : descriptors) {
+            flat[base] = descriptor.centerXBlocks();
+            flat[base + 1] = descriptor.centerYBlocks();
+            flat[base + 2] = descriptor.centerZBlocks();
+            flat[base + 3] = descriptor.translationXBlocksPerSecond();
+            flat[base + 4] = descriptor.translationZBlocksPerSecond();
+            flat[base + 5] = descriptor.coreRadiusBlocks();
+            flat[base + 6] = descriptor.influenceRadiusBlocks();
+            flat[base + 7] = descriptor.tangentialWindScaleMps() / NATIVE_VELOCITY_SCALE;
+            flat[base + 8] = descriptor.radialInflowScaleMps() / NATIVE_VELOCITY_SCALE;
+            flat[base + 9] = descriptor.updraftScale() / NATIVE_VELOCITY_SCALE;
+            flat[base + 10] = descriptor.condensationBias();
+            flat[base + 11] = descriptor.intensity();
+            flat[base + 12] = descriptor.rotationSign();
+            flat[base + 13] = descriptor.stateOrdinal();
+            flat[base + 14] = descriptor.lifecycleEnvelope();
+            flat[base + 15] = descriptor.id();
+            flat[base + 16] = descriptor.parentConvectiveClusterId();
+            base += NativeSimulationBridge.TORNADO_DESCRIPTOR_FLOATS;
+        }
+        return flat;
     }
 
     private int sanitizeStride(int requested) {
@@ -3829,7 +3962,29 @@ public final class AeroServerRuntime {
         float speedCap,
         long generation,
         NestedBoundaryCoupler.BoundarySample boundarySample,
-        BoundaryFieldData boundaryField
+        BoundaryFieldData boundaryField,
+        List<TornadoRegionDescriptor> tornadoDescriptors
+    ) {
+    }
+
+    private record TornadoRegionDescriptor(
+        int id,
+        int parentConvectiveClusterId,
+        float centerXBlocks,
+        float centerYBlocks,
+        float centerZBlocks,
+        float translationXBlocksPerSecond,
+        float translationZBlocksPerSecond,
+        float coreRadiusBlocks,
+        float influenceRadiusBlocks,
+        float tangentialWindScaleMps,
+        float radialInflowScaleMps,
+        float updraftScale,
+        float condensationBias,
+        float intensity,
+        float rotationSign,
+        int stateOrdinal,
+        float lifecycleEnvelope
     ) {
     }
 

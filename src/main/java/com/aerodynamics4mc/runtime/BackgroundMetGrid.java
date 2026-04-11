@@ -137,6 +137,11 @@ final class BackgroundMetGrid {
             state.convectiveInflowX,
             state.convectiveInflowZ,
             state.convectiveEnvelope,
+            state.tornadoWindX,
+            state.tornadoWindZ,
+            state.tornadoHeatingKelvin,
+            state.tornadoMoistening,
+            state.tornadoUpdraftProxy,
             state.surfaceClass
         );
     }
@@ -371,6 +376,11 @@ final class BackgroundMetGrid {
                 cell.convectiveInflowX = target.convectiveInflowX;
                 cell.convectiveInflowZ = target.convectiveInflowZ;
                 cell.convectiveEnvelope = target.convectiveEnvelope;
+                cell.tornadoWindX = target.tornadoWindX;
+                cell.tornadoWindZ = target.tornadoWindZ;
+                cell.tornadoHeatingKelvin = target.tornadoHeatingKelvin;
+                cell.tornadoMoistening = target.tornadoMoistening;
+                cell.tornadoUpdraftProxy = target.tornadoUpdraftProxy;
                 cell.lastUpdatedTick = currentRefreshTick;
             }
         }
@@ -403,6 +413,11 @@ final class BackgroundMetGrid {
         cell.convectiveInflowX = target.convectiveInflowX;
         cell.convectiveInflowZ = target.convectiveInflowZ;
         cell.convectiveEnvelope = target.convectiveEnvelope;
+        cell.tornadoWindX = target.tornadoWindX;
+        cell.tornadoWindZ = target.tornadoWindZ;
+        cell.tornadoHeatingKelvin = target.tornadoHeatingKelvin;
+        cell.tornadoMoistening = target.tornadoMoistening;
+        cell.tornadoUpdraftProxy = target.tornadoUpdraftProxy;
     }
 
     private StateSample sampleNeighborMean(Map<Long, StateSample> previous, int cellX, int cellZ) {
@@ -497,7 +512,12 @@ final class BackgroundMetGrid {
             driverSample == null ? 0.0f : driverSample.convectiveMoistening(),
             driverSample == null ? 0.0f : driverSample.convectiveInflowX(),
             driverSample == null ? 0.0f : driverSample.convectiveInflowZ(),
-            driverSample == null ? 0.0f : driverSample.convectiveEnvelope()
+            driverSample == null ? 0.0f : driverSample.convectiveEnvelope(),
+            driverSample == null ? 0.0f : driverSample.tornadoWindX(),
+            driverSample == null ? 0.0f : driverSample.tornadoWindZ(),
+            driverSample == null ? 0.0f : driverSample.tornadoHeatingKelvin(),
+            driverSample == null ? 0.0f : driverSample.tornadoMoistening(),
+            driverSample == null ? 0.0f : driverSample.tornadoUpdraftProxy()
         );
     }
 
@@ -557,6 +577,11 @@ final class BackgroundMetGrid {
         float convectiveInflowX,
         float convectiveInflowZ,
         float convectiveEnvelope,
+        float tornadoWindX,
+        float tornadoWindZ,
+        float tornadoHeatingKelvin,
+        float tornadoMoistening,
+        float tornadoUpdraftProxy,
         byte surfaceClass
     ) {
     }
@@ -605,6 +630,11 @@ final class BackgroundMetGrid {
         private float convectiveInflowX;
         private float convectiveInflowZ;
         private float convectiveEnvelope;
+        private float tornadoWindX;
+        private float tornadoWindZ;
+        private float tornadoHeatingKelvin;
+        private float tornadoMoistening;
+        private float tornadoUpdraftProxy;
         private byte surfaceClass;
         private long lastUpdatedTick = Long.MIN_VALUE;
     }
@@ -626,7 +656,12 @@ final class BackgroundMetGrid {
         float convectiveMoistening,
         float convectiveInflowX,
         float convectiveInflowZ,
-        float convectiveEnvelope
+        float convectiveEnvelope,
+        float tornadoWindX,
+        float tornadoWindZ,
+        float tornadoHeatingKelvin,
+        float tornadoMoistening,
+        float tornadoUpdraftProxy
     ) {
     }
 }

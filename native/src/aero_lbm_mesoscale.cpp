@@ -122,6 +122,11 @@ constexpr int kChConvectiveHeating = 10;
 constexpr int kChConvectiveMoistening = 11;
 constexpr int kChConvectiveInflowX = 12;
 constexpr int kChConvectiveInflowZ = 13;
+constexpr int kChTornadoWindX = 14;
+constexpr int kChTornadoWindZ = 15;
+constexpr int kChTornadoHeating = 16;
+constexpr int kChTornadoMoistening = 17;
+constexpr int kChTornadoUpdraft = 18;
 constexpr int kOutAmbient = 0;
 constexpr int kOutDeepGround = 1;
 constexpr int kOutSurface = 2;
@@ -369,9 +374,14 @@ CellTargets compute_cell_targets(
     const float convective_moistening = forcing[base + kChConvectiveMoistening];
     const float convective_inflow_x = forcing[base + kChConvectiveInflowX];
     const float convective_inflow_z = forcing[base + kChConvectiveInflowZ];
-    const float bg_wind_x = forcing[base + kChBackgroundWindX] + convective_inflow_x;
-    const float bg_wind_z = forcing[base + kChBackgroundWindZ] + convective_inflow_z;
-    const float humidity = std::clamp(forcing[base + kChHumidity] + convective_moistening, 0.0f, 1.0f);
+    const float tornado_wind_x = forcing[base + kChTornadoWindX];
+    const float tornado_wind_z = forcing[base + kChTornadoWindZ];
+    const float tornado_heating = forcing[base + kChTornadoHeating];
+    const float tornado_moistening = forcing[base + kChTornadoMoistening];
+    const float tornado_updraft = forcing[base + kChTornadoUpdraft];
+    const float bg_wind_x = forcing[base + kChBackgroundWindX] + convective_inflow_x + tornado_wind_x;
+    const float bg_wind_z = forcing[base + kChBackgroundWindZ] + convective_inflow_z + tornado_wind_z;
+    const float humidity = std::clamp(forcing[base + kChHumidity] + convective_moistening + tornado_moistening, 0.0f, 1.0f);
     const float slope_x = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 0);
     const float slope_z = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 1);
 
@@ -389,6 +399,7 @@ CellTargets compute_cell_targets(
         + surface_relax * humidity_surface_damping * (surface_target - ctx.surface[i])
         + 0.10f * (next_deep - ctx.surface[i])
         + 0.04f * convective_heating
+        + 0.08f * tornado_heating
         + 0.05f * surface_h_lap
         + 0.025f * surface_v_lap;
 
@@ -415,6 +426,8 @@ CellTargets compute_cell_targets(
         + (0.018f + 0.004f * humidity) * (next_surface - ambient)
         + 0.01f * (next_deep - ambient)
         + 0.08f * convective_heating * (0.5f + 0.5f * humidity)
+        + 0.10f * tornado_heating * (0.45f + 0.55f * humidity)
+        + 0.06f * tornado_updraft
         + 0.01f * ambient_h_lap
         + 0.02f * ambient_v_lap;
 
@@ -488,11 +501,15 @@ int mesoscale_cpu_step(
                 const int i = mesoscale_index(x, y, z, ny, nz);
                 const int base = i * kForcingChannels;
                 const float boundary_bg_x = clamp_lattice_speed(
-                    (forcing[base + kChBackgroundWindX] + forcing[base + kChConvectiveInflowX])
+                    (forcing[base + kChBackgroundWindX]
+                        + forcing[base + kChConvectiveInflowX]
+                        + forcing[base + kChTornadoWindX])
                         / std::max(1.0e-6f, transport.velocity_scale_m_s_per_lattice)
                 );
                 const float boundary_bg_z = clamp_lattice_speed(
-                    (forcing[base + kChBackgroundWindZ] + forcing[base + kChConvectiveInflowZ])
+                    (forcing[base + kChBackgroundWindZ]
+                        + forcing[base + kChConvectiveInflowZ]
+                        + forcing[base + kChTornadoWindZ])
                         / std::max(1.0e-6f, transport.velocity_scale_m_s_per_lattice)
                 );
                 const float boundary_temp = forcing[base + kChAmbientTarget];
@@ -725,9 +742,14 @@ inline void compute_cell_targets(
     float convective_moistening = forcing[base + 11];
     float convective_inflow_x = forcing[base + 12];
     float convective_inflow_z = forcing[base + 13];
-    float bg_wind_x = forcing[base + 6] + convective_inflow_x;
-    float bg_wind_z = forcing[base + 7] + convective_inflow_z;
-    float humidity = clamp(forcing[base + 9] + convective_moistening, 0.0f, 1.0f);
+    float tornado_wind_x = forcing[base + 14];
+    float tornado_wind_z = forcing[base + 15];
+    float tornado_heating = forcing[base + 16];
+    float tornado_moistening = forcing[base + 17];
+    float tornado_updraft = forcing[base + 18];
+    float bg_wind_x = forcing[base + 6] + convective_inflow_x + tornado_wind_x;
+    float bg_wind_z = forcing[base + 7] + convective_inflow_z + tornado_wind_z;
+    float humidity = clamp(forcing[base + 9] + convective_moistening + tornado_moistening, 0.0f, 1.0f);
     float slope_x = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 0);
     float slope_z = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 1);
 
@@ -750,6 +772,7 @@ inline void compute_cell_targets(
         + surface_relax * humidity_surface_damping * (surface_target - surface_in[cell])
         + 0.10f * (next_deep - surface_in[cell])
         + 0.04f * convective_heating
+        + 0.08f * tornado_heating
         + 0.05f * surface_h_lap
         + 0.025f * surface_v_lap;
 
@@ -768,6 +791,8 @@ inline void compute_cell_targets(
         + (0.018f + 0.004f * humidity) * (next_surface - ambient)
         + 0.01f * (next_deep - ambient)
         + 0.08f * convective_heating * (0.5f + 0.5f * humidity)
+        + 0.10f * tornado_heating * (0.45f + 0.55f * humidity)
+        + 0.06f * tornado_updraft
         + 0.01f * ambient_h_lap
         + 0.02f * ambient_v_lap;
 
@@ -826,8 +851,8 @@ __kernel void mesoscale_step(
     surface_out[gid] = next_surface_self;
 
     int base = gid * kForcingChannels;
-    float boundary_bg_x = clamp_lattice_speed((forcing[base + 6] + forcing[base + 12]) / fmax(1.0e-6f, velocity_scale));
-    float boundary_bg_z = clamp_lattice_speed((forcing[base + 7] + forcing[base + 13]) / fmax(1.0e-6f, velocity_scale));
+    float boundary_bg_x = clamp_lattice_speed((forcing[base + 6] + forcing[base + 12] + forcing[base + 14]) / fmax(1.0e-6f, velocity_scale));
+    float boundary_bg_z = clamp_lattice_speed((forcing[base + 7] + forcing[base + 13] + forcing[base + 15]) / fmax(1.0e-6f, velocity_scale));
     float boundary_temp = forcing[base + 2];
     int edge_distance = min(min(x, z), min(nx - 1 - x, nz - 1 - z));
     float edge_alpha = edge_distance <= 0 ? 1.0f : (edge_distance < 2 ? 0.5f : 0.0f);

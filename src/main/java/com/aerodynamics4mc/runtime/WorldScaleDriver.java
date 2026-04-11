@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Locale;
 
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 
 final class WorldScaleDriver {
@@ -45,10 +46,27 @@ final class WorldScaleDriver {
     private static final float CONVECTIVE_CLUSTER_LIFECYCLE_RADIANS_PER_SECOND = TAU / (24000.0f / 20.0f);
     private static final float CONVECTIVE_CLUSTER_MIN_EFFECTIVE_ENVELOPE = 0.03f;
     private static final float CONVECTIVE_CLUSTER_MIN_STORM_ACTIVITY = 0.12f;
+    private static final int MAX_ACTIVE_TORNADO_VORTICES = 2;
+    private static final float TORNADO_MIN_STORM_ACTIVITY = 0.35f;
+    private static final int TORNADO_ENVIRONMENT_RADIUS_CELLS = 1;
+    private static final float TORNADO_MIN_SUPPORT = 0.75f;
+    private static final float TORNADO_MIN_SEPARATION_BLOCKS = 320.0f;
+    private static final float TORNADO_MIN_LIFETIME_SECONDS = 45.0f;
+    private static final float TORNADO_MAX_LIFETIME_SECONDS = 140.0f;
+    private static final float TORNADO_MIN_CORE_RADIUS_BLOCKS = 10.0f;
+    private static final float TORNADO_MAX_CORE_RADIUS_BLOCKS = 24.0f;
+    private static final float TORNADO_MIN_INFLUENCE_RADIUS_BLOCKS = 48.0f;
+    private static final float TORNADO_MAX_INFLUENCE_RADIUS_BLOCKS = 128.0f;
+    private static final float TORNADO_MIN_TANGENTIAL_WIND_MPS = 18.0f;
+    private static final float TORNADO_MAX_TANGENTIAL_WIND_MPS = 42.0f;
+    private static final float TORNADO_MAX_RADIAL_INFLOW_SCALE = 0.35f;
+    private static final float TORNADO_MIN_CLUSTER_COOLDOWN_SECONDS = 80.0f;
+    private static final float TORNADO_MAX_CLUSTER_COOLDOWN_SECONDS = 180.0f;
 
     private final long worldSeed;
     private final List<CycloneCell> cycloneCells;
     private final List<ConvectiveCluster> convectiveClusters;
+    private final List<TornadoVortex> tornadoVortices;
     private long lastTickUpdated = Long.MIN_VALUE;
     private float driverTimeSeconds;
     private float baseFlowX;
@@ -61,6 +79,7 @@ final class WorldScaleDriver {
     private float mesoscaleConvectiveSupport;
     private float mesoscaleLiftSupport;
     private float mesoscaleShearSupport;
+    private int nextTornadoId;
 
     private WorldScaleDriver(
         long worldSeed,
@@ -73,7 +92,8 @@ final class WorldScaleDriver {
         float stormActivity,
         float seasonPhase,
         List<CycloneCell> cycloneCells,
-        List<ConvectiveCluster> convectiveClusters
+        List<ConvectiveCluster> convectiveClusters,
+        List<TornadoVortex> tornadoVortices
     ) {
         this.worldSeed = worldSeed;
         this.driverTimeSeconds = driverTimeSeconds;
@@ -86,6 +106,8 @@ final class WorldScaleDriver {
         this.seasonPhase = seasonPhase;
         this.cycloneCells = new ArrayList<>(cycloneCells);
         this.convectiveClusters = new ArrayList<>(convectiveClusters);
+        this.tornadoVortices = new ArrayList<>(tornadoVortices);
+        this.nextTornadoId = computeNextTornadoId(tornadoVortices);
     }
 
     static WorldScaleDriver loadOrCreate(Path path, ServerWorld world) {
@@ -129,7 +151,8 @@ final class WorldScaleDriver {
             stormActivity,
             seasonPhase,
             defaultCycloneCells,
-            createDefaultConvectiveClusters(worldSeed, defaultCycloneCells)
+            createDefaultConvectiveClusters(worldSeed, defaultCycloneCells),
+            List.of()
         );
     }
 
@@ -159,6 +182,7 @@ final class WorldScaleDriver {
                     case "planetary_wave_phase" -> driver.planetaryWavePhase = Float.parseFloat(value);
                     case "storm_activity" -> driver.stormActivity = Float.parseFloat(value);
                     case "season_phase" -> driver.seasonPhase = Float.parseFloat(value);
+                    case "next_tornado_id" -> driver.nextTornadoId = Math.max(1, Math.round(Float.parseFloat(value)));
                     default -> {
                     }
                 }
@@ -170,6 +194,8 @@ final class WorldScaleDriver {
         driver.cycloneCells.addAll(parseCycloneCells(worldSeed, lines));
         driver.convectiveClusters.clear();
         driver.convectiveClusters.addAll(parseConvectiveClusters(worldSeed, lines, driver.cycloneCells));
+        driver.tornadoVortices.clear();
+        driver.tornadoVortices.addAll(parseTornadoVortices(lines));
         driver.airmassMoistureBias = MathHelper.clamp(driver.airmassMoistureBias, 0.0f, 1.0f);
         driver.stormActivity = MathHelper.clamp(driver.stormActivity, 0.0f, 1.0f);
         driver.seasonPhase = wrap01(driver.seasonPhase);
@@ -191,6 +217,7 @@ final class WorldScaleDriver {
         appendProperty(builder, "planetary_wave_phase", planetaryWavePhase);
         appendProperty(builder, "storm_activity", stormActivity);
         appendProperty(builder, "season_phase", seasonPhase);
+        appendProperty(builder, "next_tornado_id", nextTornadoId);
         builder.append("cyclone_cell_count=").append(cycloneCells.size()).append('\n');
         for (int i = 0; i < cycloneCells.size(); i++) {
             CycloneCell cell = cycloneCells.get(i);
@@ -219,6 +246,28 @@ final class WorldScaleDriver {
             appendProperty(builder, "convective_cluster_" + i + "_moisture_bias", cluster.moistureBias);
             appendProperty(builder, "convective_cluster_" + i + "_convergence_mps", cluster.convergenceMps);
         }
+        builder.append("tornado_vortex_count=").append(tornadoVortices.size()).append('\n');
+        for (int i = 0; i < tornadoVortices.size(); i++) {
+            TornadoVortex vortex = tornadoVortices.get(i);
+            appendProperty(builder, "tornado_vortex_" + i + "_id", vortex.id);
+            appendProperty(builder, "tornado_vortex_" + i + "_parent_convective_cluster_id", vortex.parentConvectiveClusterId);
+            appendProperty(builder, "tornado_vortex_" + i + "_age_seconds", vortex.ageSeconds);
+            appendProperty(builder, "tornado_vortex_" + i + "_lifetime_seconds", vortex.lifetimeSeconds);
+            appendProperty(builder, "tornado_vortex_" + i + "_state_ordinal", vortex.stateOrdinal);
+            appendProperty(builder, "tornado_vortex_" + i + "_center_block_x", vortex.centerBlockX);
+            appendProperty(builder, "tornado_vortex_" + i + "_center_block_z", vortex.centerBlockZ);
+            appendProperty(builder, "tornado_vortex_" + i + "_base_y", vortex.baseY);
+            appendProperty(builder, "tornado_vortex_" + i + "_translation_x_blocks_per_second", vortex.translationXBlocksPerSecond);
+            appendProperty(builder, "tornado_vortex_" + i + "_translation_z_blocks_per_second", vortex.translationZBlocksPerSecond);
+            appendProperty(builder, "tornado_vortex_" + i + "_core_radius_blocks", vortex.coreRadiusBlocks);
+            appendProperty(builder, "tornado_vortex_" + i + "_influence_radius_blocks", vortex.influenceRadiusBlocks);
+            appendProperty(builder, "tornado_vortex_" + i + "_tangential_wind_scale_mps", vortex.tangentialWindScaleMps);
+            appendProperty(builder, "tornado_vortex_" + i + "_radial_inflow_scale_mps", vortex.radialInflowScaleMps);
+            appendProperty(builder, "tornado_vortex_" + i + "_updraft_scale", vortex.updraftScale);
+            appendProperty(builder, "tornado_vortex_" + i + "_condensation_bias", vortex.condensationBias);
+            appendProperty(builder, "tornado_vortex_" + i + "_intensity", vortex.intensity);
+            appendProperty(builder, "tornado_vortex_" + i + "_rotation_sign", vortex.rotationSign);
+        }
         Files.writeString(path, builder.toString(), StandardCharsets.UTF_8);
     }
 
@@ -227,7 +276,9 @@ final class WorldScaleDriver {
         AeroServerRuntime.WorldEnvironmentSnapshot environmentSnapshot,
         long tickCounter,
         float dtSeconds,
-        MesoscaleGrid.DiagnosticsSummary mesoscaleSummary
+        MesoscaleGrid.DiagnosticsSummary mesoscaleSummary,
+        MesoscaleGrid mesoscaleGrid,
+        BlockPos mesoscaleFocus
     ) {
         float elapsedSeconds = lastTickUpdated == Long.MIN_VALUE
             ? Math.max(1.0e-3f, dtSeconds)
@@ -318,6 +369,14 @@ final class WorldScaleDriver {
                 mesoscaleShearSupport
             );
         }
+        maybeSpawnTornadoVortices(world, mesoscaleGrid, mesoscaleFocus);
+        for (int i = tornadoVortices.size() - 1; i >= 0; i--) {
+            TornadoVortex vortex = tornadoVortices.get(i);
+            vortex.advance(elapsedSeconds);
+            if (vortex.isDissipated()) {
+                tornadoVortices.remove(i);
+            }
+        }
     }
 
     synchronized Sample sample(int cellX, int cellZ) {
@@ -336,6 +395,11 @@ final class WorldScaleDriver {
         float convectiveInflowX = 0.0f;
         float convectiveInflowZ = 0.0f;
         float convectiveEnvelope = 0.0f;
+        float tornadoWindX = 0.0f;
+        float tornadoWindZ = 0.0f;
+        float tornadoHeatingKelvin = 0.0f;
+        float tornadoMoistening = 0.0f;
+        float tornadoUpdraftProxy = 0.0f;
 
         for (CycloneCell cell : cycloneCells) {
             CycloneContribution contribution = cell.sample(cellX, cellZ, stormActivity);
@@ -356,6 +420,17 @@ final class WorldScaleDriver {
             convectiveInflowZ += contribution.inflowZ();
             convectiveEnvelope = Math.max(convectiveEnvelope, contribution.envelope());
         }
+        for (TornadoVortex vortex : tornadoVortices) {
+            TornadoContribution contribution = vortex.sample(cellX, cellZ);
+            targetWindX += contribution.windX();
+            targetWindZ += contribution.windZ();
+            humidity += contribution.moistening();
+            tornadoWindX += contribution.windX();
+            tornadoWindZ += contribution.windZ();
+            tornadoHeatingKelvin += contribution.heatingKelvin();
+            tornadoMoistening += contribution.moistening();
+            tornadoUpdraftProxy = Math.max(tornadoUpdraftProxy, contribution.updraftProxy());
+        }
 
         targetWindX = MathHelper.clamp(targetWindX, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
         targetWindZ = MathHelper.clamp(targetWindZ, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
@@ -370,7 +445,12 @@ final class WorldScaleDriver {
             convectiveMoistening,
             convectiveInflowX,
             convectiveInflowZ,
-            convectiveEnvelope
+            convectiveEnvelope,
+            tornadoWindX,
+            tornadoWindZ,
+            tornadoHeatingKelvin,
+            tornadoMoistening,
+            tornadoUpdraftProxy
         );
     }
 
@@ -382,6 +462,10 @@ final class WorldScaleDriver {
         List<ConvectiveClusterSnapshot> convectiveSystems = new ArrayList<>(convectiveClusters.size());
         for (ConvectiveCluster cluster : convectiveClusters) {
             convectiveSystems.add(cluster.snapshot());
+        }
+        List<TornadoVortexSnapshot> tornadoSystems = new ArrayList<>(tornadoVortices.size());
+        for (TornadoVortex vortex : tornadoVortices) {
+            tornadoSystems.add(vortex.snapshot());
         }
         return new Snapshot(
             driverTimeSeconds,
@@ -396,7 +480,8 @@ final class WorldScaleDriver {
             mesoscaleLiftSupport,
             mesoscaleShearSupport,
             List.copyOf(systems),
-            List.copyOf(convectiveSystems)
+            List.copyOf(convectiveSystems),
+            List.copyOf(tornadoSystems)
         );
     }
 
@@ -710,6 +795,250 @@ final class WorldScaleDriver {
         return clusters;
     }
 
+    private static List<TornadoVortex> parseTornadoVortices(List<String> lines) {
+        int count = 0;
+        for (String rawLine : lines) {
+            if (rawLine == null) {
+                continue;
+            }
+            String line = rawLine.trim();
+            int separator = line.indexOf('=');
+            if (separator <= 0 || separator == line.length() - 1) {
+                continue;
+            }
+            String key = line.substring(0, separator).trim();
+            if ("tornado_vortex_count".equals(key)) {
+                try {
+                    count = Math.max(0, Integer.parseInt(line.substring(separator + 1).trim()));
+                } catch (NumberFormatException ignored) {
+                    count = 0;
+                }
+                break;
+            }
+        }
+
+        List<TornadoVortex> vortices = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            vortices.add(TornadoVortex.defaultVortex());
+        }
+        if (count == 0) {
+            return vortices;
+        }
+
+        for (String rawLine : lines) {
+            if (rawLine == null) {
+                continue;
+            }
+            String line = rawLine.trim();
+            if (line.isEmpty() || line.startsWith("#")) {
+                continue;
+            }
+            int separator = line.indexOf('=');
+            if (separator <= 0 || separator == line.length() - 1) {
+                continue;
+            }
+            String key = line.substring(0, separator).trim();
+            if (!key.startsWith("tornado_vortex_")) {
+                continue;
+            }
+            String suffix = key.substring("tornado_vortex_".length());
+            int nextSeparator = suffix.indexOf('_');
+            if (nextSeparator <= 0 || nextSeparator == suffix.length() - 1) {
+                continue;
+            }
+            int index;
+            try {
+                index = Integer.parseInt(suffix.substring(0, nextSeparator));
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            if (index < 0 || index >= vortices.size()) {
+                continue;
+            }
+            String field = suffix.substring(nextSeparator + 1);
+            String value = line.substring(separator + 1).trim();
+            try {
+                vortices.get(index).set(field, Float.parseFloat(value));
+            } catch (NumberFormatException ignored) {
+                // Ignore malformed entries and keep defaults.
+            }
+        }
+        return vortices;
+    }
+
+    private void maybeSpawnTornadoVortices(ServerWorld world, MesoscaleGrid mesoscaleGrid, BlockPos mesoscaleFocus) {
+        if (mesoscaleGrid == null || mesoscaleFocus == null) {
+            return;
+        }
+        if (stormActivity < TORNADO_MIN_STORM_ACTIVITY || tornadoVortices.size() >= MAX_ACTIVE_TORNADO_VORTICES) {
+            return;
+        }
+        for (int i = 0; i < convectiveClusters.size(); i++) {
+            if (tornadoVortices.size() >= MAX_ACTIVE_TORNADO_VORTICES) {
+                return;
+            }
+            ConvectiveCluster cluster = convectiveClusters.get(i);
+            if (!cluster.supportsTornadoGenesis(stormActivity)) {
+                continue;
+            }
+            BlockPos clusterPos = clusterWorldPosition(cluster, mesoscaleFocus, world.getSeaLevel());
+            MesoscaleGrid.TornadoEnvironment environment = mesoscaleGrid.sampleTornadoEnvironment(
+                clusterPos,
+                TORNADO_ENVIRONMENT_RADIUS_CELLS
+            );
+            if (environment.sampledStateCount() <= 0) {
+                continue;
+            }
+            float tornadoSupport = computeTornadoSupport(cluster, environment);
+            if (tornadoSupport < TORNADO_MIN_SUPPORT) {
+                continue;
+            }
+            if (hasNearbyTornado(clusterPos.getX(), clusterPos.getZ(), TORNADO_MIN_SEPARATION_BLOCKS)) {
+                continue;
+            }
+            CycloneCell host = preferredCycloneHost(
+                cycloneCells,
+                i,
+                worldSeed,
+                Math.max(0, (int) Math.floor(driverTimeSeconds / (24000.0f / 20.0f)))
+            );
+            tornadoVortices.add(spawnTornadoVortex(i, cluster, host, clusterPos, environment, tornadoSupport));
+            cluster.tornadoCooldownSeconds = MathHelper.lerp(
+                MathHelper.clamp(tornadoSupport - TORNADO_MIN_SUPPORT, 0.0f, 1.0f),
+                TORNADO_MIN_CLUSTER_COOLDOWN_SECONDS,
+                TORNADO_MAX_CLUSTER_COOLDOWN_SECONDS
+            );
+        }
+    }
+
+    private TornadoVortex spawnTornadoVortex(
+        int clusterIndex,
+        ConvectiveCluster cluster,
+        CycloneCell host,
+        BlockPos clusterPos,
+        MesoscaleGrid.TornadoEnvironment environment,
+        float tornadoSupport
+    ) {
+        long salt = 0x6f31e7d49a52b8c3L + (long) nextTornadoId * 0x9e3779b97f4a7c15L;
+        float jitterRadiusBlocks = 24.0f + 48.0f * MathHelper.clamp(tornadoSupport - TORNADO_MIN_SUPPORT, 0.0f, 1.0f);
+        float jitterAngle = seededUnit(worldSeed, salt ^ 0x94d049bb133111ebL) * TAU;
+        float jitterRadius = seededUnit(worldSeed, salt ^ 0x2545f4914f6cdd1dL) * jitterRadiusBlocks;
+        float centerBlockX = clusterPos.getX() + MathHelper.cos(jitterAngle) * jitterRadius;
+        float centerBlockZ = clusterPos.getZ() + MathHelper.sin(jitterAngle) * jitterRadius;
+        float clusterDriftXBlocksPerSecond = cluster.driftCellsPerSecondX * DRIVER_CELL_SIZE_BLOCKS;
+        float clusterDriftZBlocksPerSecond = cluster.driftCellsPerSecondZ * DRIVER_CELL_SIZE_BLOCKS;
+        float lifetimeSeconds = MathHelper.lerp(
+            MathHelper.clamp((tornadoSupport - TORNADO_MIN_SUPPORT) / 0.7f, 0.0f, 1.0f),
+            TORNADO_MIN_LIFETIME_SECONDS,
+            TORNADO_MAX_LIFETIME_SECONDS
+        );
+        float intensity = MathHelper.clamp(
+            0.55f
+                + 0.18f * environment.maxInstabilityProxy()
+                + 0.16f * environment.maxLiftProxy()
+                + 0.08f * environment.maxLowLevelShear()
+                + 0.20f * (tornadoSupport - TORNADO_MIN_SUPPORT),
+            0.4f,
+            2.0f
+        );
+        float coreRadiusBlocks = MathHelper.lerp(
+            MathHelper.clamp(tornadoSupport, 0.0f, 1.5f) / 1.5f,
+            TORNADO_MIN_CORE_RADIUS_BLOCKS,
+            TORNADO_MAX_CORE_RADIUS_BLOCKS
+        );
+        float influenceRadiusBlocks = Math.max(
+            TORNADO_MIN_INFLUENCE_RADIUS_BLOCKS,
+            MathHelper.lerp(MathHelper.clamp(tornadoSupport, 0.0f, 1.5f) / 1.5f, TORNADO_MIN_INFLUENCE_RADIUS_BLOCKS, TORNADO_MAX_INFLUENCE_RADIUS_BLOCKS)
+        );
+        float tangentialWindScaleMps = MathHelper.lerp(
+            MathHelper.clamp(tornadoSupport, 0.0f, 1.5f) / 1.5f,
+            TORNADO_MIN_TANGENTIAL_WIND_MPS,
+            TORNADO_MAX_TANGENTIAL_WIND_MPS
+        );
+        float radialInflowScaleMps = tangentialWindScaleMps * TORNADO_MAX_RADIAL_INFLOW_SCALE;
+        float updraftScale = MathHelper.clamp(
+            0.65f + 0.35f * environment.maxLiftProxy() + 0.10f * environment.meanPositiveMoistureConvergence() * 256.0f * 8.0f,
+            0.4f,
+            2.5f
+        );
+        float condensationBias = MathHelper.clamp(
+            0.45f + 0.40f * environment.meanHumidity() + 0.12f * environment.meanLiftProxy(),
+            0.0f,
+            1.5f
+        );
+        float rotationSign = host != null
+            ? (host.pressureSign < 0.0f ? 1.0f : -1.0f)
+            : (seededSigned(worldSeed, salt ^ 0x1f83d9abfb41bd6bL) < 0.0f ? -1.0f : 1.0f);
+
+        TornadoVortex vortex = TornadoVortex.defaultVortex();
+        vortex.id = nextTornadoId++;
+        vortex.parentConvectiveClusterId = clusterIndex;
+        vortex.ageSeconds = 0.0f;
+        vortex.lifetimeSeconds = lifetimeSeconds;
+        vortex.stateOrdinal = 0;
+        vortex.centerBlockX = centerBlockX;
+        vortex.centerBlockZ = centerBlockZ;
+        vortex.baseY = clusterPos.getY();
+        vortex.translationXBlocksPerSecond = clusterDriftXBlocksPerSecond;
+        vortex.translationZBlocksPerSecond = clusterDriftZBlocksPerSecond;
+        vortex.coreRadiusBlocks = coreRadiusBlocks;
+        vortex.influenceRadiusBlocks = influenceRadiusBlocks;
+        vortex.tangentialWindScaleMps = tangentialWindScaleMps;
+        vortex.radialInflowScaleMps = radialInflowScaleMps;
+        vortex.updraftScale = updraftScale;
+        vortex.condensationBias = condensationBias;
+        vortex.intensity = intensity;
+        vortex.rotationSign = rotationSign;
+        return vortex;
+    }
+
+    private BlockPos clusterWorldPosition(ConvectiveCluster cluster, BlockPos mesoscaleFocus, int baseY) {
+        int focusCellX = Math.floorDiv(mesoscaleFocus.getX(), Math.round(DRIVER_CELL_SIZE_BLOCKS));
+        int focusCellZ = Math.floorDiv(mesoscaleFocus.getZ(), Math.round(DRIVER_CELL_SIZE_BLOCKS));
+        float focusCenterBlockX = focusCellX * DRIVER_CELL_SIZE_BLOCKS + DRIVER_CELL_SIZE_BLOCKS * 0.5f;
+        float focusCenterBlockZ = focusCellZ * DRIVER_CELL_SIZE_BLOCKS + DRIVER_CELL_SIZE_BLOCKS * 0.5f;
+        float dxCells = shortestWrappedDelta(cluster.centerCellX, focusCellX);
+        float dzCells = shortestWrappedDelta(cluster.centerCellZ, focusCellZ);
+        int worldX = MathHelper.floor(focusCenterBlockX + dxCells * DRIVER_CELL_SIZE_BLOCKS);
+        int worldZ = MathHelper.floor(focusCenterBlockZ + dzCells * DRIVER_CELL_SIZE_BLOCKS);
+        return new BlockPos(worldX, baseY, worldZ);
+    }
+
+    private float computeTornadoSupport(ConvectiveCluster cluster, MesoscaleGrid.TornadoEnvironment environment) {
+        float instabilityScore = Math.min(1.5f, environment.maxInstabilityProxy() / 4.0f);
+        float shearScore = Math.min(1.5f, environment.maxLowLevelShear() / 5.5f);
+        float convergenceScore = Math.min(1.5f, environment.maxPositiveMoistureConvergence() * 256.0f * 8.0f);
+        float liftScore = Math.min(1.5f, environment.maxLiftProxy());
+        float humidityScore = MathHelper.clamp(environment.meanHumidity(), 0.0f, 1.0f);
+        float clusterScore = Math.min(1.5f, cluster.intensity / 1.1f);
+        return 0.25f * instabilityScore
+            + 0.22f * shearScore
+            + 0.16f * convergenceScore
+            + 0.20f * liftScore
+            + 0.07f * humidityScore
+            + 0.10f * clusterScore;
+    }
+
+    private boolean hasNearbyTornado(float centerBlockX, float centerBlockZ, float minDistanceBlocks) {
+        float minDistanceSquared = minDistanceBlocks * minDistanceBlocks;
+        for (TornadoVortex vortex : tornadoVortices) {
+            float dx = vortex.centerBlockX - centerBlockX;
+            float dz = vortex.centerBlockZ - centerBlockZ;
+            if (dx * dx + dz * dz < minDistanceSquared) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int computeNextTornadoId(List<TornadoVortex> tornadoVortices) {
+        int nextId = 1;
+        for (TornadoVortex vortex : tornadoVortices) {
+            nextId = Math.max(nextId, vortex.id + 1);
+        }
+        return nextId;
+    }
+
     private static void appendProperty(StringBuilder builder, String key, float value) {
         builder.append(key)
             .append('=')
@@ -771,7 +1100,12 @@ final class WorldScaleDriver {
         float convectiveMoistening,
         float convectiveInflowX,
         float convectiveInflowZ,
-        float convectiveEnvelope
+        float convectiveEnvelope,
+        float tornadoWindX,
+        float tornadoWindZ,
+        float tornadoHeatingKelvin,
+        float tornadoMoistening,
+        float tornadoUpdraftProxy
     ) {
     }
 
@@ -788,7 +1122,8 @@ final class WorldScaleDriver {
         float mesoscaleLiftSupport,
         float mesoscaleShearSupport,
         List<CycloneCellSnapshot> cycloneCells,
-        List<ConvectiveClusterSnapshot> convectiveClusters
+        List<ConvectiveClusterSnapshot> convectiveClusters,
+        List<TornadoVortexSnapshot> tornadoVortices
     ) {
     }
 
@@ -817,6 +1152,28 @@ final class WorldScaleDriver {
         float warmBiasKelvin,
         float moistureBias,
         float convergenceMps
+    ) {
+    }
+
+    record TornadoVortexSnapshot(
+        int id,
+        int parentConvectiveClusterId,
+        float ageSeconds,
+        float lifetimeSeconds,
+        int stateOrdinal,
+        float centerBlockX,
+        float centerBlockZ,
+        float baseY,
+        float translationXBlocksPerSecond,
+        float translationZBlocksPerSecond,
+        float coreRadiusBlocks,
+        float influenceRadiusBlocks,
+        float tangentialWindScaleMps,
+        float radialInflowScaleMps,
+        float updraftScale,
+        float condensationBias,
+        float intensity,
+        float rotationSign
     ) {
     }
 
@@ -851,6 +1208,16 @@ final class WorldScaleDriver {
             0.0f,
             0.0f
         );
+    }
+
+    private record TornadoContribution(
+        float windX,
+        float windZ,
+        float heatingKelvin,
+        float moistening,
+        float updraftProxy
+    ) {
+        private static final TornadoContribution ZERO = new TornadoContribution(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     }
 
     private static final class CycloneCell {
@@ -1012,6 +1379,7 @@ final class WorldScaleDriver {
         private float warmBiasKelvin;
         private float moistureBias;
         private float convergenceMps;
+        private float tornadoCooldownSeconds;
 
         private ConvectiveCluster(
             float centerCellX,
@@ -1035,6 +1403,7 @@ final class WorldScaleDriver {
             this.warmBiasKelvin = warmBiasKelvin;
             this.moistureBias = moistureBias;
             this.convergenceMps = convergenceMps;
+            this.tornadoCooldownSeconds = 0.0f;
         }
 
         private ConvectiveCluster copy() {
@@ -1090,6 +1459,7 @@ final class WorldScaleDriver {
             float baseDriftZ = (baseFlowZ / DRIVER_CELL_SIZE_BLOCKS) * CONVECTIVE_CLUSTER_BASE_FLOW_ADVECTION;
             centerCellX = wrapDomain(centerCellX + elapsedSeconds * (driftCellsPerSecondX + baseDriftX));
             centerCellZ = wrapDomain(centerCellZ + elapsedSeconds * (driftCellsPerSecondZ + baseDriftZ));
+            tornadoCooldownSeconds = Math.max(0.0f, tornadoCooldownSeconds - elapsedSeconds);
         }
 
         private void respawn(
@@ -1209,6 +1579,21 @@ final class WorldScaleDriver {
             );
         }
 
+        private boolean supportsTornadoGenesis(float stormActivity) {
+            if (tornadoCooldownSeconds > 0.0f) {
+                return false;
+            }
+            if (stormActivity < TORNADO_MIN_STORM_ACTIVITY) {
+                return false;
+            }
+            float lifecycleProgress = MathHelper.clamp(lifecyclePhase / TAU, 0.0f, 1.0f);
+            float lifecycleEnvelope = MathHelper.sin(lifecycleProgress * (float) Math.PI);
+            return intensity >= 0.55f
+                && lifecycleProgress >= 0.20f
+                && lifecycleProgress <= 0.78f
+                && lifecycleEnvelope >= 0.55f;
+        }
+
         private ConvectiveClusterSnapshot snapshot() {
             return new ConvectiveClusterSnapshot(
                 centerCellX,
@@ -1236,6 +1621,140 @@ final class WorldScaleDriver {
                 case "warm_bias_kelvin" -> warmBiasKelvin = value;
                 case "moisture_bias" -> moistureBias = MathHelper.clamp(value, -0.40f, 0.40f);
                 case "convergence_mps" -> convergenceMps = MathHelper.clamp(value, 0.1f, 8.0f);
+                default -> {
+                }
+            }
+        }
+    }
+
+    private static final class TornadoVortex {
+        private int id;
+        private int parentConvectiveClusterId;
+        private float ageSeconds;
+        private float lifetimeSeconds;
+        private int stateOrdinal;
+        private float centerBlockX;
+        private float centerBlockZ;
+        private float baseY;
+        private float translationXBlocksPerSecond;
+        private float translationZBlocksPerSecond;
+        private float coreRadiusBlocks;
+        private float influenceRadiusBlocks;
+        private float tangentialWindScaleMps;
+        private float radialInflowScaleMps;
+        private float updraftScale;
+        private float condensationBias;
+        private float intensity;
+        private float rotationSign;
+
+        private static TornadoVortex defaultVortex() {
+            return new TornadoVortex();
+        }
+
+        private void advance(float elapsedSeconds) {
+            ageSeconds = Math.max(0.0f, ageSeconds + elapsedSeconds);
+            centerBlockX += translationXBlocksPerSecond * elapsedSeconds;
+            centerBlockZ += translationZBlocksPerSecond * elapsedSeconds;
+            float lifeRatio = lifetimeSeconds <= 1.0e-3f ? 1.0f : MathHelper.clamp(ageSeconds / lifetimeSeconds, 0.0f, 1.0f);
+            if (lifeRatio < 0.18f) {
+                stateOrdinal = 0;
+            } else if (lifeRatio < 0.75f) {
+                stateOrdinal = 1;
+            } else if (lifeRatio < 1.0f) {
+                stateOrdinal = 2;
+            } else {
+                stateOrdinal = 3;
+            }
+        }
+
+        private boolean isDissipated() {
+            return stateOrdinal >= 3 && ageSeconds >= lifetimeSeconds;
+        }
+
+        private TornadoVortexSnapshot snapshot() {
+            return new TornadoVortexSnapshot(
+                id,
+                parentConvectiveClusterId,
+                ageSeconds,
+                lifetimeSeconds,
+                stateOrdinal,
+                centerBlockX,
+                centerBlockZ,
+                baseY,
+                translationXBlocksPerSecond,
+                translationZBlocksPerSecond,
+                coreRadiusBlocks,
+                influenceRadiusBlocks,
+                tangentialWindScaleMps,
+                radialInflowScaleMps,
+                updraftScale,
+                condensationBias,
+                intensity,
+                rotationSign
+            );
+        }
+
+        private TornadoContribution sample(float cellX, float cellZ) {
+            float sampleBlockX = cellX * DRIVER_CELL_SIZE_BLOCKS + DRIVER_CELL_SIZE_BLOCKS * 0.5f;
+            float sampleBlockZ = cellZ * DRIVER_CELL_SIZE_BLOCKS + DRIVER_CELL_SIZE_BLOCKS * 0.5f;
+            float dx = sampleBlockX - centerBlockX;
+            float dz = sampleBlockZ - centerBlockZ;
+            float distanceSquared = dx * dx + dz * dz;
+            float influenceRadius = Math.max(influenceRadiusBlocks, coreRadiusBlocks);
+            if (distanceSquared >= influenceRadius * influenceRadius) {
+                return TornadoContribution.ZERO;
+            }
+
+            float distance = Math.max(1.0e-3f, MathHelper.sqrt(distanceSquared));
+            float outerNorm = distance / Math.max(1.0f, influenceRadiusBlocks);
+            float coreNorm = distance / Math.max(1.0f, coreRadiusBlocks);
+            float outerEnvelope = (float) Math.exp(-outerNorm * outerNorm * 1.2f);
+            float coreEnvelope = (float) Math.exp(-coreNorm * coreNorm * 2.2f);
+            float lifecycleProgress = lifetimeSeconds <= 1.0e-3f ? 1.0f : MathHelper.clamp(ageSeconds / lifetimeSeconds, 0.0f, 1.0f);
+            float lifecycleEnvelope = lifecycleProgress < 0.18f
+                ? MathHelper.clamp(lifecycleProgress / 0.18f, 0.0f, 1.0f)
+                : (lifecycleProgress > 0.78f
+                    ? MathHelper.clamp((1.0f - lifecycleProgress) / 0.22f, 0.0f, 1.0f)
+                    : 1.0f);
+            float effectiveIntensity = Math.max(0.0f, intensity) * lifecycleEnvelope;
+            if (effectiveIntensity <= 1.0e-3f) {
+                return TornadoContribution.ZERO;
+            }
+
+            float tangentX = (-dz / distance) * rotationSign;
+            float tangentZ = (dx / distance) * rotationSign;
+            float radialX = -dx / distance;
+            float radialZ = -dz / distance;
+            float windX = tangentX * tangentialWindScaleMps * effectiveIntensity * (0.30f * outerEnvelope + 1.10f * coreEnvelope)
+                + radialX * radialInflowScaleMps * effectiveIntensity * (0.55f * outerEnvelope + 0.35f * coreEnvelope);
+            float windZ = tangentZ * tangentialWindScaleMps * effectiveIntensity * (0.30f * outerEnvelope + 1.10f * coreEnvelope)
+                + radialZ * radialInflowScaleMps * effectiveIntensity * (0.55f * outerEnvelope + 0.35f * coreEnvelope);
+            float heating = 0.45f * updraftScale * effectiveIntensity * (0.20f * outerEnvelope + 0.65f * coreEnvelope);
+            float moistening = 0.08f * condensationBias * effectiveIntensity * (0.25f * outerEnvelope + 0.55f * coreEnvelope);
+            float updraft = updraftScale * effectiveIntensity * (0.30f * outerEnvelope + 0.90f * coreEnvelope);
+            return new TornadoContribution(windX, windZ, heating, moistening, updraft);
+        }
+
+        private void set(String field, float value) {
+            switch (field) {
+                case "id" -> id = Math.max(0, Math.round(value));
+                case "parent_convective_cluster_id" -> parentConvectiveClusterId = Math.max(-1, Math.round(value));
+                case "age_seconds" -> ageSeconds = Math.max(0.0f, value);
+                case "lifetime_seconds" -> lifetimeSeconds = Math.max(1.0f, value);
+                case "state_ordinal" -> stateOrdinal = MathHelper.clamp(Math.round(value), 0, 3);
+                case "center_block_x" -> centerBlockX = value;
+                case "center_block_z" -> centerBlockZ = value;
+                case "base_y" -> baseY = value;
+                case "translation_x_blocks_per_second" -> translationXBlocksPerSecond = value;
+                case "translation_z_blocks_per_second" -> translationZBlocksPerSecond = value;
+                case "core_radius_blocks" -> coreRadiusBlocks = Math.max(1.0f, value);
+                case "influence_radius_blocks" -> influenceRadiusBlocks = Math.max(1.0f, value);
+                case "tangential_wind_scale_mps" -> tangentialWindScaleMps = Math.max(0.0f, value);
+                case "radial_inflow_scale_mps" -> radialInflowScaleMps = Math.max(0.0f, value);
+                case "updraft_scale" -> updraftScale = Math.max(0.0f, value);
+                case "condensation_bias" -> condensationBias = value;
+                case "intensity" -> intensity = Math.max(0.0f, value);
+                case "rotation_sign" -> rotationSign = value < 0.0f ? -1.0f : 1.0f;
                 default -> {
                 }
             }
