@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "com.aerodynamics4mc.mixin.client",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "AscendingParticleMixin",
+    "CampfireSmokeParticleMixin",
+    "LeavesParticleMixin",
+    "ParticleAccessor",
+    "ParticleMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

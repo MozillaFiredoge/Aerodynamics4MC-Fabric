@@ -21,7 +21,8 @@
 		]
 	},
 	"mixins": [
-		"modid.mixins.json"
+		"modid.mixins.json",
+		"aerodynamics4mc.client.mixins.json"
 	],
 	"depends": {
 		"fabricloader": ">=0.18.2",
@@ -30,6 +31,7 @@
 		"fabric-api": "*"
 	},
 	"suggests": {
-		"another-mod": "*"
+		"another-mod": "*",
+		"iris": "*"
 	}
 }

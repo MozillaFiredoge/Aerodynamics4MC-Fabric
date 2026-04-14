@@ -1,4 +1,5 @@
 #include "aero_lbm_capi.h"
+#include "aero_lbm_analysis_codec.hpp"
 
 #include <jni.h>
 
@@ -3128,6 +3129,103 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         static_cast<int>(length)
     );
     env->ReleaseFloatArrayElements(out_probe_values, values_ptr, 0);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jbyteArray JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeCompressFloatGrid3d(
+    JNIEnv* env,
+    jclass,
+    jfloatArray values,
+    jint nx,
+    jint ny,
+    jint nz,
+    jdouble tolerance
+) {
+    if (!values) {
+        return nullptr;
+    }
+    const int cells = nx * ny * nz;
+    if (cells <= 0 || env->GetArrayLength(values) != static_cast<jsize>(cells)) {
+        return nullptr;
+    }
+    jboolean copy = JNI_FALSE;
+    jfloat* values_ptr = env->GetFloatArrayElements(values, &copy);
+    if (!values_ptr) {
+        return nullptr;
+    }
+    std::vector<std::uint8_t> compressed;
+    std::string error;
+    const bool ok = aero_lbm_analysis_codec::compress_float_grid_3d(
+        values_ptr,
+        nx,
+        ny,
+        nz,
+        static_cast<double>(tolerance),
+        compressed,
+        error
+    );
+    env->ReleaseFloatArrayElements(values, values_ptr, JNI_ABORT);
+    if (!ok || compressed.size() > static_cast<std::size_t>(std::numeric_limits<jsize>::max())) {
+        return nullptr;
+    }
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(compressed.size()));
+    if (!out) {
+        return nullptr;
+    }
+    env->SetByteArrayRegion(
+        out,
+        0,
+        static_cast<jsize>(compressed.size()),
+        reinterpret_cast<const jbyte*>(compressed.data())
+    );
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeDecompressFloatGrid3d(
+    JNIEnv* env,
+    jclass,
+    jbyteArray compressed,
+    jint nx,
+    jint ny,
+    jint nz,
+    jfloatArray out_values
+) {
+    if (!compressed || !out_values) {
+        return JNI_FALSE;
+    }
+    const int cells = nx * ny * nz;
+    if (cells <= 0 || env->GetArrayLength(out_values) != static_cast<jsize>(cells)) {
+        return JNI_FALSE;
+    }
+    const jsize compressed_size = env->GetArrayLength(compressed);
+    std::vector<std::uint8_t> compressed_bytes(static_cast<std::size_t>(compressed_size));
+    if (compressed_size > 0) {
+        env->GetByteArrayRegion(
+            compressed,
+            0,
+            compressed_size,
+            reinterpret_cast<jbyte*>(compressed_bytes.data())
+        );
+        if (env->ExceptionCheck()) {
+            return JNI_FALSE;
+        }
+    }
+    jboolean copy = JNI_FALSE;
+    jfloat* out_ptr = env->GetFloatArrayElements(out_values, &copy);
+    if (!out_ptr) {
+        return JNI_FALSE;
+    }
+    std::string error;
+    const bool ok = aero_lbm_analysis_codec::decompress_float_grid_3d(
+        compressed_bytes.data(),
+        compressed_bytes.size(),
+        nx,
+        ny,
+        nz,
+        out_ptr,
+        error
+    );
+    env->ReleaseFloatArrayElements(out_values, out_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

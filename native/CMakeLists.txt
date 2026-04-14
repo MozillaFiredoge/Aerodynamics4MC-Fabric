@@ -105,11 +105,14 @@ option(AERO_LBM_ENABLE_OPENCL "Enable OpenCL backend in native solver" ON)
 
 add_library(aero_lbm SHARED
     src/aero_lbm_jni.cpp
+    src/aero_lbm_analysis_codec.cpp
     src/aero_lbm_hydro_core.cpp
     src/aero_lbm_thermal_core.cpp
     src/aero_lbm_mesoscale.cpp
     src/aero_lbm_simulation_bridge.cpp
 )
+
+add_subdirectory(third_party/zfp)
 
 target_include_directories(aero_lbm PRIVATE ${JNI_INCLUDE_DIRS})
 target_include_directories(aero_lbm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -121,6 +124,8 @@ if (AERO_LBM_ENABLE_OPENCL)
 else()
     message(STATUS "AERO_LBM_ENABLE_OPENCL=OFF (CPU-only native build)")
 endif()
+
+target_link_libraries(aero_lbm PRIVATE zfp::zfp)
 
 if (WIN32)
     set_target_properties(aero_lbm PROPERTIES PREFIX "")

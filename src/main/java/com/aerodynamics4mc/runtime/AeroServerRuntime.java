@@ -26,7 +26,9 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
+import com.aerodynamics4mc.flow.AnalysisFlowCodec;
 import com.aerodynamics4mc.net.AeroFlowPayload;
+import com.aerodynamics4mc.net.AeroFlowAnalysisPayload;
 import com.aerodynamics4mc.net.AeroRuntimeStatePayload;
 import com.mojang.brigadier.CommandDispatcher;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -103,6 +105,9 @@ public final class AeroServerRuntime {
     private static final int WINDOW_THERMAL_REFRESH_TICKS = 40;
     private static final int PARTICLE_FLOW_SYNC_INTERVAL_TICKS = 4;
     private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 4;
+    private static final int ANALYSIS_FLOW_SYNC_INTERVAL_TICKS = 20;
+    private static final float ANALYSIS_FLOW_VELOCITY_TOLERANCE = 0.02f;
+    private static final float ANALYSIS_FLOW_PRESSURE_TOLERANCE = 0.0005f;
     private static final int MAX_SIMULATION_STEP_BACKLOG = 2;
     private static final int CHUNK_SIZE = 16;
     private static final int WINDOW_SECTION_COUNT = GRID_SIZE / CHUNK_SIZE;
@@ -1024,6 +1029,9 @@ public final class AeroServerRuntime {
         if (shouldSyncFlow) {
             phaseStartNanos = System.nanoTime();
             syncPublishedFlowToPlayers(server, frame, PARTICLE_FLOW_SAMPLE_STRIDE);
+            if (tickCounter % ANALYSIS_FLOW_SYNC_INTERVAL_TICKS == 0) {
+                syncAnalysisFlowToPlayers(server, frame);
+            }
             recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, System.nanoTime() - phaseStartNanos);
         } else {
             recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, 0L);
@@ -3642,6 +3650,66 @@ public final class AeroServerRuntime {
                 ServerPlayNetworking.send(player, payload);
             }
         }
+    }
+
+    private void syncAnalysisFlowToPlayers(MinecraftServer server, PublishedFrame frame) {
+        Map<WindowKey, AeroFlowAnalysisPayload> payloadCache = new HashMap<>();
+        Set<WindowKey> missingKeys = new HashSet<>();
+        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+            ServerWorld world = player.getEntityWorld();
+            WindowKey key = new WindowKey(world.getRegistryKey(), windowOriginFromCoreOrigin(coreOriginForPosition(player.getBlockPos())));
+            short[] basePacked = frame.regionAtlases().get(key);
+            if (basePacked == null || missingKeys.contains(key)) {
+                continue;
+            }
+            AeroFlowAnalysisPayload payload = payloadCache.get(key);
+            if (payload == null && !payloadCache.containsKey(key)) {
+                payload = buildAnalysisFlowPayload(world, key, basePacked);
+                if (payload == null) {
+                    missingKeys.add(key);
+                    continue;
+                }
+                payloadCache.put(key, payload);
+            }
+            if (payload != null) {
+                ServerPlayNetworking.send(player, payload);
+            }
+        }
+    }
+
+    private AeroFlowAnalysisPayload buildAnalysisFlowPayload(ServerWorld world, WindowKey key, short[] basePacked) {
+        float[] fullFlowState = null;
+        synchronized (simulationStateLock) {
+            if (simulationServiceId == 0L) {
+                return null;
+            }
+            RegionRecord region = regions.get(key);
+            if (region == null || !region.serviceReady) {
+                return null;
+            }
+            fullFlowState = new float[GRID_SIZE * GRID_SIZE * GRID_SIZE * NativeSimulationBridge.FLOW_STATE_CHANNELS];
+            if (!simulationBridge.getRegionFlowState(
+                simulationServiceId,
+                simulationRegionKey(key),
+                GRID_SIZE,
+                GRID_SIZE,
+                GRID_SIZE,
+                fullFlowState
+            )) {
+                return null;
+            }
+        }
+        return AnalysisFlowCodec.encodePayload(
+            simulationBridge,
+            world.getRegistryKey().getValue(),
+            key.origin(),
+            PARTICLE_FLOW_SAMPLE_STRIDE,
+            basePacked,
+            GRID_SIZE,
+            fullFlowState,
+            ANALYSIS_FLOW_VELOCITY_TOLERANCE,
+            ANALYSIS_FLOW_PRESSURE_TOLERANCE
+        );
     }
 
     private short[] pollPackedFlowForNetwork(WindowKey key, int stride) {

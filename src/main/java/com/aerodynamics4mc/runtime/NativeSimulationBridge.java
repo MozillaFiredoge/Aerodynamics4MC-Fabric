@@ -575,6 +575,27 @@ public final class NativeSimulationBridge {
         return nativePollPackedFlowAtlas(serviceKey, atlasKey, outPackedValues);
     }
 
+    public byte[] compressFloatGrid3d(float[] values, int nx, int ny, int nz, double tolerance) {
+        if (!LOADED || values == null) {
+            return null;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        if (cells <= 0 || values.length != cells || !(tolerance > 0.0) || Double.isNaN(tolerance)) {
+            return null;
+        }
+        return nativeCompressFloatGrid3d(values, nx, ny, nz, tolerance);
+    }
+
+    public boolean decompressFloatGrid3d(byte[] compressed, int nx, int ny, int nz, float[] outValues) {
+        if (!LOADED || compressed == null || outValues == null) {
+            return false;
+        }
+        int cells = checkedCellCount(nx, ny, nz);
+        return cells > 0
+            && outValues.length == cells
+            && nativeDecompressFloatGrid3d(compressed, nx, ny, nz, outValues);
+    }
+
     public boolean sampleRegionPoint(
         long serviceKey,
         long regionKey,
@@ -854,6 +875,22 @@ public final class NativeSimulationBridge {
         int sampleY,
         int sampleZ,
         float[] outProbeValues
+    );
+
+    private static native byte[] nativeCompressFloatGrid3d(
+        float[] values,
+        int nx,
+        int ny,
+        int nz,
+        double tolerance
+    );
+
+    private static native boolean nativeDecompressFloatGrid3d(
+        byte[] compressed,
+        int nx,
+        int ny,
+        int nz,
+        float[] outValues
     );
 
     private static native String nativeRuntimeInfo();
