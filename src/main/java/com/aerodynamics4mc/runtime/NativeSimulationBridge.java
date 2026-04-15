@@ -359,6 +359,9 @@ public final class NativeSimulationBridge {
         float[] boundaryWindFaceY,
         float[] boundaryWindFaceZ,
         float[] boundaryAirTemperatureKelvin,
+        int spongeThicknessCells,
+        float spongeVelocityRelaxation,
+        float spongeTemperatureRelaxation,
         int tornadoDescriptorCount,
         float[] tornadoDescriptors
     ) {
@@ -400,6 +403,9 @@ public final class NativeSimulationBridge {
             boundaryWindFaceY,
             boundaryWindFaceZ,
             boundaryAirTemperatureKelvin,
+            spongeThicknessCells,
+            spongeVelocityRelaxation,
+            spongeTemperatureRelaxation,
             tornadoDescriptorCount,
             tornadoDescriptors,
             outMaxSpeed
@@ -783,6 +789,9 @@ public final class NativeSimulationBridge {
         float[] boundaryWindFaceY,
         float[] boundaryWindFaceZ,
         float[] boundaryAirTemperatureKelvin,
+        int spongeThicknessCells,
+        float spongeVelocityRelaxation,
+        float spongeTemperatureRelaxation,
         int tornadoDescriptorCount,
         float[] tornadoDescriptors,
         float[] outMaxSpeed

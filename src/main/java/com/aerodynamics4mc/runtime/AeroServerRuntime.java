@@ -15,6 +15,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -31,6 +33,7 @@ import com.aerodynamics4mc.net.AeroFlowPayload;
 import com.aerodynamics4mc.net.AeroFlowAnalysisPayload;
 import com.aerodynamics4mc.net.AeroRuntimeStatePayload;
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerBlockEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
@@ -59,6 +62,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.world.LightType;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
@@ -105,9 +109,36 @@ public final class AeroServerRuntime {
     private static final int WINDOW_THERMAL_REFRESH_TICKS = 40;
     private static final int PARTICLE_FLOW_SYNC_INTERVAL_TICKS = 4;
     private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 4;
-    private static final int ANALYSIS_FLOW_SYNC_INTERVAL_TICKS = 20;
     private static final float ANALYSIS_FLOW_VELOCITY_TOLERANCE = 0.02f;
     private static final float ANALYSIS_FLOW_PRESSURE_TOLERANCE = 0.0005f;
+    private static final int L2_CAPTURE_DEFAULT_DURATION_SECONDS = 30;
+    private static final int L2_CAPTURE_DEFAULT_FPS = 2;
+    private static final int L2_CAPTURE_MIN_DURATION_SECONDS = 1;
+    private static final int L2_CAPTURE_MAX_DURATION_SECONDS = 600;
+    private static final int L2_CAPTURE_MIN_FPS = 1;
+    private static final int L2_CAPTURE_MAX_FPS = 20;
+    private static final int L2_CAPTURE_MAX_PENDING_FRAMES = 4;
+    private static final int INSPECTION_PATCH_DEFAULT_DOMAIN_BLOCKS = 64;
+    private static final int INSPECTION_PATCH_MIN_DOMAIN_BLOCKS = 32;
+    private static final int INSPECTION_PATCH_MAX_DOMAIN_BLOCKS = 128;
+    private static final int INSPECTION_PATCH_DEFAULT_GRID_RESOLUTION = 128;
+    private static final int INSPECTION_PATCH_MIN_GRID_RESOLUTION = 32;
+    private static final int INSPECTION_PATCH_MAX_GRID_RESOLUTION = 256;
+    private static final int INSPECTION_PATCH_DEFAULT_FACE_RESOLUTION = 24;
+    private static final int INSPECTION_PATCH_MIN_FACE_RESOLUTION = 2;
+    private static final int INSPECTION_PATCH_MAX_FACE_RESOLUTION = 24;
+    private static final int INSPECTION_PATCH_DEFAULT_SOLVE_STEPS = 120;
+    private static final int INSPECTION_PATCH_MIN_SOLVE_STEPS = 1;
+    private static final int INSPECTION_PATCH_MAX_SOLVE_STEPS = 2000;
+    private static final float INSPECTION_PATCH_BOUNDARY_VELOCITY_TOLERANCE = 0.0005f;
+    private static final float INSPECTION_PATCH_BOUNDARY_TEMPERATURE_TOLERANCE = 0.01f;
+    private static final float INSPECTION_PATCH_EMITTER_POWER_TOLERANCE = 0.1f;
+    private static final float INSPECTION_PATCH_OUTPUT_VELOCITY_TOLERANCE = 0.001f;
+    private static final float INSPECTION_PATCH_OUTPUT_PRESSURE_TOLERANCE = 0.00025f;
+    private static final float INSPECTION_PATCH_OUTPUT_TEMPERATURE_TOLERANCE = 0.01f;
+    private static final int INSPECTION_PATCH_SPONGE_THICKNESS_CELLS = 12;
+    private static final float INSPECTION_PATCH_SPONGE_VELOCITY_RELAXATION = 0.18f;
+    private static final float INSPECTION_PATCH_SPONGE_TEMPERATURE_RELAXATION = 0.08f;
     private static final int MAX_SIMULATION_STEP_BACKLOG = 2;
     private static final int CHUNK_SIZE = 16;
     private static final int WINDOW_SECTION_COUNT = GRID_SIZE / CHUNK_SIZE;
@@ -145,6 +176,7 @@ public final class AeroServerRuntime {
     private static final byte SURFACE_KIND_MOLTEN = 6;
     private static final Direction[] CARDINAL_DIRECTIONS = Direction.values();
     private static final int FACE_COUNT = 6;
+    private static final int INSPECTION_PATCH_ALL_FACE_MASK = (1 << FACE_COUNT) - 1;
     private static final int BACKGROUND_MET_CELL_SIZE_BLOCKS = 256;
     private static final int BACKGROUND_MET_RADIUS_CELLS = 20;
     private static final int MESOSCALE_MET_CELL_SIZE_BLOCKS = 64;
@@ -227,6 +259,11 @@ public final class AeroServerRuntime {
         thread.setDaemon(true);
         return thread;
     });
+    private final ExecutorService diagnosticsExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "aero-diagnostics-writer");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final AtomicInteger activeSolveTasks = new AtomicInteger(0);
     private final AtomicInteger simulationStepBudget = new AtomicInteger(0);
     private final AtomicLong runtimeGeneration = new AtomicLong(0L);
@@ -241,6 +278,8 @@ public final class AeroServerRuntime {
     private volatile List<EntitySampleRequest> activeEntitySampleRequests = List.of();
     private volatile ActiveRegionBatch pendingActiveRegionBatch;
     private volatile BackgroundRefreshBatch pendingBackgroundRefreshBatch;
+    private volatile L2CaptureSession activeL2CaptureSession;
+    private volatile InspectionSolveSession activeInspectionSolveSession;
 
     private volatile boolean streamingEnabled = false;
     private volatile int tickCounter = 0;
@@ -588,7 +627,1106 @@ public final class AeroServerRuntime {
             .then(CommandManager.literal("dump_l1")
                 .executes(ctx -> dumpMesoscaleSnapshot(ctx.getSource()))
                 )
+            .then(CommandManager.literal("capture_l2")
+                .then(CommandManager.literal("start")
+                    .executes(ctx -> startL2Capture(ctx.getSource(), L2_CAPTURE_DEFAULT_DURATION_SECONDS, L2_CAPTURE_DEFAULT_FPS))
+                    .then(CommandManager.argument("duration_seconds", IntegerArgumentType.integer(L2_CAPTURE_MIN_DURATION_SECONDS, L2_CAPTURE_MAX_DURATION_SECONDS))
+                        .executes(ctx -> startL2Capture(
+                            ctx.getSource(),
+                            IntegerArgumentType.getInteger(ctx, "duration_seconds"),
+                            L2_CAPTURE_DEFAULT_FPS
+                        ))
+                        .then(CommandManager.argument("fps", IntegerArgumentType.integer(L2_CAPTURE_MIN_FPS, L2_CAPTURE_MAX_FPS))
+                            .executes(ctx -> startL2Capture(
+                                ctx.getSource(),
+                                IntegerArgumentType.getInteger(ctx, "duration_seconds"),
+                                IntegerArgumentType.getInteger(ctx, "fps")
+                            ))
+                        )
+                    )
+                )
+                .then(CommandManager.literal("stop")
+                    .executes(ctx -> stopL2Capture(ctx.getSource(), true))
+                )
+                .then(CommandManager.literal("status")
+                    .executes(ctx -> l2CaptureStatus(ctx.getSource()))
+                )
+            )
+            .then(CommandManager.literal("inspect_patch")
+                .then(CommandManager.literal("dump")
+                    .executes(ctx -> dumpInspectionPatch(
+                        ctx.getSource(),
+                        INSPECTION_PATCH_DEFAULT_DOMAIN_BLOCKS,
+                        INSPECTION_PATCH_DEFAULT_GRID_RESOLUTION,
+                        INSPECTION_PATCH_DEFAULT_FACE_RESOLUTION
+                    ))
+                    .then(CommandManager.argument("domain_blocks", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_DOMAIN_BLOCKS, INSPECTION_PATCH_MAX_DOMAIN_BLOCKS))
+                        .executes(ctx -> dumpInspectionPatch(
+                            ctx.getSource(),
+                            IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                            defaultInspectionPatchGridResolution(IntegerArgumentType.getInteger(ctx, "domain_blocks")),
+                            INSPECTION_PATCH_DEFAULT_FACE_RESOLUTION
+                        ))
+                        .then(CommandManager.argument("face_resolution", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_FACE_RESOLUTION, INSPECTION_PATCH_MAX_FACE_RESOLUTION))
+                            .executes(ctx -> dumpInspectionPatch(
+                                ctx.getSource(),
+                                IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                defaultInspectionPatchGridResolution(IntegerArgumentType.getInteger(ctx, "domain_blocks")),
+                                IntegerArgumentType.getInteger(ctx, "face_resolution")
+                            ))
+                        )
+                        .then(CommandManager.argument("grid_resolution", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_GRID_RESOLUTION, INSPECTION_PATCH_MAX_GRID_RESOLUTION))
+                            .executes(ctx -> dumpInspectionPatch(
+                                ctx.getSource(),
+                                IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                IntegerArgumentType.getInteger(ctx, "grid_resolution"),
+                                INSPECTION_PATCH_DEFAULT_FACE_RESOLUTION
+                            ))
+                            .then(CommandManager.argument("face_resolution", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_FACE_RESOLUTION, INSPECTION_PATCH_MAX_FACE_RESOLUTION))
+                                .executes(ctx -> dumpInspectionPatch(
+                                    ctx.getSource(),
+                                    IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                    IntegerArgumentType.getInteger(ctx, "grid_resolution"),
+                                    IntegerArgumentType.getInteger(ctx, "face_resolution")
+                                ))
+                            )
+                        )
+                    )
+                )
+                .then(CommandManager.literal("solve")
+                    .executes(ctx -> startInspectionPatchSolve(
+                        ctx.getSource(),
+                        INSPECTION_PATCH_DEFAULT_DOMAIN_BLOCKS,
+                        INSPECTION_PATCH_DEFAULT_GRID_RESOLUTION,
+                        INSPECTION_PATCH_DEFAULT_FACE_RESOLUTION,
+                        INSPECTION_PATCH_DEFAULT_SOLVE_STEPS
+                    ))
+                    .then(CommandManager.argument("domain_blocks", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_DOMAIN_BLOCKS, INSPECTION_PATCH_MAX_DOMAIN_BLOCKS))
+                        .executes(ctx -> startInspectionPatchSolve(
+                            ctx.getSource(),
+                            IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                            defaultInspectionPatchGridResolution(IntegerArgumentType.getInteger(ctx, "domain_blocks")),
+                            INSPECTION_PATCH_DEFAULT_FACE_RESOLUTION,
+                            INSPECTION_PATCH_DEFAULT_SOLVE_STEPS
+                        ))
+                        .then(CommandManager.argument("face_resolution", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_FACE_RESOLUTION, INSPECTION_PATCH_MAX_FACE_RESOLUTION))
+                            .executes(ctx -> startInspectionPatchSolve(
+                                ctx.getSource(),
+                                IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                defaultInspectionPatchGridResolution(IntegerArgumentType.getInteger(ctx, "domain_blocks")),
+                                IntegerArgumentType.getInteger(ctx, "face_resolution"),
+                                INSPECTION_PATCH_DEFAULT_SOLVE_STEPS
+                            ))
+                            .then(CommandManager.argument("steps", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_SOLVE_STEPS, INSPECTION_PATCH_MAX_SOLVE_STEPS))
+                                .executes(ctx -> startInspectionPatchSolve(
+                                    ctx.getSource(),
+                                    IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                    defaultInspectionPatchGridResolution(IntegerArgumentType.getInteger(ctx, "domain_blocks")),
+                                    IntegerArgumentType.getInteger(ctx, "face_resolution"),
+                                    IntegerArgumentType.getInteger(ctx, "steps")
+                                ))
+                            )
+                        )
+                        .then(CommandManager.argument("grid_resolution", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_GRID_RESOLUTION, INSPECTION_PATCH_MAX_GRID_RESOLUTION))
+                            .executes(ctx -> startInspectionPatchSolve(
+                                ctx.getSource(),
+                                IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                IntegerArgumentType.getInteger(ctx, "grid_resolution"),
+                                INSPECTION_PATCH_DEFAULT_FACE_RESOLUTION,
+                                INSPECTION_PATCH_DEFAULT_SOLVE_STEPS
+                            ))
+                            .then(CommandManager.argument("face_resolution", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_FACE_RESOLUTION, INSPECTION_PATCH_MAX_FACE_RESOLUTION))
+                                .executes(ctx -> startInspectionPatchSolve(
+                                    ctx.getSource(),
+                                    IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                    IntegerArgumentType.getInteger(ctx, "grid_resolution"),
+                                    IntegerArgumentType.getInteger(ctx, "face_resolution"),
+                                    INSPECTION_PATCH_DEFAULT_SOLVE_STEPS
+                                ))
+                                .then(CommandManager.argument("steps", IntegerArgumentType.integer(INSPECTION_PATCH_MIN_SOLVE_STEPS, INSPECTION_PATCH_MAX_SOLVE_STEPS))
+                                    .executes(ctx -> startInspectionPatchSolve(
+                                        ctx.getSource(),
+                                        IntegerArgumentType.getInteger(ctx, "domain_blocks"),
+                                        IntegerArgumentType.getInteger(ctx, "grid_resolution"),
+                                        IntegerArgumentType.getInteger(ctx, "face_resolution"),
+                                        IntegerArgumentType.getInteger(ctx, "steps")
+                                    ))
+                                )
+                            )
+                        )
+                    )
+                )
+                .then(CommandManager.literal("stop")
+                    .executes(ctx -> stopInspectionPatchSolve(ctx.getSource()))
+                )
+                .then(CommandManager.literal("status")
+                    .executes(ctx -> inspectionPatchSolveStatus(ctx.getSource()))
+                )
+            )
         );
+    }
+
+    private int startL2Capture(ServerCommandSource source, int durationSeconds, int fps) {
+        if (!streamingEnabled) {
+            feedback(source, "Streaming must be enabled before starting L2 capture");
+            return 0;
+        }
+        L2CaptureSession existing = activeL2CaptureSession;
+        if (existing != null && !existing.stopRequested.get()) {
+            feedback(source, "L2 capture already active: " + existing.outputDir);
+            return 0;
+        }
+        ServerWorld world = source.getWorld();
+        BlockPos focus = BlockPos.ofFloored(source.getPosition());
+        BlockPos anchorCoreOrigin = coreOriginForPosition(focus);
+        List<L2CaptureRegionSpec> captureRegions = activeRegionKeys(List.of(new PlayerRegionAnchor(world.getRegistryKey(), anchorCoreOrigin)))
+            .stream()
+            .sorted(Comparator
+                .comparingInt((WindowKey key) -> key.origin().getY())
+                .thenComparingInt(key -> key.origin().getX())
+                .thenComparingInt(key -> key.origin().getZ()))
+            .map(key -> new L2CaptureRegionSpec(
+                key,
+                key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS)
+            ))
+            .toList();
+        int sampleIntervalTicks = Math.max(1, Math.round((float) TICKS_PER_SECOND / Math.max(1, fps)));
+        Path outputDir = source.getServer()
+            .getSavePath(WorldSavePath.ROOT)
+            .resolve("aerodynamics4mc")
+            .resolve("diagnostics")
+            .resolve("l2_capture")
+            .resolve("l2_" + storageSafeWorldId(world.getRegistryKey()) + "_tick" + tickCounter + "_" + anchorCoreOrigin.getX() + "_" + anchorCoreOrigin.getY() + "_" + anchorCoreOrigin.getZ());
+        try {
+            Files.createDirectories(outputDir.resolve("frames"));
+        } catch (IOException e) {
+            feedback(source, "Failed to create capture output dir: " + e.getMessage());
+            return 0;
+        }
+        L2CaptureSession session = new L2CaptureSession(
+            world.getRegistryKey(),
+            world.getRegistryKey().getValue(),
+            anchorCoreOrigin,
+            captureRegions,
+            outputDir,
+            tickCounter,
+            tickCounter + durationSeconds * TICKS_PER_SECOND,
+            durationSeconds,
+            fps,
+            sampleIntervalTicks
+        );
+        activeL2CaptureSession = session;
+        persistL2CaptureMetadata(session);
+        feedback(
+            source,
+            "Started L2 capture duration=" + durationSeconds + "s fps=" + fps
+                + " intervalTicks=" + sampleIntervalTicks
+                + " regions=" + captureRegions.size()
+                + " anchorCore=" + anchorCoreOrigin
+                + " output=" + outputDir
+        );
+        feedback(source, "Render with: python3 eval_l2_capture.py --input \"" + outputDir + "\"");
+        return 1;
+    }
+
+    private int stopL2Capture(ServerCommandSource source, boolean explicit) {
+        L2CaptureSession session = activeL2CaptureSession;
+        if (session == null) {
+            feedback(source, "No L2 capture session is active");
+            return 0;
+        }
+        session.stopRequested.set(true);
+        activeL2CaptureSession = null;
+        persistL2CaptureMetadata(session);
+        feedback(
+            source,
+            (explicit ? "Stopping" : "Stopped") + " L2 capture framesWritten=" + session.framesWritten.get()
+                + " dropped=" + session.framesDropped.get()
+                + " failed=" + session.framesFailed.get()
+                + " output=" + session.outputDir
+        );
+        return 1;
+    }
+
+    private int l2CaptureStatus(ServerCommandSource source) {
+        L2CaptureSession session = activeL2CaptureSession;
+        if (session == null) {
+            feedback(source, "No L2 capture session is active");
+            return 1;
+        }
+        feedback(
+            source,
+            "L2 capture active dim=" + session.dimensionId
+                + " anchorCore=" + session.anchorCoreOrigin
+                + " regions=" + session.regions.size()
+                + " layout=[" + session.layoutMinX + "," + session.layoutMinY + "," + session.layoutMinZ + " -> "
+                + session.layoutMaxExclusiveX + "," + session.layoutMaxExclusiveY + "," + session.layoutMaxExclusiveZ + ")"
+                + " tickRange=[" + session.startTick + "," + session.endTick + "]"
+                + " fps=" + session.fps
+                + " intervalTicks=" + session.sampleIntervalTicks
+                + " nextSampleTick=" + session.nextSampleTick
+                + " inFlight=" + session.inFlightFrames.get()
+                + " framesScheduled=" + session.nextFrameIndex.get()
+                + " framesWritten=" + session.framesWritten.get()
+                + " dropped=" + session.framesDropped.get()
+                + " failed=" + session.framesFailed.get()
+                + " output=" + session.outputDir
+        );
+        return 1;
+    }
+
+    private int dumpInspectionPatch(ServerCommandSource source, int domainBlocks, int gridResolution, int faceResolution) {
+        InspectionPatchInput input = captureInspectionPatchInput(source, domainBlocks, gridResolution, faceResolution);
+        if (input == null) {
+            return 0;
+        }
+        try {
+            persistInspectionPatchDump(input);
+        } catch (IOException e) {
+            feedback(source, "Failed to dump inspection patch: " + e.getMessage());
+            return 0;
+        }
+
+        feedback(
+            source,
+            "Dumped inspection patch blocks=" + input.domainBlocks()
+                + " grid=" + input.gridResolution()
+                + " cellsPerBlock=" + input.cellsPerBlock()
+                + " faceRes=" + input.faceResolution()
+                + " origin=" + input.origin()
+                + " fans=" + input.fans().size()
+                + " output=" + input.outputDir()
+        );
+        feedback(source, "Use /aero inspect_patch solve to run a monolithic inspection solve on this patch");
+        return 1;
+    }
+
+    private int startInspectionPatchSolve(ServerCommandSource source, int domainBlocks, int gridResolution, int faceResolution, int steps) {
+        if (!streamingEnabled) {
+            feedback(source, "Streaming must be enabled before solving an inspection patch");
+            return 0;
+        }
+        if (!simulationBridge.isLoaded()) {
+            feedback(source, "Native simulation bridge is not loaded: " + simulationBridge.getLoadError());
+            return 0;
+        }
+        if (activeL2CaptureSession != null) {
+            feedback(source, "Stop L2 capture before starting an inspection solve");
+            return 0;
+        }
+        InspectionSolveSession existing = activeInspectionSolveSession;
+        if (existing != null) {
+            feedback(source, "Inspection solve already active: " + existing.outputDir);
+            return 0;
+        }
+        InspectionPatchInput input = captureInspectionPatchInput(source, domainBlocks, gridResolution, faceResolution);
+        if (input == null) {
+            return 0;
+        }
+        try {
+            persistInspectionPatchDump(input);
+        } catch (IOException e) {
+            feedback(source, "Failed to dump inspection patch input: " + e.getMessage());
+            return 0;
+        }
+        stopSimulationCoordinator();
+        waitForSolverIdle();
+        InspectionSolveSession session = new InspectionSolveSession(input, steps);
+        activeInspectionSolveSession = session;
+        diagnosticsExecutor.execute(() -> runInspectionPatchSolve(session));
+        feedback(
+            source,
+            "Started inspection solve blocks=" + input.domainBlocks()
+                + " grid=" + input.gridResolution()
+                + " cellsPerBlock=" + input.cellsPerBlock()
+                + " faceRes=" + faceResolution
+                + " steps=" + steps
+                + " output=" + input.outputDir()
+        );
+        feedback(source, "Use /aero inspect_patch status to monitor progress");
+        return 1;
+    }
+
+    private int stopInspectionPatchSolve(ServerCommandSource source) {
+        InspectionSolveSession session = activeInspectionSolveSession;
+        if (session == null) {
+            feedback(source, "No inspection solve is active");
+            return 0;
+        }
+        session.stopRequested.set(true);
+        feedback(source, "Requested stop for inspection solve at " + session.outputDir);
+        return 1;
+    }
+
+    private int inspectionPatchSolveStatus(ServerCommandSource source) {
+        InspectionSolveSession session = activeInspectionSolveSession;
+        if (session == null) {
+            feedback(source, "No inspection solve is active");
+            return 1;
+        }
+        feedback(
+            source,
+            "Inspection solve phase=" + session.phase.get()
+                + " steps=" + session.completedSteps.get() + "/" + session.totalSteps
+                + " maxSpeed=" + format3(session.maxSpeedMetersPerSecond.get()) + " m/s"
+                + " output=" + session.outputDir
+        );
+        if (!session.lastError.get().isBlank()) {
+            feedback(source, "Inspection solve error: " + session.lastError.get());
+        }
+        return 1;
+    }
+
+    private InspectionPatchInput captureInspectionPatchInput(ServerCommandSource source, int domainBlocks, int gridResolution, int faceResolution) {
+        if ((domainBlocks % CHUNK_SIZE) != 0) {
+            feedback(source, "Inspection patch domain size must be a multiple of " + CHUNK_SIZE + " blocks");
+            return null;
+        }
+        if (!isValidInspectionPatchGridResolution(domainBlocks, gridResolution)) {
+            feedback(
+                source,
+                "Inspection patch grid resolution must be >= domain blocks and an integer multiple of it"
+                    + " (blocks=" + domainBlocks + ", grid=" + gridResolution + ")"
+            );
+            return null;
+        }
+        if (!streamingEnabled) {
+            feedback(source, "Streaming must be enabled before dumping an inspection patch");
+            return null;
+        }
+        if (!simulationBridge.isLoaded()) {
+            feedback(source, "Native simulation bridge is not loaded: " + simulationBridge.getLoadError());
+            return null;
+        }
+        ServerWorld world = source.getWorld();
+        RegistryKey<World> worldKey = world.getRegistryKey();
+        if (mesoscaleMetGrids.get(worldKey) == null && backgroundMetGrids.get(worldKey) == null) {
+            feedback(source, "No active L0/L1 background fields are available for " + worldKey.getValue());
+            return null;
+        }
+
+        BlockPos focus = BlockPos.ofFloored(source.getPosition());
+        BlockPos origin = inspectionPatchOriginForFocus(world, focus, domainBlocks);
+        WorldEnvironmentSnapshot environmentSnapshot = new WorldEnvironmentSnapshot(
+            world.getTimeOfDay(),
+            world.getRainGradient(1.0f),
+            world.getThunderGradient(1.0f),
+            world.getSeaLevel()
+        );
+        NestedBoundaryCoupler.BoundarySample fallbackBoundary = sampleNestedBoundaryAtPosition(worldKey, focus);
+        BoundaryFieldData boundaryField = sampleInspectionBoundaryField(worldKey, origin, domainBlocks, faceResolution, fallbackBoundary);
+        if (boundaryField == null) {
+            feedback(source, "Failed to sample six-face inspection boundary field");
+            return null;
+        }
+        ThermalEnvironment thermalEnvironment = sampleThermalEnvironment(
+            environmentSnapshot,
+            worldKey,
+            focus,
+            SOLVER_STEP_SECONDS
+        );
+        int cellsPerBlock = gridResolution / domainBlocks;
+        InspectionPatchStaticFields staticFields = captureInspectionPatchStaticFields(world, origin, domainBlocks, gridResolution, cellsPerBlock);
+        List<FanSource> fans = queryFanSources(worldKey, origin, domainBlocks);
+
+        Path outputDir = inspectionPatchOutputDir(source.getServer(), worldKey, focus, domainBlocks, gridResolution);
+        try {
+            Files.createDirectories(outputDir.resolve("static"));
+            Files.createDirectories(outputDir.resolve("boundary"));
+        } catch (IOException e) {
+            feedback(source, "Failed to create inspection patch output dir: " + e.getMessage());
+            return null;
+        }
+        return new InspectionPatchInput(
+            worldKey,
+            focus,
+            origin,
+            domainBlocks,
+            gridResolution,
+            cellsPerBlock,
+            faceResolution,
+            outputDir,
+            environmentSnapshot,
+            fallbackBoundary,
+            thermalEnvironment,
+            boundaryField,
+            staticFields,
+            fans
+        );
+    }
+
+    private Path inspectionPatchOutputDir(MinecraftServer server, RegistryKey<World> worldKey, BlockPos focus, int domainBlocks, int gridResolution) {
+        return server.getSavePath(WorldSavePath.ROOT)
+            .resolve("aerodynamics4mc")
+            .resolve("diagnostics")
+            .resolve("inspection_patch")
+            .resolve("inspection_" + storageSafeWorldId(worldKey) + "_tick" + tickCounter + "_"
+                + focus.getX() + "_" + focus.getY() + "_" + focus.getZ()
+                + "_b" + domainBlocks + "_r" + gridResolution);
+    }
+
+    private void runInspectionPatchSolve(InspectionSolveSession session) {
+        try {
+            session.phase.set("prepare_runtime");
+            long regionKey;
+            synchronized (simulationStateLock) {
+                ensureSimulationServiceInitialized();
+                if (simulationServiceId == 0L) {
+                    throw new IOException("Simulation service unavailable");
+                }
+                if (!simulationBridge.ensureL2Runtime(
+                    simulationServiceId,
+                    session.input.gridResolution(),
+                    session.input.gridResolution(),
+                    session.input.gridResolution(),
+                    CHANNELS,
+                    RESPONSE_CHANNELS
+                )) {
+                    throw new IOException("Failed to switch native runtime to inspection patch dimensions");
+                }
+                regionKey = inspectionPatchRegionKey(session.input);
+                prepareInspectionPatchInSimulation(regionKey, session.input);
+            }
+
+            session.phase.set("solve");
+            float maxSpeedMps = 0.0f;
+            for (int step = 0; step < session.totalSteps; step++) {
+                if (session.stopRequested.get()) {
+                    session.phase.set("stopping");
+                    break;
+                }
+                float latticeMaxSpeed;
+                synchronized (simulationStateLock) {
+                    latticeMaxSpeed = simulationBridge.stepRegionStored(
+                        simulationServiceId,
+                        regionKey,
+                        session.input.gridResolution(),
+                        session.input.gridResolution(),
+                        session.input.gridResolution(),
+                        session.input.fallbackBoundary().windX() / NATIVE_VELOCITY_SCALE,
+                        session.input.fallbackBoundary().windY() / NATIVE_VELOCITY_SCALE,
+                        session.input.fallbackBoundary().windZ() / NATIVE_VELOCITY_SCALE,
+                        session.input.fallbackBoundary().ambientAirTemperatureKelvin(),
+                        session.input.boundaryField().externalFaceMask(),
+                        session.input.boundaryField().faceResolution(),
+                        session.input.boundaryField().windX(),
+                        session.input.boundaryField().windY(),
+                        session.input.boundaryField().windZ(),
+                        session.input.boundaryField().airTemperatureKelvin(),
+                        INSPECTION_PATCH_SPONGE_THICKNESS_CELLS,
+                        INSPECTION_PATCH_SPONGE_VELOCITY_RELAXATION,
+                        INSPECTION_PATCH_SPONGE_TEMPERATURE_RELAXATION,
+                        0,
+                        null
+                    );
+                }
+                if (!Float.isFinite(latticeMaxSpeed)) {
+                    throw new IOException("Inspection solve step failed: " + simulationBridge.lastError());
+                }
+                maxSpeedMps = Math.max(maxSpeedMps, latticeMaxSpeed * NATIVE_VELOCITY_SCALE);
+                session.completedSteps.incrementAndGet();
+                session.maxSpeedMetersPerSecond.set(maxSpeedMps);
+            }
+
+            session.phase.set("export");
+            InspectionPatchSolveResult result;
+            synchronized (simulationStateLock) {
+                result = exportInspectionPatchSolveResult(
+                    regionKey,
+                    session.input.domainBlocks(),
+                    session.input.gridResolution(),
+                    session.input.cellsPerBlock(),
+                    session.completedSteps.get(),
+                    maxSpeedMps
+                );
+            }
+            persistInspectionPatchSolveResult(session.input.outputDir(), result);
+            session.phase.set("done");
+        } catch (Throwable t) {
+            session.phase.set("failed");
+            session.lastError.set(t.getClass().getSimpleName() + ": " + t.getMessage());
+            log("Inspection solve failed: " + t.getMessage());
+        } finally {
+            synchronized (simulationStateLock) {
+                restoreSimulationRuntimeAfterInspectionSolve();
+            }
+            session.completed.set(true);
+        }
+    }
+
+    private long inspectionPatchRegionKey(InspectionPatchInput input) {
+        long value = 1469598103934665603L;
+        value = (value ^ input.worldKey().getValue().hashCode()) * 1099511628211L;
+        value = (value ^ input.origin().getX()) * 1099511628211L;
+        value = (value ^ input.origin().getY()) * 1099511628211L;
+        value = (value ^ input.origin().getZ()) * 1099511628211L;
+        value = (value ^ input.domainBlocks()) * 1099511628211L;
+        value = (value ^ input.gridResolution()) * 1099511628211L;
+        return value == 0L ? 1L : value;
+    }
+
+    private void prepareInspectionPatchInSimulation(long regionKey, InspectionPatchInput input) throws IOException {
+        int size = input.gridResolution();
+        int cells = size * size * size;
+        if (!simulationBridge.activateRegion(simulationServiceId, regionKey, size, size, size)) {
+            throw new IOException("Failed to activate inspection patch region");
+        }
+        if (!simulationBridge.uploadStaticRegion(
+            simulationServiceId,
+            regionKey,
+            size,
+            size,
+            size,
+            input.staticFields().obstacle(),
+            input.staticFields().surfaceKind(),
+            unsignedByteFieldToShorts(input.staticFields().openFaceMask()),
+            input.staticFields().emitterPowerWatts(),
+            input.staticFields().faceSkyExposure(),
+            input.staticFields().faceDirectExposure()
+        )) {
+            throw new IOException("Failed to upload inspection patch static field");
+        }
+        InspectionPatchForcing forcing = buildInspectionPatchForcing(input);
+        if (!simulationBridge.uploadRegionForcing(
+            simulationServiceId,
+            regionKey,
+            size,
+            size,
+            size,
+            forcing.thermalSource(),
+            forcing.fanMask(),
+            forcing.fanVx(),
+            forcing.fanVy(),
+            forcing.fanVz()
+        )) {
+            throw new IOException("Failed to upload inspection patch forcing");
+        }
+        InspectionPatchDynamicState initialState = buildInspectionPatchInitialState(input, cells);
+        if (!simulationBridge.importDynamicRegion(
+            simulationServiceId,
+            regionKey,
+            size,
+            size,
+            size,
+            initialState.flowState(),
+            initialState.airTemperature(),
+            initialState.surfaceTemperature()
+        )) {
+            throw new IOException("Failed to initialize inspection patch dynamic state");
+        }
+        if (!simulationBridge.refreshRegionThermal(
+            simulationServiceId,
+            regionKey,
+            size,
+            size,
+            size,
+            input.thermalEnvironment().directSolarFluxWm2(),
+            input.thermalEnvironment().diffuseSolarFluxWm2(),
+            input.thermalEnvironment().ambientAirTemperatureKelvin(),
+            input.thermalEnvironment().deepGroundTemperatureKelvin(),
+            input.thermalEnvironment().skyTemperatureKelvin(),
+            input.thermalEnvironment().precipitationTemperatureKelvin(),
+            input.thermalEnvironment().precipitationStrength(),
+            input.thermalEnvironment().sunX(),
+            input.thermalEnvironment().sunY(),
+            input.thermalEnvironment().sunZ(),
+            input.thermalEnvironment().surfaceDeltaSeconds()
+        )) {
+            throw new IOException("Failed to initialize inspection patch thermal state");
+        }
+    }
+
+    private InspectionPatchForcing buildInspectionPatchForcing(InspectionPatchInput input) {
+        int size = input.gridResolution();
+        int cells = size * size * size;
+        byte[] fanMask = new byte[cells];
+        float[] fanVx = new float[cells];
+        float[] fanVy = new float[cells];
+        float[] fanVz = new float[cells];
+        float[] thermalSource = new float[cells];
+        for (FanSource fan : input.fans()) {
+            applyFanSourceToPatchForcing(
+                input.staticFields().obstacle(),
+                size,
+                fanMask,
+                fanVx,
+                fanVy,
+                fanVz,
+                fan,
+                input.cellsPerBlock(),
+                input.origin().getX(),
+                input.origin().getY(),
+                input.origin().getZ()
+            );
+        }
+        return new InspectionPatchForcing(thermalSource, fanMask, fanVx, fanVy, fanVz);
+    }
+
+    private InspectionPatchDynamicState buildInspectionPatchInitialState(InspectionPatchInput input, int cells) {
+        float[] flowState = new float[cells * RESPONSE_CHANNELS];
+        float[] airTemperature = new float[cells];
+        float[] surfaceTemperature = new float[cells];
+        float initialVx = input.fallbackBoundary().windX() / NATIVE_VELOCITY_SCALE;
+        float initialVy = input.fallbackBoundary().windY() / NATIVE_VELOCITY_SCALE;
+        float initialVz = input.fallbackBoundary().windZ() / NATIVE_VELOCITY_SCALE;
+        float initialAirTemperature = input.thermalEnvironment().ambientAirTemperatureKelvin();
+        float initialSurfaceTemperature = input.thermalEnvironment().deepGroundTemperatureKelvin();
+        for (int cell = 0; cell < cells; cell++) {
+            airTemperature[cell] = initialAirTemperature;
+            surfaceTemperature[cell] = initialSurfaceTemperature;
+            if (input.staticFields().obstacle()[cell] != 0) {
+                continue;
+            }
+            int base = cell * RESPONSE_CHANNELS;
+            flowState[base] = initialVx;
+            flowState[base + 1] = initialVy;
+            flowState[base + 2] = initialVz;
+            flowState[base + 3] = 0.0f;
+        }
+        return new InspectionPatchDynamicState(flowState, airTemperature, surfaceTemperature);
+    }
+
+    private InspectionPatchSolveResult exportInspectionPatchSolveResult(
+        long regionKey,
+        int domainBlocks,
+        int gridResolution,
+        int cellsPerBlock,
+        int completedSteps,
+        float maxSpeedMps
+    )
+        throws IOException {
+        int cells = gridResolution * gridResolution * gridResolution;
+        float[] flowState = new float[cells * RESPONSE_CHANNELS];
+        float[] airTemperature = new float[cells];
+        float[] surfaceTemperature = new float[cells];
+        if (!simulationBridge.exportDynamicRegion(
+            simulationServiceId,
+            regionKey,
+            gridResolution,
+            gridResolution,
+            gridResolution,
+            flowState,
+            airTemperature,
+            surfaceTemperature
+        )) {
+            throw new IOException("Failed to export inspection patch solution");
+        }
+        float[] vx = new float[cells];
+        float[] vy = new float[cells];
+        float[] vz = new float[cells];
+        float[] pressure = new float[cells];
+        for (int cell = 0; cell < cells; cell++) {
+            int base = cell * RESPONSE_CHANNELS;
+            vx[cell] = flowState[base];
+            vy[cell] = flowState[base + 1];
+            vz[cell] = flowState[base + 2];
+            pressure[cell] = flowState[base + 3];
+        }
+        simulationBridge.deactivateRegion(simulationServiceId, regionKey);
+        return new InspectionPatchSolveResult(
+            domainBlocks,
+            gridResolution,
+            cellsPerBlock,
+            vx,
+            vy,
+            vz,
+            pressure,
+            airTemperature,
+            surfaceTemperature,
+            completedSteps,
+            maxSpeedMps
+        );
+    }
+
+    private void persistInspectionPatchSolveResult(Path outputDir, InspectionPatchSolveResult result) throws IOException {
+        Path solutionDir = outputDir.resolve("solution");
+        Files.createDirectories(solutionDir);
+        Path vxPath = solutionDir.resolve("velocity_x.zfp");
+        Path vyPath = solutionDir.resolve("velocity_y.zfp");
+        Path vzPath = solutionDir.resolve("velocity_z.zfp");
+        Path pressurePath = solutionDir.resolve("pressure.zfp");
+        Path airTemperaturePath = solutionDir.resolve("air_temperature.zfp");
+        Path surfaceTemperaturePath = solutionDir.resolve("surface_temperature.zfp");
+        int size = result.gridResolution();
+        if (!writeCompressedFloatGridFile(vxPath, result.vx(), size, size, size, INSPECTION_PATCH_OUTPUT_VELOCITY_TOLERANCE)
+            || !writeCompressedFloatGridFile(vyPath, result.vy(), size, size, size, INSPECTION_PATCH_OUTPUT_VELOCITY_TOLERANCE)
+            || !writeCompressedFloatGridFile(vzPath, result.vz(), size, size, size, INSPECTION_PATCH_OUTPUT_VELOCITY_TOLERANCE)
+            || !writeCompressedFloatGridFile(pressurePath, result.pressure(), size, size, size, INSPECTION_PATCH_OUTPUT_PRESSURE_TOLERANCE)
+            || !writeCompressedFloatGridFile(airTemperaturePath, result.airTemperature(), size, size, size, INSPECTION_PATCH_OUTPUT_TEMPERATURE_TOLERANCE)
+            || !writeCompressedFloatGridFile(surfaceTemperaturePath, result.surfaceTemperature(), size, size, size, INSPECTION_PATCH_OUTPUT_TEMPERATURE_TOLERANCE)) {
+            throw new IOException("Failed to compress inspection patch solution fields");
+        }
+
+        StringBuilder builder = new StringBuilder(4096);
+        builder.append("{\n");
+        appendJsonField(builder, "format", "a4mc_inspection_patch_solution_v2", true);
+        appendJsonField(builder, "domain_blocks_x", result.domainBlocks(), true);
+        appendJsonField(builder, "domain_blocks_y", result.domainBlocks(), true);
+        appendJsonField(builder, "domain_blocks_z", result.domainBlocks(), true);
+        appendJsonField(builder, "grid_resolution_x", result.gridResolution(), true);
+        appendJsonField(builder, "grid_resolution_y", result.gridResolution(), true);
+        appendJsonField(builder, "grid_resolution_z", result.gridResolution(), true);
+        appendJsonField(builder, "size_x", result.gridResolution(), true);
+        appendJsonField(builder, "size_y", result.gridResolution(), true);
+        appendJsonField(builder, "size_z", result.gridResolution(), true);
+        appendJsonField(builder, "cells_per_block", result.cellsPerBlock(), true);
+        appendJsonField(builder, "cell_size_blocks", 1.0f / (float) result.cellsPerBlock(), true);
+        appendJsonField(builder, "completed_steps", result.completedSteps(), true);
+        appendJsonField(builder, "max_speed_mps", result.maxSpeedMps(), true);
+        appendJsonField(builder, "velocity_tolerance", INSPECTION_PATCH_OUTPUT_VELOCITY_TOLERANCE, true);
+        appendJsonField(builder, "pressure_tolerance", INSPECTION_PATCH_OUTPUT_PRESSURE_TOLERANCE, true);
+        appendJsonField(builder, "temperature_tolerance", INSPECTION_PATCH_OUTPUT_TEMPERATURE_TOLERANCE, true);
+        builder.append("  \"files\": {\n");
+        appendJsonField(builder, "velocity_x", outputDir.relativize(vxPath).toString(), true, 4);
+        appendJsonField(builder, "velocity_y", outputDir.relativize(vyPath).toString(), true, 4);
+        appendJsonField(builder, "velocity_z", outputDir.relativize(vzPath).toString(), true, 4);
+        appendJsonField(builder, "pressure", outputDir.relativize(pressurePath).toString(), true, 4);
+        appendJsonField(builder, "air_temperature", outputDir.relativize(airTemperaturePath).toString(), true, 4);
+        appendJsonField(builder, "surface_temperature", outputDir.relativize(surfaceTemperaturePath).toString(), false, 4);
+        builder.append("  }\n");
+        builder.append("}\n");
+        Files.writeString(solutionDir.resolve("metadata.json"), builder.toString(), StandardCharsets.UTF_8);
+    }
+
+    private void restoreSimulationRuntimeAfterInspectionSolve() {
+        if (simulationServiceId == 0L) {
+            return;
+        }
+        simulationBridge.ensureL2Runtime(simulationServiceId, GRID_SIZE, GRID_SIZE, GRID_SIZE, CHANNELS, RESPONSE_CHANNELS);
+    }
+
+    private short[] unsignedByteFieldToShorts(byte[] values) {
+        short[] result = new short[values.length];
+        for (int i = 0; i < values.length; i++) {
+            result[i] = (short) Byte.toUnsignedInt(values[i]);
+        }
+        return result;
+    }
+
+    private void tickL2Capture(MinecraftServer server) {
+        L2CaptureSession session = activeL2CaptureSession;
+        if (session == null) {
+            return;
+        }
+        if (session.stopRequested.get() || tickCounter > session.endTick) {
+            session.stopRequested.set(true);
+            activeL2CaptureSession = null;
+            persistL2CaptureMetadata(session);
+            return;
+        }
+        if (tickCounter < session.nextSampleTick) {
+            return;
+        }
+    }
+
+    private void captureL2Frame(L2CaptureSession session, L2CapturePendingFrame pendingFrame) {
+        try {
+            Path framesDir = session.outputDir.resolve("frames");
+            String framePrefix = String.format(Locale.ROOT, "frame_%05d_tick%d", pendingFrame.frameIndex(), pendingFrame.tick());
+            List<L2CaptureFrameRegionRecord> frameRegions = new ArrayList<>(pendingFrame.regions().size());
+            for (L2CapturePendingRegionFrame regionFrame : pendingFrame.regions()) {
+                byte[] vxCompressed = simulationBridge.compressFloatGrid3d(
+                    regionFrame.vx(),
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    ANALYSIS_FLOW_VELOCITY_TOLERANCE
+                );
+                byte[] vyCompressed = simulationBridge.compressFloatGrid3d(
+                    regionFrame.vy(),
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    ANALYSIS_FLOW_VELOCITY_TOLERANCE
+                );
+                byte[] vzCompressed = simulationBridge.compressFloatGrid3d(
+                    regionFrame.vz(),
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    ANALYSIS_FLOW_VELOCITY_TOLERANCE
+                );
+                byte[] pressureCompressed = simulationBridge.compressFloatGrid3d(
+                    regionFrame.pressure(),
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    REGION_CORE_SIZE,
+                    ANALYSIS_FLOW_PRESSURE_TOLERANCE
+                );
+                if (vxCompressed == null || vyCompressed == null || vzCompressed == null || pressureCompressed == null) {
+                    session.framesFailed.incrementAndGet();
+                    return;
+                }
+
+                BlockPos origin = regionFrame.origin();
+                BlockPos coreOrigin = regionFrame.coreOrigin();
+                String regionSuffix = "_ox" + origin.getX() + "_oy" + origin.getY() + "_oz" + origin.getZ();
+                Path vxPath = framesDir.resolve(framePrefix + regionSuffix + "_vx.zfp");
+                Path vyPath = framesDir.resolve(framePrefix + regionSuffix + "_vy.zfp");
+                Path vzPath = framesDir.resolve(framePrefix + regionSuffix + "_vz.zfp");
+                Path pressurePath = framesDir.resolve(framePrefix + regionSuffix + "_p.zfp");
+                Path obstaclePath = framesDir.resolve(framePrefix + regionSuffix + "_obstacle.mask");
+                Files.write(vxPath, vxCompressed);
+                Files.write(vyPath, vyCompressed);
+                Files.write(vzPath, vzCompressed);
+                Files.write(pressurePath, pressureCompressed);
+                Files.write(obstaclePath, regionFrame.obstacle());
+
+                frameRegions.add(new L2CaptureFrameRegionRecord(
+                    origin.getX(),
+                    origin.getY(),
+                    origin.getZ(),
+                    coreOrigin.getX(),
+                    coreOrigin.getY(),
+                    coreOrigin.getZ(),
+                    session.outputDir.relativize(vxPath).toString(),
+                    session.outputDir.relativize(vyPath).toString(),
+                    session.outputDir.relativize(vzPath).toString(),
+                    session.outputDir.relativize(pressurePath).toString(),
+                    session.outputDir.relativize(obstaclePath).toString()
+                ));
+            }
+
+            session.frames.add(new L2CaptureFrameRecord(
+                pendingFrame.frameIndex(),
+                pendingFrame.tick(),
+                List.copyOf(frameRegions)
+            ));
+            session.framesWritten.incrementAndGet();
+            persistL2CaptureMetadata(session);
+        } catch (IOException e) {
+            session.framesFailed.incrementAndGet();
+        } finally {
+            session.inFlightFrames.decrementAndGet();
+        }
+    }
+
+    private void queueCoherentL2CaptureIfNeeded(int sampleTick) {
+        L2CaptureSession session = activeL2CaptureSession;
+        if (session == null || session.stopRequested.get()) {
+            return;
+        }
+        if (sampleTick < session.nextSampleTick) {
+            return;
+        }
+        if (session.inFlightFrames.get() >= L2_CAPTURE_MAX_PENDING_FRAMES) {
+            session.framesDropped.incrementAndGet();
+            session.nextSampleTick = sampleTick + session.sampleIntervalTicks;
+            persistL2CaptureMetadata(session);
+            return;
+        }
+
+        List<L2CapturePendingRegionFrame> pendingRegions = new ArrayList<>(session.regions.size());
+        for (L2CaptureRegionSpec regionSpec : session.regions) {
+            float[] fullFlowState = snapshotFullRegionFlow(regionSpec.key());
+            if (fullFlowState == null) {
+                session.framesFailed.incrementAndGet();
+                session.nextSampleTick = sampleTick + session.sampleIntervalTicks;
+                persistL2CaptureMetadata(session);
+                return;
+            }
+            byte[] obstacle = snapshotCoreObstacleMask(regionSpec.key());
+            if (obstacle == null) {
+                session.framesFailed.incrementAndGet();
+                session.nextSampleTick = sampleTick + session.sampleIntervalTicks;
+                persistL2CaptureMetadata(session);
+                return;
+            }
+            pendingRegions.add(new L2CapturePendingRegionFrame(
+                regionSpec.key().origin(),
+                regionSpec.coreOrigin(),
+                extractCoreFlowChannel(fullFlowState, 0),
+                extractCoreFlowChannel(fullFlowState, 1),
+                extractCoreFlowChannel(fullFlowState, 2),
+                extractCoreFlowChannel(fullFlowState, 3),
+                obstacle
+            ));
+        }
+
+        int frameIndex = session.nextFrameIndex.getAndIncrement();
+        session.nextSampleTick = sampleTick + session.sampleIntervalTicks;
+        session.inFlightFrames.incrementAndGet();
+        L2CapturePendingFrame pendingFrame = new L2CapturePendingFrame(frameIndex, sampleTick, List.copyOf(pendingRegions));
+        diagnosticsExecutor.execute(() -> captureL2Frame(session, pendingFrame));
+    }
+
+    private float[] snapshotFullRegionFlow(WindowKey key) {
+        synchronized (simulationStateLock) {
+            if (simulationServiceId == 0L) {
+                return null;
+            }
+            RegionRecord region = regions.get(key);
+            if (region == null || !region.serviceReady) {
+                return null;
+            }
+            float[] fullFlowState = new float[GRID_SIZE * GRID_SIZE * GRID_SIZE * NativeSimulationBridge.FLOW_STATE_CHANNELS];
+            if (!simulationBridge.getRegionFlowState(
+                simulationServiceId,
+                simulationRegionKey(key),
+                GRID_SIZE,
+                GRID_SIZE,
+                GRID_SIZE,
+                fullFlowState
+            )) {
+                return null;
+            }
+            return fullFlowState;
+        }
+    }
+
+    private float[] extractCoreFlowChannel(float[] fullFlowState, int channel) {
+        float[] values = new float[REGION_CORE_SIZE * REGION_CORE_SIZE * REGION_CORE_SIZE];
+        int writeIndex = 0;
+        for (int x = REGION_HALO_CELLS; x < GRID_SIZE - REGION_HALO_CELLS; x++) {
+            for (int y = REGION_HALO_CELLS; y < GRID_SIZE - REGION_HALO_CELLS; y++) {
+                for (int z = REGION_HALO_CELLS; z < GRID_SIZE - REGION_HALO_CELLS; z++) {
+                    int cell = gridCellIndex(x, y, z);
+                    values[writeIndex++] = fullFlowState[cell * NativeSimulationBridge.FLOW_STATE_CHANNELS + channel];
+                }
+            }
+        }
+        return values;
+    }
+
+    private byte[] snapshotCoreObstacleMask(WindowKey key) {
+        synchronized (simulationStateLock) {
+            RegionRecord region = regions.get(key);
+            if (region == null) {
+                return null;
+            }
+            byte[] values = new byte[REGION_CORE_SIZE * REGION_CORE_SIZE * REGION_CORE_SIZE];
+            int writeIndex = 0;
+            for (int x = REGION_HALO_CELLS; x < GRID_SIZE - REGION_HALO_CELLS; x++) {
+                int sx = x / CHUNK_SIZE;
+                int lx = x % CHUNK_SIZE;
+                for (int y = REGION_HALO_CELLS; y < GRID_SIZE - REGION_HALO_CELLS; y++) {
+                    int sy = y / CHUNK_SIZE;
+                    int ly = y % CHUNK_SIZE;
+                    for (int z = REGION_HALO_CELLS; z < GRID_SIZE - REGION_HALO_CELLS; z++) {
+                        int sz = z / CHUNK_SIZE;
+                        int lz = z % CHUNK_SIZE;
+                        WorldMirror.SectionSnapshot section = region.sectionAt(sx, sy, sz);
+                        values[writeIndex++] = section != null && section.obstacle()[localSectionCellIndex(lx, ly, lz)] >= 0.5f
+                            ? (byte) 1
+                            : (byte) 0;
+                    }
+                }
+            }
+            return values;
+        }
+    }
+
+    private void persistL2CaptureMetadata(L2CaptureSession session) {
+        if (session == null) {
+            return;
+        }
+        Path metadataPath = session.outputDir.resolve("metadata.json");
+        List<L2CaptureFrameRecord> framesSnapshot;
+        synchronized (session.frames) {
+            framesSnapshot = List.copyOf(session.frames);
+        }
+        StringBuilder builder = new StringBuilder(1 << 16);
+        builder.append("{\n");
+        appendJsonField(builder, "format", "a4mc_l2_capture_v2", true);
+        appendJsonField(builder, "capture_mode", "active_core_bricks", true);
+        appendJsonField(builder, "dimension_id", session.dimensionId.toString(), true);
+        appendJsonField(builder, "anchor_core_x", session.anchorCoreOrigin.getX(), true);
+        appendJsonField(builder, "anchor_core_y", session.anchorCoreOrigin.getY(), true);
+        appendJsonField(builder, "anchor_core_z", session.anchorCoreOrigin.getZ(), true);
+        appendJsonField(builder, "region_resolution", GRID_SIZE, true);
+        appendJsonField(builder, "halo_cells", REGION_HALO_CELLS, true);
+        appendJsonField(builder, "core_min", REGION_HALO_CELLS, true);
+        appendJsonField(builder, "core_max_exclusive", GRID_SIZE - REGION_HALO_CELLS, true);
+        appendJsonField(builder, "core_resolution", REGION_CORE_SIZE, true);
+        appendJsonField(builder, "obstacle_mask_encoding", "u8_raw_0_1", true);
+        appendJsonField(builder, "region_count", session.regions.size(), true);
+        appendJsonField(builder, "layout_min_x", session.layoutMinX, true);
+        appendJsonField(builder, "layout_min_y", session.layoutMinY, true);
+        appendJsonField(builder, "layout_min_z", session.layoutMinZ, true);
+        appendJsonField(builder, "layout_max_exclusive_x", session.layoutMaxExclusiveX, true);
+        appendJsonField(builder, "layout_max_exclusive_y", session.layoutMaxExclusiveY, true);
+        appendJsonField(builder, "layout_max_exclusive_z", session.layoutMaxExclusiveZ, true);
+        appendJsonField(builder, "layout_resolution_x", session.layoutMaxExclusiveX - session.layoutMinX, true);
+        appendJsonField(builder, "layout_resolution_y", session.layoutMaxExclusiveY - session.layoutMinY, true);
+        appendJsonField(builder, "layout_resolution_z", session.layoutMaxExclusiveZ - session.layoutMinZ, true);
+        appendJsonField(builder, "channels", NativeSimulationBridge.FLOW_STATE_CHANNELS, true);
+        appendJsonField(builder, "velocity_tolerance", ANALYSIS_FLOW_VELOCITY_TOLERANCE, true);
+        appendJsonField(builder, "pressure_tolerance", ANALYSIS_FLOW_PRESSURE_TOLERANCE, true);
+        appendJsonField(builder, "start_tick", session.startTick, true);
+        appendJsonField(builder, "end_tick", session.endTick, true);
+        appendJsonField(builder, "duration_seconds", session.durationSeconds, true);
+        appendJsonField(builder, "fps_requested", session.fps, true);
+        appendJsonField(builder, "sample_interval_ticks", session.sampleIntervalTicks, true);
+        appendJsonField(builder, "frames_written", session.framesWritten.get(), true);
+        appendJsonField(builder, "frames_dropped", session.framesDropped.get(), true);
+        appendJsonField(builder, "frames_failed", session.framesFailed.get(), true);
+        int scheduledFrames = session.framesWritten.get() + session.framesDropped.get() + session.framesFailed.get();
+        float effectiveFps = session.durationSeconds > 0
+            ? (float) session.framesWritten.get() / (float) session.durationSeconds
+            : 0.0f;
+        float captureRatio = scheduledFrames > 0
+            ? (float) session.framesWritten.get() / (float) scheduledFrames
+            : 0.0f;
+        appendJsonField(builder, "fps_effective", effectiveFps, true);
+        appendJsonField(builder, "capture_ratio", captureRatio, true);
+        appendJsonField(builder, "active", activeL2CaptureSession == session && !session.stopRequested.get(), true);
+        builder.append("  \"regions\": [\n");
+        for (int i = 0; i < session.regions.size(); i++) {
+            L2CaptureRegionSpec region = session.regions.get(i);
+            builder.append("    {\n");
+            appendJsonField(builder, "origin_x", region.key().origin().getX(), true, 6);
+            appendJsonField(builder, "origin_y", region.key().origin().getY(), true, 6);
+            appendJsonField(builder, "origin_z", region.key().origin().getZ(), true, 6);
+            appendJsonField(builder, "core_origin_x", region.coreOrigin().getX(), true, 6);
+            appendJsonField(builder, "core_origin_y", region.coreOrigin().getY(), true, 6);
+            appendJsonField(builder, "core_origin_z", region.coreOrigin().getZ(), false, 6);
+            builder.append("    }");
+            if (i + 1 < session.regions.size()) {
+                builder.append(',');
+            }
+            builder.append('\n');
+        }
+        builder.append("  ],\n");
+        builder.append("  \"frames\": [\n");
+        for (int i = 0; i < framesSnapshot.size(); i++) {
+            L2CaptureFrameRecord frame = framesSnapshot.get(i);
+            builder.append("    {\n");
+            appendJsonField(builder, "index", frame.index(), true, 6);
+            appendJsonField(builder, "tick", frame.tick(), true, 6);
+            builder.append("      \"regions\": [\n");
+            for (int regionIndex = 0; regionIndex < frame.regions().size(); regionIndex++) {
+                L2CaptureFrameRegionRecord region = frame.regions().get(regionIndex);
+                builder.append("        {\n");
+                appendJsonField(builder, "origin_x", region.originX(), true, 10);
+                appendJsonField(builder, "origin_y", region.originY(), true, 10);
+                appendJsonField(builder, "origin_z", region.originZ(), true, 10);
+                appendJsonField(builder, "core_origin_x", region.coreOriginX(), true, 10);
+                appendJsonField(builder, "core_origin_y", region.coreOriginY(), true, 10);
+                appendJsonField(builder, "core_origin_z", region.coreOriginZ(), true, 10);
+                appendJsonField(builder, "vx", region.vxPath(), true, 10);
+                appendJsonField(builder, "vy", region.vyPath(), true, 10);
+                appendJsonField(builder, "vz", region.vzPath(), true, 10);
+                appendJsonField(builder, "pressure", region.pressurePath(), true, 10);
+                appendJsonField(builder, "obstacle", region.obstaclePath(), false, 10);
+                builder.append("        }");
+                if (regionIndex + 1 < frame.regions().size()) {
+                    builder.append(',');
+                }
+                builder.append('\n');
+            }
+            builder.append("      ]\n");
+            builder.append("    }");
+            if (i + 1 < framesSnapshot.size()) {
+                builder.append(',');
+            }
+            builder.append('\n');
+        }
+        builder.append("  ]\n");
+        builder.append("}\n");
+        try {
+            Files.writeString(metadataPath, builder.toString(), StandardCharsets.UTF_8);
+        } catch (IOException ignored) {
+        }
     }
 
     private int dumpRuntimeData(ServerCommandSource source) {
@@ -866,6 +2004,11 @@ public final class AeroServerRuntime {
     }
 
     private void appendJsonField(StringBuilder builder, String key, String value, boolean trailingComma) {
+        appendJsonField(builder, key, value, trailingComma, 2);
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, String value, boolean trailingComma, int indentSpaces) {
+        appendIndent(builder, indentSpaces);
         builder.append("  \"")
             .append(key)
             .append("\": \"")
@@ -919,6 +2062,22 @@ public final class AeroServerRuntime {
             .append(key)
             .append("\": ")
             .append(Float.toString(value));
+        if (trailingComma) {
+            builder.append(',');
+        }
+        builder.append('\n');
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, boolean value, boolean trailingComma) {
+        appendJsonField(builder, key, value, trailingComma, 2);
+    }
+
+    private void appendJsonField(StringBuilder builder, String key, boolean value, boolean trailingComma, int indentSpaces) {
+        appendIndent(builder, indentSpaces);
+        builder.append('"')
+            .append(key)
+            .append("\": ")
+            .append(value ? "true" : "false");
         if (trailingComma) {
             builder.append(',');
         }
@@ -982,6 +2141,22 @@ public final class AeroServerRuntime {
             return;
         }
         tickCounter++;
+        InspectionSolveSession inspectionSolveSession = activeInspectionSolveSession;
+        if (inspectionSolveSession != null) {
+            if (inspectionSolveSession.completed.get()) {
+                activeInspectionSolveSession = null;
+            }
+            recordMainThreadPhase(MAIN_THREAD_PHASE_SERVICE_INIT, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_FOCUS, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_BACKGROUND_BATCH, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_ACTIVE_BATCH, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_LIVE_BUILDS, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_FAN_REFRESHES, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_COORDINATOR, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_TOTAL, System.nanoTime() - tickStartNanos);
+            return;
+        }
         long phaseStartNanos = System.nanoTime();
         ensureSimulationServiceInitialized();
         recordMainThreadPhase(MAIN_THREAD_PHASE_SERVICE_INIT, System.nanoTime() - phaseStartNanos);
@@ -1029,11 +2204,10 @@ public final class AeroServerRuntime {
         if (shouldSyncFlow) {
             phaseStartNanos = System.nanoTime();
             syncPublishedFlowToPlayers(server, frame, PARTICLE_FLOW_SAMPLE_STRIDE);
-            if (tickCounter % ANALYSIS_FLOW_SYNC_INTERVAL_TICKS == 0) {
-                syncAnalysisFlowToPlayers(server, frame);
-            }
+            tickL2Capture(server);
             recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, System.nanoTime() - phaseStartNanos);
         } else {
+            tickL2Capture(server);
             recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, 0L);
         }
         long frameId = frame.frameId();
@@ -1146,6 +2320,12 @@ public final class AeroServerRuntime {
 
     private void stopStreaming(MinecraftServer server, boolean persistDynamicRegions) {
         runtimeGeneration.incrementAndGet();
+        L2CaptureSession captureSession = activeL2CaptureSession;
+        if (captureSession != null) {
+            captureSession.stopRequested.set(true);
+            activeL2CaptureSession = null;
+            persistL2CaptureMetadata(captureSession);
+        }
         streamingEnabled = false;
         stopSimulationCoordinator();
         saveAllWorldScaleDrivers(server);
@@ -1417,6 +2597,125 @@ public final class AeroServerRuntime {
         currentServer = null;
     }
 
+    private static final class L2CaptureSession {
+        final RegistryKey<World> worldKey;
+        final Identifier dimensionId;
+        final BlockPos anchorCoreOrigin;
+        final List<L2CaptureRegionSpec> regions;
+        final Path outputDir;
+        final int startTick;
+        final int endTick;
+        final int durationSeconds;
+        final int fps;
+        final int sampleIntervalTicks;
+        final int layoutMinX;
+        final int layoutMinY;
+        final int layoutMinZ;
+        final int layoutMaxExclusiveX;
+        final int layoutMaxExclusiveY;
+        final int layoutMaxExclusiveZ;
+        final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        final AtomicInteger nextFrameIndex = new AtomicInteger(0);
+        final AtomicInteger inFlightFrames = new AtomicInteger(0);
+        final AtomicInteger framesWritten = new AtomicInteger(0);
+        final AtomicInteger framesDropped = new AtomicInteger(0);
+        final AtomicInteger framesFailed = new AtomicInteger(0);
+        final List<L2CaptureFrameRecord> frames = Collections.synchronizedList(new ArrayList<>());
+        volatile int nextSampleTick;
+
+        L2CaptureSession(
+            RegistryKey<World> worldKey,
+            Identifier dimensionId,
+            BlockPos anchorCoreOrigin,
+            List<L2CaptureRegionSpec> regions,
+            Path outputDir,
+            int startTick,
+            int endTick,
+            int durationSeconds,
+            int fps,
+            int sampleIntervalTicks
+        ) {
+            this.worldKey = worldKey;
+            this.dimensionId = dimensionId;
+            this.anchorCoreOrigin = anchorCoreOrigin.toImmutable();
+            this.regions = List.copyOf(regions);
+            this.outputDir = outputDir;
+            this.startTick = startTick;
+            this.endTick = endTick;
+            this.durationSeconds = durationSeconds;
+            this.fps = fps;
+            this.sampleIntervalTicks = sampleIntervalTicks;
+            int minX = Integer.MAX_VALUE;
+            int minY = Integer.MAX_VALUE;
+            int minZ = Integer.MAX_VALUE;
+            int maxX = Integer.MIN_VALUE;
+            int maxY = Integer.MIN_VALUE;
+            int maxZ = Integer.MIN_VALUE;
+            for (L2CaptureRegionSpec region : this.regions) {
+                BlockPos coreOrigin = region.coreOrigin();
+                minX = Math.min(minX, coreOrigin.getX());
+                minY = Math.min(minY, coreOrigin.getY());
+                minZ = Math.min(minZ, coreOrigin.getZ());
+                maxX = Math.max(maxX, coreOrigin.getX() + REGION_CORE_SIZE);
+                maxY = Math.max(maxY, coreOrigin.getY() + REGION_CORE_SIZE);
+                maxZ = Math.max(maxZ, coreOrigin.getZ() + REGION_CORE_SIZE);
+            }
+            this.layoutMinX = minX;
+            this.layoutMinY = minY;
+            this.layoutMinZ = minZ;
+            this.layoutMaxExclusiveX = maxX;
+            this.layoutMaxExclusiveY = maxY;
+            this.layoutMaxExclusiveZ = maxZ;
+            this.nextSampleTick = startTick;
+        }
+    }
+
+    private record L2CaptureRegionSpec(
+        WindowKey key,
+        BlockPos coreOrigin
+    ) {
+    }
+
+    private record L2CaptureFrameRecord(
+        int index,
+        int tick,
+        List<L2CaptureFrameRegionRecord> regions
+    ) {
+    }
+
+    private record L2CaptureFrameRegionRecord(
+        int originX,
+        int originY,
+        int originZ,
+        int coreOriginX,
+        int coreOriginY,
+        int coreOriginZ,
+        String vxPath,
+        String vyPath,
+        String vzPath,
+        String pressurePath,
+        String obstaclePath
+    ) {
+    }
+
+    private record L2CapturePendingFrame(
+        int frameIndex,
+        int tick,
+        List<L2CapturePendingRegionFrame> regions
+    ) {
+    }
+
+    private record L2CapturePendingRegionFrame(
+        BlockPos origin,
+        BlockPos coreOrigin,
+        float[] vx,
+        float[] vy,
+        float[] vz,
+        float[] pressure,
+        byte[] obstacle
+    ) {
+    }
+
     private ActiveRegionBatch captureActiveRegionBatch(MinecraftServer server) {
         List<PlayerRegionAnchor> anchors = new ArrayList<>();
         List<PlayerProbeRequest> probeRequests = new ArrayList<>();
@@ -1604,10 +2903,14 @@ public final class AeroServerRuntime {
     }
 
     private List<FanSource> queryFanSources(RegistryKey<World> worldKey, BlockPos origin) {
+        return queryFanSources(worldKey, origin, GRID_SIZE);
+    }
+
+    private List<FanSource> queryFanSources(RegistryKey<World> worldKey, BlockPos origin, int gridSize) {
         List<WorldMirror.FanRecord> fans = worldMirror.queryFans(
             worldKey,
             origin,
-            GRID_SIZE,
+            gridSize,
             DUCT_JET_RANGE + FAN_RADIUS + 1
         );
         if (fans.isEmpty()) {
@@ -1983,6 +3286,372 @@ public final class AeroServerRuntime {
 
     private int gridCellIndex(int x, int y, int z) {
         return (x * GRID_SIZE + y) * GRID_SIZE + z;
+    }
+
+    private int patchCellIndex(int x, int y, int z, int size) {
+        return (x * size + y) * size + z;
+    }
+
+    private int defaultInspectionPatchGridResolution(int domainBlocks) {
+        return Math.min(INSPECTION_PATCH_MAX_GRID_RESOLUTION, domainBlocks * 2);
+    }
+
+    private boolean isValidInspectionPatchGridResolution(int domainBlocks, int gridResolution) {
+        return gridResolution >= domainBlocks
+            && gridResolution <= INSPECTION_PATCH_MAX_GRID_RESOLUTION
+            && (gridResolution % domainBlocks) == 0;
+    }
+
+    private double inspectionPatchCellSizeBlocks(int domainBlocks, int gridResolution) {
+        return (double) domainBlocks / (double) gridResolution;
+    }
+
+    private int worldToPatchCell(double worldCoord, int originCoord, int cellsPerBlock) {
+        return (int) Math.floor((worldCoord - originCoord) * cellsPerBlock);
+    }
+
+    private double patchCellCenterWorld(int originCoord, int cell, int cellsPerBlock) {
+        return originCoord + ((double) cell + 0.5) / (double) cellsPerBlock;
+    }
+
+    private BlockPos inspectionPatchOriginForFocus(ServerWorld world, BlockPos focus, int domainBlocks) {
+        int half = domainBlocks / 2;
+        int rawX = Math.floorDiv(focus.getX() - half, CHUNK_SIZE) * CHUNK_SIZE;
+        int rawY = Math.floorDiv(focus.getY() - half, CHUNK_SIZE) * CHUNK_SIZE;
+        int rawZ = Math.floorDiv(focus.getZ() - half, CHUNK_SIZE) * CHUNK_SIZE;
+        int maxOriginY = world.getTopYInclusive() + 1 - domainBlocks;
+        int clampedY = MathHelper.clamp(rawY, world.getBottomY(), maxOriginY);
+        return new BlockPos(rawX, clampedY, rawZ);
+    }
+
+    private InspectionPatchStaticFields captureInspectionPatchStaticFields(
+        ServerWorld world,
+        BlockPos origin,
+        int domainBlocks,
+        int gridResolution,
+        int cellsPerBlock
+    ) {
+        int cells = gridResolution * gridResolution * gridResolution;
+        byte[] obstacle = new byte[cells];
+        byte[] surfaceKind = new byte[cells];
+        byte[] openFaceMask = new byte[cells];
+        float[] emitterPowerWatts = new float[cells];
+        byte[] faceSkyExposure = new byte[cells * FACE_COUNT];
+        byte[] faceDirectExposure = new byte[cells * FACE_COUNT];
+        BlockPos.Mutable cursor = new BlockPos.Mutable();
+        double cellSizeBlocks = inspectionPatchCellSizeBlocks(domainBlocks, gridResolution);
+        for (int x = 0; x < gridResolution; x++) {
+            double sampleX = patchCellCenterWorld(origin.getX(), x, cellsPerBlock);
+            for (int y = 0; y < gridResolution; y++) {
+                double sampleY = patchCellCenterWorld(origin.getY(), y, cellsPerBlock);
+                for (int z = 0; z < gridResolution; z++) {
+                    double sampleZ = patchCellCenterWorld(origin.getZ(), z, cellsPerBlock);
+                    int cell = patchCellIndex(x, y, z, gridResolution);
+                    cursor.set(MathHelper.floor(sampleX), MathHelper.floor(sampleY), MathHelper.floor(sampleZ));
+                    BlockState state = world.getBlockState(cursor);
+                    boolean solid = isSolidObstacleAtPoint(world, cursor, state, sampleX, sampleY, sampleZ);
+                    obstacle[cell] = solid ? (byte) 1 : (byte) 0;
+                    ThermalMaterial material = thermalMaterial(state);
+                    surfaceKind[cell] = material == null ? SURFACE_KIND_NONE : material.kind();
+                    patchStaticThermalFieldsAtSample(
+                        world,
+                        cursor,
+                        state,
+                        sampleX,
+                        sampleY,
+                        sampleZ,
+                        cellSizeBlocks,
+                        cell,
+                        material,
+                        emitterPowerWatts,
+                        openFaceMask,
+                        faceSkyExposure,
+                        faceDirectExposure
+                    );
+                }
+            }
+        }
+        return new InspectionPatchStaticFields(
+            obstacle,
+            surfaceKind,
+            openFaceMask,
+            emitterPowerWatts,
+            faceSkyExposure,
+            faceDirectExposure
+        );
+    }
+
+    private void patchStaticThermalFieldsAtSample(
+        ServerWorld world,
+        BlockPos pos,
+        BlockState state,
+        double sampleX,
+        double sampleY,
+        double sampleZ,
+        double cellSizeBlocks,
+        int cell,
+        ThermalMaterial material,
+        float[] emitterPowerWatts,
+        byte[] openFaceMaskField,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    ) {
+        float emitterPower = sampleEmitterThermalPowerWatts(state);
+        byte openFaceMask = 0;
+        if (emitterPowerWatts != null) {
+            emitterPowerWatts[cell] = emitterPower;
+        }
+        if (openFaceMaskField != null) {
+            openFaceMaskField[cell] = 0;
+        }
+        if (faceSkyExposure != null) {
+            Arrays.fill(faceSkyExposure, cell * FACE_COUNT, cell * FACE_COUNT + FACE_COUNT, (byte) 0);
+        }
+        if (faceDirectExposure != null) {
+            Arrays.fill(faceDirectExposure, cell * FACE_COUNT, cell * FACE_COUNT + FACE_COUNT, (byte) 0);
+        }
+        if (material == null && emitterPower <= 0.0f) {
+            return;
+        }
+        BlockPos.Mutable neighborCursor = new BlockPos.Mutable();
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            double neighborSampleX = sampleX + direction.getOffsetX() * cellSizeBlocks;
+            double neighborSampleY = sampleY + direction.getOffsetY() * cellSizeBlocks;
+            double neighborSampleZ = sampleZ + direction.getOffsetZ() * cellSizeBlocks;
+            neighborCursor.set(
+                MathHelper.floor(neighborSampleX),
+                MathHelper.floor(neighborSampleY),
+                MathHelper.floor(neighborSampleZ)
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            boolean openFace;
+            if (material != null) {
+                openFace = material.atmosphericExchangeRequiresAirNeighbor()
+                    ? neighborState.isAir()
+                    : !isSolidObstacleAtPoint(world, neighborCursor, neighborState, neighborSampleX, neighborSampleY, neighborSampleZ);
+            } else {
+                openFace = neighborState.isAir();
+            }
+            if (!openFace) {
+                continue;
+            }
+            openFaceMask = setFaceBit(openFaceMask, direction);
+            if (material != null && faceSkyExposure != null && faceDirectExposure != null) {
+                int faceIndex = faceDataIndex(cell, direction);
+                faceSkyExposure[faceIndex] = quantizeUnitFloat(sampleSkyExposure(world, neighborCursor));
+                faceDirectExposure[faceIndex] = quantizeUnitFloat(sampleDirectSunExposure(world, neighborCursor));
+            }
+        }
+        if (openFaceMaskField != null) {
+            openFaceMaskField[cell] = openFaceMask;
+        }
+    }
+
+    private void persistInspectionPatchDump(InspectionPatchInput input) throws IOException {
+        persistInspectionPatchDump(
+            input.outputDir(),
+            input.worldKey(),
+            input.focus(),
+            input.origin(),
+            input.domainBlocks(),
+            input.gridResolution(),
+            input.cellsPerBlock(),
+            input.faceResolution(),
+            input.environmentSnapshot(),
+            input.fallbackBoundary(),
+            input.thermalEnvironment(),
+            input.boundaryField(),
+            input.staticFields(),
+            input.fans()
+        );
+    }
+
+    private void persistInspectionPatchDump(
+        Path outputDir,
+        RegistryKey<World> worldKey,
+        BlockPos focus,
+        BlockPos origin,
+        int domainBlocks,
+        int gridResolution,
+        int cellsPerBlock,
+        int faceResolution,
+        WorldEnvironmentSnapshot environmentSnapshot,
+        NestedBoundaryCoupler.BoundarySample fallbackBoundary,
+        ThermalEnvironment thermalEnvironment,
+        BoundaryFieldData boundaryField,
+        InspectionPatchStaticFields staticFields,
+        List<FanSource> fans
+    ) throws IOException {
+        Path staticDir = outputDir.resolve("static");
+        Path boundaryDir = outputDir.resolve("boundary");
+
+        Path obstaclePath = staticDir.resolve("obstacle.mask");
+        Path surfaceKindPath = staticDir.resolve("surface_kind.u8");
+        Path openFaceMaskPath = staticDir.resolve("open_face_mask.u8");
+        Path emitterPowerPath = staticDir.resolve("emitter_power.zfp");
+        Path faceSkyExposurePath = staticDir.resolve("face_sky_exposure.u8");
+        Path faceDirectExposurePath = staticDir.resolve("face_direct_exposure.u8");
+        Path boundaryWindXPath = boundaryDir.resolve("wind_x.zfp");
+        Path boundaryWindYPath = boundaryDir.resolve("wind_y.zfp");
+        Path boundaryWindZPath = boundaryDir.resolve("wind_z.zfp");
+        Path boundaryAirTemperaturePath = boundaryDir.resolve("air_temperature.zfp");
+
+        Files.write(obstaclePath, staticFields.obstacle());
+        Files.write(surfaceKindPath, staticFields.surfaceKind());
+        Files.write(openFaceMaskPath, staticFields.openFaceMask());
+        Files.write(faceSkyExposurePath, staticFields.faceSkyExposure());
+        Files.write(faceDirectExposurePath, staticFields.faceDirectExposure());
+        if (!writeCompressedFloatGridFile(
+            emitterPowerPath,
+            staticFields.emitterPowerWatts(),
+            gridResolution,
+            gridResolution,
+            gridResolution,
+            INSPECTION_PATCH_EMITTER_POWER_TOLERANCE
+        )) {
+            throw new IOException("Failed to compress emitter power field");
+        }
+        if (!writeCompressedFloatGridFile(
+            boundaryWindXPath,
+            boundaryField.windX(),
+            FACE_COUNT,
+            faceResolution,
+            faceResolution,
+            INSPECTION_PATCH_BOUNDARY_VELOCITY_TOLERANCE
+        ) || !writeCompressedFloatGridFile(
+            boundaryWindYPath,
+            boundaryField.windY(),
+            FACE_COUNT,
+            faceResolution,
+            faceResolution,
+            INSPECTION_PATCH_BOUNDARY_VELOCITY_TOLERANCE
+        ) || !writeCompressedFloatGridFile(
+            boundaryWindZPath,
+            boundaryField.windZ(),
+            FACE_COUNT,
+            faceResolution,
+            faceResolution,
+            INSPECTION_PATCH_BOUNDARY_VELOCITY_TOLERANCE
+        ) || !writeCompressedFloatGridFile(
+            boundaryAirTemperaturePath,
+            boundaryField.airTemperatureKelvin(),
+            FACE_COUNT,
+            faceResolution,
+            faceResolution,
+            INSPECTION_PATCH_BOUNDARY_TEMPERATURE_TOLERANCE
+        )) {
+            throw new IOException("Failed to compress boundary field");
+        }
+
+        StringBuilder builder = new StringBuilder(1 << 15);
+        builder.append("{\n");
+        appendJsonField(builder, "format", "a4mc_inspection_patch_v2", true);
+        appendJsonField(builder, "capture_mode", "monolithic_patch_input", true);
+        appendJsonField(builder, "dimension_id", worldKey.getValue().toString(), true);
+        appendJsonField(builder, "tick", tickCounter, true);
+        appendJsonField(builder, "focus_x", focus.getX(), true);
+        appendJsonField(builder, "focus_y", focus.getY(), true);
+        appendJsonField(builder, "focus_z", focus.getZ(), true);
+        appendJsonField(builder, "origin_x", origin.getX(), true);
+        appendJsonField(builder, "origin_y", origin.getY(), true);
+        appendJsonField(builder, "origin_z", origin.getZ(), true);
+        appendJsonField(builder, "domain_blocks_x", domainBlocks, true);
+        appendJsonField(builder, "domain_blocks_y", domainBlocks, true);
+        appendJsonField(builder, "domain_blocks_z", domainBlocks, true);
+        appendJsonField(builder, "grid_resolution_x", gridResolution, true);
+        appendJsonField(builder, "grid_resolution_y", gridResolution, true);
+        appendJsonField(builder, "grid_resolution_z", gridResolution, true);
+        appendJsonField(builder, "size_x", gridResolution, true);
+        appendJsonField(builder, "size_y", gridResolution, true);
+        appendJsonField(builder, "size_z", gridResolution, true);
+        appendJsonField(builder, "cells_per_block", cellsPerBlock, true);
+        appendJsonField(builder, "cell_size_blocks", 1.0f / (float) cellsPerBlock, true);
+        appendJsonField(builder, "obstacle_mask_encoding", "u8_raw_0_1", true);
+        appendJsonField(builder, "surface_kind_encoding", "u8_enum", true);
+        appendJsonField(builder, "open_face_mask_encoding", "u8_direction_bits", true);
+        appendJsonField(builder, "face_exposure_encoding", "u8_unit_0_255", true);
+        appendJsonField(builder, "boundary_face_resolution", faceResolution, true);
+        appendJsonField(builder, "boundary_external_face_mask", boundaryField.externalFaceMask(), true);
+        appendJsonField(builder, "boundary_velocity_tolerance", INSPECTION_PATCH_BOUNDARY_VELOCITY_TOLERANCE, true);
+        appendJsonField(builder, "boundary_temperature_tolerance", INSPECTION_PATCH_BOUNDARY_TEMPERATURE_TOLERANCE, true);
+        appendJsonField(builder, "emitter_power_tolerance", INSPECTION_PATCH_EMITTER_POWER_TOLERANCE, true);
+        builder.append("  \"environment\": {\n");
+        appendJsonField(builder, "time_of_day", environmentSnapshot.timeOfDay(), true, 4);
+        appendJsonField(builder, "rain_gradient", environmentSnapshot.rainGradient(), true, 4);
+        appendJsonField(builder, "thunder_gradient", environmentSnapshot.thunderGradient(), true, 4);
+        appendJsonField(builder, "sea_level", environmentSnapshot.seaLevel(), false, 4);
+        builder.append("  },\n");
+        builder.append("  \"fallback_boundary_sample\": {\n");
+        appendJsonField(builder, "wind_x", fallbackBoundary.windX(), true, 4);
+        appendJsonField(builder, "wind_y", fallbackBoundary.windY(), true, 4);
+        appendJsonField(builder, "wind_z", fallbackBoundary.windZ(), true, 4);
+        appendJsonField(builder, "ambient_air_temperature_kelvin", fallbackBoundary.ambientAirTemperatureKelvin(), true, 4);
+        appendJsonField(builder, "deep_ground_temperature_kelvin", fallbackBoundary.deepGroundTemperatureKelvin(), false, 4);
+        builder.append("  },\n");
+        builder.append("  \"thermal_environment\": {\n");
+        appendJsonField(builder, "direct_solar_flux_wm2", thermalEnvironment.directSolarFluxWm2(), true, 4);
+        appendJsonField(builder, "diffuse_solar_flux_wm2", thermalEnvironment.diffuseSolarFluxWm2(), true, 4);
+        appendJsonField(builder, "ambient_air_temperature_kelvin", thermalEnvironment.ambientAirTemperatureKelvin(), true, 4);
+        appendJsonField(builder, "deep_ground_temperature_kelvin", thermalEnvironment.deepGroundTemperatureKelvin(), true, 4);
+        appendJsonField(builder, "sky_temperature_kelvin", thermalEnvironment.skyTemperatureKelvin(), true, 4);
+        appendJsonField(builder, "precipitation_temperature_kelvin", thermalEnvironment.precipitationTemperatureKelvin(), true, 4);
+        appendJsonField(builder, "precipitation_strength", thermalEnvironment.precipitationStrength(), true, 4);
+        appendJsonField(builder, "sun_x", thermalEnvironment.sunX(), true, 4);
+        appendJsonField(builder, "sun_y", thermalEnvironment.sunY(), true, 4);
+        appendJsonField(builder, "sun_z", thermalEnvironment.sunZ(), true, 4);
+        appendJsonField(builder, "surface_delta_seconds", thermalEnvironment.surfaceDeltaSeconds(), false, 4);
+        builder.append("  },\n");
+        builder.append("  \"static_files\": {\n");
+        appendJsonField(builder, "obstacle", outputDir.relativize(obstaclePath).toString(), true, 4);
+        appendJsonField(builder, "surface_kind", outputDir.relativize(surfaceKindPath).toString(), true, 4);
+        appendJsonField(builder, "open_face_mask", outputDir.relativize(openFaceMaskPath).toString(), true, 4);
+        appendJsonField(builder, "emitter_power", outputDir.relativize(emitterPowerPath).toString(), true, 4);
+        appendJsonField(builder, "face_sky_exposure", outputDir.relativize(faceSkyExposurePath).toString(), true, 4);
+        appendJsonField(builder, "face_direct_exposure", outputDir.relativize(faceDirectExposurePath).toString(), false, 4);
+        builder.append("  },\n");
+        builder.append("  \"boundary_files\": {\n");
+        appendJsonField(builder, "wind_x", outputDir.relativize(boundaryWindXPath).toString(), true, 4);
+        appendJsonField(builder, "wind_y", outputDir.relativize(boundaryWindYPath).toString(), true, 4);
+        appendJsonField(builder, "wind_z", outputDir.relativize(boundaryWindZPath).toString(), true, 4);
+        appendJsonField(builder, "air_temperature", outputDir.relativize(boundaryAirTemperaturePath).toString(), false, 4);
+        builder.append("  },\n");
+        builder.append("  \"fans\": [\n");
+        for (int i = 0; i < fans.size(); i++) {
+            FanSource fan = fans.get(i);
+            builder.append("    {\n");
+            appendJsonField(builder, "world_x", fan.pos().getX(), true, 6);
+            appendJsonField(builder, "world_y", fan.pos().getY(), true, 6);
+            appendJsonField(builder, "world_z", fan.pos().getZ(), true, 6);
+            appendJsonField(builder, "local_x_blocks", fan.pos().getX() - origin.getX(), true, 6);
+            appendJsonField(builder, "local_y_blocks", fan.pos().getY() - origin.getY(), true, 6);
+            appendJsonField(builder, "local_z_blocks", fan.pos().getZ() - origin.getZ(), true, 6);
+            appendJsonField(builder, "facing", fan.facing().asString(), true, 6);
+            appendJsonField(builder, "duct_length", fan.ductLength(), false, 6);
+            builder.append("    }");
+            if (i + 1 < fans.size()) {
+                builder.append(',');
+            }
+            builder.append('\n');
+        }
+        builder.append("  ]\n");
+        builder.append("}\n");
+        Files.writeString(outputDir.resolve("metadata.json"), builder.toString(), StandardCharsets.UTF_8);
+    }
+
+    private boolean writeCompressedFloatGridFile(
+        Path path,
+        float[] values,
+        int nx,
+        int ny,
+        int nz,
+        double tolerance
+    ) throws IOException {
+        byte[] compressed = simulationBridge.compressFloatGrid3d(values, nx, ny, nz, tolerance);
+        if (compressed == null) {
+            return false;
+        }
+        Files.write(path, compressed);
+        return true;
     }
 
     private long simulationRegionKey(WindowKey key) {
@@ -2394,6 +4063,16 @@ public final class AeroServerRuntime {
         return section.obstacle()[localSectionCellIndex(x % CHUNK_SIZE, y % CHUNK_SIZE, z % CHUNK_SIZE)] > 0.5f;
     }
 
+    private boolean obstacleAtPatch(byte[] obstacleMask, int size, int x, int y, int z) {
+        return x < 0
+            || y < 0
+            || z < 0
+            || x >= size
+            || y >= size
+            || z >= size
+            || obstacleMask[patchCellIndex(x, y, z, size)] != 0;
+    }
+
     private void applyFanAtVoxelToForcing(
         RegionRecord region,
         byte[] fanMask,
@@ -2411,6 +4090,30 @@ public final class AeroServerRuntime {
             return;
         }
         int cell = gridCellIndex(x, y, z);
+        fanMask[cell] = 1;
+        fanVxField[cell] += fanVx;
+        fanVyField[cell] += fanVy;
+        fanVzField[cell] += fanVz;
+    }
+
+    private void applyFanAtVoxelToPatchForcing(
+        byte[] obstacleMask,
+        int size,
+        byte[] fanMask,
+        float[] fanVxField,
+        float[] fanVyField,
+        float[] fanVzField,
+        int x,
+        int y,
+        int z,
+        float fanVx,
+        float fanVy,
+        float fanVz
+    ) {
+        if (obstacleAtPatch(obstacleMask, size, x, y, z)) {
+            return;
+        }
+        int cell = patchCellIndex(x, y, z, size);
         fanMask[cell] = 1;
         fanVxField[cell] += fanVx;
         fanVyField[cell] += fanVy;
@@ -2479,6 +4182,125 @@ public final class AeroServerRuntime {
             default -> applyFanAtVoxelToForcing(region, fanMask, fanVxField, fanVyField, fanVzField, cx, cy, cz, fanVx, fanVy, fanVz);
         }
         applyDuctJetToForcing(region, fanMask, fanVxField, fanVyField, fanVzField, fan, minX, minY, minZ);
+    }
+
+    private void applyFanSourceToPatchForcing(
+        byte[] obstacleMask,
+        int size,
+        byte[] fanMask,
+        float[] fanVxField,
+        float[] fanVyField,
+        float[] fanVzField,
+        FanSource fan,
+        int cellsPerBlock,
+        int minX,
+        int minY,
+        int minZ
+    ) {
+        BlockPos inflowPos = fan.pos().offset(fan.facing());
+        int cx = worldToPatchCell(inflowPos.getX() + 0.5, minX, cellsPerBlock);
+        int cy = worldToPatchCell(inflowPos.getY() + 0.5, minY, cellsPerBlock);
+        int cz = worldToPatchCell(inflowPos.getZ() + 0.5, minZ, cellsPerBlock);
+
+        float inflowSpeed = runtimeFanSpeedMetersPerSecond();
+        float fanVx = fan.facing().getOffsetX() * inflowSpeed;
+        float fanVy = fan.facing().getOffsetY() * inflowSpeed;
+        float fanVz = fan.facing().getOffsetZ() * inflowSpeed;
+
+        int radiusCells = Math.max(1, FAN_RADIUS * cellsPerBlock);
+        int radius2 = radiusCells * radiusCells;
+        switch (fan.facing().getAxis()) {
+            case X -> {
+                for (int y = cy - radiusCells; y <= cy + radiusCells; y++) {
+                    for (int z = cz - radiusCells; z <= cz + radiusCells; z++) {
+                        int dy = y - cy;
+                        int dz = z - cz;
+                        if (dy * dy + dz * dz > radius2) {
+                            continue;
+                        }
+                        applyFanAtVoxelToPatchForcing(
+                            obstacleMask,
+                            size,
+                            fanMask,
+                            fanVxField,
+                            fanVyField,
+                            fanVzField,
+                            cx,
+                            y,
+                            z,
+                            fanVx,
+                            fanVy,
+                            fanVz
+                        );
+                    }
+                }
+            }
+            case Y -> {
+                for (int x = cx - radiusCells; x <= cx + radiusCells; x++) {
+                    for (int z = cz - radiusCells; z <= cz + radiusCells; z++) {
+                        int dx = x - cx;
+                        int dz = z - cz;
+                        if (dx * dx + dz * dz > radius2) {
+                            continue;
+                        }
+                        applyFanAtVoxelToPatchForcing(
+                            obstacleMask,
+                            size,
+                            fanMask,
+                            fanVxField,
+                            fanVyField,
+                            fanVzField,
+                            x,
+                            cy,
+                            z,
+                            fanVx,
+                            fanVy,
+                            fanVz
+                        );
+                    }
+                }
+            }
+            case Z -> {
+                for (int x = cx - radiusCells; x <= cx + radiusCells; x++) {
+                    for (int y = cy - radiusCells; y <= cy + radiusCells; y++) {
+                        int dx = x - cx;
+                        int dy = y - cy;
+                        if (dx * dx + dy * dy > radius2) {
+                            continue;
+                        }
+                        applyFanAtVoxelToPatchForcing(
+                            obstacleMask,
+                            size,
+                            fanMask,
+                            fanVxField,
+                            fanVyField,
+                            fanVzField,
+                            x,
+                            y,
+                            cz,
+                            fanVx,
+                            fanVy,
+                            fanVz
+                        );
+                    }
+                }
+            }
+            default -> applyFanAtVoxelToPatchForcing(
+                obstacleMask,
+                size,
+                fanMask,
+                fanVxField,
+                fanVyField,
+                fanVzField,
+                cx,
+                cy,
+                cz,
+                fanVx,
+                fanVy,
+                fanVz
+            );
+        }
+        applyDuctJetToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, fan, cellsPerBlock, minX, minY, minZ);
     }
 
     private void applyDuctJetToForcing(
@@ -2565,6 +4387,93 @@ public final class AeroServerRuntime {
         }
     }
 
+    private void applyDuctJetToPatchForcing(
+        byte[] obstacleMask,
+        int size,
+        byte[] fanMask,
+        float[] fanVxField,
+        float[] fanVyField,
+        float[] fanVzField,
+        FanSource fan,
+        int cellsPerBlock,
+        int minX,
+        int minY,
+        int minZ
+    ) {
+        int level = ductLevel(fan.ductLength());
+        if (level <= 0) {
+            return;
+        }
+
+        BlockPos inflowPos = fan.pos().offset(fan.facing());
+        int sx = worldToPatchCell(inflowPos.getX() + 0.5, minX, cellsPerBlock);
+        int sy = worldToPatchCell(inflowPos.getY() + 0.5, minY, cellsPerBlock);
+        int sz = worldToPatchCell(inflowPos.getZ() + 0.5, minZ, cellsPerBlock);
+        int dx = fan.facing().getOffsetX();
+        int dy = fan.facing().getOffsetY();
+        int dz = fan.facing().getOffsetZ();
+        float levelBoost = switch (level) {
+            case 1 -> 1.05f;
+            case 2 -> 1.25f;
+            default -> 1.55f;
+        };
+
+        float inflowSpeed = runtimeFanSpeedMetersPerSecond();
+        float baseVx = dx * inflowSpeed;
+        float baseVy = dy * inflowSpeed;
+        float baseVz = dz * inflowSpeed;
+        int range = switch (level) {
+            case 1 -> 8;
+            case 2 -> 14;
+            default -> DUCT_JET_RANGE;
+        } * cellsPerBlock;
+        for (int step = 0; step < range; step++) {
+            float t = range > 1 ? (float) step / (range - 1) : 0.0f;
+            float decay = 1.0f - 0.55f * t;
+            float coreScale = levelBoost * Math.max(0.35f, decay);
+            int cx = sx + dx * step;
+            int cy = sy + dy * step;
+            int cz = sz + dz * step;
+            applyFanAtVoxelToPatchForcing(
+                obstacleMask,
+                size,
+                fanMask,
+                fanVxField,
+                fanVyField,
+                fanVzField,
+                cx,
+                cy,
+                cz,
+                baseVx * coreScale,
+                baseVy * coreScale,
+                baseVz * coreScale
+            );
+
+            float edgeFalloff = Math.max(0.10f, 1.0f - 0.90f * t);
+            float edgeScale = coreScale * DUCT_EDGE_FACTOR * edgeFalloff;
+            switch (fan.facing().getAxis()) {
+                case X -> {
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy + 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy - 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy, cz + 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy, cz - 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                }
+                case Y -> {
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx + 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx - 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy, cz + 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy, cz - 1, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                }
+                case Z -> {
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx + 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx - 1, cy, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy + 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                    applyFanAtVoxelToPatchForcing(obstacleMask, size, fanMask, fanVxField, fanVyField, fanVzField, cx, cy - 1, cz, baseVx * edgeScale, baseVy * edgeScale, baseVz * edgeScale);
+                }
+            }
+        }
+    }
+
     private int ductLevel(int ductLength) {
         if (ductLength >= DUCT_LEVEL_THREE_MIN) {
             return 3;
@@ -2623,6 +4532,24 @@ public final class AeroServerRuntime {
         return nestedBoundaryCoupler.fromBackgroundSample(sampleBackgroundMetAtWindow(key));
     }
 
+    private NestedBoundaryCoupler.BoundarySample sampleNestedBoundaryAtPosition(RegistryKey<World> worldKey, BlockPos pos) {
+        MesoscaleGrid.Sample mesoscaleSample = sampleMesoscaleMet(worldKey, pos);
+        if (mesoscaleSample != null) {
+            return nestedBoundaryCoupler.fromMesoscaleSample(mesoscaleSample);
+        }
+        BackgroundMetGrid.Sample backgroundSample = sampleBackgroundMet(worldKey, pos);
+        if (backgroundSample != null) {
+            return nestedBoundaryCoupler.fromBackgroundSample(backgroundSample);
+        }
+        return new NestedBoundaryCoupler.BoundarySample(
+            0.0f,
+            0.0f,
+            0.0f,
+            THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K,
+            THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K + THERMAL_DEEP_GROUND_OFFSET_K
+        );
+    }
+
     private BoundaryFieldData sampleNestedBoundaryFieldAtWindow(
         WindowKey key,
         Set<WindowKey> activeKeys,
@@ -2665,6 +4592,34 @@ public final class AeroServerRuntime {
             fillHorizontalBoundaryFace(key.worldKey(), Direction.UP.ordinal(), minX, maxX, minZ, maxZ, maxY - 0.5, res, windX, windY, windZ, airTemperature, minY, maxY, fallback);
         }
         return new BoundaryFieldData(res, externalFaceMask, windX, windY, windZ, airTemperature);
+    }
+
+    private BoundaryFieldData sampleInspectionBoundaryField(
+        RegistryKey<World> worldKey,
+        BlockPos origin,
+        int size,
+        int faceResolution,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        int faceCells = FACE_COUNT * faceResolution * faceResolution;
+        float[] windX = new float[faceCells];
+        float[] windY = new float[faceCells];
+        float[] windZ = new float[faceCells];
+        float[] airTemperature = new float[faceCells];
+        double minX = origin.getX();
+        double minY = origin.getY();
+        double minZ = origin.getZ();
+        double maxX = minX + size;
+        double maxY = minY + size;
+        double maxZ = minZ + size;
+
+        fillVerticalBoundaryFace(worldKey, Direction.WEST.ordinal(), minX + 0.5, minZ, maxZ, minY, maxY, faceResolution, windX, windY, windZ, airTemperature, fallback);
+        fillVerticalBoundaryFace(worldKey, Direction.EAST.ordinal(), maxX - 0.5, minZ, maxZ, minY, maxY, faceResolution, windX, windY, windZ, airTemperature, fallback);
+        fillVerticalBoundaryFace(worldKey, Direction.NORTH.ordinal(), minZ + 0.5, minX, maxX, minY, maxY, faceResolution, windX, windY, windZ, airTemperature, fallback);
+        fillVerticalBoundaryFace(worldKey, Direction.SOUTH.ordinal(), maxZ - 0.5, minX, maxX, minY, maxY, faceResolution, windX, windY, windZ, airTemperature, fallback);
+        fillHorizontalBoundaryFace(worldKey, Direction.DOWN.ordinal(), minX, maxX, minZ, maxZ, minY + 0.5, faceResolution, windX, windY, windZ, airTemperature, minY, maxY, fallback);
+        fillHorizontalBoundaryFace(worldKey, Direction.UP.ordinal(), minX, maxX, minZ, maxZ, maxY - 0.5, faceResolution, windX, windY, windZ, airTemperature, minY, maxY, fallback);
+        return new BoundaryFieldData(faceResolution, INSPECTION_PATCH_ALL_FACE_MASK, windX, windY, windZ, airTemperature);
     }
 
     private List<TornadoRegionDescriptor> collectTornadoRegionDescriptors(WindowKey key) {
@@ -2935,6 +4890,34 @@ public final class AeroServerRuntime {
             return false;
         }
         return !state.getCollisionShape(world, pos).isEmpty();
+    }
+
+    private boolean isSolidObstacleAtPoint(
+        ServerWorld world,
+        BlockPos pos,
+        BlockState state,
+        double worldX,
+        double worldY,
+        double worldZ
+    ) {
+        if (!isSolidObstacle(world, pos, state)) {
+            return false;
+        }
+        VoxelShape shape = state.getCollisionShape(world, pos);
+        if (shape.isEmpty()) {
+            return false;
+        }
+        double localX = MathHelper.clamp(worldX - pos.getX(), 0.0, 0.999999);
+        double localY = MathHelper.clamp(worldY - pos.getY(), 0.0, 0.999999);
+        double localZ = MathHelper.clamp(worldZ - pos.getZ(), 0.0, 0.999999);
+        for (Box box : shape.getBoundingBoxes()) {
+            if (localX >= box.minX && localX < box.maxX
+                && localY >= box.minY && localY < box.maxY
+                && localZ >= box.minZ && localZ < box.maxZ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private float sampleEmitterThermalPowerWatts(BlockState state) {
@@ -3246,6 +5229,9 @@ public final class AeroServerRuntime {
             snapshot.boundaryField() == null ? null : snapshot.boundaryField().windY(),
             snapshot.boundaryField() == null ? null : snapshot.boundaryField().windZ(),
             snapshot.boundaryField() == null ? null : snapshot.boundaryField().airTemperatureKelvin(),
+            0,
+            0.0f,
+            0.0f,
             snapshot.tornadoDescriptors().size(),
             tornadoDescriptors
         );
@@ -3930,6 +5916,65 @@ public final class AeroServerRuntime {
     ) {
     }
 
+    private record InspectionPatchStaticFields(
+        byte[] obstacle,
+        byte[] surfaceKind,
+        byte[] openFaceMask,
+        float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    ) {
+    }
+
+    private record InspectionPatchInput(
+        RegistryKey<World> worldKey,
+        BlockPos focus,
+        BlockPos origin,
+        int domainBlocks,
+        int gridResolution,
+        int cellsPerBlock,
+        int faceResolution,
+        Path outputDir,
+        WorldEnvironmentSnapshot environmentSnapshot,
+        NestedBoundaryCoupler.BoundarySample fallbackBoundary,
+        ThermalEnvironment thermalEnvironment,
+        BoundaryFieldData boundaryField,
+        InspectionPatchStaticFields staticFields,
+        List<FanSource> fans
+    ) {
+    }
+
+    private record InspectionPatchForcing(
+        float[] thermalSource,
+        byte[] fanMask,
+        float[] fanVx,
+        float[] fanVy,
+        float[] fanVz
+    ) {
+    }
+
+    private record InspectionPatchDynamicState(
+        float[] flowState,
+        float[] airTemperature,
+        float[] surfaceTemperature
+    ) {
+    }
+
+    private record InspectionPatchSolveResult(
+        int domainBlocks,
+        int gridResolution,
+        int cellsPerBlock,
+        float[] vx,
+        float[] vy,
+        float[] vz,
+        float[] pressure,
+        float[] airTemperature,
+        float[] surfaceTemperature,
+        int completedSteps,
+        float maxSpeedMps
+    ) {
+    }
+
     private record PlayerRegionAnchor(
         RegistryKey<World> worldKey,
         BlockPos coreOrigin
@@ -4167,6 +6212,24 @@ public final class AeroServerRuntime {
         }
     }
 
+    private static final class InspectionSolveSession {
+        private final InspectionPatchInput input;
+        private final int totalSteps;
+        private final Path outputDir;
+        private final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        private final AtomicBoolean completed = new AtomicBoolean(false);
+        private final AtomicInteger completedSteps = new AtomicInteger(0);
+        private final AtomicReference<String> phase = new AtomicReference<>("queued");
+        private final AtomicReference<String> lastError = new AtomicReference<>("");
+        private final AtomicReference<Float> maxSpeedMetersPerSecond = new AtomicReference<>(0.0f);
+
+        private InspectionSolveSession(InspectionPatchInput input, int totalSteps) {
+            this.input = input;
+            this.totalSteps = totalSteps;
+            this.outputDir = input.outputDir();
+        }
+    }
+
     private final class SimulationCoordinator implements Runnable {
         private final AtomicBoolean running = new AtomicBoolean(true);
         private final Thread thread = new Thread(this, "aero-sim-coordinator");
@@ -4253,6 +6316,11 @@ public final class AeroServerRuntime {
                         sleepQuietly(5L);
                         continue;
                     }
+
+                    synchronized (simulationStateLock) {
+                        queueCoherentL2CaptureIfNeeded(observedTick);
+                    }
+
                     if (!acquireSimulationStepBudget()) {
                         lastCoordinatorState = "noBudget";
                         lastCoordinatorNoPublishReason = "noBudget";

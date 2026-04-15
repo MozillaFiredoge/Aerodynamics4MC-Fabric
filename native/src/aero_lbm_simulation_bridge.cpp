@@ -124,6 +124,7 @@ constexpr int k_window_edge_stabilization_layers = 8;
 constexpr float k_window_edge_stabilization_min_keep = 0.15f;
 constexpr int k_nested_boundary_layers = 3;
 constexpr float k_nested_boundary_min_keep = 0.25f;
+constexpr float k_sponge_relaxation_max = 0.95f;
 constexpr float k_runtime_temperature_scale_kelvin = 20.0f;
 constexpr int k_tornado_descriptor_floats = 17;
 constexpr int k_tornado_desc_center_x = 0;
@@ -398,6 +399,65 @@ float sample_boundary_face_scalar(
     return c0 + (c1 - c0) * fv;
 }
 
+bool use_boundary_face_sample(
+    int external_face_mask,
+    int face,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k
+) {
+    return boundary_face_resolution > 0
+        && (external_face_mask & (1 << face)) != 0
+        && boundary_wind_face_x
+        && boundary_wind_face_y
+        && boundary_wind_face_z
+        && boundary_air_temperature_k;
+}
+
+void sample_boundary_face_target(
+    int face,
+    int boundary_face_resolution,
+    int external_face_mask,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
+    float fallback_boundary_wind_x,
+    float fallback_boundary_wind_y,
+    float fallback_boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    double u,
+    double v,
+    float& out_vx,
+    float& out_vy,
+    float& out_vz,
+    float& out_air_k
+) {
+    const bool use_face = use_boundary_face_sample(
+        external_face_mask,
+        face,
+        boundary_face_resolution,
+        boundary_wind_face_x,
+        boundary_wind_face_y,
+        boundary_wind_face_z,
+        boundary_air_temperature_k
+    );
+    out_vx = use_face
+        ? sample_boundary_face_scalar(boundary_wind_face_x, face, boundary_face_resolution, u, v)
+        : fallback_boundary_wind_x;
+    out_vy = use_face
+        ? sample_boundary_face_scalar(boundary_wind_face_y, face, boundary_face_resolution, u, v)
+        : fallback_boundary_wind_y;
+    out_vz = use_face
+        ? sample_boundary_face_scalar(boundary_wind_face_z, face, boundary_face_resolution, u, v)
+        : fallback_boundary_wind_z;
+    out_air_k = use_face
+        ? sample_boundary_face_scalar(boundary_air_temperature_k, face, boundary_face_resolution, u, v)
+        : fallback_boundary_air_temperature_k;
+}
+
 float neighbor_air_temperature_kelvin(
     const DynamicRegionData& dynamic,
     int x,
@@ -670,12 +730,29 @@ void apply_nested_boundary_fields(
         float eta = (k_nested_boundary_layers - layer_index) / static_cast<float>(k_nested_boundary_layers);
         float keep = k_nested_boundary_min_keep + (1.0f - k_nested_boundary_min_keep) * (1.0f - eta * eta);
         float relax = 1.0f - keep;
-        bool use_face = boundary_face_resolution > 0 && (external_face_mask & (1 << face)) != 0
-            && boundary_wind_face_x && boundary_wind_face_y && boundary_wind_face_z && boundary_air_temperature_k;
-        float vx = use_face ? sample_boundary_face_scalar(boundary_wind_face_x, face, boundary_face_resolution, u, v) : fallback_boundary_wind_x;
-        float vy = use_face ? sample_boundary_face_scalar(boundary_wind_face_y, face, boundary_face_resolution, u, v) : fallback_boundary_wind_y;
-        float vz = use_face ? sample_boundary_face_scalar(boundary_wind_face_z, face, boundary_face_resolution, u, v) : fallback_boundary_wind_z;
-        float air_k = use_face ? sample_boundary_face_scalar(boundary_air_temperature_k, face, boundary_face_resolution, u, v) : fallback_boundary_air_temperature_k;
+        float vx = 0.0f;
+        float vy = 0.0f;
+        float vz = 0.0f;
+        float air_k = 0.0f;
+        sample_boundary_face_target(
+            face,
+            boundary_face_resolution,
+            external_face_mask,
+            boundary_wind_face_x,
+            boundary_wind_face_y,
+            boundary_wind_face_z,
+            boundary_air_temperature_k,
+            fallback_boundary_wind_x,
+            fallback_boundary_wind_y,
+            fallback_boundary_wind_z,
+            fallback_boundary_air_temperature_k,
+            u,
+            v,
+            vx,
+            vy,
+            vz,
+            air_k
+        );
         packet[base + k_channel_state_vx] = packet[base + k_channel_state_vx] * keep + vx * relax;
         packet[base + k_channel_state_vy] = packet[base + k_channel_state_vy] * keep + vy * relax;
         packet[base + k_channel_state_vz] = packet[base + k_channel_state_vz] * keep + vz * relax;
@@ -707,6 +784,136 @@ void apply_nested_boundary_fields(
                 double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
                 apply_face(0, x, layer, z, layer, u, v);
                 apply_face(1, x, ny - 1 - layer, z, layer, u, v);
+            }
+        }
+    }
+}
+
+void apply_sponge_boundary_fields(
+    std::vector<float>& packet,
+    std::vector<float>& air_temperature,
+    int nx,
+    int ny,
+    int nz,
+    float fallback_boundary_wind_x,
+    float fallback_boundary_wind_y,
+    float fallback_boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
+    int sponge_thickness_cells,
+    float sponge_velocity_relaxation,
+    float sponge_temperature_relaxation
+) {
+    if (packet.empty() || nx <= 0 || ny <= 0 || nz <= 0) {
+        return;
+    }
+    if (air_temperature.size() != static_cast<size_t>(nx * ny * nz)) {
+        return;
+    }
+    if (sponge_thickness_cells <= 0 || external_face_mask == 0) {
+        return;
+    }
+    const float velocity_relaxation = std::max(0.0f, sponge_velocity_relaxation);
+    const float temperature_relaxation = std::max(0.0f, sponge_temperature_relaxation);
+    if (velocity_relaxation <= 0.0f && temperature_relaxation <= 0.0f) {
+        return;
+    }
+
+    auto apply_face = [&](int face, int x, int y, int z, int layer_index, double u, double v) {
+        if (layer_index < 0 || layer_index >= sponge_thickness_cells) {
+            return;
+        }
+        const int cell = grid_cell_index(ny, nz, x, y, z);
+        const size_t base = static_cast<size_t>(cell) * k_packet_channels;
+        if (packet[base + k_channel_obstacle] > 0.5f) {
+            return;
+        }
+        const float normalized = 1.0f - (layer_index / static_cast<float>(sponge_thickness_cells));
+        const float weight = normalized * normalized;
+        const float velocity_relax = std::clamp(velocity_relaxation * weight, 0.0f, k_sponge_relaxation_max);
+        const float temperature_relax = std::clamp(temperature_relaxation * weight, 0.0f, k_sponge_relaxation_max);
+        if (velocity_relax <= 0.0f && temperature_relax <= 0.0f) {
+            return;
+        }
+
+        float target_vx = 0.0f;
+        float target_vy = 0.0f;
+        float target_vz = 0.0f;
+        float target_air_k = 0.0f;
+        sample_boundary_face_target(
+            face,
+            boundary_face_resolution,
+            external_face_mask,
+            boundary_wind_face_x,
+            boundary_wind_face_y,
+            boundary_wind_face_z,
+            boundary_air_temperature_k,
+            fallback_boundary_wind_x,
+            fallback_boundary_wind_y,
+            fallback_boundary_wind_z,
+            fallback_boundary_air_temperature_k,
+            u,
+            v,
+            target_vx,
+            target_vy,
+            target_vz,
+            target_air_k
+        );
+
+        if (velocity_relax > 0.0f) {
+            const float velocity_keep = 1.0f - velocity_relax;
+            packet[base + k_channel_state_vx] = packet[base + k_channel_state_vx] * velocity_keep + target_vx * velocity_relax;
+            packet[base + k_channel_state_vy] = packet[base + k_channel_state_vy] * velocity_keep + target_vy * velocity_relax;
+            packet[base + k_channel_state_vz] = packet[base + k_channel_state_vz] * velocity_keep + target_vz * velocity_relax;
+        }
+        if (temperature_relax > 0.0f) {
+            const float temperature_keep = 1.0f - temperature_relax;
+            const float target_temp = (target_air_k - fallback_boundary_air_temperature_k) / k_runtime_temperature_scale_kelvin;
+            air_temperature[static_cast<size_t>(cell)] = air_temperature[static_cast<size_t>(cell)] * temperature_keep
+                + target_temp * temperature_relax;
+        }
+    };
+
+    for (int layer = 0; layer < sponge_thickness_cells; ++layer) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                const double u = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                if ((external_face_mask & (1 << 4)) != 0) {
+                    apply_face(4, layer, y, z, layer, u, v);
+                }
+                if ((external_face_mask & (1 << 5)) != 0) {
+                    apply_face(5, nx - 1 - layer, y, z, layer, u, v);
+                }
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int y = 0; y < ny; ++y) {
+                const double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                if ((external_face_mask & (1 << 2)) != 0) {
+                    apply_face(2, x, y, layer, layer, u, v);
+                }
+                if ((external_face_mask & (1 << 3)) != 0) {
+                    apply_face(3, x, y, nz - 1 - layer, layer, u, v);
+                }
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int z = 0; z < nz; ++z) {
+                const double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                if ((external_face_mask & (1 << 0)) != 0) {
+                    apply_face(0, x, layer, z, layer, u, v);
+                }
+                if ((external_face_mask & (1 << 1)) != 0) {
+                    apply_face(1, x, ny - 1 - layer, z, layer, u, v);
+                }
             }
         }
     }
@@ -836,6 +1043,7 @@ bool build_region_packet_from_template(
     const float* boundary_wind_face_y,
     const float* boundary_wind_face_z,
     const float* boundary_air_temperature_k,
+    int sponge_thickness_cells,
     int tornado_descriptor_count,
     const float* tornado_descriptors,
     std::vector<float>& packet
@@ -863,7 +1071,9 @@ bool build_region_packet_from_template(
         packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
         packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
     }
-    apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
+    if (sponge_thickness_cells <= 0) {
+        apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
+    }
     apply_tornado_vortex_descriptors(packet, nx, ny, nz, tornado_descriptor_count, tornado_descriptors);
     return true;
 }
@@ -1563,6 +1773,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     const float* boundary_wind_face_y,
     const float* boundary_wind_face_z,
     const float* boundary_air_temperature_k,
+    int sponge_thickness_cells,
+    float sponge_velocity_relaxation,
+    float sponge_temperature_relaxation,
     int tornado_descriptor_count,
     const float* tornado_descriptors,
     float* out_max_speed
@@ -1627,6 +1840,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         boundary_wind_face_y,
         boundary_wind_face_z,
         boundary_air_temperature_k,
+        sponge_thickness_cells,
         tornado_descriptor_count,
         tornado_descriptors,
         packet
@@ -1634,23 +1848,46 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         return 0;
     }
     if (boundary_face_resolution > 0 && external_face_mask != 0) {
-        apply_nested_boundary_fields(
-            packet,
-            dynamic_region.air_temperature,
-            nx,
-            ny,
-            nz,
-            boundary_wind_x,
-            boundary_wind_y,
-            boundary_wind_z,
-            fallback_boundary_air_temperature_k,
-            external_face_mask,
-            boundary_face_resolution,
-            boundary_wind_face_x,
-            boundary_wind_face_y,
-            boundary_wind_face_z,
-            boundary_air_temperature_k
-        );
+        if (sponge_thickness_cells > 0) {
+            apply_sponge_boundary_fields(
+                packet,
+                dynamic_region.air_temperature,
+                nx,
+                ny,
+                nz,
+                boundary_wind_x,
+                boundary_wind_y,
+                boundary_wind_z,
+                fallback_boundary_air_temperature_k,
+                external_face_mask,
+                boundary_face_resolution,
+                boundary_wind_face_x,
+                boundary_wind_face_y,
+                boundary_wind_face_z,
+                boundary_air_temperature_k,
+                sponge_thickness_cells,
+                sponge_velocity_relaxation,
+                sponge_temperature_relaxation
+            );
+        } else {
+            apply_nested_boundary_fields(
+                packet,
+                dynamic_region.air_temperature,
+                nx,
+                ny,
+                nz,
+                boundary_wind_x,
+                boundary_wind_y,
+                boundary_wind_z,
+                fallback_boundary_air_temperature_k,
+                external_face_mask,
+                boundary_face_resolution,
+                boundary_wind_face_x,
+                boundary_wind_face_y,
+                boundary_wind_face_z,
+                boundary_air_temperature_k
+            );
+        }
     }
     if (dynamic_region.air_temperature.size() == static_cast<size_t>(cells)) {
         if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic_region.air_temperature.data())) {
@@ -2659,6 +2896,9 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     jfloatArray boundary_wind_face_y,
     jfloatArray boundary_wind_face_z,
     jfloatArray boundary_air_temperature_k,
+    jint sponge_thickness_cells,
+    jfloat sponge_velocity_relaxation,
+    jfloat sponge_temperature_relaxation,
     jint tornado_descriptor_count,
     jfloatArray tornado_descriptors,
     jfloatArray out_max_speed
@@ -2737,6 +2977,9 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         face_y_ptr,
         face_z_ptr,
         face_temp_ptr,
+        sponge_thickness_cells,
+        sponge_velocity_relaxation,
+        sponge_temperature_relaxation,
         tornado_descriptor_count,
         tornado_ptr,
         max_speed_ptr

@@ -6,10 +6,14 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.joml.Matrix4f;
+import org.joml.Vector3f;
+import org.joml.Vector4f;
+
 import com.aerodynamics4mc.ModBlocks;
 import com.aerodynamics4mc.flow.AnalysisFlowCodec;
-import com.aerodynamics4mc.net.AeroFlowPayload;
 import com.aerodynamics4mc.net.AeroFlowAnalysisPayload;
+import com.aerodynamics4mc.net.AeroFlowPayload;
 import com.aerodynamics4mc.runtime.NativeSimulationBridge;
 import com.mojang.blaze3d.pipeline.BlendFunction;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
@@ -28,9 +32,9 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.DynamicUniforms;
 import net.minecraft.client.gl.Framebuffer;
 import net.minecraft.client.gl.UniformType;
-import net.minecraft.client.render.DrawStyle;
 import net.minecraft.client.render.BufferBuilder;
 import net.minecraft.client.render.BuiltBuffer;
+import net.minecraft.client.render.DrawStyle;
 import net.minecraft.client.render.Tessellator;
 import net.minecraft.client.render.VertexFormats;
 import net.minecraft.util.Identifier;
@@ -38,12 +42,10 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.debug.gizmo.GizmoDrawing;
-import org.joml.Matrix4f;
-import org.joml.Vector3f;
-import org.joml.Vector4f;
 
 final class AeroVisualizer {
     static final Identifier WIND_TRAIL_SHADER_ID = Identifier.of(ModBlocks.MOD_ID, "core/wind_trail");
+    static final Identifier ANALYSIS_SLICE_SHADER_ID = Identifier.of(ModBlocks.MOD_ID, "core/analysis_slice");
 
     private static final float ATLAS_VELOCITY_RANGE = 5.6f;
     private static final float ATLAS_PRESSURE_RANGE = 0.03f;
@@ -64,13 +66,14 @@ final class AeroVisualizer {
     private static final float STREAMLINE_MIN_SPEED = 0.03f;
     private static final float TUBE_WIDTH = 0.24f;
     private static final float TUBE_BASE_WIDTH = 0.06f;
-    private static final int ANALYSIS_SLICE_GLYPH_STEP = 4;
-    private static final float ANALYSIS_SLICE_MIN_SPEED = 0.02f;
-    private static final float ANALYSIS_SLICE_ALPHA = 0.18f;
+    private static final int ANALYSIS_SLICE_GLYPH_STEP = 2;
+    private static final float ANALYSIS_SLICE_MIN_SPEED = 0.005f;
+    private static final float ANALYSIS_SLICE_ALPHA = 0.8f;
     private static final float ANALYSIS_SLICE_HEIGHT_OFFSET = 0.045f;
-    private static final float ANALYSIS_SLICE_SPEED_RANGE = 2.5f;
-    private static final float ANALYSIS_SLICE_GLYPH_LENGTH = 1.7f;
+    private static final float ANALYSIS_SLICE_MIN_RANGE = 0.04f;
+    private static final float ANALYSIS_SLICE_GLYPH_LENGTH = 1.4f;
     private static final float ANALYSIS_SLICE_GLYPH_WIDTH = 1.0f;
+    private static final double ANALYSIS_SLICE_VIEW_OFFSET_Y = -1.25;
     private static final RenderPipeline WIND_TRAIL_PIPELINE = RenderPipeline.builder()
         .withLocation(Identifier.of(ModBlocks.MOD_ID, "wind_trail_pipeline"))
         .withVertexShader(WIND_TRAIL_SHADER_ID)
@@ -83,6 +86,18 @@ final class AeroVisualizer {
         .withDepthWrite(false)
         .withVertexFormat(VertexFormats.POSITION_TEXTURE_COLOR, DrawMode.QUADS)
         .build();
+    private static final RenderPipeline ANALYSIS_SLICE_PIPELINE = RenderPipeline.builder()
+        .withLocation(Identifier.of(ModBlocks.MOD_ID, "analysis_slice_pipeline"))
+        .withVertexShader(ANALYSIS_SLICE_SHADER_ID)
+        .withFragmentShader(ANALYSIS_SLICE_SHADER_ID)
+        .withUniform("DynamicTransforms", UniformType.UNIFORM_BUFFER)
+        .withUniform("Projection", UniformType.UNIFORM_BUFFER)
+        .withBlend(BlendFunction.TRANSLUCENT)
+        .withDepthTestFunction(DepthTestFunction.NO_DEPTH_TEST)
+        .withCull(false)
+        .withDepthWrite(false)
+        .withVertexFormat(VertexFormats.POSITION_COLOR, DrawMode.QUADS)
+        .build();
 
     private final Map<WindowKey, RemoteFlowField> remoteWindows = new HashMap<>();
     private final Map<WindowKey, AnalysisFlowField> analysisWindows = new HashMap<>();
@@ -93,6 +108,7 @@ final class AeroVisualizer {
     void initialize() {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clearState());
         ClientTickEvents.END_CLIENT_TICK.register(client -> onClientTick());
+        WorldRenderEvents.BEFORE_TRANSLUCENT.register(this::renderAnalysisSlicePass);
         WorldRenderEvents.BEFORE_TRANSLUCENT.register(this::renderWindTrailsPass);
         WorldRenderEvents.BEFORE_DEBUG_RENDER.register(this::renderAtlasOverlay);
     }
@@ -206,23 +222,42 @@ final class AeroVisualizer {
                 }
                 renderRegionOverlay(field, distanceSq);
             }
-            renderAnalysisOverlay(client, dimensionId, cameraPos);
+            AnalysisSliceView analysisSlice = prepareAnalysisSlice(client, dimensionId, cameraPos);
+            if (analysisSlice != null) {
+                renderAnalysisOverlay(analysisSlice);
+            }
         }
     }
 
-    private void renderAnalysisOverlay(MinecraftClient client, Identifier dimensionId, Vec3d cameraPos) {
-        AnalysisFlowField field = selectAnalysisField(dimensionId, cameraPos);
-        if (field == null) {
+    private void renderAnalysisSlicePass(WorldRenderContext context) {
+        if (!streamingEnabled || analysisWindows.isEmpty()) {
             return;
         }
-        double distanceSq = field.regionBox().squaredMagnitude(cameraPos);
-        if (distanceSq > ANALYSIS_RENDER_DISTANCE * ANALYSIS_RENDER_DISTANCE) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null || client.player == null || !client.getDebugHud().shouldShowDebugHud()) {
             return;
         }
-        int sliceY = field.sliceIndexForWorldY(cameraPos.y);
-        float sliceMaxSpeed = field.maxSpeedOnSlice(sliceY);
-        float speedRange = Math.max(ANALYSIS_SLICE_SPEED_RANGE, sliceMaxSpeed);
-        renderAnalysisSliceXZ(field, sliceY, speedRange);
+        Identifier dimensionId = client.world.getRegistryKey().getValue();
+        Vec3d cameraPos = client.gameRenderer.getCamera().getCameraPos();
+        AnalysisSliceView analysisSlice = prepareAnalysisSlice(client, dimensionId, cameraPos);
+        if (analysisSlice == null) {
+            return;
+        }
+        BufferBuilder buffer = Tessellator.getInstance().begin(DrawMode.QUADS, VertexFormats.POSITION_COLOR);
+        int quadCount = appendAnalysisSliceQuads(buffer, analysisSlice, cameraPos);
+        if (quadCount <= 0) {
+            return;
+        }
+        try (BuiltBuffer built = buffer.end()) {
+            renderBuiltAnalysisSlice(client, built);
+        }
+    }
+
+    private void renderAnalysisOverlay(AnalysisSliceView analysisSlice) {
+        AnalysisFlowField field = analysisSlice.field();
+        int sliceY = analysisSlice.sliceY();
+        float speedRange = analysisSlice.speedRange();
+        SliceStats sliceStats = analysisSlice.sliceStats();
         renderAnalysisSliceGlyphs(field, sliceY, speedRange);
 
         Vec3d labelPos = new Vec3d(
@@ -230,12 +265,30 @@ final class AeroVisualizer {
             field.origin().getY() + sliceY + 0.9,
             field.origin().getZ() + field.fullResolution() * 0.5
         );
-        String label = "CFD slice |v| y=" + (field.origin().getY() + sliceY) + " max=" + String.format("%.2f", sliceMaxSpeed);
+        String label = "CFD slice |v| y=" + (field.origin().getY() + sliceY)
+            + " max=" + String.format("%.2f", sliceStats.maxSpeed())
+            + " p95=" + String.format("%.2f", sliceStats.p95Speed());
         GizmoDrawing.text(
             label,
             labelPos,
             net.minecraft.world.debug.gizmo.TextGizmo.Style.centered(argb(0.92f, 0.96f, 0.98f, 1.0f)).scaled(0.03f)
         ).ignoreOcclusion().withLifespan(1);
+    }
+
+    private AnalysisSliceView prepareAnalysisSlice(MinecraftClient client, Identifier dimensionId, Vec3d cameraPos) {
+        AnalysisFlowField field = selectAnalysisField(dimensionId, cameraPos);
+        if (field == null) {
+            return null;
+        }
+        double distanceSq = field.regionBox().squaredMagnitude(cameraPos);
+        if (distanceSq > ANALYSIS_RENDER_DISTANCE * ANALYSIS_RENDER_DISTANCE) {
+            return null;
+        }
+        double sliceWorldY = client.player != null ? client.player.getY() + ANALYSIS_SLICE_VIEW_OFFSET_Y : cameraPos.y + ANALYSIS_SLICE_VIEW_OFFSET_Y;
+        int sliceY = field.sliceIndexForWorldY(sliceWorldY);
+        SliceStats sliceStats = field.sliceStats(sliceY);
+        float speedRange = Math.max(ANALYSIS_SLICE_MIN_RANGE, sliceStats.colorRange());
+        return new AnalysisSliceView(field, sliceY, sliceStats, speedRange);
     }
 
     private AnalysisFlowField selectAnalysisField(Identifier dimensionId, Vec3d cameraPos) {
@@ -262,34 +315,34 @@ final class AeroVisualizer {
         return bestContaining != null ? bestContaining : bestNearest;
     }
 
-    private void renderAnalysisSliceXZ(AnalysisFlowField field, int sliceY, float speedRange) {
+    private int appendAnalysisSliceQuads(BufferBuilder buffer, AnalysisSliceView analysisSlice, Vec3d cameraPos) {
+        AnalysisFlowField field = analysisSlice.field();
+        int sliceY = analysisSlice.sliceY();
+        float speedRange = analysisSlice.speedRange();
         int resolution = field.fullResolution();
         double y = field.origin().getY() + sliceY + ANALYSIS_SLICE_HEIGHT_OFFSET;
-        DrawStyle frameStyle = DrawStyle.stroked(argb(0.42f, 0.96f, 0.96f, 1.0f), 1.1f);
-        Box sliceBox = new Box(
-            field.origin().getX(),
-            y,
-            field.origin().getZ(),
-            field.origin().getX() + resolution,
-            y + 0.02,
-            field.origin().getZ() + resolution
-        );
-        GizmoDrawing.box(sliceBox, frameStyle, false).ignoreOcclusion().withLifespan(1);
+        int quadCount = 0;
         for (int x = 0; x < resolution; x++) {
             for (int z = 0; z < resolution; z++) {
                 float speed = field.speed(x, sliceY, z);
-                float speedNorm = clamp01(speed / speedRange);
+                float speedNorm = Math.max(0.05f, clamp01(speed / speedRange));
                 int fillColor = analysisScalarColor(speedNorm, ANALYSIS_SLICE_ALPHA);
                 if ((fillColor >>> 24) == 0) {
                     continue;
                 }
-                Vec3d p1 = new Vec3d(field.origin().getX() + x, y, field.origin().getZ() + z);
-                Vec3d p2 = new Vec3d(field.origin().getX() + x + 1.0, y, field.origin().getZ() + z);
-                Vec3d p3 = new Vec3d(field.origin().getX() + x + 1.0, y, field.origin().getZ() + z + 1.0);
-                Vec3d p4 = new Vec3d(field.origin().getX() + x, y, field.origin().getZ() + z + 1.0);
-                GizmoDrawing.quad(p1, p2, p3, p4, DrawStyle.filled(fillColor)).ignoreOcclusion().withLifespan(1);
+                float x0 = field.origin().getX() + x;
+                float z0 = field.origin().getZ() + z;
+                float x1 = x0 + 1.0f;
+                float z1 = z0 + 1.0f;
+                float py = (float) (y - cameraPos.y);
+                buffer.vertex((float) (x0 - cameraPos.x), py, (float) (z0 - cameraPos.z)).color(fillColor);
+                buffer.vertex((float) (x1 - cameraPos.x), py, (float) (z0 - cameraPos.z)).color(fillColor);
+                buffer.vertex((float) (x1 - cameraPos.x), py, (float) (z1 - cameraPos.z)).color(fillColor);
+                buffer.vertex((float) (x0 - cameraPos.x), py, (float) (z1 - cameraPos.z)).color(fillColor);
+                quadCount++;
             }
         }
+        return quadCount;
     }
 
     private void renderAnalysisSliceGlyphs(AnalysisFlowField field, int sliceY, float speedRange) {
@@ -304,7 +357,7 @@ final class AeroVisualizer {
                     continue;
                 }
                 Vec3d direction = horizontal.multiply(1.0 / horizontalSpeed);
-                float speedNorm = clamp01((float) horizontalSpeed / speedRange);
+                float speedNorm = Math.max(0.05f, clamp01((float) horizontalSpeed / speedRange));
                 double arrowLength = ANALYSIS_SLICE_GLYPH_LENGTH + ANALYSIS_SLICE_GLYPH_LENGTH * speedNorm;
                 Vec3d start = new Vec3d(field.origin().getX() + x + 0.5, arrowBaseY, field.origin().getZ() + z + 0.5);
                 Vec3d end = start.add(direction.multiply(arrowLength));
@@ -564,6 +617,40 @@ final class AeroVisualizer {
         }
     }
 
+    private void renderBuiltAnalysisSlice(MinecraftClient client, BuiltBuffer built) {
+        BuiltBuffer.DrawParameters drawParameters = built.getDrawParameters();
+        if (drawParameters.vertexCount() <= 0 || drawParameters.indexCount() <= 0) {
+            return;
+        }
+        VertexFormat format = drawParameters.format();
+        var vertexBuffer = format.uploadImmediateVertexBuffer(built.getBuffer());
+        var indexBuffer = RenderSystem.getSequentialBuffer(drawParameters.mode()).getIndexBuffer(drawParameters.indexCount());
+        var indexType = RenderSystem.getSequentialBuffer(drawParameters.mode()).getIndexType();
+        DynamicUniforms dynamicUniforms = RenderSystem.getDynamicUniforms();
+        var transforms = dynamicUniforms.write(
+            RenderSystem.getModelViewMatrix(),
+            new Vector4f(1.0f, 1.0f, 1.0f, 1.0f),
+            new Vector3f(),
+            new Matrix4f()
+        );
+        Framebuffer framebuffer = client.getFramebuffer();
+        CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
+        try (RenderPass renderPass = encoder.createRenderPass(
+            () -> "aerodynamics4mc_analysis_slice",
+            framebuffer.getColorAttachmentView(),
+            java.util.OptionalInt.empty(),
+            framebuffer.getDepthAttachmentView(),
+            java.util.OptionalDouble.empty()
+        )) {
+            renderPass.setPipeline(ANALYSIS_SLICE_PIPELINE);
+            RenderSystem.bindDefaultUniforms(renderPass);
+            renderPass.setUniform("DynamicTransforms", transforms);
+            renderPass.setVertexBuffer(0, vertexBuffer);
+            renderPass.setIndexBuffer(indexBuffer, indexType);
+            renderPass.drawIndexed(0, 0, drawParameters.indexCount(), 1);
+        }
+    }
+
     private static float decodeVelocity(short value) {
         return value / 32767.0f * ATLAS_VELOCITY_RANGE;
     }
@@ -637,6 +724,14 @@ final class AeroVisualizer {
     private record WindowKey(Identifier dimensionId, BlockPos origin) {
     }
 
+    private record AnalysisSliceView(
+        AnalysisFlowField field,
+        int sliceY,
+        SliceStats sliceStats,
+        float speedRange
+    ) {
+    }
+
     private record AnalysisFlowField(
         Identifier dimensionId,
         BlockPos origin,
@@ -682,14 +777,38 @@ final class AeroVisualizer {
         }
 
         float maxSpeedOnSlice(int y) {
+            return sliceStats(y).maxSpeed();
+        }
+
+        SliceStats sliceStats(int y) {
+            int sampleCount = fullResolution * fullResolution;
+            float[] speeds = new float[sampleCount];
             float max = 0.0f;
+            float sum = 0.0f;
+            int cursor = 0;
             for (int x = 0; x < fullResolution; x++) {
                 for (int z = 0; z < fullResolution; z++) {
-                    max = Math.max(max, speed(x, y, z));
+                    float speed = speed(x, y, z);
+                    speeds[cursor++] = speed;
+                    max = Math.max(max, speed);
+                    sum += speed;
                 }
             }
-            return max;
+            java.util.Arrays.sort(speeds);
+            float p80 = speeds[Math.max(0, Math.min(speeds.length - 1, (int) Math.floor((speeds.length - 1) * 0.80)))];
+            float p95 = speeds[Math.max(0, Math.min(speeds.length - 1, (int) Math.floor((speeds.length - 1) * 0.95)))];
+            float mean = sum / Math.max(1, sampleCount);
+            float colorRange = Math.max(Math.max(p80, mean * 1.15f), max * 0.12f);
+            return new SliceStats(max, mean, p95, colorRange);
         }
+    }
+
+    private record SliceStats(
+        float maxSpeed,
+        float meanSpeed,
+        float p95Speed,
+        float colorRange
+    ) {
     }
 
     private record FlowStreamline(
