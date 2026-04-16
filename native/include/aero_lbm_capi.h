@@ -21,7 +21,8 @@ enum {
     AERO_LBM_MESOSCALE_STATE_CHANNELS = 5,
     AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS = 4,
     AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS = 4,
-    AERO_LBM_SIMULATION_PLAYER_PROBE_CHANNELS = 6
+    AERO_LBM_SIMULATION_PLAYER_PROBE_CHANNELS = 6,
+    AERO_LBM_SIMULATION_PREFETCH_FLOW_CHANNELS = 3
 };
 
 typedef enum AeroLbmBenchmarkPreset {
@@ -154,6 +155,21 @@ typedef struct AeroLbmWorldDelta {
     float value2;
     float value3;
 } AeroLbmWorldDelta;
+
+typedef struct AeroLbmPrefetchSlotMetadata {
+    uint64_t generation;
+    int64_t region_key;
+    int valid;
+    int frame_index;
+    int nx;
+    int ny;
+    int nz;
+    int value_count;
+    float scale_vx;
+    float scale_vy;
+    float scale_vz;
+    float max_speed;
+} AeroLbmPrefetchSlotMetadata;
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_init(int grid_size, int input_channels, int output_channels);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step(const float* packet, int grid_size, long long context_key, float* output_flow);
@@ -323,6 +339,38 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     int tornado_descriptor_count,
     const float* tornado_descriptors,
     float* out_max_speed
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_prefetch_region_stored(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
+    int sponge_thickness_cells,
+    float sponge_velocity_relaxation,
+    float sponge_temperature_relaxation,
+    int tornado_descriptor_count,
+    const float* tornado_descriptors,
+    int prefetch_frame_count,
+    float* out_max_speed
+);
+AERO_LBM_CAPI_EXPORT const int16_t* aero_lbm_simulation_prefetch_buffer_ptr(long long service_key);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_prefetch_slot_count(long long service_key);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_prefetch_values_per_frame(long long service_key);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_prefetch_slot_metadata(
+    long long service_key,
+    int slot_index,
+    AeroLbmPrefetchSlotMetadata* out_metadata
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     long long service_key,

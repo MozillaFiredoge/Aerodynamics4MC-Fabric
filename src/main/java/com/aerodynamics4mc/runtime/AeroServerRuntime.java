@@ -118,6 +118,12 @@ public final class AeroServerRuntime {
     private static final int L2_CAPTURE_MIN_FPS = 1;
     private static final int L2_CAPTURE_MAX_FPS = 20;
     private static final int L2_CAPTURE_MAX_PENDING_FRAMES = 4;
+    private static final boolean ENABLE_LEGACY_STITCHED_L2 = false;
+    private static final int LOCAL_L2_DOMAIN_BLOCKS = 64;
+    private static final int LOCAL_L2_GRID_RESOLUTION = 128;
+    private static final int LOCAL_L2_FACE_RESOLUTION = 24;
+    private static final int LOCAL_L2_PREFETCH_FRAME_COUNT = 5;
+    private static final int LOCAL_L2_REBUILD_INTERVAL_TICKS = 5;
     private static final int INSPECTION_PATCH_DEFAULT_DOMAIN_BLOCKS = 64;
     private static final int INSPECTION_PATCH_MIN_DOMAIN_BLOCKS = 32;
     private static final int INSPECTION_PATCH_MAX_DOMAIN_BLOCKS = 128;
@@ -280,6 +286,7 @@ public final class AeroServerRuntime {
     private volatile BackgroundRefreshBatch pendingBackgroundRefreshBatch;
     private volatile L2CaptureSession activeL2CaptureSession;
     private volatile InspectionSolveSession activeInspectionSolveSession;
+    private volatile LocalL2RuntimeState activeLocalL2Runtime;
 
     private volatile boolean streamingEnabled = false;
     private volatile int tickCounter = 0;
@@ -593,6 +600,21 @@ public final class AeroServerRuntime {
                             + " coordPublishedMax=" + format3(lastCoordinatorPublishedMaxSpeed)
                             + " coordNoPublish=" + (lastCoordinatorNoPublishReason.isEmpty() ? "-" : lastCoordinatorNoPublishReason)
                     );
+                    LocalL2RuntimeState localL2 = activeLocalL2Runtime;
+                    feedback(
+                        ctx.getSource(),
+                        localL2 == null
+                            ? "LocalL2 inactive"
+                            : "LocalL2 player=" + localL2.playerId
+                                + " origin=" + localL2.origin
+                                + " phase=" + localL2.phase
+                                + " inFlight=" + localL2.inFlight.get()
+                                + " lastRequestTick=" + localL2.lastRequestTick
+                                + " lastCompletedTick=" + localL2.lastCompletedTick
+                                + " maxSpeed=" + format3(localL2.maxSpeedMetersPerSecond)
+                                + " reason=" + localL2.lastDecisionReason
+                                + (localL2.lastError.isEmpty() ? "" : " error=" + localL2.lastError)
+                    );
                     feedback(
                         ctx.getSource(),
                         "MainThread lastTick=" + format3(nanosToMillis(lastMainThreadPhaseNanos[MAIN_THREAD_PHASE_TOTAL])) + "ms"
@@ -767,6 +789,10 @@ public final class AeroServerRuntime {
     }
 
     private int startL2Capture(ServerCommandSource source, int durationSeconds, int fps) {
+        if (!ENABLE_LEGACY_STITCHED_L2) {
+            feedback(source, "Legacy stitched L2 is disabled");
+            return 0;
+        }
         if (!streamingEnabled) {
             feedback(source, "Streaming must be enabled before starting L2 capture");
             return 0;
@@ -849,6 +875,10 @@ public final class AeroServerRuntime {
     }
 
     private int l2CaptureStatus(ServerCommandSource source) {
+        if (!ENABLE_LEGACY_STITCHED_L2) {
+            feedback(source, "Legacy stitched L2 is disabled");
+            return 1;
+        }
         L2CaptureSession session = activeL2CaptureSession;
         if (session == null) {
             feedback(source, "No L2 capture session is active");
@@ -1013,10 +1043,40 @@ public final class AeroServerRuntime {
             world.getThunderGradient(1.0f),
             world.getSeaLevel()
         );
+        Path outputDir = inspectionPatchOutputDir(source.getServer(), worldKey, focus, domainBlocks, gridResolution);
+        InspectionPatchInput input = buildInspectionPatchInput(
+            world,
+            worldKey,
+            focus,
+            origin,
+            domainBlocks,
+            gridResolution,
+            faceResolution,
+            outputDir,
+            environmentSnapshot,
+            true
+        );
+        if (input == null) {
+            feedback(source, "Failed to build inspection patch input");
+        }
+        return input;
+    }
+
+    private InspectionPatchInput buildInspectionPatchInput(
+        ServerWorld world,
+        RegistryKey<World> worldKey,
+        BlockPos focus,
+        BlockPos origin,
+        int domainBlocks,
+        int gridResolution,
+        int faceResolution,
+        Path outputDir,
+        WorldEnvironmentSnapshot environmentSnapshot,
+        boolean createOutputDir
+    ) {
         NestedBoundaryCoupler.BoundarySample fallbackBoundary = sampleNestedBoundaryAtPosition(worldKey, focus);
         BoundaryFieldData boundaryField = sampleInspectionBoundaryField(worldKey, origin, domainBlocks, faceResolution, fallbackBoundary);
         if (boundaryField == null) {
-            feedback(source, "Failed to sample six-face inspection boundary field");
             return null;
         }
         ThermalEnvironment thermalEnvironment = sampleThermalEnvironment(
@@ -1028,14 +1088,13 @@ public final class AeroServerRuntime {
         int cellsPerBlock = gridResolution / domainBlocks;
         InspectionPatchStaticFields staticFields = captureInspectionPatchStaticFields(world, origin, domainBlocks, gridResolution, cellsPerBlock);
         List<FanSource> fans = queryFanSources(worldKey, origin, domainBlocks);
-
-        Path outputDir = inspectionPatchOutputDir(source.getServer(), worldKey, focus, domainBlocks, gridResolution);
-        try {
-            Files.createDirectories(outputDir.resolve("static"));
-            Files.createDirectories(outputDir.resolve("boundary"));
-        } catch (IOException e) {
-            feedback(source, "Failed to create inspection patch output dir: " + e.getMessage());
-            return null;
+        if (createOutputDir && outputDir != null) {
+            try {
+                Files.createDirectories(outputDir.resolve("static"));
+                Files.createDirectories(outputDir.resolve("boundary"));
+            } catch (IOException e) {
+                return null;
+            }
         }
         return new InspectionPatchInput(
             worldKey,
@@ -1163,6 +1222,174 @@ public final class AeroServerRuntime {
         value = (value ^ input.domainBlocks()) * 1099511628211L;
         value = (value ^ input.gridResolution()) * 1099511628211L;
         return value == 0L ? 1L : value;
+    }
+
+    private void tickLocalL2Runtime(MinecraftServer server) {
+        LocalL2SampleContext sample = sampleLocalL2Context(server);
+        if (sample == null) {
+            deactivateLocalL2Runtime();
+            return;
+        }
+        LocalL2ActivationDecision decision = evaluateLocalL2Candidate(sample);
+        if (!decision.activate()) {
+            deactivateLocalL2Runtime();
+            return;
+        }
+        LocalL2RuntimeState current = activeLocalL2Runtime;
+        if (current != null) {
+            current.lastDecisionReason = decision.reason();
+        }
+        boolean sameAnchor = current != null
+            && current.worldKey.equals(sample.worldKey())
+            && current.origin.equals(sample.origin());
+        if (sameAnchor && tickCounter - current.lastRequestTick < LOCAL_L2_REBUILD_INTERVAL_TICKS) {
+            return;
+        }
+        if (current != null && current.inFlight.get()) {
+            return;
+        }
+        InspectionPatchInput input = buildInspectionPatchInput(
+            sample.world(),
+            sample.worldKey(),
+            sample.focus(),
+            sample.origin(),
+            LOCAL_L2_DOMAIN_BLOCKS,
+            LOCAL_L2_GRID_RESOLUTION,
+            LOCAL_L2_FACE_RESOLUTION,
+            null,
+            sample.environmentSnapshot(),
+            false
+        );
+        if (input == null) {
+            return;
+        }
+        long regionKey = inspectionPatchRegionKey(input);
+        if (current != null && current.regionKey != regionKey) {
+            releaseLocalL2Region(current.regionKey);
+        }
+        LocalL2RuntimeState next = new LocalL2RuntimeState(
+            sample.playerId(),
+            sample.worldKey(),
+            sample.focus(),
+            sample.origin(),
+            regionKey,
+            tickCounter,
+            decision.reason()
+        );
+        next.inFlight.set(true);
+        activeLocalL2Runtime = next;
+        diagnosticsExecutor.execute(() -> runLocalL2Prefetch(next, input));
+    }
+
+    private LocalL2SampleContext sampleLocalL2Context(MinecraftServer server) {
+        List<ServerPlayerEntity> players = server.getPlayerManager().getPlayerList();
+        if (players.isEmpty()) {
+            return null;
+        }
+        ServerPlayerEntity player = players.get(0);
+        ServerWorld world = player.getEntityWorld();
+        RegistryKey<World> worldKey = world.getRegistryKey();
+        if (mesoscaleMetGrids.get(worldKey) == null && backgroundMetGrids.get(worldKey) == null) {
+            return null;
+        }
+        BlockPos focus = BlockPos.ofFloored(player.getX(), player.getY(), player.getZ());
+        BlockPos origin = inspectionPatchOriginForFocus(world, focus, LOCAL_L2_DOMAIN_BLOCKS);
+        WorldEnvironmentSnapshot environmentSnapshot = new WorldEnvironmentSnapshot(
+            world.getTimeOfDay(),
+            world.getRainGradient(1.0f),
+            world.getThunderGradient(1.0f),
+            world.getSeaLevel()
+        );
+        return new LocalL2SampleContext(world, player.getUuid(), worldKey, focus, origin, environmentSnapshot);
+    }
+
+    private LocalL2ActivationDecision evaluateLocalL2Candidate(LocalL2SampleContext sample) {
+        return new LocalL2ActivationDecision(true, "placeholder_always_on");
+    }
+
+    private void runLocalL2Prefetch(LocalL2RuntimeState state, InspectionPatchInput input) {
+        try {
+            if (!streamingEnabled || activeLocalL2Runtime != state) {
+                return;
+            }
+            state.phase = "prepare_runtime";
+            synchronized (simulationStateLock) {
+                ensureSimulationServiceInitialized();
+                if (simulationServiceId == 0L) {
+                    throw new IOException("Simulation service unavailable");
+                }
+                if (!simulationBridge.ensureL2Runtime(
+                    simulationServiceId,
+                    input.gridResolution(),
+                    input.gridResolution(),
+                    input.gridResolution(),
+                    CHANNELS,
+                    RESPONSE_CHANNELS
+                )) {
+                    throw new IOException("Failed to switch native runtime to local patch dimensions");
+                }
+                prepareInspectionPatchInSimulation(state.regionKey, input);
+            }
+            state.phase = "prefetch";
+            float maxSpeedMps;
+            synchronized (simulationStateLock) {
+                float latticeMaxSpeed = simulationBridge.prefetchRegionStored(
+                    simulationServiceId,
+                    state.regionKey,
+                    input.gridResolution(),
+                    input.gridResolution(),
+                    input.gridResolution(),
+                    input.fallbackBoundary().windX() / NATIVE_VELOCITY_SCALE,
+                    input.fallbackBoundary().windY() / NATIVE_VELOCITY_SCALE,
+                    input.fallbackBoundary().windZ() / NATIVE_VELOCITY_SCALE,
+                    input.fallbackBoundary().ambientAirTemperatureKelvin(),
+                    input.boundaryField().externalFaceMask(),
+                    input.boundaryField().faceResolution(),
+                    input.boundaryField().windX(),
+                    input.boundaryField().windY(),
+                    input.boundaryField().windZ(),
+                    input.boundaryField().airTemperatureKelvin(),
+                    INSPECTION_PATCH_SPONGE_THICKNESS_CELLS,
+                    INSPECTION_PATCH_SPONGE_VELOCITY_RELAXATION,
+                    INSPECTION_PATCH_SPONGE_TEMPERATURE_RELAXATION,
+                    0,
+                    null,
+                    LOCAL_L2_PREFETCH_FRAME_COUNT
+                );
+                if (!Float.isFinite(latticeMaxSpeed)) {
+                    throw new IOException("Local patch prefetch failed: " + simulationBridge.lastError());
+                }
+                maxSpeedMps = latticeMaxSpeed * NATIVE_VELOCITY_SCALE;
+            }
+            state.lastCompletedTick = tickCounter;
+            state.maxSpeedMetersPerSecond = maxSpeedMps;
+            state.phase = "ready";
+        } catch (Throwable t) {
+            state.phase = "failed";
+            state.lastError = t.getClass().getSimpleName() + ": " + t.getMessage();
+            log("Local L2 prefetch failed: " + t.getMessage());
+        } finally {
+            state.inFlight.set(false);
+            if (activeLocalL2Runtime != state) {
+                releaseLocalL2Region(state.regionKey);
+            }
+        }
+    }
+
+    private void deactivateLocalL2Runtime() {
+        LocalL2RuntimeState state = activeLocalL2Runtime;
+        activeLocalL2Runtime = null;
+        if (state != null && !state.inFlight.get()) {
+            releaseLocalL2Region(state.regionKey);
+        }
+    }
+
+    private void releaseLocalL2Region(long regionKey) {
+        synchronized (simulationStateLock) {
+            if (simulationServiceId != 0L && regionKey != 0L) {
+                simulationBridge.deactivateRegion(simulationServiceId, regionKey);
+            }
+        }
     }
 
     private void prepareInspectionPatchInSimulation(long regionKey, InspectionPatchInput input) throws IOException {
@@ -2188,8 +2415,22 @@ public final class AeroServerRuntime {
         worldMirror.drainFanRefreshes(server, FAN_DUCT_REFRESH_BUDGET_PER_TICK);
         recordMainThreadPhase(MAIN_THREAD_PHASE_FAN_REFRESHES, System.nanoTime() - phaseStartNanos);
         phaseStartNanos = System.nanoTime();
-        ensureSimulationCoordinatorRunning();
+        if (!ENABLE_LEGACY_STITCHED_L2) {
+            stopSimulationCoordinator();
+            clearPublishedFlowState();
+            tickLocalL2Runtime(server);
+        } else {
+            ensureSimulationCoordinatorRunning();
+        }
         recordMainThreadPhase(MAIN_THREAD_PHASE_COORDINATOR, System.nanoTime() - phaseStartNanos);
+
+        if (!ENABLE_LEGACY_STITCHED_L2) {
+            updateSimulationRate(0);
+            lastMaxFlowSpeed = 0.0f;
+            recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, 0L);
+            recordMainThreadPhase(MAIN_THREAD_PHASE_TOTAL, System.nanoTime() - tickStartNanos);
+            return;
+        }
 
         PublishedFrame frame = publishedFrame.get();
         if (frame == null || frame.regionAtlases().isEmpty()) {
@@ -2326,6 +2567,7 @@ public final class AeroServerRuntime {
             activeL2CaptureSession = null;
             persistL2CaptureMetadata(captureSession);
         }
+        deactivateLocalL2Runtime();
         streamingEnabled = false;
         stopSimulationCoordinator();
         saveAllWorldScaleDrivers(server);
@@ -2364,9 +2606,7 @@ public final class AeroServerRuntime {
         activePlayerProbeRequests = List.of();
         activeEntitySampleRequests = List.of();
         worldEnvironmentSnapshots = Map.of();
-        publishedFrame.set(null);
-        publishedPlayerProbes.set(Map.of());
-        publishedEntitySamples.set(Map.of());
+        clearPublishedFlowState();
         synchronized (pendingWorldDeltasLock) {
             pendingWorldDeltas.clear();
         }
@@ -4020,7 +4260,13 @@ public final class AeroServerRuntime {
                 airTemperatureState,
                 surfaceTemperatureState
             )) {
-                return;
+                synthesizeWindowDynamicRegionFromNestedBackground(
+                    key,
+                    region,
+                    flowState,
+                    airTemperatureState,
+                    surfaceTemperatureState
+                );
             }
             simulationBridge.importDynamicRegion(
                 simulationServiceId,
@@ -4033,6 +4279,120 @@ public final class AeroServerRuntime {
                 surfaceTemperatureState
             );
         }
+    }
+
+    private void synthesizeWindowDynamicRegionFromNestedBackground(
+        WindowKey key,
+        RegionRecord region,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState
+    ) {
+        NestedBoundaryCoupler.BoundarySample fallback = sampleNestedBoundaryAtWindow(key);
+        BlockPos.Mutable samplePos = new BlockPos.Mutable();
+        float fallbackWindX = fallback == null ? 0.0f : fallback.windX();
+        float fallbackWindY = fallback == null ? 0.0f : fallback.windY();
+        float fallbackWindZ = fallback == null ? 0.0f : fallback.windZ();
+        float fallbackAmbient = fallback == null
+            ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K
+            : fallback.ambientAirTemperatureKelvin();
+        float fallbackDeepGround = fallback == null
+            ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K + THERMAL_DEEP_GROUND_OFFSET_K
+            : fallback.deepGroundTemperatureKelvin();
+        float[][] verticalVelocityColumns = new float[GRID_SIZE * GRID_SIZE][];
+
+        for (int x = 0; x < GRID_SIZE; x++) {
+            for (int z = 0; z < GRID_SIZE; z++) {
+                verticalVelocityColumns[x * GRID_SIZE + z] = synthesizeWindowVerticalVelocityColumn(
+                    key.worldKey(),
+                    key.origin().getX() + x,
+                    key.origin().getY(),
+                    key.origin().getZ() + z,
+                    GRID_SIZE,
+                    fallback
+                );
+            }
+        }
+
+        for (int x = 0; x < GRID_SIZE; x++) {
+            for (int y = 0; y < GRID_SIZE; y++) {
+                for (int z = 0; z < GRID_SIZE; z++) {
+                    int cell = gridCellIndex(x, y, z);
+                    samplePos.set(
+                        key.origin().getX() + x,
+                        key.origin().getY() + y,
+                        key.origin().getZ() + z
+                    );
+                    MesoscaleGrid.Sample mesoscale = sampleMesoscaleMet(key.worldKey(), samplePos);
+                    BackgroundMetGrid.Sample background = mesoscale == null ? sampleBackgroundMet(key.worldKey(), samplePos) : null;
+
+                    float windX = mesoscale != null
+                        ? mesoscale.windX()
+                        : background != null ? background.backgroundWindX() : fallbackWindX;
+                    float[] vyColumn = verticalVelocityColumns[x * GRID_SIZE + z];
+                    float windY = vyColumn == null || y >= vyColumn.length ? fallbackWindY : vyColumn[y];
+                    float windZ = mesoscale != null
+                        ? mesoscale.windZ()
+                        : background != null ? background.backgroundWindZ() : fallbackWindZ;
+                    float ambient = mesoscale != null
+                        ? mesoscale.ambientAirTemperatureKelvin()
+                        : background != null ? background.ambientAirTemperatureKelvin() : fallbackAmbient;
+                    float deepGround = mesoscale != null
+                        ? mesoscale.deepGroundTemperatureKelvin()
+                        : background != null ? background.deepGroundTemperatureKelvin() : fallbackDeepGround;
+
+                    airTemperatureState[cell] = ambient;
+                    surfaceTemperatureState[cell] = deepGround;
+
+                    if (isWindowObstacleCell(region, x, y, z)) {
+                        continue;
+                    }
+
+                    int base = cell * RESPONSE_CHANNELS;
+                    flowState[base] = windX / NATIVE_VELOCITY_SCALE;
+                    flowState[base + 1] = windY / NATIVE_VELOCITY_SCALE;
+                    flowState[base + 2] = windZ / NATIVE_VELOCITY_SCALE;
+                    flowState[base + 3] = 0.0f;
+                }
+            }
+        }
+    }
+
+    private float[] synthesizeWindowVerticalVelocityColumn(
+        RegistryKey<World> worldKey,
+        int worldX,
+        int minWorldY,
+        int worldZ,
+        int resolution,
+        NestedBoundaryCoupler.BoundarySample fallback
+    ) {
+        float[] divColumn = new float[resolution];
+        float maxHorizontalSpeed = 0.0f;
+        BlockPos.Mutable samplePos = new BlockPos.Mutable();
+        for (int y = 0; y < resolution; y++) {
+            samplePos.set(worldX, minWorldY + y, worldZ);
+            NestedMetState state = sampleNestedMetState(worldKey, samplePos, fallback);
+            divColumn[y] = sampleHorizontalDivergence(worldKey, samplePos, fallback);
+            maxHorizontalSpeed = Math.max(
+                maxHorizontalSpeed,
+                (float) Math.sqrt(state.windX() * state.windX() + state.windZ() * state.windZ())
+            );
+        }
+        return integrateVerticalVelocity(divColumn, maxHorizontalSpeed, 1.0f);
+    }
+
+    private boolean isWindowObstacleCell(RegionRecord region, int x, int y, int z) {
+        int sx = x / CHUNK_SIZE;
+        int sy = y / CHUNK_SIZE;
+        int sz = z / CHUNK_SIZE;
+        WorldMirror.SectionSnapshot snapshot = region.sectionAt(sx, sy, sz);
+        if (snapshot == null) {
+            return true;
+        }
+        int localX = x - sx * CHUNK_SIZE;
+        int localY = y - sy * CHUNK_SIZE;
+        int localZ = z - sz * CHUNK_SIZE;
+        return snapshot.obstacle()[localSectionCellIndex(localX, localY, localZ)] >= 0.5f;
     }
 
     private ServerWorld resolveWorld(RegistryKey<World> worldKey) {
@@ -5382,6 +5742,9 @@ public final class AeroServerRuntime {
     }
 
     private void ensureSimulationCoordinatorRunning() {
+        if (!ENABLE_LEGACY_STITCHED_L2) {
+            return;
+        }
         synchronized (coordinatorLifecycleLock) {
             if (simulationCoordinator != null && simulationCoordinator.running()) {
                 return;
@@ -5401,6 +5764,12 @@ public final class AeroServerRuntime {
         if (coordinator != null) {
             coordinator.shutdown();
         }
+    }
+
+    private void clearPublishedFlowState() {
+        publishedFrame.set(null);
+        publishedPlayerProbes.set(Map.of());
+        publishedEntitySamples.set(Map.of());
     }
 
     private List<ActiveWindow> snapshotActiveWindowsForCoordinatorLocked() {
@@ -5975,6 +6344,22 @@ public final class AeroServerRuntime {
     ) {
     }
 
+    private record LocalL2SampleContext(
+        ServerWorld world,
+        UUID playerId,
+        RegistryKey<World> worldKey,
+        BlockPos focus,
+        BlockPos origin,
+        WorldEnvironmentSnapshot environmentSnapshot
+    ) {
+    }
+
+    private record LocalL2ActivationDecision(
+        boolean activate,
+        String reason
+    ) {
+    }
+
     private record PlayerRegionAnchor(
         RegistryKey<World> worldKey,
         BlockPos coreOrigin
@@ -6124,6 +6509,39 @@ public final class AeroServerRuntime {
         Map<WindowKey, short[]> regionAtlases,
         Map<WindowKey, Float> regionMaxSpeeds
     ) {
+    }
+
+    private static final class LocalL2RuntimeState {
+        private final UUID playerId;
+        private final RegistryKey<World> worldKey;
+        private final BlockPos focus;
+        private final BlockPos origin;
+        private final long regionKey;
+        private final int lastRequestTick;
+        private final AtomicBoolean inFlight = new AtomicBoolean(false);
+        private volatile int lastCompletedTick = Integer.MIN_VALUE;
+        private volatile float maxSpeedMetersPerSecond = 0.0f;
+        private volatile String phase = "queued";
+        private volatile String lastDecisionReason;
+        private volatile String lastError = "";
+
+        private LocalL2RuntimeState(
+            UUID playerId,
+            RegistryKey<World> worldKey,
+            BlockPos focus,
+            BlockPos origin,
+            long regionKey,
+            int lastRequestTick,
+            String lastDecisionReason
+        ) {
+            this.playerId = playerId;
+            this.worldKey = worldKey;
+            this.focus = focus;
+            this.origin = origin;
+            this.regionKey = regionKey;
+            this.lastRequestTick = lastRequestTick;
+            this.lastDecisionReason = lastDecisionReason;
+        }
     }
 
     private static final class RegionRecord {

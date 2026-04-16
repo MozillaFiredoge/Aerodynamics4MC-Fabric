@@ -52,6 +52,29 @@ struct AtlasData {
     std::vector<int16_t> values;
 };
 
+struct PrefetchSlotMetadata {
+    uint64_t generation = 0;
+    long long region_key = 0;
+    int valid = 0;
+    int frame_index = -1;
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    int value_count = 0;
+    float scale_vx = 1.0f;
+    float scale_vy = 1.0f;
+    float scale_vz = 1.0f;
+    float max_speed = 0.0f;
+};
+
+struct PrefetchRingData {
+    int slot_count = 0;
+    int values_per_frame = 0;
+    std::vector<int16_t> values;
+    std::vector<PrefetchSlotMetadata> metadata;
+    uint64_t next_generation = 1;
+};
+
 struct RegionPacketTemplateData {
     int nx = 0;
     int ny = 0;
@@ -84,6 +107,7 @@ struct ServiceState {
     std::unordered_map<long long, std::shared_ptr<const ForcingRegionData>> forcing_regions;
     std::unordered_map<long long, AtlasData> atlases;
     std::unordered_map<long long, std::shared_ptr<const RegionPacketTemplateData>> packet_templates;
+    PrefetchRingData prefetch_ring;
 };
 
 struct SpinMutex {
@@ -106,6 +130,8 @@ long long g_service_key = 0;
 std::string g_simulation_last_error;
 
 constexpr int k_default_packed_atlas_stride = 4;
+constexpr int k_prefetch_slot_count = 5;
+constexpr int k_prefetch_flow_channels = AERO_LBM_SIMULATION_PREFETCH_FLOW_CHANNELS;
 constexpr float k_atlas_velocity_quant_range = 5.6f;
 constexpr float k_atlas_pressure_quant_range = 0.03f;
 constexpr int k_face_count = 6;
@@ -304,6 +330,10 @@ int16_t quantize_signed(float value, float range) {
     }
     const float normalized = std::clamp(value / range, -1.0f, 1.0f);
     return static_cast<int16_t>(std::lround(normalized * 32767.0f));
+}
+
+float finite_or_zero(float value) {
+    return std::isfinite(value) ? value : 0.0f;
 }
 
 int local_face_index(int cell, int direction_index) {
@@ -525,6 +555,91 @@ bool ensure_l2_runtime(ServiceState& service, int nx, int ny, int nz, int input_
     service.l2_input_channels = input_channels;
     service.l2_output_channels = output_channels;
     return true;
+}
+
+bool ensure_prefetch_ring(ServiceState& service, int nx, int ny, int nz) {
+    int cells = 0;
+    if (!checked_cell_count(nx, ny, nz, &cells)) {
+        set_simulation_last_error("simulation_prefetch: invalid dimensions");
+        return false;
+    }
+    PrefetchRingData& ring = service.prefetch_ring;
+    const int values_per_frame = cells * k_prefetch_flow_channels;
+    if (ring.slot_count <= 0) {
+        ring.slot_count = k_prefetch_slot_count;
+    }
+    if (ring.values_per_frame == values_per_frame
+        && ring.values.size() == static_cast<size_t>(ring.slot_count) * static_cast<size_t>(values_per_frame)
+        && ring.metadata.size() == static_cast<size_t>(ring.slot_count)) {
+        return true;
+    }
+    ring.values_per_frame = values_per_frame;
+    ring.values.assign(
+        static_cast<size_t>(ring.slot_count) * static_cast<size_t>(values_per_frame),
+        static_cast<int16_t>(0)
+    );
+    ring.metadata.assign(static_cast<size_t>(ring.slot_count), PrefetchSlotMetadata());
+    return true;
+}
+
+void clear_prefetch_ring(ServiceState& service) {
+    PrefetchRingData& ring = service.prefetch_ring;
+    for (PrefetchSlotMetadata& metadata : ring.metadata) {
+        metadata = PrefetchSlotMetadata();
+    }
+    std::fill(ring.values.begin(), ring.values.end(), static_cast<int16_t>(0));
+}
+
+void store_prefetch_frame(
+    ServiceState& service,
+    long long region_key,
+    int frame_index,
+    const DynamicRegionData& dynamic_region,
+    float max_speed
+) {
+    if (!ensure_prefetch_ring(service, dynamic_region.nx, dynamic_region.ny, dynamic_region.nz)) {
+        return;
+    }
+    PrefetchRingData& ring = service.prefetch_ring;
+    if (ring.slot_count <= 0 || ring.values_per_frame <= 0) {
+        return;
+    }
+    const int slot_index = frame_index % ring.slot_count;
+    const size_t slot_base = static_cast<size_t>(slot_index) * static_cast<size_t>(ring.values_per_frame);
+    const size_t cells = static_cast<size_t>(dynamic_region.nx) * static_cast<size_t>(dynamic_region.ny)
+        * static_cast<size_t>(dynamic_region.nz);
+    float max_abs_vx = 0.0f;
+    float max_abs_vy = 0.0f;
+    float max_abs_vz = 0.0f;
+    for (size_t cell = 0; cell < cells; ++cell) {
+        const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        max_abs_vx = std::max(max_abs_vx, std::abs(finite_or_zero(dynamic_region.flow_state[flow_base])));
+        max_abs_vy = std::max(max_abs_vy, std::abs(finite_or_zero(dynamic_region.flow_state[flow_base + 1])));
+        max_abs_vz = std::max(max_abs_vz, std::abs(finite_or_zero(dynamic_region.flow_state[flow_base + 2])));
+    }
+    const float scale_vx = std::max(max_abs_vx, 1.0e-4f);
+    const float scale_vy = std::max(max_abs_vy, 1.0e-4f);
+    const float scale_vz = std::max(max_abs_vz, 1.0e-4f);
+    for (size_t cell = 0; cell < cells; ++cell) {
+        const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        const size_t dst = slot_base + cell * k_prefetch_flow_channels;
+        ring.values[dst] = quantize_signed(dynamic_region.flow_state[flow_base], scale_vx);
+        ring.values[dst + 1] = quantize_signed(dynamic_region.flow_state[flow_base + 1], scale_vy);
+        ring.values[dst + 2] = quantize_signed(dynamic_region.flow_state[flow_base + 2], scale_vz);
+    }
+    PrefetchSlotMetadata& metadata = ring.metadata[static_cast<size_t>(slot_index)];
+    metadata.generation = ring.next_generation++;
+    metadata.region_key = region_key;
+    metadata.valid = 1;
+    metadata.frame_index = frame_index;
+    metadata.nx = dynamic_region.nx;
+    metadata.ny = dynamic_region.ny;
+    metadata.nz = dynamic_region.nz;
+    metadata.value_count = ring.values_per_frame;
+    metadata.scale_vx = scale_vx;
+    metadata.scale_vy = scale_vy;
+    metadata.scale_vz = scale_vz;
+    metadata.max_speed = max_speed;
 }
 
 void rebuild_default_packed_atlas(const DynamicRegionData& region, AtlasData& atlas) {
@@ -1316,6 +1431,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_create_service(long long* out_servi
         return 0;
     }
     if (!g_service) {
+        g_service_storage = ServiceState();
+        g_service_storage.prefetch_ring.slot_count = k_prefetch_slot_count;
         g_service = &g_service_storage;
         g_service_key = 1;
     }
@@ -1919,6 +2036,153 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         service->atlases[region_key] = std::move(atlas);
     }
     *out_max_speed = max_speed;
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_prefetch_region_stored(
+    long long service_key,
+    long long region_key,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
+    int sponge_thickness_cells,
+    float sponge_velocity_relaxation,
+    float sponge_temperature_relaxation,
+    int tornado_descriptor_count,
+    const float* tornado_descriptors,
+    int prefetch_frame_count,
+    float* out_max_speed
+) {
+    if (prefetch_frame_count <= 0 || !out_max_speed) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_prefetch_region_stored: invalid arguments");
+        return 0;
+    }
+    float last_max_speed = 0.0f;
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_prefetch_region_stored: missing service");
+            return 0;
+        }
+        clear_prefetch_ring(*service);
+    }
+    const int frame_limit = std::min(prefetch_frame_count, k_prefetch_slot_count);
+    for (int frame_index = 0; frame_index < frame_limit; ++frame_index) {
+        if (!aero_lbm_simulation_step_region_stored(
+            service_key,
+            region_key,
+            nx,
+            ny,
+            nz,
+            boundary_wind_x,
+            boundary_wind_y,
+            boundary_wind_z,
+            fallback_boundary_air_temperature_k,
+            external_face_mask,
+            boundary_face_resolution,
+            boundary_wind_face_x,
+            boundary_wind_face_y,
+            boundary_wind_face_z,
+            boundary_air_temperature_k,
+            sponge_thickness_cells,
+            sponge_velocity_relaxation,
+            sponge_temperature_relaxation,
+            tornado_descriptor_count,
+            tornado_descriptors,
+            &last_max_speed
+        )) {
+            return 0;
+        }
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_prefetch_region_stored: missing service after step");
+            return 0;
+        }
+        auto dynamic_it = service->dynamic_regions.find(region_key);
+        if (dynamic_it == service->dynamic_regions.end()) {
+            set_simulation_last_error("simulation_prefetch_region_stored: missing dynamic region after step");
+            return 0;
+        }
+        store_prefetch_frame(*service, region_key, frame_index, dynamic_it->second, last_max_speed);
+    }
+    *out_max_speed = last_max_speed;
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT const int16_t* aero_lbm_simulation_prefetch_buffer_ptr(long long service_key) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service || service->prefetch_ring.values.empty()) {
+        return nullptr;
+    }
+    return service->prefetch_ring.values.data();
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_prefetch_slot_count(long long service_key) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        return 0;
+    }
+    return service->prefetch_ring.slot_count;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_prefetch_values_per_frame(long long service_key) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        return 0;
+    }
+    return service->prefetch_ring.values_per_frame;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_prefetch_slot_metadata(
+    long long service_key,
+    int slot_index,
+    AeroLbmPrefetchSlotMetadata* out_metadata
+) {
+    if (!out_metadata) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_prefetch_metadata: out_metadata is null");
+        return 0;
+    }
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_prefetch_metadata: missing service");
+        return 0;
+    }
+    const PrefetchRingData& ring = service->prefetch_ring;
+    if (slot_index < 0 || slot_index >= static_cast<int>(ring.metadata.size())) {
+        set_simulation_last_error("simulation_prefetch_metadata: slot index out of range");
+        return 0;
+    }
+    const PrefetchSlotMetadata& metadata = ring.metadata[static_cast<size_t>(slot_index)];
+    out_metadata->generation = metadata.generation;
+    out_metadata->region_key = metadata.region_key;
+    out_metadata->valid = metadata.valid;
+    out_metadata->frame_index = metadata.frame_index;
+    out_metadata->nx = metadata.nx;
+    out_metadata->ny = metadata.ny;
+    out_metadata->nz = metadata.nz;
+    out_metadata->value_count = metadata.value_count;
+    out_metadata->scale_vx = metadata.scale_vx;
+    out_metadata->scale_vy = metadata.scale_vy;
+    out_metadata->scale_vz = metadata.scale_vz;
+    out_metadata->max_speed = metadata.max_speed;
     return 1;
 }
 
@@ -3001,6 +3265,194 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     }
     env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativePrefetchRegionStored(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint nx,
+    jint ny,
+    jint nz,
+    jfloat boundary_wind_x,
+    jfloat boundary_wind_y,
+    jfloat boundary_wind_z,
+    jfloat fallback_boundary_air_temperature_k,
+    jint external_face_mask,
+    jint boundary_face_resolution,
+    jfloatArray boundary_wind_face_x,
+    jfloatArray boundary_wind_face_y,
+    jfloatArray boundary_wind_face_z,
+    jfloatArray boundary_air_temperature_k,
+    jint sponge_thickness_cells,
+    jfloat sponge_velocity_relaxation,
+    jfloat sponge_temperature_relaxation,
+    jint tornado_descriptor_count,
+    jfloatArray tornado_descriptors,
+    jint prefetch_frame_count,
+    jfloatArray out_max_speed
+) {
+    if (!out_max_speed || env->GetArrayLength(out_max_speed) != 1 || prefetch_frame_count <= 0) {
+        return JNI_FALSE;
+    }
+    const int face_cells = boundary_face_resolution <= 0
+        ? 0
+        : k_face_count * boundary_face_resolution * boundary_face_resolution;
+    if (face_cells > 0
+        && (!boundary_wind_face_x
+            || !boundary_wind_face_y
+            || !boundary_wind_face_z
+            || !boundary_air_temperature_k
+            || env->GetArrayLength(boundary_wind_face_x) != static_cast<jsize>(face_cells)
+            || env->GetArrayLength(boundary_wind_face_y) != static_cast<jsize>(face_cells)
+            || env->GetArrayLength(boundary_wind_face_z) != static_cast<jsize>(face_cells)
+            || env->GetArrayLength(boundary_air_temperature_k) != static_cast<jsize>(face_cells))) {
+        return JNI_FALSE;
+    }
+    if (tornado_descriptor_count < 0
+        || (tornado_descriptor_count > 0
+            && (!tornado_descriptors
+                || env->GetArrayLength(tornado_descriptors)
+                    != static_cast<jsize>(tornado_descriptor_count * k_tornado_descriptor_floats)))) {
+        return JNI_FALSE;
+    }
+    jboolean copy = JNI_FALSE;
+    jfloat* max_speed_ptr = env->GetFloatArrayElements(out_max_speed, &copy);
+    if (!max_speed_ptr) {
+        return JNI_FALSE;
+    }
+    jboolean face_x_copy = JNI_FALSE;
+    jboolean face_y_copy = JNI_FALSE;
+    jboolean face_z_copy = JNI_FALSE;
+    jboolean face_temp_copy = JNI_FALSE;
+    jboolean tornado_copy = JNI_FALSE;
+    jfloat* face_x_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_x, &face_x_copy) : nullptr;
+    jfloat* face_y_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_y, &face_y_copy) : nullptr;
+    jfloat* face_z_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_wind_face_z, &face_z_copy) : nullptr;
+    jfloat* face_temp_ptr = face_cells > 0 ? env->GetFloatArrayElements(boundary_air_temperature_k, &face_temp_copy) : nullptr;
+    jfloat* tornado_ptr = tornado_descriptor_count > 0 ? env->GetFloatArrayElements(tornado_descriptors, &tornado_copy) : nullptr;
+    if ((face_cells > 0 && (!face_x_ptr || !face_y_ptr || !face_z_ptr || !face_temp_ptr))
+        || (tornado_descriptor_count > 0 && !tornado_ptr)) {
+        if (face_x_ptr) env->ReleaseFloatArrayElements(boundary_wind_face_x, face_x_ptr, JNI_ABORT);
+        if (face_y_ptr) env->ReleaseFloatArrayElements(boundary_wind_face_y, face_y_ptr, JNI_ABORT);
+        if (face_z_ptr) env->ReleaseFloatArrayElements(boundary_wind_face_z, face_z_ptr, JNI_ABORT);
+        if (face_temp_ptr) env->ReleaseFloatArrayElements(boundary_air_temperature_k, face_temp_ptr, JNI_ABORT);
+        if (tornado_ptr) env->ReleaseFloatArrayElements(tornado_descriptors, tornado_ptr, JNI_ABORT);
+        env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, JNI_ABORT);
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_prefetch_region_stored(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        nx,
+        ny,
+        nz,
+        boundary_wind_x,
+        boundary_wind_y,
+        boundary_wind_z,
+        fallback_boundary_air_temperature_k,
+        external_face_mask,
+        boundary_face_resolution,
+        face_x_ptr,
+        face_y_ptr,
+        face_z_ptr,
+        face_temp_ptr,
+        sponge_thickness_cells,
+        sponge_velocity_relaxation,
+        sponge_temperature_relaxation,
+        tornado_descriptor_count,
+        tornado_ptr,
+        prefetch_frame_count,
+        max_speed_ptr
+    );
+    if (face_x_ptr) env->ReleaseFloatArrayElements(boundary_wind_face_x, face_x_ptr, JNI_ABORT);
+    if (face_y_ptr) env->ReleaseFloatArrayElements(boundary_wind_face_y, face_y_ptr, JNI_ABORT);
+    if (face_z_ptr) env->ReleaseFloatArrayElements(boundary_wind_face_z, face_z_ptr, JNI_ABORT);
+    if (face_temp_ptr) env->ReleaseFloatArrayElements(boundary_air_temperature_k, face_temp_ptr, JNI_ABORT);
+    if (tornado_ptr) env->ReleaseFloatArrayElements(tornado_descriptors, tornado_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(out_max_speed, max_speed_ptr, ok ? 0 : JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jobject JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeGetPrefetchPayloadBuffer(
+    JNIEnv* env,
+    jclass,
+    jlong service_key
+) {
+    const int16_t* data = aero_lbm_simulation_prefetch_buffer_ptr(static_cast<long long>(service_key));
+    const int slot_count = aero_lbm_simulation_prefetch_slot_count(static_cast<long long>(service_key));
+    const int values_per_frame = aero_lbm_simulation_prefetch_values_per_frame(static_cast<long long>(service_key));
+    if (!data || slot_count <= 0 || values_per_frame <= 0) {
+        return nullptr;
+    }
+    const jlong byte_count = static_cast<jlong>(slot_count)
+        * static_cast<jlong>(values_per_frame)
+        * static_cast<jlong>(sizeof(int16_t));
+    return env->NewDirectByteBuffer(const_cast<int16_t*>(data), byte_count);
+}
+
+JNIEXPORT jint JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeGetPrefetchSlotCount(
+    JNIEnv*,
+    jclass,
+    jlong service_key
+) {
+    return aero_lbm_simulation_prefetch_slot_count(static_cast<long long>(service_key));
+}
+
+JNIEXPORT jint JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeGetPrefetchValuesPerFrame(
+    JNIEnv*,
+    jclass,
+    jlong service_key
+) {
+    return aero_lbm_simulation_prefetch_values_per_frame(static_cast<long long>(service_key));
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeGetPrefetchSlotMetadata(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jint slot_index,
+    jlongArray out_longs,
+    jintArray out_ints,
+    jfloatArray out_floats
+) {
+    if (!out_longs || !out_ints || !out_floats
+        || env->GetArrayLength(out_longs) < 2
+        || env->GetArrayLength(out_ints) < 6
+        || env->GetArrayLength(out_floats) < 4) {
+        return JNI_FALSE;
+    }
+    AeroLbmPrefetchSlotMetadata metadata{};
+    if (!aero_lbm_simulation_get_prefetch_slot_metadata(
+        static_cast<long long>(service_key),
+        slot_index,
+        &metadata
+    )) {
+        return JNI_FALSE;
+    }
+    jlong longs[2] = {
+        static_cast<jlong>(metadata.generation),
+        static_cast<jlong>(metadata.region_key)
+    };
+    jint ints[6] = {
+        metadata.valid,
+        metadata.frame_index,
+        metadata.nx,
+        metadata.ny,
+        metadata.nz,
+        metadata.value_count
+    };
+    jfloat floats[4] = {
+        metadata.scale_vx,
+        metadata.scale_vy,
+        metadata.scale_vz,
+        metadata.max_speed
+    };
+    env->SetLongArrayRegion(out_longs, 0, 2, longs);
+    env->SetIntArrayRegion(out_ints, 0, 6, ints);
+    env->SetFloatArrayRegion(out_floats, 0, 4, floats);
+    return JNI_TRUE;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeExchangeRegionHalo(

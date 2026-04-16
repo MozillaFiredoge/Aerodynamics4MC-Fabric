@@ -7,6 +7,10 @@ public final class NativeSimulationBridge {
     public static final int PACKED_ATLAS_CHANNELS = 4;
     public static final int PLAYER_PROBE_CHANNELS = 6;
     public static final int TORNADO_DESCRIPTOR_FLOATS = 17;
+    public static final int PREFETCH_FLOW_CHANNELS = 3;
+    private static final int PREFETCH_METADATA_LONGS = 2;
+    private static final int PREFETCH_METADATA_INTS = 6;
+    private static final int PREFETCH_METADATA_FLOATS = 4;
     private static final int FACE_COUNT = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
@@ -412,6 +416,124 @@ public final class NativeSimulationBridge {
         ) ? outMaxSpeed[0] : Float.NaN;
     }
 
+    public float prefetchRegionStored(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float boundaryWindX,
+        float boundaryWindY,
+        float boundaryWindZ,
+        float fallbackBoundaryAirTemperatureKelvin,
+        int externalFaceMask,
+        int boundaryFaceResolution,
+        float[] boundaryWindFaceX,
+        float[] boundaryWindFaceY,
+        float[] boundaryWindFaceZ,
+        float[] boundaryAirTemperatureKelvin,
+        int spongeThicknessCells,
+        float spongeVelocityRelaxation,
+        float spongeTemperatureRelaxation,
+        int tornadoDescriptorCount,
+        float[] tornadoDescriptors,
+        int prefetchFrameCount
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || prefetchFrameCount <= 0) {
+            return Float.NaN;
+        }
+        int faceCells = boundaryFaceResolution <= 0 ? 0 : FACE_COUNT * boundaryFaceResolution * boundaryFaceResolution;
+        if (faceCells > 0
+            && (boundaryWindFaceX == null
+                || boundaryWindFaceY == null
+                || boundaryWindFaceZ == null
+                || boundaryAirTemperatureKelvin == null
+                || boundaryWindFaceX.length != faceCells
+                || boundaryWindFaceY.length != faceCells
+                || boundaryWindFaceZ.length != faceCells
+                || boundaryAirTemperatureKelvin.length != faceCells)) {
+            return Float.NaN;
+        }
+        if (tornadoDescriptorCount < 0
+            || (tornadoDescriptorCount > 0
+                && (tornadoDescriptors == null
+                    || tornadoDescriptors.length != tornadoDescriptorCount * TORNADO_DESCRIPTOR_FLOATS))) {
+            return Float.NaN;
+        }
+        float[] outMaxSpeed = new float[1];
+        return nativePrefetchRegionStored(
+            serviceKey,
+            regionKey,
+            nx,
+            ny,
+            nz,
+            boundaryWindX,
+            boundaryWindY,
+            boundaryWindZ,
+            fallbackBoundaryAirTemperatureKelvin,
+            externalFaceMask,
+            boundaryFaceResolution,
+            boundaryWindFaceX,
+            boundaryWindFaceY,
+            boundaryWindFaceZ,
+            boundaryAirTemperatureKelvin,
+            spongeThicknessCells,
+            spongeVelocityRelaxation,
+            spongeTemperatureRelaxation,
+            tornadoDescriptorCount,
+            tornadoDescriptors,
+            prefetchFrameCount,
+            outMaxSpeed
+        ) ? outMaxSpeed[0] : Float.NaN;
+    }
+
+    public ByteBuffer getPrefetchPayloadBuffer(long serviceKey) {
+        if (!LOADED || serviceKey == 0L) {
+            return null;
+        }
+        return nativeGetPrefetchPayloadBuffer(serviceKey);
+    }
+
+    public int getPrefetchSlotCount(long serviceKey) {
+        if (!LOADED || serviceKey == 0L) {
+            return 0;
+        }
+        return nativeGetPrefetchSlotCount(serviceKey);
+    }
+
+    public int getPrefetchValuesPerFrame(long serviceKey) {
+        if (!LOADED || serviceKey == 0L) {
+            return 0;
+        }
+        return nativeGetPrefetchValuesPerFrame(serviceKey);
+    }
+
+    public PrefetchSlotMetadata getPrefetchSlotMetadata(long serviceKey, int slotIndex) {
+        if (!LOADED || serviceKey == 0L || slotIndex < 0) {
+            return null;
+        }
+        long[] longs = new long[PREFETCH_METADATA_LONGS];
+        int[] ints = new int[PREFETCH_METADATA_INTS];
+        float[] floats = new float[PREFETCH_METADATA_FLOATS];
+        if (!nativeGetPrefetchSlotMetadata(serviceKey, slotIndex, longs, ints, floats)) {
+            return null;
+        }
+        return new PrefetchSlotMetadata(
+            longs[0],
+            longs[1],
+            ints[0] != 0,
+            ints[1],
+            ints[2],
+            ints[3],
+            ints[4],
+            ints[5],
+            floats[0],
+            floats[1],
+            floats[2],
+            floats[3]
+        );
+    }
+
     public boolean exchangeRegionHalo(
         long serviceKey,
         long firstRegionKey,
@@ -670,6 +792,22 @@ public final class NativeSimulationBridge {
     ) {
     }
 
+    public record PrefetchSlotMetadata(
+        long generation,
+        long regionKey,
+        boolean valid,
+        int frameIndex,
+        int nx,
+        int ny,
+        int nz,
+        int valueCount,
+        float scaleVx,
+        float scaleVy,
+        float scaleVz,
+        float maxSpeed
+    ) {
+    }
+
     private static native long nativeCreateService();
 
     private static native void nativeReleaseService(long serviceKey);
@@ -795,6 +933,45 @@ public final class NativeSimulationBridge {
         int tornadoDescriptorCount,
         float[] tornadoDescriptors,
         float[] outMaxSpeed
+    );
+
+    private static native boolean nativePrefetchRegionStored(
+        long serviceKey,
+        long regionKey,
+        int nx,
+        int ny,
+        int nz,
+        float boundaryWindX,
+        float boundaryWindY,
+        float boundaryWindZ,
+        float fallbackBoundaryAirTemperatureKelvin,
+        int externalFaceMask,
+        int boundaryFaceResolution,
+        float[] boundaryWindFaceX,
+        float[] boundaryWindFaceY,
+        float[] boundaryWindFaceZ,
+        float[] boundaryAirTemperatureKelvin,
+        int spongeThicknessCells,
+        float spongeVelocityRelaxation,
+        float spongeTemperatureRelaxation,
+        int tornadoDescriptorCount,
+        float[] tornadoDescriptors,
+        int prefetchFrameCount,
+        float[] outMaxSpeed
+    );
+
+    private static native ByteBuffer nativeGetPrefetchPayloadBuffer(long serviceKey);
+
+    private static native int nativeGetPrefetchSlotCount(long serviceKey);
+
+    private static native int nativeGetPrefetchValuesPerFrame(long serviceKey);
+
+    private static native boolean nativeGetPrefetchSlotMetadata(
+        long serviceKey,
+        int slotIndex,
+        long[] outLongs,
+        int[] outInts,
+        float[] outFloats
     );
 
     private static native boolean nativeExchangeRegionHalo(
