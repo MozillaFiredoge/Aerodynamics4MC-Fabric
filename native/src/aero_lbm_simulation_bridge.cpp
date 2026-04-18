@@ -324,20 +324,34 @@ void accumulate_nested_feedback(
                         continue;
                     }
                     const std::size_t flow_base = static_cast<std::size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-                    const float rho = std::max(1.0e-6f, 1.0f + dynamic.flow_state[flow_base + 3]);
+                    const float vx = dynamic.flow_state[flow_base];
+                    const float vy = dynamic.flow_state[flow_base + 1];
+                    const float vz = dynamic.flow_state[flow_base + 2];
+                    const float pressure = dynamic.flow_state[flow_base + 3];
+                    const float air_temperature = dynamic.air_temperature[static_cast<std::size_t>(cell)];
+                    const float surface_temperature = dynamic.surface_temperature[static_cast<std::size_t>(cell)];
+                    if (!std::isfinite(vx)
+                        || !std::isfinite(vy)
+                        || !std::isfinite(vz)
+                        || !std::isfinite(pressure)
+                        || !std::isfinite(air_temperature)
+                        || !std::isfinite(surface_temperature)) {
+                        continue;
+                    }
+                    const float rho = std::max(1.0e-6f, 1.0f + pressure);
                     accumulator.volume_sum += k_cell_volume_cubic_meters;
                     accumulator.density_sum += rho;
-                    accumulator.momentum_x_sum += rho * dynamic.flow_state[flow_base];
-                    accumulator.momentum_z_sum += rho * dynamic.flow_state[flow_base + 2];
-                    accumulator.air_temperature_volume_sum += dynamic.air_temperature[static_cast<std::size_t>(cell)];
-                    accumulator.surface_temperature_volume_sum += dynamic.surface_temperature[static_cast<std::size_t>(cell)];
+                    accumulator.momentum_x_sum += rho * vx;
+                    accumulator.momentum_z_sum += rho * vz;
+                    accumulator.air_temperature_volume_sum += air_temperature;
+                    accumulator.surface_temperature_volume_sum += surface_temperature;
                     if (y == bin.min_y) {
                         accumulator.bottom_area_sum += k_cell_face_area_square_meters;
-                        accumulator.bottom_mass_flux_sum += rho * dynamic.flow_state[flow_base + 1];
+                        accumulator.bottom_mass_flux_sum += rho * vy;
                     }
                     if (y == bin.max_y - 1) {
                         accumulator.top_area_sum += k_cell_face_area_square_meters;
-                        accumulator.top_mass_flux_sum += rho * dynamic.flow_state[flow_base + 1];
+                        accumulator.top_mass_flux_sum += rho * vy;
                     }
                 }
             }

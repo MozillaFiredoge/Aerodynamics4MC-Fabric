@@ -16,7 +16,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final float DEFAULT_MOLECULAR_NU_M2_S = 1.5e-5f;
     private static final float DEFAULT_PRANDTL_AIR = 0.71f;
     private static final float DEFAULT_TURBULENT_PRANDTL = 0.85f;
-    private static final int NATIVE_FORCING_CHANNELS = 20;
+    private static final int NATIVE_FORCING_CHANNELS = 24;
     private static final int NATIVE_STATE_CHANNELS = 5;
     private static final int CH_TERRAIN_HEIGHT = 0;
     private static final int CH_BIOME_TEMPERATURE = 1;
@@ -38,6 +38,10 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final int CH_TORNADO_MOISTENING = 17;
     private static final int CH_TORNADO_UPDRAFT = 18;
     private static final int CH_NESTED_UPDRAFT = 19;
+    private static final int CH_NESTED_WIND_X_DELTA = 20;
+    private static final int CH_NESTED_WIND_Z_DELTA = 21;
+    private static final int CH_NESTED_AMBIENT_DELTA = 22;
+    private static final int CH_NESTED_SURFACE_DELTA = 23;
     private static final int OUT_AMBIENT = 0;
     private static final int OUT_DEEP_GROUND = 1;
     private static final int OUT_SURFACE = 2;
@@ -408,6 +412,10 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] forcingSurfaceTargetKelvin = new float[stateCount];
         float[] forcingBackgroundWindX = new float[stateCount];
         float[] forcingBackgroundWindZ = new float[stateCount];
+        float[] forcingNestedAmbientDeltaKelvin = new float[stateCount];
+        float[] forcingNestedSurfaceDeltaKelvin = new float[stateCount];
+        float[] forcingNestedWindXDelta = new float[stateCount];
+        float[] forcingNestedWindZDelta = new float[stateCount];
         float[] forcingNestedUpdraft = new float[stateCount];
         float[] windX = new float[stateCount];
         float[] windZ = new float[stateCount];
@@ -457,6 +465,18 @@ final class MesoscaleGrid implements AutoCloseable {
                         : 0.0f;
                     forcingBackgroundWindZ[stateIndex] = forcingBase >= 0 && forcingBase + CH_BACKGROUND_WIND_Z < forcingBuffer.length
                         ? forcingBuffer[forcingBase + CH_BACKGROUND_WIND_Z]
+                        : 0.0f;
+                    forcingNestedAmbientDeltaKelvin[stateIndex] = forcingBase >= 0 && forcingBase + CH_NESTED_AMBIENT_DELTA < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_NESTED_AMBIENT_DELTA]
+                        : 0.0f;
+                    forcingNestedSurfaceDeltaKelvin[stateIndex] = forcingBase >= 0 && forcingBase + CH_NESTED_SURFACE_DELTA < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_NESTED_SURFACE_DELTA]
+                        : 0.0f;
+                    forcingNestedWindXDelta[stateIndex] = forcingBase >= 0 && forcingBase + CH_NESTED_WIND_X_DELTA < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_NESTED_WIND_X_DELTA]
+                        : 0.0f;
+                    forcingNestedWindZDelta[stateIndex] = forcingBase >= 0 && forcingBase + CH_NESTED_WIND_Z_DELTA < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_NESTED_WIND_Z_DELTA]
                         : 0.0f;
                     forcingNestedUpdraft[stateIndex] = forcingBase >= 0 && forcingBase + CH_NESTED_UPDRAFT < forcingBuffer.length
                         ? forcingBuffer[forcingBase + CH_NESTED_UPDRAFT]
@@ -544,6 +564,10 @@ final class MesoscaleGrid implements AutoCloseable {
             forcingSurfaceTargetKelvin,
             forcingBackgroundWindX,
             forcingBackgroundWindZ,
+            forcingNestedAmbientDeltaKelvin,
+            forcingNestedSurfaceDeltaKelvin,
+            forcingNestedWindXDelta,
+            forcingNestedWindZDelta,
             forcingNestedUpdraft,
             windX,
             windZ,
@@ -594,7 +618,18 @@ final class MesoscaleGrid implements AutoCloseable {
         int acceptedBinCount = 0;
         for (NestedFeedbackBin bin : feedbackBins) {
             inputBinCount++;
-            if (bin == null || !(bin.volumeAverage() > 0.0f)) {
+            if (bin == null
+                || !(bin.volumeAverage() > 0.0f)
+                || !Float.isFinite(bin.volumeAverage())
+                || !Float.isFinite(bin.densityAverage())
+                || !Float.isFinite(bin.momentumXAverage())
+                || !Float.isFinite(bin.momentumZAverage())
+                || !Float.isFinite(bin.airTemperatureVolumeAverage())
+                || !Float.isFinite(bin.surfaceTemperatureVolumeAverage())
+                || !Float.isFinite(bin.bottomAreaAverage())
+                || !Float.isFinite(bin.bottomMassFluxAverage())
+                || !Float.isFinite(bin.topAreaAverage())
+                || !Float.isFinite(bin.topMassFluxAverage())) {
                 continue;
             }
             int layer = MathHelper.clamp(bin.layer(), 0, activeLayers - 1);
@@ -650,7 +685,7 @@ final class MesoscaleGrid implements AutoCloseable {
             NestedFeedbackAccumulator aggregate = entry.getValue();
             float densityAverage = Math.max(1.0e-6f, aggregate.densityAverage);
             float coverage = MathHelper.clamp(aggregate.volumeAverage / coarseCellVolume, 0.0f, 1.0f);
-            if (coverage <= 0.0f) {
+            if (coverage <= 0.0f || !Float.isFinite(densityAverage) || !Float.isFinite(coverage)) {
                 continue;
             }
 
@@ -666,41 +701,55 @@ final class MesoscaleGrid implements AutoCloseable {
                 : 0.0f;
             float meanVerticalVelocity = 0.5f * (bottomFluxDensity + topFluxDensity) / densityAverage;
             float nestedUpdraft = MathHelper.clamp(meanVerticalVelocity, -NESTED_FEEDBACK_MAX_UPDRAFT, NESTED_FEEDBACK_MAX_UPDRAFT);
+            if (!Float.isFinite(meanWindX)
+                || !Float.isFinite(meanWindZ)
+                || !Float.isFinite(meanAirTemperature)
+                || !Float.isFinite(bottomFluxDensity)
+                || !Float.isFinite(topFluxDensity)
+                || !Float.isFinite(nestedUpdraft)) {
+                continue;
+            }
 
-            CellColumnState cell = cells.computeIfAbsent(pack(key.cellX(), key.cellZ()), ignored -> new CellColumnState(activeLayers));
-            cell.ensureLayers(activeLayers);
             int base = forcingIndex(key.cellX(), key.layer(), key.cellZ(), gridWidth) * NATIVE_FORCING_CHANNELS;
             float windBlend = MathHelper.clamp(NESTED_FEEDBACK_WIND_BLEND * coverage, 0.0f, 1.0f);
             float airBlend = MathHelper.clamp(NESTED_FEEDBACK_AIR_BLEND * coverage, 0.0f, 1.0f);
             float surfaceBlend = MathHelper.clamp(NESTED_FEEDBACK_SURFACE_BLEND * coverage, 0.0f, 1.0f);
             float updraftBlend = MathHelper.clamp(NESTED_FEEDBACK_UPDRAFT_BLEND * coverage, 0.0f, 1.0f);
 
-            float previousWindX = cell.windX[key.layer()];
-            float previousWindZ = cell.windZ[key.layer()];
-            float previousAirTemperature = cell.ambientAirTemperatureKelvin[key.layer()];
-            float previousSurfaceTemperature = cell.surfaceTemperatureKelvin[key.layer()];
-            float previousNestedUpdraft = forcingBuffer[base + CH_NESTED_UPDRAFT];
+            float previousForcingWindX = finiteOrDefault(forcingBuffer[base + CH_BACKGROUND_WIND_X], 0.0f);
+            float previousForcingWindZ = finiteOrDefault(forcingBuffer[base + CH_BACKGROUND_WIND_Z], 0.0f);
+            float previousForcingAmbient = finiteOrDefault(forcingBuffer[base + CH_AMBIENT_TARGET], meanAirTemperature);
+            float previousForcingSurface = finiteOrDefault(forcingBuffer[base + CH_SURFACE_TARGET], meanSurfaceTemperature);
+            float previousNestedWindXDelta = finiteOrDefault(forcingBuffer[base + CH_NESTED_WIND_X_DELTA], 0.0f);
+            float previousNestedWindZDelta = finiteOrDefault(forcingBuffer[base + CH_NESTED_WIND_Z_DELTA], 0.0f);
+            float previousNestedAmbientDelta = finiteOrDefault(forcingBuffer[base + CH_NESTED_AMBIENT_DELTA], 0.0f);
+            float previousNestedSurfaceDelta = finiteOrDefault(forcingBuffer[base + CH_NESTED_SURFACE_DELTA], 0.0f);
+            float previousNestedUpdraft = finiteOrDefault(forcingBuffer[base + CH_NESTED_UPDRAFT], 0.0f);
+            float targetNestedWindXDelta = meanWindX - previousForcingWindX;
+            float targetNestedWindZDelta = meanWindZ - previousForcingWindZ;
+            float targetNestedAmbientDelta = meanAirTemperature - previousForcingAmbient;
 
-            forcingBuffer[base + CH_BACKGROUND_WIND_X] = MathHelper.lerp(windBlend, forcingBuffer[base + CH_BACKGROUND_WIND_X], meanWindX);
-            forcingBuffer[base + CH_BACKGROUND_WIND_Z] = MathHelper.lerp(windBlend, forcingBuffer[base + CH_BACKGROUND_WIND_Z], meanWindZ);
-            forcingBuffer[base + CH_AMBIENT_TARGET] = MathHelper.lerp(airBlend, forcingBuffer[base + CH_AMBIENT_TARGET], meanAirTemperature);
-            forcingBuffer[base + CH_NESTED_UPDRAFT] = MathHelper.lerp(updraftBlend, forcingBuffer[base + CH_NESTED_UPDRAFT], nestedUpdraft);
+            // Feed back into dedicated nested-delta channels only. The base background
+            // and target channels stay owned by the coarse-scale model.
+            forcingBuffer[base + CH_NESTED_WIND_X_DELTA] = MathHelper.lerp(windBlend, previousNestedWindXDelta, targetNestedWindXDelta);
+            forcingBuffer[base + CH_NESTED_WIND_Z_DELTA] = MathHelper.lerp(windBlend, previousNestedWindZDelta, targetNestedWindZDelta);
+            forcingBuffer[base + CH_NESTED_AMBIENT_DELTA] = MathHelper.lerp(airBlend, previousNestedAmbientDelta, targetNestedAmbientDelta);
+            forcingBuffer[base + CH_NESTED_UPDRAFT] = MathHelper.lerp(updraftBlend, previousNestedUpdraft, nestedUpdraft);
 
-            cell.windX[key.layer()] = MathHelper.lerp(windBlend, previousWindX, meanWindX);
-            cell.windZ[key.layer()] = MathHelper.lerp(windBlend, previousWindZ, meanWindZ);
-            cell.ambientAirTemperatureKelvin[key.layer()] = MathHelper.lerp(airBlend, previousAirTemperature, meanAirTemperature);
-
+            float appliedSurfaceDelta = 0.0f;
             if (Float.isFinite(meanSurfaceTemperature) && meanSurfaceTemperature > 0.0f) {
-                forcingBuffer[base + CH_SURFACE_TARGET] = MathHelper.lerp(surfaceBlend, forcingBuffer[base + CH_SURFACE_TARGET], meanSurfaceTemperature);
-                cell.surfaceTemperatureKelvin[key.layer()] = MathHelper.lerp(surfaceBlend, previousSurfaceTemperature, meanSurfaceTemperature);
+                float targetNestedSurfaceDelta = meanSurfaceTemperature - previousForcingSurface;
+                forcingBuffer[base + CH_NESTED_SURFACE_DELTA] = MathHelper.lerp(surfaceBlend, previousNestedSurfaceDelta, targetNestedSurfaceDelta);
+                appliedSurfaceDelta = Math.abs(forcingBuffer[base + CH_NESTED_SURFACE_DELTA] - previousNestedSurfaceDelta);
             }
 
             float appliedWindDelta = (float) Math.sqrt(
-                (cell.windX[key.layer()] - previousWindX) * (cell.windX[key.layer()] - previousWindX)
-                    + (cell.windZ[key.layer()] - previousWindZ) * (cell.windZ[key.layer()] - previousWindZ)
+                (forcingBuffer[base + CH_NESTED_WIND_X_DELTA] - previousNestedWindXDelta)
+                    * (forcingBuffer[base + CH_NESTED_WIND_X_DELTA] - previousNestedWindXDelta)
+                    + (forcingBuffer[base + CH_NESTED_WIND_Z_DELTA] - previousNestedWindZDelta)
+                    * (forcingBuffer[base + CH_NESTED_WIND_Z_DELTA] - previousNestedWindZDelta)
             );
-            float appliedAirDelta = Math.abs(cell.ambientAirTemperatureKelvin[key.layer()] - previousAirTemperature);
-            float appliedSurfaceDelta = Math.abs(cell.surfaceTemperatureKelvin[key.layer()] - previousSurfaceTemperature);
+            float appliedAirDelta = Math.abs(forcingBuffer[base + CH_NESTED_AMBIENT_DELTA] - previousNestedAmbientDelta);
             float appliedNestedUpdraft = forcingBuffer[base + CH_NESTED_UPDRAFT];
 
             appliedCellCount++;
@@ -869,6 +918,10 @@ final class MesoscaleGrid implements AutoCloseable {
                     forcingBuffer[base + CH_TORNADO_MOISTENING] = bgTornadoMoistening * tornadoLayerWeight;
                     forcingBuffer[base + CH_TORNADO_UPDRAFT] = bgTornadoUpdraft * tornadoLayerWeight;
                     forcingBuffer[base + CH_NESTED_UPDRAFT] = 0.0f;
+                    forcingBuffer[base + CH_NESTED_WIND_X_DELTA] = 0.0f;
+                    forcingBuffer[base + CH_NESTED_WIND_Z_DELTA] = 0.0f;
+                    forcingBuffer[base + CH_NESTED_AMBIENT_DELTA] = 0.0f;
+                    forcingBuffer[base + CH_NESTED_SURFACE_DELTA] = 0.0f;
                     cell.humidity[layer] = layerHumidity;
                 }
             }
@@ -939,13 +992,33 @@ final class MesoscaleGrid implements AutoCloseable {
                 }
                 cell.ensureLayers(activeLayers);
                 for (int layer = 0; layer < activeLayers; layer++) {
-                    int base = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_STATE_CHANNELS;
-                    cell.ambientAirTemperatureKelvin[layer] = stateBuffer[base + OUT_AMBIENT];
-                    cell.deepGroundTemperatureKelvin[layer] = stateBuffer[base + OUT_DEEP_GROUND];
-                    cell.surfaceTemperatureKelvin[layer] = stateBuffer[base + OUT_SURFACE];
-                    cell.windX[layer] = stateBuffer[base + OUT_WIND_X];
-                    cell.windZ[layer] = stateBuffer[base + OUT_WIND_Z];
-                    cell.humidity[layer] = forcingBuffer[forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS + CH_HUMIDITY];
+                    int stateBase = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_STATE_CHANNELS;
+                    int forcingBase = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS;
+                    cell.ambientAirTemperatureKelvin[layer] = finiteOrDefault(
+                        stateBuffer[stateBase + OUT_AMBIENT],
+                        finiteOrDefault(forcingBuffer[forcingBase + CH_AMBIENT_TARGET], cell.ambientAirTemperatureKelvin[layer])
+                    );
+                    cell.deepGroundTemperatureKelvin[layer] = finiteOrDefault(
+                        stateBuffer[stateBase + OUT_DEEP_GROUND],
+                        finiteOrDefault(forcingBuffer[forcingBase + CH_DEEP_GROUND_TARGET], cell.deepGroundTemperatureKelvin[layer])
+                    );
+                    cell.surfaceTemperatureKelvin[layer] = finiteOrDefault(
+                        stateBuffer[stateBase + OUT_SURFACE],
+                        finiteOrDefault(forcingBuffer[forcingBase + CH_SURFACE_TARGET], cell.surfaceTemperatureKelvin[layer])
+                    );
+                    cell.windX[layer] = finiteOrDefault(
+                        stateBuffer[stateBase + OUT_WIND_X],
+                        finiteOrDefault(forcingBuffer[forcingBase + CH_BACKGROUND_WIND_X], cell.windX[layer])
+                    );
+                    cell.windZ[layer] = finiteOrDefault(
+                        stateBuffer[stateBase + OUT_WIND_Z],
+                        finiteOrDefault(forcingBuffer[forcingBase + CH_BACKGROUND_WIND_Z], cell.windZ[layer])
+                    );
+                    cell.humidity[layer] = MathHelper.clamp(
+                        finiteOrDefault(forcingBuffer[forcingBase + CH_HUMIDITY], cell.humidity[layer]),
+                        0.0f,
+                        1.0f
+                    );
                 }
             }
         }
@@ -963,9 +1036,13 @@ final class MesoscaleGrid implements AutoCloseable {
                 int gridWidth = radiusCells * 2 + 1;
                 for (int layer = 0; layer < activeLayers; layer++) {
                     int base = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS;
+                    float ambientTarget = forcingBuffer[base + CH_AMBIENT_TARGET] + forcingBuffer[base + CH_NESTED_AMBIENT_DELTA];
+                    float surfaceTarget = forcingBuffer[base + CH_SURFACE_TARGET] + forcingBuffer[base + CH_NESTED_SURFACE_DELTA];
+                    float windTargetX = forcingBuffer[base + CH_BACKGROUND_WIND_X] + forcingBuffer[base + CH_NESTED_WIND_X_DELTA];
+                    float windTargetZ = forcingBuffer[base + CH_BACKGROUND_WIND_Z] + forcingBuffer[base + CH_NESTED_WIND_Z_DELTA];
                     cell.ambientAirTemperatureKelvin[layer] = relax(
                         cell.ambientAirTemperatureKelvin[layer],
-                        forcingBuffer[base + CH_AMBIENT_TARGET],
+                        ambientTarget,
                         deltaSeconds
                     );
                     cell.deepGroundTemperatureKelvin[layer] = relax(
@@ -975,11 +1052,11 @@ final class MesoscaleGrid implements AutoCloseable {
                     );
                     cell.surfaceTemperatureKelvin[layer] = relax(
                         cell.surfaceTemperatureKelvin[layer],
-                        forcingBuffer[base + CH_SURFACE_TARGET],
+                        surfaceTarget,
                         deltaSeconds
                     );
-                    cell.windX[layer] = relax(cell.windX[layer], forcingBuffer[base + CH_BACKGROUND_WIND_X], deltaSeconds * 0.5f);
-                    cell.windZ[layer] = relax(cell.windZ[layer], forcingBuffer[base + CH_BACKGROUND_WIND_Z], deltaSeconds * 0.5f);
+                    cell.windX[layer] = relax(cell.windX[layer], windTargetX, deltaSeconds * 0.5f);
+                    cell.windZ[layer] = relax(cell.windZ[layer], windTargetZ, deltaSeconds * 0.5f);
                     cell.humidity[layer] = relax(cell.humidity[layer], forcingBuffer[base + CH_HUMIDITY], deltaSeconds * 0.5f);
                 }
             }
@@ -1045,7 +1122,12 @@ final class MesoscaleGrid implements AutoCloseable {
             return 0.0f;
         }
         int clampedLayer = MathHelper.clamp(layer, 0, state.layerCount() - 1);
-        return MathHelper.clamp(state.humidity[clampedLayer], 0.0f, 1.0f) * state.windX[clampedLayer];
+        float humidity = state.humidity[clampedLayer];
+        float wind = state.windX[clampedLayer];
+        if (!Float.isFinite(humidity) || !Float.isFinite(wind)) {
+            return 0.0f;
+        }
+        return MathHelper.clamp(humidity, 0.0f, 1.0f) * wind;
     }
 
     private float humidityFluxZ(int cellX, int cellZ, int layer) {
@@ -1054,7 +1136,12 @@ final class MesoscaleGrid implements AutoCloseable {
             return 0.0f;
         }
         int clampedLayer = MathHelper.clamp(layer, 0, state.layerCount() - 1);
-        return MathHelper.clamp(state.humidity[clampedLayer], 0.0f, 1.0f) * state.windZ[clampedLayer];
+        float humidity = state.humidity[clampedLayer];
+        float wind = state.windZ[clampedLayer];
+        if (!Float.isFinite(humidity) || !Float.isFinite(wind)) {
+            return 0.0f;
+        }
+        return MathHelper.clamp(humidity, 0.0f, 1.0f) * wind;
     }
 
     private int snapshotIndex(int localX, int layer, int localZ, int gridWidth) {
@@ -1099,12 +1186,31 @@ final class MesoscaleGrid implements AutoCloseable {
                 float surfaceWindZ = windZ[surfaceIndex];
                 for (int layer = 0; layer < layers; layer++) {
                     int stateIndex = snapshotIndex(localX, layer, localZ, gridWidth);
-                    float q = MathHelper.clamp(humidity[stateIndex], 0.0f, 1.0f);
+                    float ambientLayer = ambientAirTemperatureKelvin[stateIndex];
+                    float windLayerX = windX[stateIndex];
+                    float windLayerZ = windZ[stateIndex];
+                    float humidityLayer = humidity[stateIndex];
+                    if (!Float.isFinite(surfaceReferenceKelvin)
+                        || !Float.isFinite(deepGroundReferenceKelvin)
+                        || !Float.isFinite(surfaceAmbientKelvin)
+                        || !Float.isFinite(surfaceWindX)
+                        || !Float.isFinite(surfaceWindZ)
+                        || !Float.isFinite(ambientLayer)
+                        || !Float.isFinite(windLayerX)
+                        || !Float.isFinite(windLayerZ)
+                        || !Float.isFinite(humidityLayer)) {
+                        instabilityProxy[stateIndex] = 0.0f;
+                        lowLevelShear[stateIndex] = 0.0f;
+                        moistureConvergence[stateIndex] = 0.0f;
+                        liftProxy[stateIndex] = 0.0f;
+                        continue;
+                    }
+                    float q = MathHelper.clamp(humidityLayer, 0.0f, 1.0f);
                     float instability = computeInstabilityProxy(
                         surfaceReferenceKelvin,
                         deepGroundReferenceKelvin,
                         surfaceAmbientKelvin,
-                        ambientAirTemperatureKelvin[stateIndex],
+                        ambientLayer,
                         q,
                         convectiveHeating[stateIndex] + tornadoHeating[stateIndex],
                         convectiveMoistening[stateIndex] + tornadoMoistening[stateIndex],
@@ -1112,14 +1218,30 @@ final class MesoscaleGrid implements AutoCloseable {
                     );
                     instabilityProxy[stateIndex] = instability;
 
-                    float du = windX[stateIndex] - surfaceWindX;
-                    float dv = windZ[stateIndex] - surfaceWindZ;
+                    float du = windLayerX - surfaceWindX;
+                    float dv = windLayerZ - surfaceWindZ;
                     lowLevelShear[stateIndex] = MathHelper.sqrt(du * du + dv * dv);
 
-                    float leftFlux = humidity[snapshotIndex(leftX, layer, localZ, gridWidth)] * windX[snapshotIndex(leftX, layer, localZ, gridWidth)];
-                    float rightFlux = humidity[snapshotIndex(rightX, layer, localZ, gridWidth)] * windX[snapshotIndex(rightX, layer, localZ, gridWidth)];
-                    float southFlux = humidity[snapshotIndex(localX, layer, prevZ, gridWidth)] * windZ[snapshotIndex(localX, layer, prevZ, gridWidth)];
-                    float northFlux = humidity[snapshotIndex(localX, layer, nextZ, gridWidth)] * windZ[snapshotIndex(localX, layer, nextZ, gridWidth)];
+                    float leftHumidity = humidity[snapshotIndex(leftX, layer, localZ, gridWidth)];
+                    float rightHumidity = humidity[snapshotIndex(rightX, layer, localZ, gridWidth)];
+                    float southHumidity = humidity[snapshotIndex(localX, layer, prevZ, gridWidth)];
+                    float northHumidity = humidity[snapshotIndex(localX, layer, nextZ, gridWidth)];
+                    float leftWind = windX[snapshotIndex(leftX, layer, localZ, gridWidth)];
+                    float rightWind = windX[snapshotIndex(rightX, layer, localZ, gridWidth)];
+                    float southWind = windZ[snapshotIndex(localX, layer, prevZ, gridWidth)];
+                    float northWind = windZ[snapshotIndex(localX, layer, nextZ, gridWidth)];
+                    float leftFlux = (Float.isFinite(leftHumidity) && Float.isFinite(leftWind))
+                        ? MathHelper.clamp(leftHumidity, 0.0f, 1.0f) * leftWind
+                        : 0.0f;
+                    float rightFlux = (Float.isFinite(rightHumidity) && Float.isFinite(rightWind))
+                        ? MathHelper.clamp(rightHumidity, 0.0f, 1.0f) * rightWind
+                        : 0.0f;
+                    float southFlux = (Float.isFinite(southHumidity) && Float.isFinite(southWind))
+                        ? MathHelper.clamp(southHumidity, 0.0f, 1.0f) * southWind
+                        : 0.0f;
+                    float northFlux = (Float.isFinite(northHumidity) && Float.isFinite(northWind))
+                        ? MathHelper.clamp(northHumidity, 0.0f, 1.0f) * northWind
+                        : 0.0f;
                     float dQudx = (rightFlux - leftFlux) / (Math.max(1, rightX - leftX) * horizontalScaleMeters);
                     float dQwdz = (northFlux - southFlux) / (Math.max(1, nextZ - prevZ) * horizontalScaleMeters);
                     float convergence = -(dQudx + dQwdz);
@@ -1227,8 +1349,25 @@ final class MesoscaleGrid implements AutoCloseable {
                 float surfaceAmbientKelvin = column.ambientAirTemperatureKelvin[0];
                 float surfaceWindX = column.windX[0];
                 float surfaceWindZ = column.windZ[0];
+                if (!Float.isFinite(surfaceReferenceKelvin)
+                    || !Float.isFinite(deepGroundReferenceKelvin)
+                    || !Float.isFinite(surfaceAmbientKelvin)
+                    || !Float.isFinite(surfaceWindX)
+                    || !Float.isFinite(surfaceWindZ)) {
+                    continue;
+                }
                 for (int layer = 0; layer < sampledLayers; layer++) {
-                    float q = MathHelper.clamp(column.humidity[layer], 0.0f, 1.0f);
+                    float ambientLayer = column.ambientAirTemperatureKelvin[layer];
+                    float windLayerX = column.windX[layer];
+                    float windLayerZ = column.windZ[layer];
+                    float humidityLayer = column.humidity[layer];
+                    if (!Float.isFinite(ambientLayer)
+                        || !Float.isFinite(windLayerX)
+                        || !Float.isFinite(windLayerZ)
+                        || !Float.isFinite(humidityLayer)) {
+                        continue;
+                    }
+                    float q = MathHelper.clamp(humidityLayer, 0.0f, 1.0f);
                     float convectiveHeating = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_HEATING);
                     float convectiveMoistening = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_MOISTENING);
                     float convectiveInflowX = forcingChannel(cx, layer, cz, gridWidth, CH_CONVECTIVE_INFLOW_X);
@@ -1243,14 +1382,14 @@ final class MesoscaleGrid implements AutoCloseable {
                         surfaceReferenceKelvin,
                         deepGroundReferenceKelvin,
                         surfaceAmbientKelvin,
-                        column.ambientAirTemperatureKelvin[layer],
+                        ambientLayer,
                         q,
                         convectiveHeating + tornadoHeating,
                         convectiveMoistening + tornadoMoistening,
                         layer
                     );
-                    float du = column.windX[layer] - surfaceWindX;
-                    float dv = column.windZ[layer] - surfaceWindZ;
+                    float du = windLayerX - surfaceWindX;
+                    float dv = windLayerZ - surfaceWindZ;
                     float shear = MathHelper.sqrt(du * du + dv * dv);
 
                     float leftFlux = humidityFluxX(cx - 1, cz, layer);
@@ -1273,6 +1412,12 @@ final class MesoscaleGrid implements AutoCloseable {
                         sampledLayers,
                         horizontalScaleMeters
                     );
+                    if (!Float.isFinite(instability)
+                        || !Float.isFinite(shear)
+                        || !Float.isFinite(positiveConvergence)
+                        || !Float.isFinite(lift)) {
+                        continue;
+                    }
 
                     meanInstability += instability;
                     maxInstability = Math.max(maxInstability, instability);
@@ -1307,11 +1452,19 @@ final class MesoscaleGrid implements AutoCloseable {
     }
 
     private float relax(float current, float target, float deltaSeconds) {
+        float safeTarget = finiteOrDefault(target, finiteOrDefault(current, 0.0f));
         if (!Float.isFinite(current) || current == 0.0f) {
-            return target;
+            return safeTarget;
         }
         float alpha = MathHelper.clamp(deltaSeconds * SURFACE_RELAXATION_PER_SECOND, 0.0f, 1.0f);
-        return MathHelper.lerp(alpha, current, target);
+        return MathHelper.lerp(alpha, current, safeTarget);
+    }
+
+    private float finiteOrDefault(float value, float fallback) {
+        if (Float.isFinite(value)) {
+            return value;
+        }
+        return Float.isFinite(fallback) ? fallback : 0.0f;
     }
 
     private long pack(int x, int z) {
@@ -1408,6 +1561,10 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] forcingSurfaceTargetKelvin,
         float[] forcingBackgroundWindX,
         float[] forcingBackgroundWindZ,
+        float[] forcingNestedAmbientDeltaKelvin,
+        float[] forcingNestedSurfaceDeltaKelvin,
+        float[] forcingNestedWindXDelta,
+        float[] forcingNestedWindZDelta,
         float[] forcingNestedUpdraft,
         float[] windX,
         float[] windZ,

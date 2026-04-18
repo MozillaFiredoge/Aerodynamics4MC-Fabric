@@ -345,10 +345,11 @@ final class WorldScaleDriver {
             0.0f,
             1.0f
         );
-        stormActivity = MathHelper.clamp(
+        stormActivity = finiteClamp(
             relax(stormActivity, targetStormActivity, elapsedSeconds, STORM_RELAX_PER_SECOND),
             0.0f,
-            1.0f
+            1.0f,
+            0.0f
         );
 
         for (CycloneCell cell : cycloneCells) {
@@ -386,10 +387,11 @@ final class WorldScaleDriver {
         float waveB = MathHelper.cos(sampleZ - planetaryWavePhase * 0.45f);
         float eddy = MathHelper.sin((sampleX + sampleZ) * 0.55f + planetaryWavePhase * 0.25f);
 
-        float targetWindX = baseFlowX + 0.90f * waveA + 0.35f * eddy;
-        float targetWindZ = baseFlowZ + 0.90f * waveB - 0.35f * eddy;
-        float temperatureBiasKelvin = airmassTemperatureBias + 1.4f * waveA + 0.8f * waveB;
-        float humidity = MathHelper.clamp(airmassMoistureBias + 0.08f * waveB - 0.05f * eddy, 0.0f, 1.0f);
+        float activeStormActivity = finiteClamp(stormActivity, 0.0f, 1.0f, 0.0f);
+        float targetWindX = finiteOrDefault(baseFlowX, 0.0f) + 0.90f * waveA + 0.35f * eddy;
+        float targetWindZ = finiteOrDefault(baseFlowZ, 0.0f) + 0.90f * waveB - 0.35f * eddy;
+        float temperatureBiasKelvin = finiteOrDefault(airmassTemperatureBias, 0.0f) + 1.4f * waveA + 0.8f * waveB;
+        float humidity = finiteClamp(finiteOrDefault(airmassMoistureBias, 0.50f) + 0.08f * waveB - 0.05f * eddy, 0.0f, 1.0f, 0.50f);
         float convectiveHeatingKelvin = 0.0f;
         float convectiveMoistening = 0.0f;
         float convectiveInflowX = 0.0f;
@@ -402,14 +404,14 @@ final class WorldScaleDriver {
         float tornadoUpdraftProxy = 0.0f;
 
         for (CycloneCell cell : cycloneCells) {
-            CycloneContribution contribution = cell.sample(cellX, cellZ, stormActivity);
+            CycloneContribution contribution = cell.sample(cellX, cellZ, activeStormActivity);
             targetWindX += contribution.windX();
             targetWindZ += contribution.windZ();
             temperatureBiasKelvin += contribution.temperatureBiasKelvin();
             humidity += contribution.humidityBias();
         }
         for (ConvectiveCluster cluster : convectiveClusters) {
-            ConvectiveContribution contribution = cluster.sample(cellX, cellZ, stormActivity);
+            ConvectiveContribution contribution = cluster.sample(cellX, cellZ, activeStormActivity);
             targetWindX += contribution.windX();
             targetWindZ += contribution.windZ();
             temperatureBiasKelvin += contribution.temperatureBiasKelvin();
@@ -432,25 +434,25 @@ final class WorldScaleDriver {
             tornadoUpdraftProxy = Math.max(tornadoUpdraftProxy, contribution.updraftProxy());
         }
 
-        targetWindX = MathHelper.clamp(targetWindX, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
-        targetWindZ = MathHelper.clamp(targetWindZ, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
-        humidity = MathHelper.clamp(humidity, 0.0f, 1.0f);
+        targetWindX = finiteClamp(targetWindX, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS, 0.0f);
+        targetWindZ = finiteClamp(targetWindZ, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS, 0.0f);
+        humidity = finiteClamp(humidity, 0.0f, 1.0f, 0.50f);
         return new Sample(
             targetWindX,
             targetWindZ,
-            temperatureBiasKelvin,
+            finiteOrDefault(temperatureBiasKelvin, 0.0f),
             humidity,
-            stormActivity,
-            convectiveHeatingKelvin,
-            convectiveMoistening,
-            convectiveInflowX,
-            convectiveInflowZ,
-            convectiveEnvelope,
-            tornadoWindX,
-            tornadoWindZ,
-            tornadoHeatingKelvin,
-            tornadoMoistening,
-            tornadoUpdraftProxy
+            activeStormActivity,
+            finiteOrDefault(convectiveHeatingKelvin, 0.0f),
+            finiteOrDefault(convectiveMoistening, 0.0f),
+            finiteOrDefault(convectiveInflowX, 0.0f),
+            finiteOrDefault(convectiveInflowZ, 0.0f),
+            Math.max(0.0f, finiteOrDefault(convectiveEnvelope, 0.0f)),
+            finiteOrDefault(tornadoWindX, 0.0f),
+            finiteOrDefault(tornadoWindZ, 0.0f),
+            finiteOrDefault(tornadoHeatingKelvin, 0.0f),
+            finiteOrDefault(tornadoMoistening, 0.0f),
+            Math.max(0.0f, finiteOrDefault(tornadoUpdraftProxy, 0.0f))
         );
     }
 
@@ -492,22 +494,37 @@ final class WorldScaleDriver {
             mesoscaleShearSupport = 0.0f;
             return;
         }
-        float instabilitySupport = Math.min(1.5f, summary.maxInstabilityProxy() / 8.0f);
-        float liftSupport = Math.min(1.5f, summary.maxLiftProxy());
-        float shearSupport = Math.min(1.5f, summary.meanLowLevelShear() / 6.0f);
-        float humiditySupport = MathHelper.clamp(summary.meanHumidity(), 0.0f, 1.0f);
-        float convergenceSupport = Math.min(1.5f, summary.maxPositiveMoistureConvergence() * 256.0f * 8.0f);
+        float instabilitySupport = finiteClamp(summary.maxInstabilityProxy() / 8.0f, 0.0f, 1.5f, 0.0f);
+        float liftSupport = finiteClamp(summary.maxLiftProxy(), 0.0f, 1.5f, 0.0f);
+        float shearSupport = finiteClamp(summary.meanLowLevelShear() / 6.0f, 0.0f, 1.5f, 0.0f);
+        float humiditySupport = finiteClamp(summary.meanHumidity(), 0.0f, 1.0f, 0.0f);
+        float convergenceSupport = finiteClamp(summary.maxPositiveMoistureConvergence() * 256.0f * 8.0f, 0.0f, 1.5f, 0.0f);
         mesoscaleLiftSupport = liftSupport;
         mesoscaleShearSupport = shearSupport;
-        mesoscaleConvectiveSupport = MathHelper.clamp(
+        mesoscaleConvectiveSupport = finiteClamp(
             0.30f * instabilitySupport
                 + 0.22f * liftSupport
                 + 0.18f * shearSupport
                 + 0.18f * humiditySupport
                 + 0.12f * convergenceSupport,
             0.0f,
-            1.75f
+            1.75f,
+            0.0f
         );
+    }
+
+    private static float finiteOrDefault(float value, float fallback) {
+        if (Float.isFinite(value)) {
+            return value;
+        }
+        return Float.isFinite(fallback) ? fallback : 0.0f;
+    }
+
+    private static float finiteClamp(float value, float min, float max, float fallback) {
+        if (Float.isFinite(value)) {
+            return MathHelper.clamp(value, min, max);
+        }
+        return MathHelper.clamp(finiteOrDefault(fallback, min), min, max);
     }
 
     private static List<CycloneCell> createDefaultCycloneCells(long worldSeed) {
@@ -1061,8 +1078,10 @@ final class WorldScaleDriver {
     }
 
     private static float relax(float current, float target, float deltaSeconds, float ratePerSecond) {
+        float safeTarget = finiteOrDefault(target, finiteOrDefault(current, 0.0f));
+        float safeCurrent = finiteOrDefault(current, safeTarget);
         float alpha = MathHelper.clamp(deltaSeconds * ratePerSecond, 0.0f, 1.0f);
-        return MathHelper.lerp(alpha, current, target);
+        return MathHelper.lerp(alpha, safeCurrent, safeTarget);
     }
 
     private static float wrap01(float value) {

@@ -2043,6 +2043,10 @@ public final class AeroServerRuntime {
         appendJsonArray(builder, "forcing_surface_target_kelvin", snapshot.forcingSurfaceTargetKelvin(), true);
         appendJsonArray(builder, "forcing_background_wind_x", snapshot.forcingBackgroundWindX(), true);
         appendJsonArray(builder, "forcing_background_wind_z", snapshot.forcingBackgroundWindZ(), true);
+        appendJsonArray(builder, "forcing_nested_ambient_delta_kelvin", snapshot.forcingNestedAmbientDeltaKelvin(), true);
+        appendJsonArray(builder, "forcing_nested_surface_delta_kelvin", snapshot.forcingNestedSurfaceDeltaKelvin(), true);
+        appendJsonArray(builder, "forcing_nested_wind_x_delta", snapshot.forcingNestedWindXDelta(), true);
+        appendJsonArray(builder, "forcing_nested_wind_z_delta", snapshot.forcingNestedWindZDelta(), true);
         appendJsonArray(builder, "forcing_nested_updraft", snapshot.forcingNestedUpdraft(), true);
         appendJsonArray(builder, "wind_x", snapshot.windX(), true);
         appendJsonArray(builder, "wind_z", snapshot.windZ(), true);
@@ -3979,11 +3983,26 @@ public final class AeroServerRuntime {
             float bottomMassFluxAverage = values[base + 7] * scale;
             float topAreaAverage = values[base + 8] * scale;
             float topMassFluxAverage = values[base + 9] * scale;
+            if (!Float.isFinite(volumeAverage)
+                || !Float.isFinite(densityAverage)
+                || !Float.isFinite(momentumXAverage)
+                || !Float.isFinite(momentumZAverage)
+                || !Float.isFinite(airTemperatureVolumeAverage)
+                || !Float.isFinite(surfaceTemperatureVolumeAverage)
+                || !Float.isFinite(bottomAreaAverage)
+                || !Float.isFinite(bottomMassFluxAverage)
+                || !Float.isFinite(topAreaAverage)
+                || !Float.isFinite(topMassFluxAverage)) {
+                continue;
+            }
             if (!(volumeAverage > 0.0f) && !(bottomAreaAverage > 0.0f) && !(topAreaAverage > 0.0f)) {
                 continue;
             }
             float bottomFluxDensity = bottomAreaAverage > 0.0f ? bottomMassFluxAverage / bottomAreaAverage : 0.0f;
             float topFluxDensity = topAreaAverage > 0.0f ? topMassFluxAverage / topAreaAverage : 0.0f;
+            if (!Float.isFinite(bottomFluxDensity) || !Float.isFinite(topFluxDensity)) {
+                continue;
+            }
             L2ToL1FeedbackLayoutBin bin = bins.get(i);
             queue.add(new MesoscaleGrid.NestedFeedbackBin(
                 bin.cellX(),

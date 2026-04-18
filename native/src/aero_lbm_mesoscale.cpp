@@ -128,6 +128,10 @@ constexpr int kChTornadoHeating = 16;
 constexpr int kChTornadoMoistening = 17;
 constexpr int kChTornadoUpdraft = 18;
 constexpr int kChNestedUpdraft = 19;
+constexpr int kChNestedWindXDelta = 20;
+constexpr int kChNestedWindZDelta = 21;
+constexpr int kChNestedAmbientDelta = 22;
+constexpr int kChNestedSurfaceDelta = 23;
 constexpr int kOutAmbient = 0;
 constexpr int kOutDeepGround = 1;
 constexpr int kOutSurface = 2;
@@ -256,18 +260,22 @@ void seed_mesoscale_state(
     const int cells = mesoscale_cells(ctx.config);
     for (int i = 0; i < cells; ++i) {
         const int base = i * kForcingChannels;
+        const float ambient_target = forcing[base + kChAmbientTarget] + forcing[base + kChNestedAmbientDelta];
+        const float surface_target = forcing[base + kChSurfaceTarget] + forcing[base + kChNestedSurfaceDelta];
+        const float bg_wind_x = forcing[base + kChBackgroundWindX] + forcing[base + kChNestedWindXDelta];
+        const float bg_wind_z = forcing[base + kChBackgroundWindZ] + forcing[base + kChNestedWindZDelta];
         const float bg_wind_x_lattice = clamp_lattice_speed(
-            forcing[base + kChBackgroundWindX] / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
+            bg_wind_x / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
         );
         const float bg_wind_z_lattice = clamp_lattice_speed(
-            forcing[base + kChBackgroundWindZ] / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
+            bg_wind_z / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
         );
         ctx.rho[i] = 1.0f;
-        ctx.ambient[i] = forcing[base + kChAmbientTarget];
+        ctx.ambient[i] = ambient_target;
         ctx.deep_ground[i] = forcing[base + kChDeepGroundTarget];
-        ctx.surface[i] = forcing[base + kChSurfaceTarget];
-        ctx.wind_x[i] = forcing[base + kChBackgroundWindX];
-        ctx.wind_z[i] = forcing[base + kChBackgroundWindZ];
+        ctx.surface[i] = surface_target;
+        ctx.wind_x[i] = bg_wind_x;
+        ctx.wind_z[i] = bg_wind_z;
         for (int q = 0; q < kMesoQ; ++q) {
             ctx.f[dist_index(i, q)] = hydro_feq_2d(q, 1.0f, bg_wind_x_lattice, bg_wind_z_lattice);
             ctx.g[dist_index(i, q)] = thermal_feq_2d(q, ctx.ambient[i], bg_wind_x_lattice, bg_wind_z_lattice);
@@ -367,9 +375,9 @@ CellTargets compute_cell_targets(
     ux /= rho;
     uz /= rho;
 
-    const float ambient_target = forcing[base + kChAmbientTarget];
+    const float ambient_target = forcing[base + kChAmbientTarget] + forcing[base + kChNestedAmbientDelta];
     const float deep_target = forcing[base + kChDeepGroundTarget];
-    const float surface_target = forcing[base + kChSurfaceTarget];
+    const float surface_target = forcing[base + kChSurfaceTarget] + forcing[base + kChNestedSurfaceDelta];
     const float roughness = std::max(0.0f, forcing[base + kChRoughness]);
     const float convective_heating = forcing[base + kChConvectiveHeating];
     const float convective_moistening = forcing[base + kChConvectiveMoistening];
@@ -381,8 +389,10 @@ CellTargets compute_cell_targets(
     const float tornado_moistening = forcing[base + kChTornadoMoistening];
     const float tornado_updraft = forcing[base + kChTornadoUpdraft];
     const float nested_updraft = forcing[base + kChNestedUpdraft];
-    const float bg_wind_x = forcing[base + kChBackgroundWindX] + convective_inflow_x + tornado_wind_x;
-    const float bg_wind_z = forcing[base + kChBackgroundWindZ] + convective_inflow_z + tornado_wind_z;
+    const float nested_wind_x_delta = forcing[base + kChNestedWindXDelta];
+    const float nested_wind_z_delta = forcing[base + kChNestedWindZDelta];
+    const float bg_wind_x = forcing[base + kChBackgroundWindX] + nested_wind_x_delta + convective_inflow_x + tornado_wind_x;
+    const float bg_wind_z = forcing[base + kChBackgroundWindZ] + nested_wind_z_delta + convective_inflow_z + tornado_wind_z;
     const float humidity = std::clamp(forcing[base + kChHumidity] + convective_moistening + tornado_moistening, 0.0f, 1.0f);
     const float slope_x = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 0);
     const float slope_z = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 1);
@@ -505,17 +515,19 @@ int mesoscale_cpu_step(
                 const int base = i * kForcingChannels;
                 const float boundary_bg_x = clamp_lattice_speed(
                     (forcing[base + kChBackgroundWindX]
+                        + forcing[base + kChNestedWindXDelta]
                         + forcing[base + kChConvectiveInflowX]
                         + forcing[base + kChTornadoWindX])
                         / std::max(1.0e-6f, transport.velocity_scale_m_s_per_lattice)
                 );
                 const float boundary_bg_z = clamp_lattice_speed(
                     (forcing[base + kChBackgroundWindZ]
+                        + forcing[base + kChNestedWindZDelta]
                         + forcing[base + kChConvectiveInflowZ]
                         + forcing[base + kChTornadoWindZ])
                         / std::max(1.0e-6f, transport.velocity_scale_m_s_per_lattice)
                 );
-                const float boundary_temp = forcing[base + kChAmbientTarget];
+                const float boundary_temp = forcing[base + kChAmbientTarget] + forcing[base + kChNestedAmbientDelta];
                 const int edge_distance = std::min(std::min(x, z), std::min(nx - 1 - x, nz - 1 - z));
                 const float edge_alpha = edge_distance <= 0
                     ? 1.0f
@@ -737,9 +749,9 @@ inline void compute_cell_targets(
     float ambient;
     recover_cell_state(f_in, g_in, cell, &rho, &ux, &uz, &ambient);
 
-    float ambient_target = forcing[base + 2];
+    float ambient_target = forcing[base + 2] + forcing[base + 22];
     float deep_target = forcing[base + 3];
-    float surface_target = forcing[base + 4];
+    float surface_target = forcing[base + 4] + forcing[base + 23];
     float roughness = fmax(0.0f, forcing[base + 5]);
     float convective_heating = forcing[base + 10];
     float convective_moistening = forcing[base + 11];
@@ -751,8 +763,8 @@ inline void compute_cell_targets(
     float tornado_moistening = forcing[base + 17];
     float tornado_updraft = forcing[base + 18];
     float nested_updraft = forcing[base + 19];
-    float bg_wind_x = forcing[base + 6] + convective_inflow_x + tornado_wind_x;
-    float bg_wind_z = forcing[base + 7] + convective_inflow_z + tornado_wind_z;
+    float bg_wind_x = forcing[base + 6] + forcing[base + 20] + convective_inflow_x + tornado_wind_x;
+    float bg_wind_z = forcing[base + 7] + forcing[base + 21] + convective_inflow_z + tornado_wind_z;
     float humidity = clamp(forcing[base + 9] + convective_moistening + tornado_moistening, 0.0f, 1.0f);
     float slope_x = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 0);
     float slope_z = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 1);
@@ -856,9 +868,9 @@ __kernel void mesoscale_step(
     surface_out[gid] = next_surface_self;
 
     int base = gid * kForcingChannels;
-    float boundary_bg_x = clamp_lattice_speed((forcing[base + 6] + forcing[base + 12] + forcing[base + 14]) / fmax(1.0e-6f, velocity_scale));
-    float boundary_bg_z = clamp_lattice_speed((forcing[base + 7] + forcing[base + 13] + forcing[base + 15]) / fmax(1.0e-6f, velocity_scale));
-    float boundary_temp = forcing[base + 2];
+    float boundary_bg_x = clamp_lattice_speed((forcing[base + 6] + forcing[base + 20] + forcing[base + 12] + forcing[base + 14]) / fmax(1.0e-6f, velocity_scale));
+    float boundary_bg_z = clamp_lattice_speed((forcing[base + 7] + forcing[base + 21] + forcing[base + 13] + forcing[base + 15]) / fmax(1.0e-6f, velocity_scale));
+    float boundary_temp = forcing[base + 2] + forcing[base + 22];
     int edge_distance = min(min(x, z), min(nx - 1 - x, nz - 1 - z));
     float edge_alpha = edge_distance <= 0 ? 1.0f : (edge_distance < 2 ? 0.5f : 0.0f);
 

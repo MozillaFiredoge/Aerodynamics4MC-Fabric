@@ -122,26 +122,32 @@ final class BackgroundMetGrid {
         int cellX = Math.floorDiv(pos.getX(), cellSizeBlocks);
         int cellZ = Math.floorDiv(pos.getZ(), cellSizeBlocks);
         CellState state = ensureCell(cellX, cellZ);
+        WorldScaleTarget target = targetState(state, cellX, cellZ);
         return new Sample(
             state.terrainHeightBlocks,
             state.biomeTemperature,
-            state.ambientAirTemperatureKelvin,
-            state.deepGroundTemperatureKelvin,
-            state.surfaceTemperatureKelvin,
+            finiteOrDefault(state.ambientAirTemperatureKelvin, target.targetAmbientAirTemperatureKelvin),
+            finiteOrDefault(state.deepGroundTemperatureKelvin, target.targetAmbientAirTemperatureKelvin + DEEP_GROUND_OFFSET_K),
+            finiteOrDefault(
+                state.surfaceTemperatureKelvin,
+                target.targetAmbientAirTemperatureKelvin
+                    + currentSolarAltitude * currentClearSky * SOLAR_SURFACE_HEATING_K
+                    - (1.0f - currentSolarAltitude) * currentClearSky * CLEAR_SKY_COOLING_K
+            ),
             state.roughnessLengthMeters,
-            state.backgroundWindX,
-            state.backgroundWindZ,
-            state.humidity,
-            state.convectiveHeatingKelvin,
-            state.convectiveMoistening,
-            state.convectiveInflowX,
-            state.convectiveInflowZ,
-            state.convectiveEnvelope,
-            state.tornadoWindX,
-            state.tornadoWindZ,
-            state.tornadoHeatingKelvin,
-            state.tornadoMoistening,
-            state.tornadoUpdraftProxy,
+            finiteOrDefault(state.backgroundWindX, target.targetWindX),
+            finiteOrDefault(state.backgroundWindZ, target.targetWindZ),
+            finiteClamp(state.humidity, 0.0f, 1.0f, target.targetHumidity),
+            finiteOrDefault(state.convectiveHeatingKelvin, target.convectiveHeatingKelvin),
+            finiteOrDefault(state.convectiveMoistening, target.convectiveMoistening),
+            finiteOrDefault(state.convectiveInflowX, target.convectiveInflowX),
+            finiteOrDefault(state.convectiveInflowZ, target.convectiveInflowZ),
+            Math.max(0.0f, finiteOrDefault(state.convectiveEnvelope, target.convectiveEnvelope)),
+            finiteOrDefault(state.tornadoWindX, target.tornadoWindX),
+            finiteOrDefault(state.tornadoWindZ, target.tornadoWindZ),
+            finiteOrDefault(state.tornadoHeatingKelvin, target.tornadoHeatingKelvin),
+            finiteOrDefault(state.tornadoMoistening, target.tornadoMoistening),
+            Math.max(0.0f, finiteOrDefault(state.tornadoUpdraftProxy, target.tornadoUpdraftProxy)),
             state.surfaceClass
         );
     }
@@ -308,11 +314,14 @@ final class BackgroundMetGrid {
         Map<Long, StateSample> previous = new HashMap<>(cells.size());
         for (Map.Entry<Long, CellState> entry : cells.entrySet()) {
             CellState state = entry.getValue();
+            int stateCellX = unpackX(entry.getKey());
+            int stateCellZ = unpackZ(entry.getKey());
+            WorldScaleTarget target = targetState(state, stateCellX, stateCellZ);
             previous.put(entry.getKey(), new StateSample(
-                state.backgroundWindX,
-                state.backgroundWindZ,
-                state.ambientAirTemperatureKelvin,
-                state.humidity
+                finiteOrDefault(state.backgroundWindX, target.targetWindX),
+                finiteOrDefault(state.backgroundWindZ, target.targetWindZ),
+                finiteOrDefault(state.ambientAirTemperatureKelvin, target.targetAmbientAirTemperatureKelvin),
+                finiteClamp(state.humidity, 0.0f, 1.0f, target.targetHumidity)
             ));
         }
         for (int cx = centerCellX - radiusCells; cx <= centerCellX + radiusCells; cx++) {
@@ -360,27 +369,27 @@ final class BackgroundMetGrid {
                     - (1.0f - currentSolarAltitude) * currentClearSky * CLEAR_SKY_COOLING_K
                     - nextHumidity * 2.0f
                     - currentRainGradient * 3.0f;
-                cell.ambientAirTemperatureKelvin = nextAmbient;
+                cell.ambientAirTemperatureKelvin = finiteOrDefault(nextAmbient, target.targetAmbientAirTemperatureKelvin);
                 cell.deepGroundTemperatureKelvin = relax(
                     cell.deepGroundTemperatureKelvin,
-                    nextAmbient + DEEP_GROUND_OFFSET_K,
+                    cell.ambientAirTemperatureKelvin + DEEP_GROUND_OFFSET_K,
                     currentDeltaSeconds,
                     DEEP_GROUND_RELAXATION_PER_SECOND
                 );
                 cell.surfaceTemperatureKelvin = relax(cell.surfaceTemperatureKelvin, targetSurfaceTemperatureKelvin, currentDeltaSeconds);
-                cell.backgroundWindX = nextWindX;
-                cell.backgroundWindZ = nextWindZ;
-                cell.humidity = nextHumidity;
-                cell.convectiveHeatingKelvin = target.convectiveHeatingKelvin;
-                cell.convectiveMoistening = target.convectiveMoistening;
-                cell.convectiveInflowX = target.convectiveInflowX;
-                cell.convectiveInflowZ = target.convectiveInflowZ;
-                cell.convectiveEnvelope = target.convectiveEnvelope;
-                cell.tornadoWindX = target.tornadoWindX;
-                cell.tornadoWindZ = target.tornadoWindZ;
-                cell.tornadoHeatingKelvin = target.tornadoHeatingKelvin;
-                cell.tornadoMoistening = target.tornadoMoistening;
-                cell.tornadoUpdraftProxy = target.tornadoUpdraftProxy;
+                cell.backgroundWindX = finiteClamp(nextWindX, -MAX_DYNAMIC_WIND_MPS, MAX_DYNAMIC_WIND_MPS, target.targetWindX);
+                cell.backgroundWindZ = finiteClamp(nextWindZ, -MAX_DYNAMIC_WIND_MPS, MAX_DYNAMIC_WIND_MPS, target.targetWindZ);
+                cell.humidity = finiteClamp(nextHumidity, 0.0f, 1.0f, target.targetHumidity);
+                cell.convectiveHeatingKelvin = finiteOrDefault(target.convectiveHeatingKelvin, 0.0f);
+                cell.convectiveMoistening = finiteOrDefault(target.convectiveMoistening, 0.0f);
+                cell.convectiveInflowX = finiteOrDefault(target.convectiveInflowX, 0.0f);
+                cell.convectiveInflowZ = finiteOrDefault(target.convectiveInflowZ, 0.0f);
+                cell.convectiveEnvelope = Math.max(0.0f, finiteOrDefault(target.convectiveEnvelope, 0.0f));
+                cell.tornadoWindX = finiteOrDefault(target.tornadoWindX, 0.0f);
+                cell.tornadoWindZ = finiteOrDefault(target.tornadoWindZ, 0.0f);
+                cell.tornadoHeatingKelvin = finiteOrDefault(target.tornadoHeatingKelvin, 0.0f);
+                cell.tornadoMoistening = finiteOrDefault(target.tornadoMoistening, 0.0f);
+                cell.tornadoUpdraftProxy = Math.max(0.0f, finiteOrDefault(target.tornadoUpdraftProxy, 0.0f));
                 cell.lastUpdatedTick = currentRefreshTick;
             }
         }
@@ -487,58 +496,81 @@ final class BackgroundMetGrid {
             + (cell.biomeTemperature - 0.8f) * BIOME_TEMPERATURE_SCALE_K
             - Math.max(0.0f, cell.terrainHeightBlocks - currentWorld.getSeaLevel()) * ALTITUDE_LAPSE_RATE_K_PER_BLOCK;
         WorldScaleDriver.Sample driverSample = currentDriver == null ? null : currentDriver.sample(cellX, cellZ);
-        float targetWindX = driverSample != null
-            ? driverSample.targetWindX()
-            : prevailingWindComponent(currentWorld.getSeed(), cellX, cellZ, 0x517cc1b727220a95L);
-        float targetWindZ = driverSample != null
-            ? driverSample.targetWindZ()
-            : prevailingWindComponent(currentWorld.getSeed(), cellX, cellZ, 0x9e3779b97f4a7c15L);
-        targetWindX = MathHelper.clamp(targetWindX, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
-        targetWindZ = MathHelper.clamp(targetWindZ, -MAX_DRIVER_WIND_MPS, MAX_DRIVER_WIND_MPS);
-        float targetAmbient = baseAmbient + (driverSample == null ? 0.0f : driverSample.temperatureBiasKelvin());
-        float humidity = MathHelper.clamp(
+        float fallbackWindX = prevailingWindComponent(currentWorld.getSeed(), cellX, cellZ, 0x517cc1b727220a95L);
+        float fallbackWindZ = prevailingWindComponent(currentWorld.getSeed(), cellX, cellZ, 0x9e3779b97f4a7c15L);
+        float targetWindX = finiteClamp(
+            driverSample != null ? driverSample.targetWindX() : fallbackWindX,
+            -MAX_DRIVER_WIND_MPS,
+            MAX_DRIVER_WIND_MPS,
+            fallbackWindX
+        );
+        float targetWindZ = finiteClamp(
+            driverSample != null ? driverSample.targetWindZ() : fallbackWindZ,
+            -MAX_DRIVER_WIND_MPS,
+            MAX_DRIVER_WIND_MPS,
+            fallbackWindZ
+        );
+        float targetAmbient = finiteOrDefault(baseAmbient + (driverSample == null ? 0.0f : driverSample.temperatureBiasKelvin()), baseAmbient);
+        float humidity = finiteClamp(
             (driverSample == null ? 0.50f : driverSample.humidity())
                 + currentRainGradient * MAX_HUMIDITY_RESPONSE
                 + currentThunderGradient * 0.10f,
             0.0f,
-            1.0f
+            1.0f,
+            0.50f
         );
         return new WorldScaleTarget(
             targetWindX,
             targetWindZ,
             targetAmbient,
             humidity,
-            driverSample == null ? 0.0f : driverSample.convectiveHeatingKelvin(),
-            driverSample == null ? 0.0f : driverSample.convectiveMoistening(),
-            driverSample == null ? 0.0f : driverSample.convectiveInflowX(),
-            driverSample == null ? 0.0f : driverSample.convectiveInflowZ(),
-            driverSample == null ? 0.0f : driverSample.convectiveEnvelope(),
-            driverSample == null ? 0.0f : driverSample.tornadoWindX(),
-            driverSample == null ? 0.0f : driverSample.tornadoWindZ(),
-            driverSample == null ? 0.0f : driverSample.tornadoHeatingKelvin(),
-            driverSample == null ? 0.0f : driverSample.tornadoMoistening(),
-            driverSample == null ? 0.0f : driverSample.tornadoUpdraftProxy()
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.convectiveHeatingKelvin(), 0.0f),
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.convectiveMoistening(), 0.0f),
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.convectiveInflowX(), 0.0f),
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.convectiveInflowZ(), 0.0f),
+            Math.max(0.0f, finiteOrDefault(driverSample == null ? 0.0f : driverSample.convectiveEnvelope(), 0.0f)),
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.tornadoWindX(), 0.0f),
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.tornadoWindZ(), 0.0f),
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.tornadoHeatingKelvin(), 0.0f),
+            finiteOrDefault(driverSample == null ? 0.0f : driverSample.tornadoMoistening(), 0.0f),
+            Math.max(0.0f, finiteOrDefault(driverSample == null ? 0.0f : driverSample.tornadoUpdraftProxy(), 0.0f))
         );
     }
 
     private float relax(float current, float target, float deltaSeconds) {
+        float safeTarget = finiteOrDefault(target, finiteOrDefault(current, 0.0f));
         if (!Float.isFinite(current) || current <= 0.0f) {
-            return target;
+            return safeTarget;
         }
         float alpha = MathHelper.clamp(deltaSeconds * SURFACE_RELAXATION_PER_SECOND, 0.0f, 1.0f);
-        return MathHelper.lerp(alpha, current, target);
+        return MathHelper.lerp(alpha, current, safeTarget);
     }
 
     private float relax(float current, float target, float deltaSeconds, float ratePerSecond) {
+        float safeTarget = finiteOrDefault(target, finiteOrDefault(current, 0.0f));
         if (!Float.isFinite(current)) {
-            return target;
+            return safeTarget;
         }
         float alpha = MathHelper.clamp(deltaSeconds * ratePerSecond, 0.0f, 1.0f);
-        return MathHelper.lerp(alpha, current, target);
+        return MathHelper.lerp(alpha, current, safeTarget);
     }
 
     private float mix(float a, float b, float t) {
         return MathHelper.lerp(MathHelper.clamp(t, 0.0f, 1.0f), a, b);
+    }
+
+    private float finiteOrDefault(float value, float fallback) {
+        if (Float.isFinite(value)) {
+            return value;
+        }
+        return Float.isFinite(fallback) ? fallback : 0.0f;
+    }
+
+    private float finiteClamp(float value, float min, float max, float fallback) {
+        if (Float.isFinite(value)) {
+            return MathHelper.clamp(value, min, max);
+        }
+        return MathHelper.clamp(finiteOrDefault(fallback, min), min, max);
     }
 
     private float prevailingWindComponent(long seed, int x, int z, long salt) {
