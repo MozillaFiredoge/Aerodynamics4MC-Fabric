@@ -161,6 +161,195 @@ final class MesoscaleGrid implements AutoCloseable {
         );
     }
 
+    synchronized boolean seedL2Window(
+        BlockPos origin,
+        int sizeX,
+        int sizeY,
+        int sizeZ,
+        float[] outWindX,
+        float[] outWindZ,
+        float[] outAirTemperature,
+        float[] outSurfaceTemperature
+    ) {
+        if (cells.isEmpty()
+            || activeLayers <= 0
+            || sizeX <= 0
+            || sizeY <= 0
+            || sizeZ <= 0) {
+            return false;
+        }
+        int cellsCount = sizeX * sizeY * sizeZ;
+        if (outWindX == null
+            || outWindZ == null
+            || outAirTemperature == null
+            || outSurfaceTemperature == null
+            || outWindX.length != cellsCount
+            || outWindZ.length != cellsCount
+            || outAirTemperature.length != cellsCount
+            || outSurfaceTemperature.length != cellsCount) {
+            return false;
+        }
+
+        int minCellX = centerCellX - radiusCells;
+        int maxCellX = centerCellX + radiusCells;
+        int minCellZ = centerCellZ - radiusCells;
+        int maxCellZ = centerCellZ + radiusCells;
+
+        int[] lowerCellX = new int[sizeX];
+        int[] upperCellX = new int[sizeX];
+        float[] cellBlendX = new float[sizeX];
+        for (int x = 0; x < sizeX; x++) {
+            double worldX = origin.getX() + x + 0.5;
+            double cellCoord = (worldX - cellSizeBlocks * 0.5) / cellSizeBlocks;
+            int lower = MathHelper.floor(cellCoord);
+            int upper = lower + 1;
+            float blend = (float) (cellCoord - lower);
+            lower = MathHelper.clamp(lower, minCellX, maxCellX);
+            upper = MathHelper.clamp(upper, minCellX, maxCellX);
+            if (lower == upper) {
+                blend = 0.0f;
+            }
+            lowerCellX[x] = lower;
+            upperCellX[x] = upper;
+            cellBlendX[x] = blend;
+        }
+
+        int[] lowerCellZ = new int[sizeZ];
+        int[] upperCellZ = new int[sizeZ];
+        float[] cellBlendZ = new float[sizeZ];
+        for (int z = 0; z < sizeZ; z++) {
+            double worldZ = origin.getZ() + z + 0.5;
+            double cellCoord = (worldZ - cellSizeBlocks * 0.5) / cellSizeBlocks;
+            int lower = MathHelper.floor(cellCoord);
+            int upper = lower + 1;
+            float blend = (float) (cellCoord - lower);
+            lower = MathHelper.clamp(lower, minCellZ, maxCellZ);
+            upper = MathHelper.clamp(upper, minCellZ, maxCellZ);
+            if (lower == upper) {
+                blend = 0.0f;
+            }
+            lowerCellZ[z] = lower;
+            upperCellZ[z] = upper;
+            cellBlendZ[z] = blend;
+        }
+
+        int[] lowerLayer = new int[sizeY];
+        int[] upperLayer = new int[sizeY];
+        float[] layerBlend = new float[sizeY];
+        for (int y = 0; y < sizeY; y++) {
+            double worldY = origin.getY() + y + 0.5;
+            double layerCoord = (worldY - (verticalBaseY + layerHeightBlocks * 0.5)) / layerHeightBlocks;
+            int lower = MathHelper.floor(layerCoord);
+            int upper = lower + 1;
+            float blend = (float) (layerCoord - lower);
+            lower = MathHelper.clamp(lower, 0, activeLayers - 1);
+            upper = MathHelper.clamp(upper, 0, activeLayers - 1);
+            if (lower == upper) {
+                blend = 0.0f;
+            }
+            lowerLayer[y] = lower;
+            upperLayer[y] = upper;
+            layerBlend[y] = blend;
+        }
+
+        for (int x = 0; x < sizeX; x++) {
+            int x0 = lowerCellX[x];
+            int x1 = upperCellX[x];
+            float tx = cellBlendX[x];
+            for (int z = 0; z < sizeZ; z++) {
+                int z0 = lowerCellZ[z];
+                int z1 = upperCellZ[z];
+                float tz = cellBlendZ[z];
+
+                CellColumnState c00 = columnStateAtClamped(x0, z0);
+                CellColumnState c10 = columnStateAtClamped(x1, z0);
+                CellColumnState c01 = columnStateAtClamped(x0, z1);
+                CellColumnState c11 = columnStateAtClamped(x1, z1);
+                if (c00 == null || c10 == null || c01 == null || c11 == null) {
+                    return false;
+                }
+
+                for (int y = 0; y < sizeY; y++) {
+                    int layer0 = lowerLayer[y];
+                    int layer1 = upperLayer[y];
+                    float ty = layerBlend[y];
+                    int cell = (x * sizeY + y) * sizeZ + z;
+
+                    float windX0 = bilerp(
+                        c00.windX[layer0],
+                        c10.windX[layer0],
+                        c01.windX[layer0],
+                        c11.windX[layer0],
+                        tx,
+                        tz
+                    );
+                    float windX1 = bilerp(
+                        c00.windX[layer1],
+                        c10.windX[layer1],
+                        c01.windX[layer1],
+                        c11.windX[layer1],
+                        tx,
+                        tz
+                    );
+                    float windZ0 = bilerp(
+                        c00.windZ[layer0],
+                        c10.windZ[layer0],
+                        c01.windZ[layer0],
+                        c11.windZ[layer0],
+                        tx,
+                        tz
+                    );
+                    float windZ1 = bilerp(
+                        c00.windZ[layer1],
+                        c10.windZ[layer1],
+                        c01.windZ[layer1],
+                        c11.windZ[layer1],
+                        tx,
+                        tz
+                    );
+                    float air0 = bilerp(
+                        c00.ambientAirTemperatureKelvin[layer0],
+                        c10.ambientAirTemperatureKelvin[layer0],
+                        c01.ambientAirTemperatureKelvin[layer0],
+                        c11.ambientAirTemperatureKelvin[layer0],
+                        tx,
+                        tz
+                    );
+                    float air1 = bilerp(
+                        c00.ambientAirTemperatureKelvin[layer1],
+                        c10.ambientAirTemperatureKelvin[layer1],
+                        c01.ambientAirTemperatureKelvin[layer1],
+                        c11.ambientAirTemperatureKelvin[layer1],
+                        tx,
+                        tz
+                    );
+                    float surface0 = bilerp(
+                        c00.surfaceTemperatureKelvin[layer0],
+                        c10.surfaceTemperatureKelvin[layer0],
+                        c01.surfaceTemperatureKelvin[layer0],
+                        c11.surfaceTemperatureKelvin[layer0],
+                        tx,
+                        tz
+                    );
+                    float surface1 = bilerp(
+                        c00.surfaceTemperatureKelvin[layer1],
+                        c10.surfaceTemperatureKelvin[layer1],
+                        c01.surfaceTemperatureKelvin[layer1],
+                        c11.surfaceTemperatureKelvin[layer1],
+                        tx,
+                        tz
+                    );
+
+                    outWindX[cell] = MathHelper.lerp(ty, windX0, windX1);
+                    outWindZ[cell] = MathHelper.lerp(ty, windZ0, windZ1);
+                    outAirTemperature[cell] = MathHelper.lerp(ty, air0, air1);
+                    outSurfaceTemperature[cell] = MathHelper.lerp(ty, surface0, surface1);
+                }
+            }
+        }
+        return true;
+    }
+
     synchronized int cellCount() {
         return cells.size() * activeLayers;
     }
@@ -618,6 +807,18 @@ final class MesoscaleGrid implements AutoCloseable {
         int localX = cellX - (centerCellX - radiusCells);
         int localZ = cellZ - (centerCellZ - radiusCells);
         return (localX * activeLayers + layer) * gridWidth + localZ;
+    }
+
+    private CellColumnState columnStateAtClamped(int cellX, int cellZ) {
+        int clampedX = MathHelper.clamp(cellX, centerCellX - radiusCells, centerCellX + radiusCells);
+        int clampedZ = MathHelper.clamp(cellZ, centerCellZ - radiusCells, centerCellZ + radiusCells);
+        return cells.get(pack(clampedX, clampedZ));
+    }
+
+    private float bilerp(float v00, float v10, float v01, float v11, float tx, float tz) {
+        float vx0 = MathHelper.lerp(tx, v00, v10);
+        float vx1 = MathHelper.lerp(tx, v01, v11);
+        return MathHelper.lerp(tz, vx0, vx1);
     }
 
     private float humidityFluxX(int cellX, int cellZ, int layer) {

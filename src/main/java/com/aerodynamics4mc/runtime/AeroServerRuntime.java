@@ -2888,7 +2888,9 @@ public final class AeroServerRuntime {
                 return false;
             }
             if (!region.dynamicRestoreAttempted) {
-                tryRestoreWindowDynamicRegionFromSimulation(key, region);
+                if (!ensureWindowDynamicRegionInitialized(key, region)) {
+                    return false;
+                }
                 region.dynamicRestoreAttempted = true;
                 refreshRegionLifecycle(key, region);
                 if (!region.serviceReady) {
@@ -3220,6 +3222,24 @@ public final class AeroServerRuntime {
     private void resetWindowBackend(WindowKey key, RegionRecord region) {
         if (simulationServiceId != 0L) {
             simulationBridge.releaseRegionRuntime(simulationServiceId, simulationRegionKey(key));
+            if (region.sections != null) {
+                refreshRegionLifecycle(key, region);
+                if (!region.serviceActive) {
+                    activateWindowRegionInSimulation(key);
+                    refreshRegionLifecycle(key, region);
+                }
+                region.forcingDirty = true;
+                refreshRegionFansIfNeeded(key, region);
+                seedWindowDynamicRegionFromNestedMet(
+                    key,
+                    region,
+                    new float[FLOW_COUNT],
+                    new float[GRID_SIZE * GRID_SIZE * GRID_SIZE],
+                    new float[GRID_SIZE * GRID_SIZE * GRID_SIZE]
+                );
+                uploadRegionFanForcingToSimulation(key, region);
+                refreshRegionThermalInSimulation(key, region);
+            }
         }
         region.clearBackendResetPending();
     }
@@ -3990,15 +4010,74 @@ public final class AeroServerRuntime {
         }
     }
 
-    private void tryRestoreWindowDynamicRegionFromSimulation(WindowKey key, RegionRecord region) {
+    private boolean ensureWindowDynamicRegionInitialized(WindowKey key, RegionRecord region) {
         if (simulationServiceId == 0L || region.sections == null) {
-            return;
+            return false;
+        }
+        long regionKey = simulationRegionKey(key);
+        if (simulationBridge.hasRegionContext(simulationServiceId, regionKey)) {
+            return true;
         }
         int cells = GRID_SIZE * GRID_SIZE * GRID_SIZE;
         float[] flowState = new float[FLOW_COUNT];
         float[] airTemperatureState = new float[cells];
         float[] surfaceTemperatureState = new float[cells];
-        if (!simulationBridge.exportDynamicRegion(
+        ServerWorld world = resolveWorld(key.worldKey());
+        if (world != null && dynamicStore.loadRegion(
+            world,
+            key.worldKey(),
+            key.origin(),
+            GRID_SIZE,
+            GRID_SIZE,
+            GRID_SIZE,
+            flowState,
+            airTemperatureState,
+            surfaceTemperatureState
+        )) {
+            if (simulationBridge.importDynamicRegion(
+                simulationServiceId,
+                regionKey,
+                GRID_SIZE,
+                GRID_SIZE,
+                GRID_SIZE,
+                flowState,
+                airTemperatureState,
+                surfaceTemperatureState
+            )) {
+                return true;
+            }
+        }
+        return seedWindowDynamicRegionFromNestedMet(key, region, flowState, airTemperatureState, surfaceTemperatureState);
+    }
+
+    private boolean seedWindowDynamicRegionFromNestedMet(
+        WindowKey key,
+        RegionRecord region,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState
+    ) {
+        byte[] obstacleMask = buildRegionObstacleMask(region);
+        MesoscaleGrid mesoscaleGrid = mesoscaleMetGrids.get(key.worldKey());
+        boolean seeded = mesoscaleGrid != null
+            && seedWindowDynamicRegionFromMesoscale(
+                key,
+                obstacleMask,
+                flowState,
+                airTemperatureState,
+                surfaceTemperatureState,
+                mesoscaleGrid
+            );
+        if (!seeded) {
+            seedWindowDynamicRegionFromBoundarySample(
+                key,
+                obstacleMask,
+                flowState,
+                airTemperatureState,
+                surfaceTemperatureState
+            );
+        }
+        return simulationBridge.importDynamicRegion(
             simulationServiceId,
             simulationRegionKey(key),
             GRID_SIZE,
@@ -4007,31 +4086,169 @@ public final class AeroServerRuntime {
             flowState,
             airTemperatureState,
             surfaceTemperatureState
+        );
+    }
+
+    private boolean seedWindowDynamicRegionFromMesoscale(
+        WindowKey key,
+        byte[] obstacleMask,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState,
+        MesoscaleGrid mesoscaleGrid
+    ) {
+        int cells = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        float[] windX = new float[cells];
+        float[] windZ = new float[cells];
+        if (!mesoscaleGrid.seedL2Window(
+            key.origin(),
+            GRID_SIZE,
+            GRID_SIZE,
+            GRID_SIZE,
+            windX,
+            windZ,
+            airTemperatureState,
+            surfaceTemperatureState
         )) {
-            ServerWorld world = resolveWorld(key.worldKey());
-            if (world == null || !dynamicStore.loadRegion(
-                world,
-                key.worldKey(),
-                key.origin(),
-                GRID_SIZE,
-                GRID_SIZE,
-                GRID_SIZE,
-                flowState,
-                airTemperatureState,
-                surfaceTemperatureState
-            )) {
-                return;
+            return false;
+        }
+        for (int cell = 0; cell < cells; cell++) {
+            if (obstacleMask[cell] != 0) {
+                continue;
             }
-            simulationBridge.importDynamicRegion(
-                simulationServiceId,
-                simulationRegionKey(key),
-                GRID_SIZE,
-                GRID_SIZE,
-                GRID_SIZE,
-                flowState,
-                airTemperatureState,
-                surfaceTemperatureState
-            );
+            int base = cell * RESPONSE_CHANNELS;
+            flowState[base] = windX[cell] / NATIVE_VELOCITY_SCALE;
+            flowState[base + 2] = windZ[cell] / NATIVE_VELOCITY_SCALE;
+        }
+        deriveSeedVerticalVelocity(obstacleMask, flowState);
+        return true;
+    }
+
+    private void seedWindowDynamicRegionFromBoundarySample(
+        WindowKey key,
+        byte[] obstacleMask,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState
+    ) {
+        NestedBoundaryCoupler.BoundarySample boundarySample = sampleNestedBoundaryAtWindow(key);
+        float seedVx = boundarySample == null ? 0.0f : boundarySample.windX() / NATIVE_VELOCITY_SCALE;
+        float seedVz = boundarySample == null ? 0.0f : boundarySample.windZ() / NATIVE_VELOCITY_SCALE;
+        float seedAirTemperature = boundarySample == null
+            ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K
+            : boundarySample.ambientAirTemperatureKelvin();
+        float seedSurfaceTemperature = boundarySample == null
+            ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K + THERMAL_DEEP_GROUND_OFFSET_K
+            : boundarySample.deepGroundTemperatureKelvin();
+        int cells = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        for (int cell = 0; cell < cells; cell++) {
+            airTemperatureState[cell] = seedAirTemperature;
+            surfaceTemperatureState[cell] = seedSurfaceTemperature;
+            if (obstacleMask[cell] != 0) {
+                continue;
+            }
+            int base = cell * RESPONSE_CHANNELS;
+            flowState[base] = seedVx;
+            flowState[base + 2] = seedVz;
+        }
+        deriveSeedVerticalVelocity(obstacleMask, flowState);
+    }
+
+    private void deriveSeedVerticalVelocity(byte[] obstacleMask, float[] flowState) {
+        float[] divergenceColumn = new float[GRID_SIZE];
+        float[] verticalVelocityColumn = new float[GRID_SIZE];
+        for (int x = 0; x < GRID_SIZE; x++) {
+            for (int z = 0; z < GRID_SIZE; z++) {
+                float maxHorizontalSpeed = 0.0f;
+                for (int y = 0; y < GRID_SIZE; y++) {
+                    int cell = gridCellIndex(x, y, z);
+                    int base = cell * RESPONSE_CHANNELS;
+                    if (obstacleMask[cell] != 0) {
+                        flowState[base + 1] = 0.0f;
+                        divergenceColumn[y] = 0.0f;
+                        continue;
+                    }
+                    float vx = flowState[base];
+                    float vz = flowState[base + 2];
+                    float vxMinus = sampleSeedFlowComponent(obstacleMask, flowState, x - 1, y, z, 0, vx);
+                    float vxPlus = sampleSeedFlowComponent(obstacleMask, flowState, x + 1, y, z, 0, vx);
+                    float vzMinus = sampleSeedFlowComponent(obstacleMask, flowState, x, y, z - 1, 2, vz);
+                    float vzPlus = sampleSeedFlowComponent(obstacleMask, flowState, x, y, z + 1, 2, vz);
+                    divergenceColumn[y] = 0.5f * ((vxPlus - vxMinus) + (vzPlus - vzMinus));
+                    maxHorizontalSpeed = Math.max(maxHorizontalSpeed, (float) Math.sqrt(vx * vx + vz * vz));
+                }
+                integrateSeedVerticalVelocityColumn(
+                    x,
+                    z,
+                    obstacleMask,
+                    flowState,
+                    divergenceColumn,
+                    verticalVelocityColumn,
+                    maxHorizontalSpeed
+                );
+            }
+        }
+    }
+
+    private float sampleSeedFlowComponent(
+        byte[] obstacleMask,
+        float[] flowState,
+        int x,
+        int y,
+        int z,
+        int componentOffset,
+        float fallback
+    ) {
+        if (!inBounds(x, y, z)) {
+            return fallback;
+        }
+        int cell = gridCellIndex(x, y, z);
+        if (obstacleMask[cell] != 0) {
+            return fallback;
+        }
+        return flowState[cell * RESPONSE_CHANNELS + componentOffset];
+    }
+
+    private void integrateSeedVerticalVelocityColumn(
+        int x,
+        int z,
+        byte[] obstacleMask,
+        float[] flowState,
+        float[] divergenceColumn,
+        float[] verticalVelocityColumn,
+        float maxHorizontalSpeed
+    ) {
+        int y = 0;
+        float clamp = Math.max(0.15f / NATIVE_VELOCITY_SCALE, maxHorizontalSpeed * NESTED_BOUNDARY_MAX_VY_RATIO);
+        while (y < GRID_SIZE) {
+            int cell = gridCellIndex(x, y, z);
+            if (obstacleMask[cell] != 0) {
+                flowState[cell * RESPONSE_CHANNELS + 1] = 0.0f;
+                y++;
+                continue;
+            }
+            int startY = y;
+            while (y < GRID_SIZE && obstacleMask[gridCellIndex(x, y, z)] == 0) {
+                y++;
+            }
+            int length = y - startY;
+            verticalVelocityColumn[0] = 0.0f;
+            for (int i = 1; i < length; i++) {
+                int currentY = startY + i;
+                int previousY = currentY - 1;
+                verticalVelocityColumn[i] = verticalVelocityColumn[i - 1]
+                    - 0.5f * (divergenceColumn[previousY] + divergenceColumn[currentY]);
+            }
+            float mean = 0.0f;
+            for (int i = 0; i < length; i++) {
+                mean += verticalVelocityColumn[i];
+            }
+            mean /= length;
+            for (int i = 0; i < length; i++) {
+                float vy = MathHelper.clamp(verticalVelocityColumn[i] - mean, -clamp, clamp);
+                int runCell = gridCellIndex(x, startY + i, z);
+                flowState[runCell * RESPONSE_CHANNELS + 1] = vy;
+            }
         }
     }
 
@@ -4046,6 +4263,46 @@ public final class AeroServerRuntime {
 
     private boolean inSectionBounds(int x, int y, int z) {
         return x >= 0 && y >= 0 && z >= 0 && x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE;
+    }
+
+    private byte[] buildRegionObstacleMask(RegionRecord region) {
+        byte[] obstacleMask = new byte[GRID_SIZE * GRID_SIZE * GRID_SIZE];
+        if (region.sections == null) {
+            return obstacleMask;
+        }
+        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
+            int baseX = sx * CHUNK_SIZE;
+            for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
+                int baseY = sy * CHUNK_SIZE;
+                for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+                    int baseZ = sz * CHUNK_SIZE;
+                    WorldMirror.SectionSnapshot snapshot = region.sectionAt(sx, sy, sz);
+                    if (snapshot == null) {
+                        for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+                            int x = baseX + lx;
+                            for (int ly = 0; ly < CHUNK_SIZE; ly++) {
+                                int y = baseY + ly;
+                                for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                                    obstacleMask[gridCellIndex(x, y, baseZ + lz)] = 1;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+                        int x = baseX + lx;
+                        for (int ly = 0; ly < CHUNK_SIZE; ly++) {
+                            int y = baseY + ly;
+                            for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                                int cell = gridCellIndex(x, y, baseZ + lz);
+                                obstacleMask[cell] = snapshot.obstacle()[localSectionCellIndex(lx, ly, lz)] >= 0.5f ? (byte) 1 : (byte) 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return obstacleMask;
     }
 
     private float runtimeFanSpeedMetersPerSecond() {
