@@ -17,7 +17,7 @@ enum {
     AERO_LBM_BENCHMARK_ABI_VERSION = 1,
     AERO_LBM_MESOSCALE_ABI_VERSION = 1,
     AERO_LBM_SIMULATION_ABI_VERSION = 1,
-    AERO_LBM_MESOSCALE_FORCING_CHANNELS = 19,
+    AERO_LBM_MESOSCALE_FORCING_CHANNELS = 20,
     AERO_LBM_MESOSCALE_STATE_CHANNELS = 5,
     AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS = 4,
     AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS = 4,
@@ -262,6 +262,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_l2_runtime(
     int output_channels
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_has_region_context(long long service_key, long long region_key);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_region_nested_feedback_layout(
+    long long service_key,
+    long long region_key,
+    int steps_per_feedback,
+    const int* layout_values,
+    int value_count
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_region_forcing(
     long long service_key,
     long long region_key,
@@ -387,6 +394,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_export_dynamic_region(
     float* out_flow_state,
     float* out_air_temperature,
     float* out_surface_temperature
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_poll_region_nested_feedback(
+    long long service_key,
+    long long region_key,
+    float* out_values,
+    int value_count
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_packed_flow_atlas(
     long long service_key,

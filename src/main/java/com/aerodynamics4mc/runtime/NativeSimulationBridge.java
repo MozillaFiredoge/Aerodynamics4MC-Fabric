@@ -7,6 +7,9 @@ public final class NativeSimulationBridge {
     public static final int PACKED_ATLAS_CHANNELS = 4;
     public static final int PLAYER_PROBE_CHANNELS = 6;
     public static final int TORNADO_DESCRIPTOR_FLOATS = 17;
+    public static final int NESTED_FEEDBACK_MAX_BINS = 8;
+    public static final int NESTED_FEEDBACK_LAYOUT_INTS_PER_BIN = 9;
+    public static final int NESTED_FEEDBACK_VALUES_PER_BIN = 10;
     private static final int FACE_COUNT = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
@@ -239,6 +242,24 @@ public final class NativeSimulationBridge {
     public boolean hasRegionContext(long serviceKey, long regionKey) {
         return LOADED && serviceKey != 0L && regionKey != 0L
             && nativeHasRegionContext(serviceKey, regionKey);
+    }
+
+    public boolean setRegionNestedFeedbackLayout(
+        long serviceKey,
+        long regionKey,
+        int stepsPerFeedback,
+        int[] layout
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || layout == null) {
+            return false;
+        }
+        if (stepsPerFeedback <= 0
+            || layout.length == 0
+            || (layout.length % NESTED_FEEDBACK_LAYOUT_INTS_PER_BIN) != 0
+            || layout.length > NESTED_FEEDBACK_MAX_BINS * NESTED_FEEDBACK_LAYOUT_INTS_PER_BIN) {
+            return false;
+        }
+        return nativeSetRegionNestedFeedbackLayout(serviceKey, regionKey, stepsPerFeedback, layout);
     }
 
     public boolean uploadRegionForcing(
@@ -567,6 +588,22 @@ public final class NativeSimulationBridge {
         );
     }
 
+    public boolean pollRegionNestedFeedback(
+        long serviceKey,
+        long regionKey,
+        float[] outValues
+    ) {
+        if (!LOADED || serviceKey == 0L || regionKey == 0L || outValues == null) {
+            return false;
+        }
+        if (outValues.length == 0
+            || (outValues.length % NESTED_FEEDBACK_VALUES_PER_BIN) != 0
+            || outValues.length > NESTED_FEEDBACK_MAX_BINS * NESTED_FEEDBACK_VALUES_PER_BIN) {
+            return false;
+        }
+        return nativePollRegionNestedFeedback(serviceKey, regionKey, outValues);
+    }
+
     public boolean setPackedFlowAtlas(long serviceKey, long atlasKey, short[] packedValues) {
         if (!LOADED || serviceKey == 0L || atlasKey == 0L || packedValues == null || packedValues.length == 0) {
             return false;
@@ -731,6 +768,13 @@ public final class NativeSimulationBridge {
 
     private static native boolean nativeHasRegionContext(long serviceKey, long regionKey);
 
+    private static native boolean nativeSetRegionNestedFeedbackLayout(
+        long serviceKey,
+        long regionKey,
+        int stepsPerFeedback,
+        int[] layout
+    );
+
     private static native boolean nativeUploadRegionForcing(
         long serviceKey,
         long regionKey,
@@ -868,6 +912,12 @@ public final class NativeSimulationBridge {
         float[] outFlowState,
         float[] outAirTemperature,
         float[] outSurfaceTemperature
+    );
+
+    private static native boolean nativePollRegionNestedFeedback(
+        long serviceKey,
+        long regionKey,
+        float[] outValues
     );
 
     private static native boolean nativeSetPackedFlowAtlas(long serviceKey, long atlasKey, short[] packedValues);

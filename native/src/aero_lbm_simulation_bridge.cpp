@@ -35,6 +35,36 @@ struct DynamicRegionData {
     std::vector<float> flow_state;
     std::vector<float> air_temperature;
     std::vector<float> surface_temperature;
+    struct NestedFeedbackBinLayout {
+        int cell_x = 0;
+        int layer = 0;
+        int cell_z = 0;
+        int min_x = 0;
+        int max_x = 0;
+        int min_y = 0;
+        int max_y = 0;
+        int min_z = 0;
+        int max_z = 0;
+    };
+    struct NestedFeedbackBinAccumulator {
+        double volume_sum = 0.0;
+        double density_sum = 0.0;
+        double momentum_x_sum = 0.0;
+        double momentum_z_sum = 0.0;
+        double air_temperature_volume_sum = 0.0;
+        double surface_temperature_volume_sum = 0.0;
+        double bottom_area_sum = 0.0;
+        double bottom_mass_flux_sum = 0.0;
+        double top_area_sum = 0.0;
+        double top_mass_flux_sum = 0.0;
+    };
+    struct NestedFeedbackData {
+        int steps_per_feedback = 0;
+        int steps_accumulated = 0;
+        std::vector<NestedFeedbackBinLayout> layout;
+        std::vector<NestedFeedbackBinAccumulator> accumulators;
+        std::vector<float> ready_values;
+    } nested_feedback;
 };
 
 struct ForcingRegionData {
@@ -142,6 +172,28 @@ constexpr int k_tornado_desc_intensity = 11;
 constexpr int k_tornado_desc_rotation_sign = 12;
 constexpr int k_tornado_desc_state_ordinal = 13;
 constexpr int k_tornado_desc_lifecycle_envelope = 14;
+constexpr int k_nested_feedback_max_bins = 8;
+constexpr int k_nested_feedback_layout_ints_per_bin = 9;
+constexpr int k_nested_feedback_values_per_bin = 10;
+constexpr int k_nested_feedback_layout_cell_x = 0;
+constexpr int k_nested_feedback_layout_layer = 1;
+constexpr int k_nested_feedback_layout_cell_z = 2;
+constexpr int k_nested_feedback_layout_min_x = 3;
+constexpr int k_nested_feedback_layout_max_x = 4;
+constexpr int k_nested_feedback_layout_min_y = 5;
+constexpr int k_nested_feedback_layout_max_y = 6;
+constexpr int k_nested_feedback_layout_min_z = 7;
+constexpr int k_nested_feedback_layout_max_z = 8;
+constexpr int k_nested_feedback_value_volume = 0;
+constexpr int k_nested_feedback_value_density = 1;
+constexpr int k_nested_feedback_value_momentum_x = 2;
+constexpr int k_nested_feedback_value_momentum_z = 3;
+constexpr int k_nested_feedback_value_air_temperature = 4;
+constexpr int k_nested_feedback_value_surface_temperature = 5;
+constexpr int k_nested_feedback_value_bottom_area = 6;
+constexpr int k_nested_feedback_value_bottom_mass_flux = 7;
+constexpr int k_nested_feedback_value_top_area = 8;
+constexpr int k_nested_feedback_value_top_mass_flux = 9;
 constexpr float k_tornado_lattice_speed_cap = 0.24f;
 constexpr float k_cell_face_area_square_meters = 1.0f;
 constexpr float k_cell_volume_cubic_meters = 1.0f;
@@ -192,6 +244,141 @@ bool checked_cell_count(int nx, int ny, int nz, int* out_cells) {
 }
 
 void rebuild_region_packet_template(ServiceState& service, long long region_key);
+int grid_cell_index(int ny, int nz, int x, int y, int z);
+
+void clear_nested_feedback_accumulators(DynamicRegionData::NestedFeedbackData& nested_feedback) {
+    nested_feedback.steps_accumulated = 0;
+    nested_feedback.accumulators.assign(
+        nested_feedback.layout.size(),
+        DynamicRegionData::NestedFeedbackBinAccumulator{}
+    );
+}
+
+bool configure_nested_feedback_layout(
+    DynamicRegionData& dynamic,
+    int steps_per_feedback,
+    const int* layout_values,
+    int value_count
+) {
+    if (steps_per_feedback <= 0 || !layout_values || value_count <= 0
+        || (value_count % k_nested_feedback_layout_ints_per_bin) != 0
+        || value_count > k_nested_feedback_max_bins * k_nested_feedback_layout_ints_per_bin) {
+        set_simulation_last_error("simulation_nested_feedback_layout: invalid layout arguments");
+        return false;
+    }
+    const int bin_count = value_count / k_nested_feedback_layout_ints_per_bin;
+    std::vector<DynamicRegionData::NestedFeedbackBinLayout> layout;
+    layout.reserve(static_cast<std::size_t>(bin_count));
+    for (int index = 0; index < bin_count; ++index) {
+        const int base = index * k_nested_feedback_layout_ints_per_bin;
+        DynamicRegionData::NestedFeedbackBinLayout bin{};
+        bin.cell_x = layout_values[base + k_nested_feedback_layout_cell_x];
+        bin.layer = layout_values[base + k_nested_feedback_layout_layer];
+        bin.cell_z = layout_values[base + k_nested_feedback_layout_cell_z];
+        bin.min_x = layout_values[base + k_nested_feedback_layout_min_x];
+        bin.max_x = layout_values[base + k_nested_feedback_layout_max_x];
+        bin.min_y = layout_values[base + k_nested_feedback_layout_min_y];
+        bin.max_y = layout_values[base + k_nested_feedback_layout_max_y];
+        bin.min_z = layout_values[base + k_nested_feedback_layout_min_z];
+        bin.max_z = layout_values[base + k_nested_feedback_layout_max_z];
+        if (bin.min_x < 0 || bin.min_y < 0 || bin.min_z < 0
+            || bin.max_x > dynamic.nx || bin.max_y > dynamic.ny || bin.max_z > dynamic.nz
+            || bin.min_x >= bin.max_x || bin.min_y >= bin.max_y || bin.min_z >= bin.max_z) {
+            set_simulation_last_error("simulation_nested_feedback_layout: layout bounds out of range");
+            return false;
+        }
+        layout.push_back(bin);
+    }
+    dynamic.nested_feedback.steps_per_feedback = steps_per_feedback;
+    dynamic.nested_feedback.layout = std::move(layout);
+    dynamic.nested_feedback.ready_values.clear();
+    clear_nested_feedback_accumulators(dynamic.nested_feedback);
+    return true;
+}
+
+void accumulate_nested_feedback(
+    const StaticRegionData* stat,
+    DynamicRegionData& dynamic
+) {
+    DynamicRegionData::NestedFeedbackData& nested_feedback = dynamic.nested_feedback;
+    if (!stat
+        || nested_feedback.layout.empty()
+        || nested_feedback.steps_per_feedback <= 0
+        || !nested_feedback.ready_values.empty()) {
+        return;
+    }
+    if (dynamic.flow_state.empty()
+        || dynamic.air_temperature.empty()
+        || dynamic.surface_temperature.empty()) {
+        return;
+    }
+
+    for (std::size_t index = 0; index < nested_feedback.layout.size(); ++index) {
+        const auto& bin = nested_feedback.layout[index];
+        auto& accumulator = nested_feedback.accumulators[index];
+        for (int x = bin.min_x; x < bin.max_x; ++x) {
+            for (int y = bin.min_y; y < bin.max_y; ++y) {
+                for (int z = bin.min_z; z < bin.max_z; ++z) {
+                    const int cell = grid_cell_index(dynamic.ny, dynamic.nz, x, y, z);
+                    if (stat->obstacle[static_cast<std::size_t>(cell)] != 0) {
+                        continue;
+                    }
+                    const std::size_t flow_base = static_cast<std::size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+                    const float rho = std::max(1.0e-6f, 1.0f + dynamic.flow_state[flow_base + 3]);
+                    accumulator.volume_sum += k_cell_volume_cubic_meters;
+                    accumulator.density_sum += rho;
+                    accumulator.momentum_x_sum += rho * dynamic.flow_state[flow_base];
+                    accumulator.momentum_z_sum += rho * dynamic.flow_state[flow_base + 2];
+                    accumulator.air_temperature_volume_sum += dynamic.air_temperature[static_cast<std::size_t>(cell)];
+                    accumulator.surface_temperature_volume_sum += dynamic.surface_temperature[static_cast<std::size_t>(cell)];
+                    if (y == bin.min_y) {
+                        accumulator.bottom_area_sum += k_cell_face_area_square_meters;
+                        accumulator.bottom_mass_flux_sum += rho * dynamic.flow_state[flow_base + 1];
+                    }
+                    if (y == bin.max_y - 1) {
+                        accumulator.top_area_sum += k_cell_face_area_square_meters;
+                        accumulator.top_mass_flux_sum += rho * dynamic.flow_state[flow_base + 1];
+                    }
+                }
+            }
+        }
+    }
+
+    nested_feedback.steps_accumulated++;
+    if (nested_feedback.steps_accumulated < nested_feedback.steps_per_feedback) {
+        return;
+    }
+
+    nested_feedback.ready_values.assign(
+        nested_feedback.layout.size() * k_nested_feedback_values_per_bin,
+        0.0f
+    );
+    for (std::size_t index = 0; index < nested_feedback.layout.size(); ++index) {
+        const auto& accumulator = nested_feedback.accumulators[index];
+        const std::size_t base = index * k_nested_feedback_values_per_bin;
+        nested_feedback.ready_values[base + k_nested_feedback_value_volume] =
+            static_cast<float>(accumulator.volume_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_density] =
+            static_cast<float>(accumulator.density_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_momentum_x] =
+            static_cast<float>(accumulator.momentum_x_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_momentum_z] =
+            static_cast<float>(accumulator.momentum_z_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_air_temperature] =
+            static_cast<float>(accumulator.air_temperature_volume_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_surface_temperature] =
+            static_cast<float>(accumulator.surface_temperature_volume_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_bottom_area] =
+            static_cast<float>(accumulator.bottom_area_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_bottom_mass_flux] =
+            static_cast<float>(accumulator.bottom_mass_flux_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_top_area] =
+            static_cast<float>(accumulator.top_area_sum);
+        nested_feedback.ready_values[base + k_nested_feedback_value_top_mass_flux] =
+            static_cast<float>(accumulator.top_mass_flux_sum);
+    }
+    clear_nested_feedback_accumulators(nested_feedback);
+}
 
 void ensure_region_buffers(ServiceState& service, long long region_key, int nx, int ny, int nz, int cells) {
     DynamicRegionData& dynamic = service.dynamic_regions[region_key];
@@ -1610,6 +1797,41 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_has_region_context(long long servic
     return aero_lbm_has_context(region_key);
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_region_nested_feedback_layout(
+    long long service_key,
+    long long region_key,
+    int steps_per_feedback,
+    const int* layout_values,
+    int value_count
+) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_set_region_nested_feedback_layout: missing service");
+        return 0;
+    }
+    auto lifecycle_it = service->regions.find(region_key);
+    if (lifecycle_it == service->regions.end()) {
+        set_simulation_last_error("simulation_set_region_nested_feedback_layout: missing region lifecycle");
+        return 0;
+    }
+    int cells = 0;
+    if (!checked_cell_count(lifecycle_it->second.nx, lifecycle_it->second.ny, lifecycle_it->second.nz, &cells)) {
+        set_simulation_last_error("simulation_set_region_nested_feedback_layout: invalid region dimensions");
+        return 0;
+    }
+    ensure_region_buffers(
+        *service,
+        region_key,
+        lifecycle_it->second.nx,
+        lifecycle_it->second.ny,
+        lifecycle_it->second.nz,
+        cells
+    );
+    DynamicRegionData& dynamic = service->dynamic_regions[region_key];
+    return configure_nested_feedback_layout(dynamic, steps_per_feedback, layout_values, value_count) ? 1 : 0;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_region_forcing(
     long long service_key,
     long long region_key,
@@ -1789,6 +2011,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
 
     DynamicRegionData dynamic_region;
     std::shared_ptr<const RegionPacketTemplateData> packet_template;
+    std::shared_ptr<const StaticRegionData> static_region;
     {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
         ServiceState* service = lookup_service(service_key);
@@ -1809,6 +2032,11 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             set_simulation_last_error("simulation_step_region_stored: missing packet template");
             return 0;
         }
+        auto static_it = service->static_regions.find(region_key);
+        if (static_it == service->static_regions.end()) {
+            set_simulation_last_error("simulation_step_region_stored: missing static region");
+            return 0;
+        }
         auto dynamic_it = service->dynamic_regions.find(region_key);
         if (dynamic_it == service->dynamic_regions.end()) {
             DynamicRegionData& dynamic = service->dynamic_regions[region_key];
@@ -1821,6 +2049,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             dynamic_it = service->dynamic_regions.find(region_key);
         }
         packet_template = packet_it->second;
+        static_region = static_it->second;
         dynamic_region = dynamic_it->second;
     }
     thread_local std::vector<float> packet;
@@ -1905,6 +2134,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
         return 0;
     }
+    accumulate_nested_feedback(static_region.get(), dynamic_region);
     AtlasData atlas;
     rebuild_default_packed_atlas(dynamic_region, atlas);
     float max_speed = compute_max_speed_from_flow_state(dynamic_region);
@@ -2178,6 +2408,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_import_dynamic_region(
     region.flow_state.assign(flow_state, flow_state + cells * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS);
     region.air_temperature.assign(air_temperature, air_temperature + cells);
     region.surface_temperature.assign(surface_temperature, surface_temperature + cells);
+    region.nested_feedback.ready_values.clear();
+    clear_nested_feedback_accumulators(region.nested_feedback);
     rebuild_default_packed_atlas(*service, region_key);
     return 1;
 }
@@ -2224,6 +2456,42 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_export_dynamic_region(
     std::copy(region.flow_state.begin(), region.flow_state.end(), out_flow_state);
     std::copy(region.air_temperature.begin(), region.air_temperature.end(), out_air_temperature);
     std::copy(region.surface_temperature.begin(), region.surface_temperature.end(), out_surface_temperature);
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_poll_region_nested_feedback(
+    long long service_key,
+    long long region_key,
+    float* out_values,
+    int value_count
+) {
+    if (!out_values || value_count <= 0) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_poll_region_nested_feedback: invalid output buffer");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_poll_region_nested_feedback: missing service");
+        return 0;
+    }
+    auto region_it = service->dynamic_regions.find(region_key);
+    if (region_it == service->dynamic_regions.end()) {
+        set_simulation_last_error("simulation_poll_region_nested_feedback: missing region");
+        return 0;
+    }
+    DynamicRegionData::NestedFeedbackData& nested_feedback = region_it->second.nested_feedback;
+    if (nested_feedback.ready_values.empty()) {
+        return 0;
+    }
+    if (static_cast<int>(nested_feedback.ready_values.size()) != value_count) {
+        set_simulation_last_error("simulation_poll_region_nested_feedback: size mismatch");
+        return 0;
+    }
+    std::copy(nested_feedback.ready_values.begin(), nested_feedback.ready_values.end(), out_values);
+    nested_feedback.ready_values.clear();
     return 1;
 }
 
@@ -2730,6 +2998,34 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         static_cast<long long>(service_key),
         static_cast<long long>(region_key)
     ) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeSetRegionNestedFeedbackLayout(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jint steps_per_feedback,
+    jintArray layout
+) {
+    if (!layout) {
+        return JNI_FALSE;
+    }
+    const jsize value_count = env->GetArrayLength(layout);
+    jboolean copy = JNI_FALSE;
+    jint* layout_ptr = env->GetIntArrayElements(layout, &copy);
+    if (!layout_ptr) {
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_set_region_nested_feedback_layout(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        steps_per_feedback,
+        reinterpret_cast<const int*>(layout_ptr),
+        static_cast<int>(value_count)
+    );
+    env->ReleaseIntArrayElements(layout, layout_ptr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeUploadRegionForcing(
@@ -3282,6 +3578,32 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     env->ReleaseFloatArrayElements(out_flow_state, flow_ptr, 0);
     env->ReleaseFloatArrayElements(out_air_temperature, air_ptr, 0);
     env->ReleaseFloatArrayElements(out_surface_temperature, surface_ptr, 0);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativePollRegionNestedFeedback(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jfloatArray out_values
+) {
+    if (!out_values) {
+        return JNI_FALSE;
+    }
+    const jsize length = env->GetArrayLength(out_values);
+    jboolean copy = JNI_FALSE;
+    jfloat* values_ptr = env->GetFloatArrayElements(out_values, &copy);
+    if (!values_ptr) {
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_poll_region_nested_feedback(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        values_ptr,
+        static_cast<int>(length)
+    );
+    env->ReleaseFloatArrayElements(out_values, values_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

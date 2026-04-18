@@ -17,6 +17,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -186,6 +188,7 @@ public final class AeroServerRuntime {
     private static final int MESOSCALE_FORCING_REBUILD_TICKS = TICKS_PER_SECOND * 60;
     private static final float MESOSCALE_STEP_SECONDS = MESOSCALE_MET_CELL_SIZE_BLOCKS * SOLVER_STEP_SECONDS;
     private static final int MESOSCALE_REFRESH_TICKS = Math.max(1, Math.round(MESOSCALE_STEP_SECONDS / SOLVER_STEP_SECONDS));
+    private static final int L2_TO_L1_FEEDBACK_STEPS = MESOSCALE_REFRESH_TICKS;
     private static final int NESTED_BOUNDARY_FACE_RESOLUTION = 6;
     private static final float NESTED_BOUNDARY_MAX_VY_RATIO = 0.60f;
     private static final int BACKGROUND_MET_REFRESH_TICKS = MESOSCALE_REFRESH_TICKS * 4;
@@ -250,6 +253,8 @@ public final class AeroServerRuntime {
     private final Map<RegistryKey<World>, BackgroundMetGrid> backgroundMetGrids = new HashMap<>();
     private final Map<RegistryKey<World>, WorldScaleDriver> worldScaleDrivers = new HashMap<>();
     private final Map<RegistryKey<World>, MesoscaleGrid> mesoscaleMetGrids = new HashMap<>();
+    private final Map<RegistryKey<World>, ConcurrentLinkedQueue<MesoscaleGrid.NestedFeedbackBin>> pendingNestedFeedbackBins = new ConcurrentHashMap<>();
+    private final Map<RegistryKey<World>, NestedFeedbackRuntimeDiagnostics> nestedFeedbackRuntimeDiagnostics = new ConcurrentHashMap<>();
     private final Object simulationStateLock = new Object();
     private final Object coordinatorLifecycleLock = new Object();
     private final Object pendingWorldDeltasLock = new Object();
@@ -452,6 +457,8 @@ public final class AeroServerRuntime {
             if (grid != null) {
                 grid.close();
             }
+            pendingNestedFeedbackBins.remove(world.getRegistryKey());
+            nestedFeedbackRuntimeDiagnostics.remove(world.getRegistryKey());
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
                 NativeSimulationBridge.WORLD_DELTA_WORLD_UNLOADED,
                 0,
@@ -612,6 +619,7 @@ public final class AeroServerRuntime {
                     if (!lastCoordinatorError.isEmpty()) {
                         feedback(ctx.getSource(), "Last coordinator error: " + lastCoordinatorError);
                     }
+                    sendNestedFeedbackStatus(ctx.getSource());
                     return 1;
                 }))
             .then(CommandManager.literal("stop")
@@ -626,6 +634,9 @@ public final class AeroServerRuntime {
                 )
             .then(CommandManager.literal("dump_l1")
                 .executes(ctx -> dumpMesoscaleSnapshot(ctx.getSource()))
+                )
+            .then(CommandManager.literal("nested_feedback")
+                .executes(ctx -> nestedFeedbackStatus(ctx.getSource()))
                 )
             .then(CommandManager.literal("capture_l2")
                 .then(CommandManager.literal("start")
@@ -1807,6 +1818,65 @@ public final class AeroServerRuntime {
         return 1;
     }
 
+    private int nestedFeedbackStatus(ServerCommandSource source) {
+        if (sendNestedFeedbackStatus(source)) {
+            return 1;
+        }
+        feedback(source, "Nested feedback diagnostics unavailable for " + source.getWorld().getRegistryKey().getValue());
+        return 0;
+    }
+
+    private boolean sendNestedFeedbackStatus(ServerCommandSource source) {
+        ServerWorld world = source.getWorld();
+        RegistryKey<World> worldKey = world.getRegistryKey();
+        ConcurrentLinkedQueue<MesoscaleGrid.NestedFeedbackBin> queue = pendingNestedFeedbackBins.get(worldKey);
+        int pendingBinCount = queue == null ? 0 : queue.size();
+        NestedFeedbackRuntimeDiagnostics runtimeDiagnostics = nestedFeedbackRuntimeDiagnostics.get(worldKey);
+        MesoscaleGrid grid = mesoscaleMetGrids.get(worldKey);
+        MesoscaleGrid.NestedFeedbackDiagnostics applyDiagnostics = grid == null
+            ? null
+            : grid.nestedFeedbackDiagnostics();
+        if (runtimeDiagnostics == null
+            && (applyDiagnostics == null || applyDiagnostics.lastAppliedTick() == Long.MIN_VALUE)
+            && pendingBinCount <= 0) {
+            return false;
+        }
+
+        int lastPollAgeTicks = runtimeDiagnostics == null || runtimeDiagnostics.lastPolledTick() == Integer.MIN_VALUE
+            ? -1
+            : Math.max(0, tickCounter - runtimeDiagnostics.lastPolledTick());
+        long lastAppliedAgeTicks = applyDiagnostics == null || applyDiagnostics.lastAppliedTick() == Long.MIN_VALUE
+            ? -1L
+            : Math.max(0L, tickCounter - applyDiagnostics.lastAppliedTick());
+        feedback(
+            source,
+            "NestedFeedback poll pendingBins=" + pendingBinCount
+                + " polledPackets=" + (runtimeDiagnostics == null ? 0L : runtimeDiagnostics.polledPacketCount())
+                + " polledBins=" + (runtimeDiagnostics == null ? 0L : runtimeDiagnostics.polledBinCount())
+                + " lastPacketBins=" + (runtimeDiagnostics == null ? 0 : runtimeDiagnostics.lastPacketBinCount())
+                + " lastPollAge=" + lastPollAgeTicks
+                + " lastMeanVolume=" + format3(runtimeDiagnostics == null ? 0.0f : runtimeDiagnostics.lastMeanVolumeAverage())
+                + " lastBottomFlux=" + format3(runtimeDiagnostics == null ? 0.0f : runtimeDiagnostics.lastMeanBottomFluxDensity())
+                + " lastTopFlux=" + format3(runtimeDiagnostics == null ? 0.0f : runtimeDiagnostics.lastMeanTopFluxDensity())
+        );
+        feedback(
+            source,
+            "NestedFeedback apply appliedCells=" + (applyDiagnostics == null ? 0 : applyDiagnostics.appliedCellCount())
+                + " inputBins=" + (applyDiagnostics == null ? 0 : applyDiagnostics.inputBinCount())
+                + " acceptedBins=" + (applyDiagnostics == null ? 0 : applyDiagnostics.acceptedBinCount())
+                + " lastApplyAge=" + lastAppliedAgeTicks
+                + " coverageMean=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.meanCoverage())
+                + " coverageMax=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.maxCoverage())
+                + " windDeltaMean=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.meanWindDelta())
+                + " windDeltaMax=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.maxWindDelta())
+                + " airDeltaMean=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.meanAirDeltaKelvin())
+                + " surfaceDeltaMean=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.meanSurfaceDeltaKelvin())
+                + " updraftMean=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.meanNestedUpdraft())
+                + " updraftMax=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.maxAbsNestedUpdraft())
+        );
+        return true;
+    }
+
     private String encodeBackgroundSnapshot(RegistryKey<World> worldKey, BackgroundMetGrid.Snapshot snapshot) {
         StringBuilder builder = new StringBuilder(1 << 18);
         builder.append("{\n");
@@ -1943,6 +2013,25 @@ public final class AeroServerRuntime {
         appendJsonField(builder, "vertical_base_y", snapshot.verticalBaseY(), true);
         appendJsonField(builder, "step_seconds", snapshot.stepSeconds(), true);
         appendJsonField(builder, "tick", snapshot.lastTickProcessed(), true);
+        builder.append("  \"nested_feedback_diagnostics\": {\n");
+        MesoscaleGrid.NestedFeedbackDiagnostics nestedFeedbackDiagnostics = snapshot.nestedFeedbackDiagnostics();
+        appendJsonField(builder, "last_applied_tick", nestedFeedbackDiagnostics.lastAppliedTick(), true, 4);
+        appendJsonField(builder, "input_bin_count", nestedFeedbackDiagnostics.inputBinCount(), true, 4);
+        appendJsonField(builder, "accepted_bin_count", nestedFeedbackDiagnostics.acceptedBinCount(), true, 4);
+        appendJsonField(builder, "applied_cell_count", nestedFeedbackDiagnostics.appliedCellCount(), true, 4);
+        appendJsonField(builder, "mean_coverage", nestedFeedbackDiagnostics.meanCoverage(), true, 4);
+        appendJsonField(builder, "max_coverage", nestedFeedbackDiagnostics.maxCoverage(), true, 4);
+        appendJsonField(builder, "mean_wind_delta", nestedFeedbackDiagnostics.meanWindDelta(), true, 4);
+        appendJsonField(builder, "max_wind_delta", nestedFeedbackDiagnostics.maxWindDelta(), true, 4);
+        appendJsonField(builder, "mean_air_delta_kelvin", nestedFeedbackDiagnostics.meanAirDeltaKelvin(), true, 4);
+        appendJsonField(builder, "max_air_delta_kelvin", nestedFeedbackDiagnostics.maxAirDeltaKelvin(), true, 4);
+        appendJsonField(builder, "mean_surface_delta_kelvin", nestedFeedbackDiagnostics.meanSurfaceDeltaKelvin(), true, 4);
+        appendJsonField(builder, "max_surface_delta_kelvin", nestedFeedbackDiagnostics.maxSurfaceDeltaKelvin(), true, 4);
+        appendJsonField(builder, "mean_bottom_flux_density", nestedFeedbackDiagnostics.meanBottomFluxDensity(), true, 4);
+        appendJsonField(builder, "mean_top_flux_density", nestedFeedbackDiagnostics.meanTopFluxDensity(), true, 4);
+        appendJsonField(builder, "mean_nested_updraft", nestedFeedbackDiagnostics.meanNestedUpdraft(), true, 4);
+        appendJsonField(builder, "max_abs_nested_updraft", nestedFeedbackDiagnostics.maxAbsNestedUpdraft(), false, 4);
+        builder.append("  },\n");
         appendJsonArray(builder, "terrain_height_blocks", snapshot.terrainHeightBlocks(), true);
         appendJsonArray(builder, "biome_temperature", snapshot.biomeTemperature(), true);
         appendJsonArray(builder, "roughness_length_meters", snapshot.roughnessLengthMeters(), true);
@@ -1950,6 +2039,11 @@ public final class AeroServerRuntime {
         appendJsonArray(builder, "ambient_air_temperature_kelvin", snapshot.ambientAirTemperatureKelvin(), true);
         appendJsonArray(builder, "deep_ground_temperature_kelvin", snapshot.deepGroundTemperatureKelvin(), true);
         appendJsonArray(builder, "surface_temperature_kelvin", snapshot.surfaceTemperatureKelvin(), true);
+        appendJsonArray(builder, "forcing_ambient_target_kelvin", snapshot.forcingAmbientTargetKelvin(), true);
+        appendJsonArray(builder, "forcing_surface_target_kelvin", snapshot.forcingSurfaceTargetKelvin(), true);
+        appendJsonArray(builder, "forcing_background_wind_x", snapshot.forcingBackgroundWindX(), true);
+        appendJsonArray(builder, "forcing_background_wind_z", snapshot.forcingBackgroundWindZ(), true);
+        appendJsonArray(builder, "forcing_nested_updraft", snapshot.forcingNestedUpdraft(), true);
         appendJsonArray(builder, "wind_x", snapshot.windX(), true);
         appendJsonArray(builder, "wind_z", snapshot.windZ(), true);
         appendJsonArray(builder, "humidity", snapshot.humidity(), true);
@@ -2360,6 +2454,8 @@ public final class AeroServerRuntime {
             grid.close();
         }
         mesoscaleMetGrids.clear();
+        pendingNestedFeedbackBins.clear();
+        nestedFeedbackRuntimeDiagnostics.clear();
         desiredWindowKeys = Set.of();
         activePlayerProbeRequests = List.of();
         activeEntitySampleRequests = List.of();
@@ -2409,6 +2505,8 @@ public final class AeroServerRuntime {
     private void applyBackgroundRefreshBatch(BackgroundRefreshBatch batch) {
         Set<RegistryKey<World>> activeWorldKeys = new HashSet<>(batch.requests().keySet());
         backgroundMetGrids.keySet().removeIf(worldKey -> !activeWorldKeys.contains(worldKey));
+        pendingNestedFeedbackBins.keySet().removeIf(worldKey -> !activeWorldKeys.contains(worldKey));
+        nestedFeedbackRuntimeDiagnostics.keySet().removeIf(worldKey -> !activeWorldKeys.contains(worldKey));
         Iterator<Map.Entry<RegistryKey<World>, MesoscaleGrid>> mesoscaleIterator = mesoscaleMetGrids.entrySet().iterator();
         while (mesoscaleIterator.hasNext()) {
             Map.Entry<RegistryKey<World>, MesoscaleGrid> entry = mesoscaleIterator.next();
@@ -2468,7 +2566,24 @@ public final class AeroServerRuntime {
                 )
             );
             mesoscale.refresh(request.world(), request.focus(), batch.tickCounter(), SOLVER_STEP_SECONDS, seedTerrainProvider, grid);
+            mesoscale.applyPendingNestedFeedback(drainPendingNestedFeedback(worldKey));
         }
+    }
+
+    private List<MesoscaleGrid.NestedFeedbackBin> drainPendingNestedFeedback(RegistryKey<World> worldKey) {
+        ConcurrentLinkedQueue<MesoscaleGrid.NestedFeedbackBin> queue = pendingNestedFeedbackBins.get(worldKey);
+        if (queue == null || queue.isEmpty()) {
+            return List.of();
+        }
+        List<MesoscaleGrid.NestedFeedbackBin> drained = new ArrayList<>();
+        while (true) {
+            MesoscaleGrid.NestedFeedbackBin bin = queue.poll();
+            if (bin == null) {
+                break;
+            }
+            drained.add(bin);
+        }
+        return drained.isEmpty() ? List.of() : drained;
     }
 
     private void ensureSimulationServiceInitialized() {
@@ -2490,6 +2605,9 @@ public final class AeroServerRuntime {
         }
         simulationBridge.releaseService(simulationServiceId);
         simulationServiceId = 0L;
+        for (RegionRecord region : regions.values()) {
+            region.nestedFeedbackLayoutServiceId = 0L;
+        }
     }
 
     private void updateSimulationFocus(MinecraftServer server) {
@@ -2878,6 +2996,7 @@ public final class AeroServerRuntime {
         if (!region.serviceActive) {
             activateWindowRegionInSimulation(key);
         }
+        ensureRegionNestedFeedbackLayoutInSimulation(key, region);
         refreshRegionLifecycle(key, region);
         return region.serviceReady;
     }
@@ -3230,6 +3349,7 @@ public final class AeroServerRuntime {
                 }
                 region.forcingDirty = true;
                 refreshRegionFansIfNeeded(key, region);
+                ensureRegionNestedFeedbackLayoutInSimulation(key, region);
                 seedWindowDynamicRegionFromNestedMet(
                     key,
                     region,
@@ -3681,6 +3801,226 @@ public final class AeroServerRuntime {
         value = (value ^ key.origin().getY()) * 1099511628211L;
         value = (value ^ key.origin().getZ()) * 1099511628211L;
         return value == 0L ? 1L : value;
+    }
+
+    private List<NestedFeedbackAxisSpan> buildHorizontalNestedFeedbackSpans(
+        int worldMinInclusive,
+        int worldMaxExclusive,
+        int localOrigin,
+        int coarseCellSize
+    ) {
+        List<NestedFeedbackAxisSpan> spans = new ArrayList<>(2);
+        int spanStartWorld = worldMinInclusive;
+        int currentCell = Math.floorDiv(worldMinInclusive, coarseCellSize);
+        for (int world = worldMinInclusive + 1; world < worldMaxExclusive; world++) {
+            int cell = Math.floorDiv(world, coarseCellSize);
+            if (cell == currentCell) {
+                continue;
+            }
+            spans.add(new NestedFeedbackAxisSpan(currentCell, spanStartWorld - localOrigin, world - localOrigin));
+            spanStartWorld = world;
+            currentCell = cell;
+        }
+        spans.add(new NestedFeedbackAxisSpan(currentCell, spanStartWorld - localOrigin, worldMaxExclusive - localOrigin));
+        return spans;
+    }
+
+    private List<NestedFeedbackAxisSpan> buildVerticalNestedFeedbackSpans(
+        int worldMinInclusive,
+        int worldMaxExclusive,
+        int localOrigin,
+        int verticalBaseY
+    ) {
+        List<NestedFeedbackAxisSpan> spans = new ArrayList<>(2);
+        int spanStartWorld = worldMinInclusive;
+        int currentLayer = MathHelper.clamp(
+            Math.floorDiv(worldMinInclusive - verticalBaseY, MESOSCALE_MET_LAYER_HEIGHT_BLOCKS),
+            0,
+            MESOSCALE_MET_MAX_LAYERS - 1
+        );
+        for (int world = worldMinInclusive + 1; world < worldMaxExclusive; world++) {
+            int layer = MathHelper.clamp(
+                Math.floorDiv(world - verticalBaseY, MESOSCALE_MET_LAYER_HEIGHT_BLOCKS),
+                0,
+                MESOSCALE_MET_MAX_LAYERS - 1
+            );
+            if (layer == currentLayer) {
+                continue;
+            }
+            spans.add(new NestedFeedbackAxisSpan(currentLayer, spanStartWorld - localOrigin, world - localOrigin));
+            spanStartWorld = world;
+            currentLayer = layer;
+        }
+        spans.add(new NestedFeedbackAxisSpan(currentLayer, spanStartWorld - localOrigin, worldMaxExclusive - localOrigin));
+        return spans;
+    }
+
+    private L2ToL1FeedbackLayout buildRegionNestedFeedbackLayout(WindowKey key) {
+        ServerWorld world = resolveWorld(key.worldKey());
+        int verticalBaseY = world == null ? 0 : Math.max(0, world.getBottomY());
+        int coreMinX = key.origin().getX() + REGION_HALO_CELLS;
+        int coreMinY = key.origin().getY() + REGION_HALO_CELLS;
+        int coreMinZ = key.origin().getZ() + REGION_HALO_CELLS;
+        int coreMaxX = coreMinX + REGION_CORE_SIZE;
+        int coreMaxY = coreMinY + REGION_CORE_SIZE;
+        int coreMaxZ = coreMinZ + REGION_CORE_SIZE;
+
+        List<NestedFeedbackAxisSpan> xSpans = buildHorizontalNestedFeedbackSpans(
+            coreMinX,
+            coreMaxX,
+            key.origin().getX(),
+            MESOSCALE_MET_CELL_SIZE_BLOCKS
+        );
+        List<NestedFeedbackAxisSpan> ySpans = buildVerticalNestedFeedbackSpans(
+            coreMinY,
+            coreMaxY,
+            key.origin().getY(),
+            verticalBaseY
+        );
+        List<NestedFeedbackAxisSpan> zSpans = buildHorizontalNestedFeedbackSpans(
+            coreMinZ,
+            coreMaxZ,
+            key.origin().getZ(),
+            MESOSCALE_MET_CELL_SIZE_BLOCKS
+        );
+
+        int binCount = xSpans.size() * ySpans.size() * zSpans.size();
+        if (binCount <= 0 || binCount > NativeSimulationBridge.NESTED_FEEDBACK_MAX_BINS) {
+            return null;
+        }
+        int[] nativeLayout = new int[binCount * NativeSimulationBridge.NESTED_FEEDBACK_LAYOUT_INTS_PER_BIN];
+        List<L2ToL1FeedbackLayoutBin> bins = new ArrayList<>(binCount);
+        int index = 0;
+        for (NestedFeedbackAxisSpan xSpan : xSpans) {
+            for (NestedFeedbackAxisSpan ySpan : ySpans) {
+                for (NestedFeedbackAxisSpan zSpan : zSpans) {
+                    L2ToL1FeedbackLayoutBin bin = new L2ToL1FeedbackLayoutBin(
+                        xSpan.index(),
+                        ySpan.index(),
+                        zSpan.index(),
+                        xSpan.localMin(),
+                        xSpan.localMax(),
+                        ySpan.localMin(),
+                        ySpan.localMax(),
+                        zSpan.localMin(),
+                        zSpan.localMax()
+                    );
+                    bins.add(bin);
+                    int base = index * NativeSimulationBridge.NESTED_FEEDBACK_LAYOUT_INTS_PER_BIN;
+                    nativeLayout[base] = bin.cellX();
+                    nativeLayout[base + 1] = bin.layer();
+                    nativeLayout[base + 2] = bin.cellZ();
+                    nativeLayout[base + 3] = bin.localMinX();
+                    nativeLayout[base + 4] = bin.localMaxX();
+                    nativeLayout[base + 5] = bin.localMinY();
+                    nativeLayout[base + 6] = bin.localMaxY();
+                    nativeLayout[base + 7] = bin.localMinZ();
+                    nativeLayout[base + 8] = bin.localMaxZ();
+                    index++;
+                }
+            }
+        }
+        return new L2ToL1FeedbackLayout(nativeLayout, List.copyOf(bins));
+    }
+
+    private void ensureRegionNestedFeedbackLayoutInSimulation(WindowKey key, RegionRecord region) {
+        if (simulationServiceId == 0L) {
+            return;
+        }
+        if (region.nestedFeedbackLayout == null) {
+            region.nestedFeedbackLayout = buildRegionNestedFeedbackLayout(key);
+        }
+        if (region.nestedFeedbackLayout == null) {
+            return;
+        }
+        if (region.nestedFeedbackLayoutServiceId == simulationServiceId) {
+            return;
+        }
+        if (simulationBridge.setRegionNestedFeedbackLayout(
+            simulationServiceId,
+            simulationRegionKey(key),
+            L2_TO_L1_FEEDBACK_STEPS,
+            region.nestedFeedbackLayout.nativeLayout()
+        )) {
+            region.nestedFeedbackLayoutServiceId = simulationServiceId;
+        }
+    }
+
+    private void pollRegionNestedFeedback(WindowKey key, RegionRecord region) {
+        if (simulationServiceId == 0L || region.nestedFeedbackLayout == null) {
+            return;
+        }
+        List<L2ToL1FeedbackLayoutBin> bins = region.nestedFeedbackLayout.bins();
+        if (bins.isEmpty()) {
+            return;
+        }
+        float[] values = new float[bins.size() * NativeSimulationBridge.NESTED_FEEDBACK_VALUES_PER_BIN];
+        if (!simulationBridge.pollRegionNestedFeedback(simulationServiceId, simulationRegionKey(key), values)) {
+            return;
+        }
+        float scale = 1.0f / L2_TO_L1_FEEDBACK_STEPS;
+        ConcurrentLinkedQueue<MesoscaleGrid.NestedFeedbackBin> queue = pendingNestedFeedbackBins.computeIfAbsent(
+            key.worldKey(),
+            ignored -> new ConcurrentLinkedQueue<>()
+        );
+        float volumeAverageSum = 0.0f;
+        float bottomFluxDensitySum = 0.0f;
+        float topFluxDensitySum = 0.0f;
+        int packetBinCount = 0;
+        for (int i = 0; i < bins.size(); i++) {
+            int base = i * NativeSimulationBridge.NESTED_FEEDBACK_VALUES_PER_BIN;
+            float volumeAverage = values[base] * scale;
+            float densityAverage = values[base + 1] * scale;
+            float momentumXAverage = values[base + 2] * scale;
+            float momentumZAverage = values[base + 3] * scale;
+            float airTemperatureVolumeAverage = values[base + 4] * scale;
+            float surfaceTemperatureVolumeAverage = values[base + 5] * scale;
+            float bottomAreaAverage = values[base + 6] * scale;
+            float bottomMassFluxAverage = values[base + 7] * scale;
+            float topAreaAverage = values[base + 8] * scale;
+            float topMassFluxAverage = values[base + 9] * scale;
+            if (!(volumeAverage > 0.0f) && !(bottomAreaAverage > 0.0f) && !(topAreaAverage > 0.0f)) {
+                continue;
+            }
+            float bottomFluxDensity = bottomAreaAverage > 0.0f ? bottomMassFluxAverage / bottomAreaAverage : 0.0f;
+            float topFluxDensity = topAreaAverage > 0.0f ? topMassFluxAverage / topAreaAverage : 0.0f;
+            L2ToL1FeedbackLayoutBin bin = bins.get(i);
+            queue.add(new MesoscaleGrid.NestedFeedbackBin(
+                bin.cellX(),
+                bin.layer(),
+                bin.cellZ(),
+                volumeAverage,
+                densityAverage,
+                momentumXAverage,
+                momentumZAverage,
+                airTemperatureVolumeAverage,
+                surfaceTemperatureVolumeAverage,
+                bottomAreaAverage,
+                bottomMassFluxAverage,
+                topAreaAverage,
+                topMassFluxAverage
+            ));
+            packetBinCount++;
+            volumeAverageSum += volumeAverage;
+            bottomFluxDensitySum += bottomFluxDensity;
+            topFluxDensitySum += topFluxDensity;
+        }
+        if (packetBinCount > 0) {
+            final int packetBinCountFinal = packetBinCount;
+            final float invPacketBinCount = 1.0f / packetBinCountFinal;
+            final float meanVolumeAverage = volumeAverageSum * invPacketBinCount;
+            final float meanBottomFluxDensity = bottomFluxDensitySum * invPacketBinCount;
+            final float meanTopFluxDensity = topFluxDensitySum * invPacketBinCount;
+            nestedFeedbackRuntimeDiagnostics.compute(key.worldKey(), (ignored, previous) -> new NestedFeedbackRuntimeDiagnostics(
+                (previous == null ? 0L : previous.polledPacketCount()) + 1L,
+                (previous == null ? 0L : previous.polledBinCount()) + packetBinCountFinal,
+                packetBinCountFinal,
+                tickCounter,
+                meanVolumeAverage,
+                meanBottomFluxDensity,
+                meanTopFluxDensity
+            ));
+        }
     }
 
     private boolean uploadRegionStaticFromMirror(WindowKey key, RegionRecord region) {
@@ -5617,6 +5957,7 @@ public final class AeroServerRuntime {
                 lastSolverError = "";
                 publishPlayerProbesForSolvedRegion(snapshot);
                 publishRegionAtlas(snapshot.key(), maxSpeed);
+                pollRegionNestedFeedback(snapshot.key(), region);
             }
         } catch (IOException ex) {
             if (snapshot.generation() == runtimeGeneration.get()) {
@@ -6383,6 +6724,39 @@ public final class AeroServerRuntime {
     ) {
     }
 
+    private record NestedFeedbackAxisSpan(int index, int localMin, int localMax) {
+    }
+
+    private record L2ToL1FeedbackLayoutBin(
+        int cellX,
+        int layer,
+        int cellZ,
+        int localMinX,
+        int localMaxX,
+        int localMinY,
+        int localMaxY,
+        int localMinZ,
+        int localMaxZ
+    ) {
+    }
+
+    private record L2ToL1FeedbackLayout(
+        int[] nativeLayout,
+        List<L2ToL1FeedbackLayoutBin> bins
+    ) {
+    }
+
+    private record NestedFeedbackRuntimeDiagnostics(
+        long polledPacketCount,
+        long polledBinCount,
+        int lastPacketBinCount,
+        int lastPolledTick,
+        float lastMeanVolumeAverage,
+        float lastMeanBottomFluxDensity,
+        float lastMeanTopFluxDensity
+    ) {
+    }
+
     private static final class RegionRecord {
         private final AtomicBoolean busy = new AtomicBoolean(false);
         private final AtomicBoolean released = new AtomicBoolean(false);
@@ -6400,6 +6774,8 @@ public final class AeroServerRuntime {
         private int lastThermalRefreshTick;
         private float completedMaxSpeed;
         private List<FanSource> fans = List.of();
+        private L2ToL1FeedbackLayout nestedFeedbackLayout;
+        private long nestedFeedbackLayoutServiceId;
 
         private RegionRecord() {
             Arrays.fill(uploadedSectionVersions, Long.MIN_VALUE);

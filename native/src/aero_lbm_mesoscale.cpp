@@ -127,6 +127,7 @@ constexpr int kChTornadoWindZ = 15;
 constexpr int kChTornadoHeating = 16;
 constexpr int kChTornadoMoistening = 17;
 constexpr int kChTornadoUpdraft = 18;
+constexpr int kChNestedUpdraft = 19;
 constexpr int kOutAmbient = 0;
 constexpr int kOutDeepGround = 1;
 constexpr int kOutSurface = 2;
@@ -379,6 +380,7 @@ CellTargets compute_cell_targets(
     const float tornado_heating = forcing[base + kChTornadoHeating];
     const float tornado_moistening = forcing[base + kChTornadoMoistening];
     const float tornado_updraft = forcing[base + kChTornadoUpdraft];
+    const float nested_updraft = forcing[base + kChNestedUpdraft];
     const float bg_wind_x = forcing[base + kChBackgroundWindX] + convective_inflow_x + tornado_wind_x;
     const float bg_wind_z = forcing[base + kChBackgroundWindZ] + convective_inflow_z + tornado_wind_z;
     const float humidity = std::clamp(forcing[base + kChHumidity] + convective_moistening + tornado_moistening, 0.0f, 1.0f);
@@ -428,6 +430,7 @@ CellTargets compute_cell_targets(
         + 0.08f * convective_heating * (0.5f + 0.5f * humidity)
         + 0.10f * tornado_heating * (0.45f + 0.55f * humidity)
         + 0.06f * tornado_updraft
+        + 0.06f * nested_updraft
         + 0.01f * ambient_h_lap
         + 0.02f * ambient_v_lap;
 
@@ -747,6 +750,7 @@ inline void compute_cell_targets(
     float tornado_heating = forcing[base + 16];
     float tornado_moistening = forcing[base + 17];
     float tornado_updraft = forcing[base + 18];
+    float nested_updraft = forcing[base + 19];
     float bg_wind_x = forcing[base + 6] + convective_inflow_x + tornado_wind_x;
     float bg_wind_z = forcing[base + 7] + convective_inflow_z + tornado_wind_z;
     float humidity = clamp(forcing[base + 9] + convective_moistening + tornado_moistening, 0.0f, 1.0f);
@@ -793,6 +797,7 @@ inline void compute_cell_targets(
         + 0.08f * convective_heating * (0.5f + 0.5f * humidity)
         + 0.10f * tornado_heating * (0.45f + 0.55f * humidity)
         + 0.06f * tornado_updraft
+        + 0.06f * nested_updraft
         + 0.01f * ambient_h_lap
         + 0.02f * ambient_v_lap;
 

@@ -16,7 +16,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final float DEFAULT_MOLECULAR_NU_M2_S = 1.5e-5f;
     private static final float DEFAULT_PRANDTL_AIR = 0.71f;
     private static final float DEFAULT_TURBULENT_PRANDTL = 0.85f;
-    private static final int NATIVE_FORCING_CHANNELS = 19;
+    private static final int NATIVE_FORCING_CHANNELS = 20;
     private static final int NATIVE_STATE_CHANNELS = 5;
     private static final int CH_TERRAIN_HEIGHT = 0;
     private static final int CH_BIOME_TEMPERATURE = 1;
@@ -37,11 +37,17 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final int CH_TORNADO_HEATING = 16;
     private static final int CH_TORNADO_MOISTENING = 17;
     private static final int CH_TORNADO_UPDRAFT = 18;
+    private static final int CH_NESTED_UPDRAFT = 19;
     private static final int OUT_AMBIENT = 0;
     private static final int OUT_DEEP_GROUND = 1;
     private static final int OUT_SURFACE = 2;
     private static final int OUT_WIND_X = 3;
     private static final int OUT_WIND_Z = 4;
+    private static final float NESTED_FEEDBACK_WIND_BLEND = 0.45f;
+    private static final float NESTED_FEEDBACK_AIR_BLEND = 0.35f;
+    private static final float NESTED_FEEDBACK_SURFACE_BLEND = 0.30f;
+    private static final float NESTED_FEEDBACK_UPDRAFT_BLEND = 0.60f;
+    private static final float NESTED_FEEDBACK_MAX_UPDRAFT = 2.5f;
 
     private final int cellSizeBlocks;
     private final int radiusCells;
@@ -62,6 +68,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private long lastForcingRefreshTick = Long.MIN_VALUE;
     private float accumulatedStepSeconds = 0.0f;
     private boolean forcingReady = false;
+    private NestedFeedbackDiagnostics nestedFeedbackDiagnostics = NestedFeedbackDiagnostics.EMPTY;
 
     MesoscaleGrid(
         int cellSizeBlocks,
@@ -397,6 +404,11 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] ambientAirTemperatureKelvin = new float[stateCount];
         float[] deepGroundTemperatureKelvin = new float[stateCount];
         float[] surfaceTemperatureKelvin = new float[stateCount];
+        float[] forcingAmbientTargetKelvin = new float[stateCount];
+        float[] forcingSurfaceTargetKelvin = new float[stateCount];
+        float[] forcingBackgroundWindX = new float[stateCount];
+        float[] forcingBackgroundWindZ = new float[stateCount];
+        float[] forcingNestedUpdraft = new float[stateCount];
         float[] windX = new float[stateCount];
         float[] windZ = new float[stateCount];
         float[] humidity = new float[stateCount];
@@ -434,6 +446,21 @@ final class MesoscaleGrid implements AutoCloseable {
                     ambientAirTemperatureKelvin[stateIndex] = cell.ambientAirTemperatureKelvin[layer];
                     deepGroundTemperatureKelvin[stateIndex] = cell.deepGroundTemperatureKelvin[layer];
                     surfaceTemperatureKelvin[stateIndex] = cell.surfaceTemperatureKelvin[layer];
+                    forcingAmbientTargetKelvin[stateIndex] = forcingBase >= 0 && forcingBase + CH_AMBIENT_TARGET < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_AMBIENT_TARGET]
+                        : 0.0f;
+                    forcingSurfaceTargetKelvin[stateIndex] = forcingBase >= 0 && forcingBase + CH_SURFACE_TARGET < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_SURFACE_TARGET]
+                        : 0.0f;
+                    forcingBackgroundWindX[stateIndex] = forcingBase >= 0 && forcingBase + CH_BACKGROUND_WIND_X < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_BACKGROUND_WIND_X]
+                        : 0.0f;
+                    forcingBackgroundWindZ[stateIndex] = forcingBase >= 0 && forcingBase + CH_BACKGROUND_WIND_Z < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_BACKGROUND_WIND_Z]
+                        : 0.0f;
+                    forcingNestedUpdraft[stateIndex] = forcingBase >= 0 && forcingBase + CH_NESTED_UPDRAFT < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_NESTED_UPDRAFT]
+                        : 0.0f;
                     windX[stateIndex] = cell.windX[layer];
                     windZ[stateIndex] = cell.windZ[layer];
                     humidity[stateIndex] = cell.humidity[layer];
@@ -463,6 +490,9 @@ final class MesoscaleGrid implements AutoCloseable {
                         : 0.0f;
                     tornadoUpdraft[stateIndex] = forcingBase >= 0 && forcingBase + CH_TORNADO_UPDRAFT < forcingBuffer.length
                         ? forcingBuffer[forcingBase + CH_TORNADO_UPDRAFT]
+                            + (forcingBase + CH_NESTED_UPDRAFT < forcingBuffer.length
+                                ? forcingBuffer[forcingBase + CH_NESTED_UPDRAFT]
+                                : 0.0f)
                         : 0.0f;
                 }
             }
@@ -510,13 +540,19 @@ final class MesoscaleGrid implements AutoCloseable {
             ambientAirTemperatureKelvin,
             deepGroundTemperatureKelvin,
             surfaceTemperatureKelvin,
+            forcingAmbientTargetKelvin,
+            forcingSurfaceTargetKelvin,
+            forcingBackgroundWindX,
+            forcingBackgroundWindZ,
+            forcingNestedUpdraft,
             windX,
             windZ,
             humidity,
             instabilityProxy,
             lowLevelShear,
             moistureConvergence,
-            liftProxy
+            liftProxy,
+            nestedFeedbackDiagnostics
         );
     }
 
@@ -530,6 +566,7 @@ final class MesoscaleGrid implements AutoCloseable {
         lastForcingRefreshTick = Long.MIN_VALUE;
         accumulatedStepSeconds = 0.0f;
         forcingReady = false;
+        nestedFeedbackDiagnostics = NestedFeedbackDiagnostics.EMPTY;
     }
 
     synchronized void runPendingSteps() {
@@ -546,6 +583,186 @@ final class MesoscaleGrid implements AutoCloseable {
             }
         }
         accumulatedStepSeconds -= stepsToRun * stepSeconds;
+    }
+
+    synchronized void applyPendingNestedFeedback(Iterable<NestedFeedbackBin> feedbackBins) {
+        if (feedbackBins == null || activeLayers <= 0 || forcingBuffer.length == 0) {
+            return;
+        }
+        Map<NestedFeedbackKey, NestedFeedbackAccumulator> aggregates = new HashMap<>();
+        int inputBinCount = 0;
+        int acceptedBinCount = 0;
+        for (NestedFeedbackBin bin : feedbackBins) {
+            inputBinCount++;
+            if (bin == null || !(bin.volumeAverage() > 0.0f)) {
+                continue;
+            }
+            int layer = MathHelper.clamp(bin.layer(), 0, activeLayers - 1);
+            if (bin.cellX() < centerCellX - radiusCells
+                || bin.cellX() > centerCellX + radiusCells
+                || bin.cellZ() < centerCellZ - radiusCells
+                || bin.cellZ() > centerCellZ + radiusCells) {
+                continue;
+            }
+            NestedFeedbackKey key = new NestedFeedbackKey(bin.cellX(), layer, bin.cellZ());
+            aggregates.computeIfAbsent(key, ignored -> new NestedFeedbackAccumulator()).add(bin);
+            acceptedBinCount++;
+        }
+        if (aggregates.isEmpty()) {
+            nestedFeedbackDiagnostics = new NestedFeedbackDiagnostics(
+                lastTickProcessed,
+                inputBinCount,
+                acceptedBinCount,
+                0,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f
+            );
+            return;
+        }
+
+        int gridWidth = radiusCells * 2 + 1;
+        float coarseCellVolume = Math.max(1.0f, cellSizeBlocks * cellSizeBlocks * layerHeightBlocks);
+        int appliedCellCount = 0;
+        float coverageSum = 0.0f;
+        float maxCoverage = 0.0f;
+        float windDeltaSum = 0.0f;
+        float maxWindDelta = 0.0f;
+        float airDeltaSum = 0.0f;
+        float maxAirDelta = 0.0f;
+        float surfaceDeltaSum = 0.0f;
+        float maxSurfaceDelta = 0.0f;
+        float bottomFluxDensitySum = 0.0f;
+        float topFluxDensitySum = 0.0f;
+        float nestedUpdraftSum = 0.0f;
+        float maxAbsNestedUpdraft = 0.0f;
+        for (Map.Entry<NestedFeedbackKey, NestedFeedbackAccumulator> entry : aggregates.entrySet()) {
+            NestedFeedbackKey key = entry.getKey();
+            NestedFeedbackAccumulator aggregate = entry.getValue();
+            float densityAverage = Math.max(1.0e-6f, aggregate.densityAverage);
+            float coverage = MathHelper.clamp(aggregate.volumeAverage / coarseCellVolume, 0.0f, 1.0f);
+            if (coverage <= 0.0f) {
+                continue;
+            }
+
+            float meanWindX = aggregate.momentumXAverage / densityAverage;
+            float meanWindZ = aggregate.momentumZAverage / densityAverage;
+            float meanAirTemperature = aggregate.airTemperatureVolumeAverage / Math.max(1.0e-6f, aggregate.volumeAverage);
+            float meanSurfaceTemperature = aggregate.surfaceTemperatureVolumeAverage / Math.max(1.0e-6f, aggregate.volumeAverage);
+            float bottomFluxDensity = aggregate.bottomAreaAverage > 0.0f
+                ? aggregate.bottomMassFluxAverage / aggregate.bottomAreaAverage
+                : 0.0f;
+            float topFluxDensity = aggregate.topAreaAverage > 0.0f
+                ? aggregate.topMassFluxAverage / aggregate.topAreaAverage
+                : 0.0f;
+            float meanVerticalVelocity = 0.5f * (bottomFluxDensity + topFluxDensity) / densityAverage;
+            float nestedUpdraft = MathHelper.clamp(meanVerticalVelocity, -NESTED_FEEDBACK_MAX_UPDRAFT, NESTED_FEEDBACK_MAX_UPDRAFT);
+
+            CellColumnState cell = cells.computeIfAbsent(pack(key.cellX(), key.cellZ()), ignored -> new CellColumnState(activeLayers));
+            cell.ensureLayers(activeLayers);
+            int base = forcingIndex(key.cellX(), key.layer(), key.cellZ(), gridWidth) * NATIVE_FORCING_CHANNELS;
+            float windBlend = MathHelper.clamp(NESTED_FEEDBACK_WIND_BLEND * coverage, 0.0f, 1.0f);
+            float airBlend = MathHelper.clamp(NESTED_FEEDBACK_AIR_BLEND * coverage, 0.0f, 1.0f);
+            float surfaceBlend = MathHelper.clamp(NESTED_FEEDBACK_SURFACE_BLEND * coverage, 0.0f, 1.0f);
+            float updraftBlend = MathHelper.clamp(NESTED_FEEDBACK_UPDRAFT_BLEND * coverage, 0.0f, 1.0f);
+
+            float previousWindX = cell.windX[key.layer()];
+            float previousWindZ = cell.windZ[key.layer()];
+            float previousAirTemperature = cell.ambientAirTemperatureKelvin[key.layer()];
+            float previousSurfaceTemperature = cell.surfaceTemperatureKelvin[key.layer()];
+            float previousNestedUpdraft = forcingBuffer[base + CH_NESTED_UPDRAFT];
+
+            forcingBuffer[base + CH_BACKGROUND_WIND_X] = MathHelper.lerp(windBlend, forcingBuffer[base + CH_BACKGROUND_WIND_X], meanWindX);
+            forcingBuffer[base + CH_BACKGROUND_WIND_Z] = MathHelper.lerp(windBlend, forcingBuffer[base + CH_BACKGROUND_WIND_Z], meanWindZ);
+            forcingBuffer[base + CH_AMBIENT_TARGET] = MathHelper.lerp(airBlend, forcingBuffer[base + CH_AMBIENT_TARGET], meanAirTemperature);
+            forcingBuffer[base + CH_NESTED_UPDRAFT] = MathHelper.lerp(updraftBlend, forcingBuffer[base + CH_NESTED_UPDRAFT], nestedUpdraft);
+
+            cell.windX[key.layer()] = MathHelper.lerp(windBlend, previousWindX, meanWindX);
+            cell.windZ[key.layer()] = MathHelper.lerp(windBlend, previousWindZ, meanWindZ);
+            cell.ambientAirTemperatureKelvin[key.layer()] = MathHelper.lerp(airBlend, previousAirTemperature, meanAirTemperature);
+
+            if (Float.isFinite(meanSurfaceTemperature) && meanSurfaceTemperature > 0.0f) {
+                forcingBuffer[base + CH_SURFACE_TARGET] = MathHelper.lerp(surfaceBlend, forcingBuffer[base + CH_SURFACE_TARGET], meanSurfaceTemperature);
+                cell.surfaceTemperatureKelvin[key.layer()] = MathHelper.lerp(surfaceBlend, previousSurfaceTemperature, meanSurfaceTemperature);
+            }
+
+            float appliedWindDelta = (float) Math.sqrt(
+                (cell.windX[key.layer()] - previousWindX) * (cell.windX[key.layer()] - previousWindX)
+                    + (cell.windZ[key.layer()] - previousWindZ) * (cell.windZ[key.layer()] - previousWindZ)
+            );
+            float appliedAirDelta = Math.abs(cell.ambientAirTemperatureKelvin[key.layer()] - previousAirTemperature);
+            float appliedSurfaceDelta = Math.abs(cell.surfaceTemperatureKelvin[key.layer()] - previousSurfaceTemperature);
+            float appliedNestedUpdraft = forcingBuffer[base + CH_NESTED_UPDRAFT];
+
+            appliedCellCount++;
+            coverageSum += coverage;
+            maxCoverage = Math.max(maxCoverage, coverage);
+            windDeltaSum += appliedWindDelta;
+            maxWindDelta = Math.max(maxWindDelta, appliedWindDelta);
+            airDeltaSum += appliedAirDelta;
+            maxAirDelta = Math.max(maxAirDelta, appliedAirDelta);
+            surfaceDeltaSum += appliedSurfaceDelta;
+            maxSurfaceDelta = Math.max(maxSurfaceDelta, appliedSurfaceDelta);
+            bottomFluxDensitySum += bottomFluxDensity;
+            topFluxDensitySum += topFluxDensity;
+            nestedUpdraftSum += appliedNestedUpdraft;
+            maxAbsNestedUpdraft = Math.max(maxAbsNestedUpdraft, Math.max(Math.abs(appliedNestedUpdraft), Math.abs(previousNestedUpdraft)));
+        }
+
+        if (appliedCellCount <= 0) {
+            nestedFeedbackDiagnostics = new NestedFeedbackDiagnostics(
+                lastTickProcessed,
+                inputBinCount,
+                acceptedBinCount,
+                0,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f
+            );
+            return;
+        }
+
+        float appliedCellCountInv = 1.0f / appliedCellCount;
+        nestedFeedbackDiagnostics = new NestedFeedbackDiagnostics(
+            lastTickProcessed,
+            inputBinCount,
+            acceptedBinCount,
+            appliedCellCount,
+            coverageSum * appliedCellCountInv,
+            maxCoverage,
+            windDeltaSum * appliedCellCountInv,
+            maxWindDelta,
+            airDeltaSum * appliedCellCountInv,
+            maxAirDelta,
+            surfaceDeltaSum * appliedCellCountInv,
+            maxSurfaceDelta,
+            bottomFluxDensitySum * appliedCellCountInv,
+            topFluxDensitySum * appliedCellCountInv,
+            nestedUpdraftSum * appliedCellCountInv,
+            maxAbsNestedUpdraft
+        );
+    }
+
+    synchronized NestedFeedbackDiagnostics nestedFeedbackDiagnostics() {
+        return nestedFeedbackDiagnostics;
     }
 
     private int cellCenterBlock(int cell) {
@@ -651,6 +868,7 @@ final class MesoscaleGrid implements AutoCloseable {
                     forcingBuffer[base + CH_TORNADO_HEATING] = bgTornadoHeating * tornadoLayerWeight;
                     forcingBuffer[base + CH_TORNADO_MOISTENING] = bgTornadoMoistening * tornadoLayerWeight;
                     forcingBuffer[base + CH_TORNADO_UPDRAFT] = bgTornadoUpdraft * tornadoLayerWeight;
+                    forcingBuffer[base + CH_NESTED_UPDRAFT] = 0.0f;
                     cell.humidity[layer] = layerHumidity;
                 }
             }
@@ -1019,7 +1237,8 @@ final class MesoscaleGrid implements AutoCloseable {
                     float tornadoMoistening = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_MOISTENING);
                     float tornadoWindX = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_WIND_X);
                     float tornadoWindZ = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_WIND_Z);
-                    float tornadoUpdraft = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_UPDRAFT);
+                    float tornadoUpdraft = forcingChannel(cx, layer, cz, gridWidth, CH_TORNADO_UPDRAFT)
+                        + forcingChannel(cx, layer, cz, gridWidth, CH_NESTED_UPDRAFT);
                     float instability = computeInstabilityProxy(
                         surfaceReferenceKelvin,
                         deepGroundReferenceKelvin,
@@ -1107,6 +1326,52 @@ final class MesoscaleGrid implements AutoCloseable {
         return (int) packed;
     }
 
+    record NestedFeedbackBin(
+        int cellX,
+        int layer,
+        int cellZ,
+        float volumeAverage,
+        float densityAverage,
+        float momentumXAverage,
+        float momentumZAverage,
+        float airTemperatureVolumeAverage,
+        float surfaceTemperatureVolumeAverage,
+        float bottomAreaAverage,
+        float bottomMassFluxAverage,
+        float topAreaAverage,
+        float topMassFluxAverage
+    ) {
+    }
+
+    private record NestedFeedbackKey(int cellX, int layer, int cellZ) {
+    }
+
+    private static final class NestedFeedbackAccumulator {
+        private float volumeAverage;
+        private float densityAverage;
+        private float momentumXAverage;
+        private float momentumZAverage;
+        private float airTemperatureVolumeAverage;
+        private float surfaceTemperatureVolumeAverage;
+        private float bottomAreaAverage;
+        private float bottomMassFluxAverage;
+        private float topAreaAverage;
+        private float topMassFluxAverage;
+
+        private void add(NestedFeedbackBin bin) {
+            volumeAverage += bin.volumeAverage();
+            densityAverage += bin.densityAverage();
+            momentumXAverage += bin.momentumXAverage();
+            momentumZAverage += bin.momentumZAverage();
+            airTemperatureVolumeAverage += bin.airTemperatureVolumeAverage();
+            surfaceTemperatureVolumeAverage += bin.surfaceTemperatureVolumeAverage();
+            bottomAreaAverage += bin.bottomAreaAverage();
+            bottomMassFluxAverage += bin.bottomMassFluxAverage();
+            topAreaAverage += bin.topAreaAverage();
+            topMassFluxAverage += bin.topMassFluxAverage();
+        }
+    }
+
     record Sample(
         float terrainHeightBlocks,
         float biomeTemperature,
@@ -1139,14 +1404,58 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] ambientAirTemperatureKelvin,
         float[] deepGroundTemperatureKelvin,
         float[] surfaceTemperatureKelvin,
+        float[] forcingAmbientTargetKelvin,
+        float[] forcingSurfaceTargetKelvin,
+        float[] forcingBackgroundWindX,
+        float[] forcingBackgroundWindZ,
+        float[] forcingNestedUpdraft,
         float[] windX,
         float[] windZ,
         float[] humidity,
         float[] instabilityProxy,
         float[] lowLevelShear,
         float[] moistureConvergence,
-        float[] liftProxy
+        float[] liftProxy,
+        NestedFeedbackDiagnostics nestedFeedbackDiagnostics
     ) {
+    }
+
+    record NestedFeedbackDiagnostics(
+        long lastAppliedTick,
+        int inputBinCount,
+        int acceptedBinCount,
+        int appliedCellCount,
+        float meanCoverage,
+        float maxCoverage,
+        float meanWindDelta,
+        float maxWindDelta,
+        float meanAirDeltaKelvin,
+        float maxAirDeltaKelvin,
+        float meanSurfaceDeltaKelvin,
+        float maxSurfaceDeltaKelvin,
+        float meanBottomFluxDensity,
+        float meanTopFluxDensity,
+        float meanNestedUpdraft,
+        float maxAbsNestedUpdraft
+    ) {
+        private static final NestedFeedbackDiagnostics EMPTY = new NestedFeedbackDiagnostics(
+            Long.MIN_VALUE,
+            0,
+            0,
+            0,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f
+        );
     }
 
     record DiagnosticsSummary(
