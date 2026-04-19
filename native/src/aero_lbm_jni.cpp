@@ -132,6 +132,7 @@ constexpr float kFanSpeedSoftCap = 0.24f;
 constexpr float kFanSpeedDampWidth = 0.04f;
 constexpr float kFanPerpDamp = 1.0f;
 constexpr float kRuntimeStateNudge = 0.08f;
+constexpr int kRuntimeStateNudgeLayers = 8;
 constexpr float kMaxSpeed = kHardMaxLatticeSpeed;
 
 // Boussinesq approximation with an internal thermal scalar field.
@@ -595,10 +596,20 @@ inline bool benchmark_mode_active() {
 }
 
 inline float effective_state_nudge() {
-    // In the runtime path, the native context is the authoritative L2 state.
-    // Continuing to nudge toward packet-provided macrostate couples each step
-    // back to the Java-side dynamic mirror and defeats that ownership model.
-    return 0.0f;
+    return benchmark_mode_active() ? 0.0f : kRuntimeStateNudge;
+}
+
+inline float effective_runtime_state_nudge(int nx, int ny, int nz, int x, int y, int z) {
+    const float base = effective_state_nudge();
+    if (base <= 0.0f || kRuntimeStateNudgeLayers <= 0) {
+        return 0.0f;
+    }
+    const int d = std::min({x, y, z, nx - 1 - x, ny - 1 - y, nz - 1 - z});
+    if (d >= kRuntimeStateNudgeLayers) {
+        return 0.0f;
+    }
+    const float eta = static_cast<float>(kRuntimeStateNudgeLayers - d) / static_cast<float>(kRuntimeStateNudgeLayers);
+    return base * eta * eta;
 }
 
 bool halo_exchange_slab_bounds(
@@ -2038,7 +2049,12 @@ void collide(ContextState& ctx) {
         uy += 0.5f * duy;
         uz += 0.5f * duz;
 
-        const float state_nudge = effective_state_nudge();
+        const int yz = ctx.ny * ctx.nz;
+        const int x = static_cast<int>(cell / yz);
+        const int rem = static_cast<int>(cell - static_cast<std::size_t>(x) * yz);
+        const int y = rem / ctx.nz;
+        const int z = rem - y * ctx.nz;
+        const float state_nudge = effective_runtime_state_nudge(ctx.nx, ctx.ny, ctx.nz, x, y, z);
         ux = (1.0f - state_nudge) * ux + state_nudge * ctx.ref_ux[cell];
         uy = (1.0f - state_nudge) * uy + state_nudge * ctx.ref_uy[cell];
         uz = (1.0f - state_nudge) * uz + state_nudge * ctx.ref_uz[cell];
@@ -3349,9 +3365,15 @@ kernel void stream_collide_hydro_forced_step(
     ux += 0.5f * dux;
     uy += 0.5f * duy;
     uz += 0.5f * duz;
-    ux = mix(ux, payload[base + 5], state_nudge);
-    uy = mix(uy, payload[base + 6], state_nudge);
-    uz = mix(uz, payload[base + 7], state_nudge);
+    int edge_distance = min(min(min(x, y), z), min(min(nx - 1 - x, ny - 1 - y), nz - 1 - z));
+    float local_state_nudge = 0.0f;
+    if (state_nudge > 0.0f && edge_distance < 8) {
+        float eta = (8.0f - (float)edge_distance) / 8.0f;
+        local_state_nudge = state_nudge * eta * eta;
+    }
+    ux = mix(ux, payload[base + 5], local_state_nudge);
+    uy = mix(uy, payload[base + 6], local_state_nudge);
+    uz = mix(uz, payload[base + 7], local_state_nudge);
 
     float speed2 = ux * ux + uy * uy + uz * uz;
     if (speed2 > MAX_SPEED * MAX_SPEED) {

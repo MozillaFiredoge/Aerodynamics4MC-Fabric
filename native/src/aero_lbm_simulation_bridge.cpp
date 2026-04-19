@@ -1344,6 +1344,12 @@ bool refresh_region_thermal(
     if (dynamic.air_temperature.size() != static_cast<size_t>(cells)) {
         dynamic.air_temperature.assign(static_cast<size_t>(cells), 0.0f);
     }
+    if (aero_lbm_has_context(region_key)) {
+        if (!sync_dynamic_region_temperature_from_native(region_key, dynamic)) {
+            set_simulation_last_error(std::string("simulation_refresh_region_thermal temperature sync failed: ") + aero_lbm_last_error());
+            return false;
+        }
+    }
     if (forcing.thermal_source.size() != static_cast<size_t>(cells)) {
         forcing.thermal_source.assign(static_cast<size_t>(cells), 0.0f);
     } else {
