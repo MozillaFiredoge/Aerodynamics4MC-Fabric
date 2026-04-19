@@ -10,6 +10,7 @@ public final class NativeSimulationBridge {
     public static final int NESTED_FEEDBACK_MAX_BINS = 8;
     public static final int NESTED_FEEDBACK_LAYOUT_INTS_PER_BIN = 9;
     public static final int NESTED_FEEDBACK_VALUES_PER_BIN = 10;
+    public static final int NESTED_FEEDBACK_STATUS_FIELDS = 6;
     private static final int FACE_COUNT = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
@@ -24,6 +25,7 @@ public final class NativeSimulationBridge {
     private static final String LIB_NAME = "aero_lbm";
     private static final boolean LOADED;
     private static final String LOAD_ERROR;
+    private static volatile boolean nestedFeedbackStatusSupported = true;
 
     static {
         boolean loaded = false;
@@ -604,6 +606,31 @@ public final class NativeSimulationBridge {
         return nativePollRegionNestedFeedback(serviceKey, regionKey, outValues);
     }
 
+    public NestedFeedbackStatus getRegionNestedFeedbackStatus(long serviceKey, long regionKey) {
+        if (!LOADED || !nestedFeedbackStatusSupported || serviceKey == 0L || regionKey == 0L) {
+            return null;
+        }
+        int[] status = new int[NESTED_FEEDBACK_STATUS_FIELDS];
+        final boolean ok;
+        try {
+            ok = nativeGetRegionNestedFeedbackStatus(serviceKey, regionKey, status);
+        } catch (UnsatisfiedLinkError error) {
+            nestedFeedbackStatusSupported = false;
+            return null;
+        }
+        if (!ok) {
+            return null;
+        }
+        return new NestedFeedbackStatus(
+            status[0],
+            status[1],
+            status[2],
+            status[3],
+            status[4],
+            status[5]
+        );
+    }
+
     public boolean setPackedFlowAtlas(long serviceKey, long atlasKey, short[] packedValues) {
         if (!LOADED || serviceKey == 0L || atlasKey == 0L || packedValues == null || packedValues.length == 0) {
             return false;
@@ -704,6 +731,16 @@ public final class NativeSimulationBridge {
         float value1,
         float value2,
         float value3
+    ) {
+    }
+
+    public record NestedFeedbackStatus(
+        int configuredBinCount,
+        int stepsPerFeedback,
+        int stepsAccumulated,
+        int readyPacketBinCount,
+        int emittedPacketCount,
+        int resetCount
     ) {
     }
 
@@ -918,6 +955,12 @@ public final class NativeSimulationBridge {
         long serviceKey,
         long regionKey,
         float[] outValues
+    );
+
+    private static native boolean nativeGetRegionNestedFeedbackStatus(
+        long serviceKey,
+        long regionKey,
+        int[] outStatus
     );
 
     private static native boolean nativeSetPackedFlowAtlas(long serviceKey, long atlasKey, short[] packedValues);

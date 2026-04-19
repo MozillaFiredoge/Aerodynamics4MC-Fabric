@@ -401,6 +401,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_poll_region_nested_feedback(
     float* out_values,
     int value_count
 );
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_nested_feedback_status(
+    long long service_key,
+    long long region_key,
+    int* out_status,
+    int status_count
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_packed_flow_atlas(
     long long service_key,
     long long atlas_key,

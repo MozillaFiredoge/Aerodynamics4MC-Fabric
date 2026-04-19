@@ -826,6 +826,8 @@ final class MesoscaleGrid implements AutoCloseable {
     ) {
         int gridWidth = radiusCells * 2 + 1;
         int cellCount = gridWidth * activeLayers * gridWidth;
+        boolean preserveNestedFeedback = forcingReady
+            && forcingBuffer.length == cellCount * NATIVE_FORCING_CHANNELS;
         ensureNativeBuffers(cellCount);
         MesoscaleNativeBridge.Transport transport = nativeBridge.deriveTransport(
             gridWidth,
@@ -898,6 +900,21 @@ final class MesoscaleGrid implements AutoCloseable {
                     float tornadoLayerWeight = surfaceInfluence
                         * (1.0f - 0.75f * (layer / (float) Math.max(1, activeLayers - 1)));
                     int base = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS;
+                    float preservedNestedUpdraft = preserveNestedFeedback
+                        ? finiteOrDefault(forcingBuffer[base + CH_NESTED_UPDRAFT], 0.0f)
+                        : 0.0f;
+                    float preservedNestedWindXDelta = preserveNestedFeedback
+                        ? finiteOrDefault(forcingBuffer[base + CH_NESTED_WIND_X_DELTA], 0.0f)
+                        : 0.0f;
+                    float preservedNestedWindZDelta = preserveNestedFeedback
+                        ? finiteOrDefault(forcingBuffer[base + CH_NESTED_WIND_Z_DELTA], 0.0f)
+                        : 0.0f;
+                    float preservedNestedAmbientDelta = preserveNestedFeedback
+                        ? finiteOrDefault(forcingBuffer[base + CH_NESTED_AMBIENT_DELTA], 0.0f)
+                        : 0.0f;
+                    float preservedNestedSurfaceDelta = preserveNestedFeedback
+                        ? finiteOrDefault(forcingBuffer[base + CH_NESTED_SURFACE_DELTA], 0.0f)
+                        : 0.0f;
                     forcingBuffer[base + CH_TERRAIN_HEIGHT] = cell.terrainHeightBlocks;
                     forcingBuffer[base + CH_BIOME_TEMPERATURE] = cell.biomeTemperature;
                     forcingBuffer[base + CH_AMBIENT_TARGET] = layerAmbient;
@@ -917,11 +934,11 @@ final class MesoscaleGrid implements AutoCloseable {
                     forcingBuffer[base + CH_TORNADO_HEATING] = bgTornadoHeating * tornadoLayerWeight;
                     forcingBuffer[base + CH_TORNADO_MOISTENING] = bgTornadoMoistening * tornadoLayerWeight;
                     forcingBuffer[base + CH_TORNADO_UPDRAFT] = bgTornadoUpdraft * tornadoLayerWeight;
-                    forcingBuffer[base + CH_NESTED_UPDRAFT] = 0.0f;
-                    forcingBuffer[base + CH_NESTED_WIND_X_DELTA] = 0.0f;
-                    forcingBuffer[base + CH_NESTED_WIND_Z_DELTA] = 0.0f;
-                    forcingBuffer[base + CH_NESTED_AMBIENT_DELTA] = 0.0f;
-                    forcingBuffer[base + CH_NESTED_SURFACE_DELTA] = 0.0f;
+                    forcingBuffer[base + CH_NESTED_UPDRAFT] = preservedNestedUpdraft;
+                    forcingBuffer[base + CH_NESTED_WIND_X_DELTA] = preservedNestedWindXDelta;
+                    forcingBuffer[base + CH_NESTED_WIND_Z_DELTA] = preservedNestedWindZDelta;
+                    forcingBuffer[base + CH_NESTED_AMBIENT_DELTA] = preservedNestedAmbientDelta;
+                    forcingBuffer[base + CH_NESTED_SURFACE_DELTA] = preservedNestedSurfaceDelta;
                     cell.humidity[layer] = layerHumidity;
                 }
             }

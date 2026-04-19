@@ -1832,11 +1832,13 @@ public final class AeroServerRuntime {
         ConcurrentLinkedQueue<MesoscaleGrid.NestedFeedbackBin> queue = pendingNestedFeedbackBins.get(worldKey);
         int pendingBinCount = queue == null ? 0 : queue.size();
         NestedFeedbackRuntimeDiagnostics runtimeDiagnostics = nestedFeedbackRuntimeDiagnostics.get(worldKey);
+        NativeNestedFeedbackWorldDiagnostics nativeDiagnostics = collectNativeNestedFeedbackWorldDiagnostics(worldKey);
         MesoscaleGrid grid = mesoscaleMetGrids.get(worldKey);
         MesoscaleGrid.NestedFeedbackDiagnostics applyDiagnostics = grid == null
             ? null
             : grid.nestedFeedbackDiagnostics();
         if (runtimeDiagnostics == null
+            && nativeDiagnostics == null
             && (applyDiagnostics == null || applyDiagnostics.lastAppliedTick() == Long.MIN_VALUE)
             && pendingBinCount <= 0) {
             return false;
@@ -1874,7 +1876,88 @@ public final class AeroServerRuntime {
                 + " updraftMean=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.meanNestedUpdraft())
                 + " updraftMax=" + format3(applyDiagnostics == null ? 0.0f : applyDiagnostics.maxAbsNestedUpdraft())
         );
+        if (nativeDiagnostics != null) {
+            int lastBackendResetAgeTicks = nativeDiagnostics.lastBackendResetTick() == Integer.MIN_VALUE
+                ? -1
+                : Math.max(0, tickCounter - nativeDiagnostics.lastBackendResetTick());
+            feedback(
+                source,
+                "NestedFeedback native regions=" + nativeDiagnostics.regionCount()
+                    + " bins=" + nativeDiagnostics.configuredBinCount()
+                    + " steps=" + nativeDiagnostics.maxStepsAccumulated()
+                    + "/" + nativeDiagnostics.stepsPerFeedback()
+                    + " minSteps=" + nativeDiagnostics.minStepsAccumulated()
+                    + " readyRegions=" + nativeDiagnostics.readyRegionCount()
+                    + " emittedPackets=" + nativeDiagnostics.emittedPacketCount()
+                    + " nativeResets=" + nativeDiagnostics.nativeResetCount()
+                    + " backendResets=" + nativeDiagnostics.backendResetCount()
+                    + " lastBackendResetAge=" + lastBackendResetAgeTicks
+            );
+        }
         return true;
+    }
+
+    private NativeNestedFeedbackWorldDiagnostics collectNativeNestedFeedbackWorldDiagnostics(RegistryKey<World> worldKey) {
+        if (simulationServiceId == 0L) {
+            return null;
+        }
+        int regionCount = 0;
+        int configuredBinCount = 0;
+        int stepsPerFeedback = 0;
+        int minStepsAccumulated = Integer.MAX_VALUE;
+        int maxStepsAccumulated = 0;
+        int readyRegionCount = 0;
+        long emittedPacketCount = 0L;
+        long nativeResetCount = 0L;
+        long backendResetCount = 0L;
+        int lastBackendResetTick = Integer.MIN_VALUE;
+        for (Map.Entry<WindowKey, RegionRecord> entry : regions.entrySet()) {
+            WindowKey key = entry.getKey();
+            if (!key.worldKey().equals(worldKey)) {
+                continue;
+            }
+            RegionRecord region = entry.getValue();
+            if (!region.serviceActive || region.nestedFeedbackLayout == null) {
+                continue;
+            }
+            NativeSimulationBridge.NestedFeedbackStatus status = simulationBridge.getRegionNestedFeedbackStatus(
+                simulationServiceId,
+                simulationRegionKey(key)
+            );
+            if (status == null || status.configuredBinCount() <= 0) {
+                continue;
+            }
+            regionCount++;
+            configuredBinCount += status.configuredBinCount();
+            stepsPerFeedback = Math.max(stepsPerFeedback, status.stepsPerFeedback());
+            minStepsAccumulated = Math.min(minStepsAccumulated, status.stepsAccumulated());
+            maxStepsAccumulated = Math.max(maxStepsAccumulated, status.stepsAccumulated());
+            if (status.readyPacketBinCount() > 0) {
+                readyRegionCount++;
+            }
+            emittedPacketCount += status.emittedPacketCount();
+            nativeResetCount += status.resetCount();
+            backendResetCount += region.backendResetCount();
+            lastBackendResetTick = Math.max(lastBackendResetTick, region.lastBackendResetTick());
+        }
+        if (regionCount <= 0) {
+            return null;
+        }
+        if (minStepsAccumulated == Integer.MAX_VALUE) {
+            minStepsAccumulated = 0;
+        }
+        return new NativeNestedFeedbackWorldDiagnostics(
+            regionCount,
+            configuredBinCount,
+            stepsPerFeedback,
+            minStepsAccumulated,
+            maxStepsAccumulated,
+            readyRegionCount,
+            emittedPacketCount,
+            nativeResetCount,
+            backendResetCount,
+            lastBackendResetTick
+        );
     }
 
     private String encodeBackgroundSnapshot(RegistryKey<World> worldKey, BackgroundMetGrid.Snapshot snapshot) {
@@ -3345,6 +3428,7 @@ public final class AeroServerRuntime {
     private void resetWindowBackend(WindowKey key, RegionRecord region) {
         if (simulationServiceId != 0L) {
             simulationBridge.releaseRegionRuntime(simulationServiceId, simulationRegionKey(key));
+            region.noteBackendReset(tickCounter);
             if (region.sections != null) {
                 refreshRegionLifecycle(key, region);
                 if (!region.serviceActive) {
@@ -4201,7 +4285,9 @@ public final class AeroServerRuntime {
                     }
                     region.setSection(sx, sy, sz, snapshot);
                     region.uploadedSectionVersions[sectionIndex] = snapshot.version();
-                    region.markBackendResetPending();
+                    if (isCoreSection(sx, sy, sz)) {
+                        region.markBackendResetPending();
+                    }
                     uploadedAny = true;
                 }
             }
@@ -6776,6 +6862,20 @@ public final class AeroServerRuntime {
     ) {
     }
 
+    private record NativeNestedFeedbackWorldDiagnostics(
+        int regionCount,
+        int configuredBinCount,
+        int stepsPerFeedback,
+        int minStepsAccumulated,
+        int maxStepsAccumulated,
+        int readyRegionCount,
+        long emittedPacketCount,
+        long nativeResetCount,
+        long backendResetCount,
+        int lastBackendResetTick
+    ) {
+    }
+
     private static final class RegionRecord {
         private final AtomicBoolean busy = new AtomicBoolean(false);
         private final AtomicBoolean released = new AtomicBoolean(false);
@@ -6795,6 +6895,8 @@ public final class AeroServerRuntime {
         private List<FanSource> fans = List.of();
         private L2ToL1FeedbackLayout nestedFeedbackLayout;
         private long nestedFeedbackLayoutServiceId;
+        private long backendResetCount;
+        private int lastBackendResetTick = Integer.MIN_VALUE;
 
         private RegionRecord() {
             Arrays.fill(uploadedSectionVersions, Long.MIN_VALUE);
@@ -6827,6 +6929,19 @@ public final class AeroServerRuntime {
 
         private void clearBackendResetPending() {
             backendResetPending = false;
+        }
+
+        private void noteBackendReset(int tick) {
+            backendResetCount++;
+            lastBackendResetTick = tick;
+        }
+
+        private long backendResetCount() {
+            return backendResetCount;
+        }
+
+        private int lastBackendResetTick() {
+            return lastBackendResetTick;
         }
 
         private boolean markReleased() {
