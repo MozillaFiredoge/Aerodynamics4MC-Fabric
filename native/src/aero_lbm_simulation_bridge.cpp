@@ -141,7 +141,7 @@ constexpr int k_default_packed_atlas_stride = 4;
 constexpr float k_atlas_velocity_quant_range = 5.6f;
 constexpr float k_atlas_pressure_quant_range = 0.03f;
 constexpr int k_face_count = 6;
-constexpr int k_packet_channels = 10;
+constexpr int k_packet_channels = 11;
 constexpr int k_channel_obstacle = 0;
 constexpr int k_channel_fan_mask = 1;
 constexpr int k_channel_fan_vx = 2;
@@ -152,6 +152,7 @@ constexpr int k_channel_state_vy = 6;
 constexpr int k_channel_state_vz = 7;
 constexpr int k_channel_state_p = 8;
 constexpr int k_channel_thermal_source = 9;
+constexpr int k_channel_state_temp = 10;
 constexpr int k_window_edge_stabilization_layers = 8;
 constexpr float k_window_edge_stabilization_min_keep = 0.15f;
 constexpr int k_nested_boundary_layers = 3;
@@ -910,7 +911,6 @@ void apply_boundary_wind(
 
 void apply_nested_boundary_fields(
     std::vector<float>& packet,
-    std::vector<float>& air_temperature,
     int nx,
     int ny,
     int nz,
@@ -926,9 +926,6 @@ void apply_nested_boundary_fields(
     const float* boundary_air_temperature_k
 ) {
     if (packet.empty() || nx <= 0 || ny <= 0 || nz <= 0) {
-        return;
-    }
-    if (air_temperature.size() != static_cast<size_t>(nx * ny * nz)) {
         return;
     }
     auto apply_face = [&](int face, int x, int y, int z, int layer_index, double u, double v) {
@@ -967,7 +964,7 @@ void apply_nested_boundary_fields(
         packet[base + k_channel_state_vy] = packet[base + k_channel_state_vy] * keep + vy * relax;
         packet[base + k_channel_state_vz] = packet[base + k_channel_state_vz] * keep + vz * relax;
         packet[base + k_channel_state_p] *= keep;
-        air_temperature[static_cast<size_t>(cell)] = air_temperature[static_cast<size_t>(cell)] * keep
+        packet[base + k_channel_state_temp] = packet[base + k_channel_state_temp] * keep
             + ((air_k - fallback_boundary_air_temperature_k) / k_runtime_temperature_scale_kelvin) * relax;
     };
 
@@ -1001,7 +998,6 @@ void apply_nested_boundary_fields(
 
 void apply_sponge_boundary_fields(
     std::vector<float>& packet,
-    std::vector<float>& air_temperature,
     int nx,
     int ny,
     int nz,
@@ -1020,9 +1016,6 @@ void apply_sponge_boundary_fields(
     float sponge_temperature_relaxation
 ) {
     if (packet.empty() || nx <= 0 || ny <= 0 || nz <= 0) {
-        return;
-    }
-    if (air_temperature.size() != static_cast<size_t>(nx * ny * nz)) {
         return;
     }
     if (sponge_thickness_cells <= 0 || external_face_mask == 0) {
@@ -1084,7 +1077,7 @@ void apply_sponge_boundary_fields(
         if (temperature_relax > 0.0f) {
             const float temperature_keep = 1.0f - temperature_relax;
             const float target_temp = (target_air_k - fallback_boundary_air_temperature_k) / k_runtime_temperature_scale_kelvin;
-            air_temperature[static_cast<size_t>(cell)] = air_temperature[static_cast<size_t>(cell)] * temperature_keep
+            packet[base + k_channel_state_temp] = packet[base + k_channel_state_temp] * temperature_keep
                 + target_temp * temperature_relax;
         }
     };
@@ -1282,6 +1275,12 @@ bool build_region_packet_from_template(
             packet[packet_base + k_channel_state_vy] = dynamic.flow_state[flow_base + 1];
             packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
             packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
+        }
+    }
+    if (dynamic.air_temperature.size() == static_cast<size_t>(cells)) {
+        for (int cell = 0; cell < cells; ++cell) {
+            size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
+            packet[packet_base + k_channel_state_temp] = dynamic.air_temperature[static_cast<size_t>(cell)];
         }
     }
     if (sponge_thickness_cells <= 0) {
@@ -1982,7 +1981,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region(
         set_simulation_last_error("simulation_step_region: inactive region");
         return 0;
     }
-    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 11, 4)) {
         return 0;
     }
     if (!aero_lbm_step_rect(packet, nx, ny, nz, region_key, out_flow_state)) {
@@ -2057,7 +2056,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             set_simulation_last_error("simulation_step_region_stored: inactive region");
             return 0;
         }
-        if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+        if (!ensure_l2_runtime(*service, nx, ny, nz, 11, 4)) {
             return 0;
         }
         auto packet_it = service->packet_templates.find(region_key);
@@ -2115,7 +2114,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         if (sponge_thickness_cells > 0) {
             apply_sponge_boundary_fields(
                 packet,
-                dynamic_region.air_temperature,
                 nx,
                 ny,
                 nz,
@@ -2136,7 +2134,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         } else {
             apply_nested_boundary_fields(
                 packet,
-                dynamic_region.air_temperature,
                 nx,
                 ny,
                 nz,
@@ -2151,12 +2148,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
                 boundary_wind_face_z,
                 boundary_air_temperature_k
             );
-        }
-    }
-    if (dynamic_region.air_temperature.size() == static_cast<size_t>(cells)) {
-        if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, dynamic_region.air_temperature.data())) {
-            set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
-            return 0;
         }
     }
     std::vector<float> output_flow(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
@@ -2324,7 +2315,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_temperature_state(
         set_simulation_last_error("simulation_get_region_temperature_state: missing service");
         return 0;
     }
-    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 11, 4)) {
         return 0;
     }
     if (!aero_lbm_get_temperature_state_rect(nx, ny, nz, region_key, out_temperature)) {
@@ -2355,7 +2346,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_region_flow_state(
         set_simulation_last_error("simulation_get_region_flow_state: missing service");
         return 0;
     }
-    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 11, 4)) {
         return 0;
     }
     if (!aero_lbm_get_flow_state_rect(nx, ny, nz, region_key, out_flow_state)) {
@@ -2386,7 +2377,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_region_temperature_state(
         set_simulation_last_error("simulation_set_region_temperature_state: missing service");
         return 0;
     }
-    if (!ensure_l2_runtime(*service, nx, ny, nz, 10, 4)) {
+    if (!ensure_l2_runtime(*service, nx, ny, nz, 11, 4)) {
         return 0;
     }
     if (!aero_lbm_set_temperature_state_rect(nx, ny, nz, region_key, temperature)) {

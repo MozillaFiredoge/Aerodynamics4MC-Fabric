@@ -78,7 +78,7 @@ public final class AeroServerRuntime {
     private static final float DOMAIN_SIZE_METERS = GRID_SIZE * BLOCK_SIZE_METERS;
     private static final float SOLVER_STEP_SECONDS = 1.0f / TICKS_PER_SECOND;
     private static final float CELL_SIZE_METERS = BLOCK_SIZE_METERS;
-    private static final int CHANNELS = 10;
+    private static final int CHANNELS = 11;
     private static final int CH_OBSTACLE = 0;
     private static final int CH_FAN_MASK = 1;
     private static final int CH_FAN_VX = 2;

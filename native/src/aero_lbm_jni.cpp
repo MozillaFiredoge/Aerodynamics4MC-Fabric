@@ -65,6 +65,7 @@ constexpr int kChannelStateVy = 6;
 constexpr int kChannelStateVz = 7;
 constexpr int kChannelStateP = 8;
 constexpr int kChannelThermalSource = 9;
+constexpr int kChannelStateTemp = 10;
 
 constexpr float kLatticeSoundSpeed = 0.57735026919f;
 constexpr float kMaxMach = 0.60f;
@@ -518,6 +519,7 @@ struct ContextState {
     std::vector<float> ref_uy;
     std::vector<float> ref_uz;
     std::vector<float> ref_pressure;
+    std::vector<float> ref_temperature;
 
     std::vector<float> packet; // reused host-side payload buffer (floats)
     std::vector<float> fan_mask;
@@ -1414,6 +1416,7 @@ void allocate_cpu_context(ContextState& ctx, int nx, int ny, int nz) {
     ctx.ref_uy.assign(ctx.cells, 0.0f);
     ctx.ref_uz.assign(ctx.cells, 0.0f);
     ctx.ref_pressure.assign(ctx.cells, 0.0f);
+    ctx.ref_temperature.assign(ctx.cells, 0.0f);
     ctx.packet.assign(ctx.cells * g_cfg.input_channels, 0.0f);
 
     ctx.fan_mask.assign(ctx.cells, 0.0f);
@@ -1473,6 +1476,11 @@ void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
         ctx.ref_uy[cell] = finite_or(payload[base + kChannelStateVy], 0.0f);
         ctx.ref_uz[cell] = finite_or(payload[base + kChannelStateVz], 0.0f);
         ctx.ref_pressure[cell] = clampf(payload[base + kChannelStateP], kPressureMin, kPressureMax);
+        float ref_temperature = 0.0f;
+        if (in_channels > kChannelStateTemp) {
+            ref_temperature = payload[base + kChannelStateTemp];
+        }
+        ctx.ref_temperature[cell] = clampf(ref_temperature, kThermalMin, kThermalMax);
         float thermal_src = 0.0f;
         if (in_channels > kChannelThermalSource) {
             thermal_src = payload[base + kChannelThermalSource];
@@ -1530,6 +1538,8 @@ void initialize_distributions(ContextState& ctx) {
         }
         if (benchmark_mode_active() && std::fabs(ctx.temperature[cell]) < 1e-8f) {
             ctx.temperature[cell] = clampf(g_benchmark_cfg.initial_temperature, kThermalMin, kThermalMax);
+        } else if (!ctx.obstacle[cell] && ctx.ref_temperature.size() == ctx.cells) {
+            ctx.temperature[cell] = clampf(ctx.ref_temperature[cell], kThermalMin, kThermalMax);
         }
         ctx.temperature[cell] = clampf(ctx.temperature[cell], kThermalMin, kThermalMax);
         ctx.temperature_next[cell] = ctx.temperature[cell];
@@ -2346,6 +2356,7 @@ struct OpenClRuntime {
     cl_command_queue queue = nullptr;
     cl_program program = nullptr;
     cl_kernel k_init = nullptr;
+    cl_kernel k_apply_temperature_reference = nullptr;
     cl_kernel k_thermal_bfecc_forward = nullptr;
     cl_kernel k_thermal_bfecc_correct = nullptr;
     cl_kernel k_thermal_bfecc_finalize = nullptr;
@@ -3010,6 +3021,24 @@ kernel void init_distributions(
         f[q * cells + cell] = eq;
         f_post[q * cells + cell] = eq;
     }
+}
+
+kernel void apply_temperature_reference(
+    __global const float* payload,
+    __global float* temperature,
+    int in_ch,
+    int cells
+) {
+    int cell = (int)get_global_id(0);
+    if (cell >= cells) return;
+    if (in_ch <= 10) return;
+
+    int base = cell * in_ch;
+    if (payload[base + 0] > 0.5f) {
+        temperature[cell] = 0.0f;
+        return;
+    }
+    temperature[cell] = clampf(payload[base + 10], THERMAL_MIN, THERMAL_MAX);
 }
 
 )CLC"
@@ -4144,6 +4173,7 @@ std::string format_opencl_api_error(const char* api, cl_int err) {
 }
 
 void release_opencl_runtime() {
+    if (g_opencl.k_apply_temperature_reference) clReleaseKernel(g_opencl.k_apply_temperature_reference);
     if (g_opencl.k_thermal_bfecc_finalize) clReleaseKernel(g_opencl.k_thermal_bfecc_finalize);
     if (g_opencl.k_thermal_bfecc_correct) clReleaseKernel(g_opencl.k_thermal_bfecc_correct);
     if (g_opencl.k_thermal_bfecc_forward) clReleaseKernel(g_opencl.k_thermal_bfecc_forward);
@@ -4224,6 +4254,7 @@ bool initialize_opencl_runtime() {
     }
 
     cl_kernel k_init = clCreateKernel(program, "init_distributions", &err);
+    cl_kernel k_apply_temperature_reference = clCreateKernel(program, "apply_temperature_reference", &err);
     cl_kernel k_thermal_bfecc_forward = clCreateKernel(program, "thermal_bfecc_forward", &err);
     cl_kernel k_thermal_bfecc_correct = clCreateKernel(program, "thermal_bfecc_correct", &err);
     cl_kernel k_thermal_bfecc_finalize = clCreateKernel(program, "thermal_bfecc_finalize", &err);
@@ -4232,9 +4263,10 @@ bool initialize_opencl_runtime() {
     cl_kernel k_stream_collide_hydro_forced = clCreateKernel(program, "stream_collide_hydro_forced_step", &err);
     cl_kernel k_output = clCreateKernel(program, "output_macro", &err);
 
-    if (!k_init || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize
+    if (!k_init || !k_apply_temperature_reference || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize
         || !k_stream_collide_tgv || !k_stream_collide_hydro_bench || !k_stream_collide_hydro_forced || !k_output) {
         if (k_init) clReleaseKernel(k_init);
+        if (k_apply_temperature_reference) clReleaseKernel(k_apply_temperature_reference);
         if (k_thermal_bfecc_forward) clReleaseKernel(k_thermal_bfecc_forward);
         if (k_thermal_bfecc_correct) clReleaseKernel(k_thermal_bfecc_correct);
         if (k_thermal_bfecc_finalize) clReleaseKernel(k_thermal_bfecc_finalize);
@@ -4248,6 +4280,7 @@ bool initialize_opencl_runtime() {
 
     g_opencl.context = context; g_opencl.queue = queue; g_opencl.program = program;
     g_opencl.k_init = k_init;
+    g_opencl.k_apply_temperature_reference = k_apply_temperature_reference;
     g_opencl.k_thermal_bfecc_forward = k_thermal_bfecc_forward;
     g_opencl.k_thermal_bfecc_correct = k_thermal_bfecc_correct;
     g_opencl.k_thermal_bfecc_finalize = k_thermal_bfecc_finalize;
@@ -4428,6 +4461,23 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     cl_mem write_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f_post : ctx.d_f;
     cl_mem temp_read = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
     cl_mem temp_write = (ctx.step_counter % 2 == 0) ? ctx.d_temp_next : ctx.d_temp;
+
+    err = CL_SUCCESS;
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_read);
+    if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_read)", err);
+    err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
+    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_apply_temperature_reference,temp_read)", err);
+    err = CL_SUCCESS;
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_write);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &cells_i32);
+    if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_write)", err);
+    err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
+    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_apply_temperature_reference,temp_write)", err);
     if (use_bfecc_thermal) {
         const float thermal_dt = static_cast<float>(thermal_update_stride);
 
@@ -5193,6 +5243,24 @@ void assign_temperature_state(ContextState& ctx, const float* temperature_state)
     rebuild_thermal_distributions_from_temperature(ctx);
 }
 
+void apply_runtime_temperature_reference(ContextState& ctx) {
+    if (g_cfg.input_channels <= kChannelStateTemp) {
+        return;
+    }
+    ensure_context_temperature_storage(ctx);
+    if (ctx.ref_temperature.size() != ctx.cells) {
+        ctx.ref_temperature.assign(ctx.cells, 0.0f);
+    }
+    for (std::size_t i = 0; i < ctx.cells; ++i) {
+        const float ref_temperature = ctx.obstacle[i] ? 0.0f : clampf(ctx.ref_temperature[i], kThermalMin, kThermalMax);
+        ctx.temperature[i] = ref_temperature;
+        ctx.temperature_next[i] = ref_temperature;
+    }
+    if (thermal_ddf_benchmark_active()) {
+        rebuild_thermal_distributions_from_temperature(ctx);
+    }
+}
+
 template <typename T>
 void shift_scalar_field(std::vector<T>& field, int nx, int ny, int nz, int dx, int dy, int dz, T fill_value) {
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
@@ -5567,6 +5635,7 @@ bool shift_context_cpu_state(ContextState& ctx, int dx, int dy, int dz) {
     if (ctx.ref_uy.size() == ctx.cells) shift_scalar_field(ctx.ref_uy, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
     if (ctx.ref_uz.size() == ctx.cells) shift_scalar_field(ctx.ref_uz, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
     if (ctx.ref_pressure.size() == ctx.cells) shift_scalar_field(ctx.ref_pressure, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
+    if (ctx.ref_temperature.size() == ctx.cells) shift_scalar_field(ctx.ref_temperature, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
 
     if (ctx.fan_mask.size() == ctx.cells) shift_scalar_field(ctx.fan_mask, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
     if (ctx.fan_ux.size() == ctx.cells) shift_scalar_field(ctx.fan_ux, ctx.nx, ctx.ny, ctx.nz, dx, dy, dz, 0.0f);
@@ -5596,7 +5665,11 @@ bool shift_context_cpu_state(ContextState& ctx, int dx, int dy, int dz) {
 void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     ingest_payload(ctx, packet, g_cfg.input_channels);
-    if (!ctx.cpu_initialized) initialize_distributions(ctx);
+    if (!ctx.cpu_initialized) {
+        initialize_distributions(ctx);
+    } else {
+        apply_runtime_temperature_reference(ctx);
+    }
     if (should_update_temperature(ctx.step_counter)) {
         update_temperature_field(ctx);
     }
