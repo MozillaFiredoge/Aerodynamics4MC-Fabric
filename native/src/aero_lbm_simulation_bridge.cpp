@@ -779,6 +779,39 @@ void rebuild_default_packed_atlas(ServiceState& service, long long region_key) {
     rebuild_default_packed_atlas(region_it->second, service.atlases[region_key]);
 }
 
+float rebuild_default_packed_atlas_from_flow_samples(
+    const float* flow_samples,
+    int sample_cell_count,
+    AtlasData& atlas
+) {
+    if (!flow_samples || sample_cell_count <= 0) {
+        atlas.values.clear();
+        return 0.0f;
+    }
+    atlas.values.assign(
+        static_cast<size_t>(sample_cell_count) * AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS,
+        0
+    );
+    float max_speed = 0.0f;
+    for (int cell = 0; cell < sample_cell_count; ++cell) {
+        const size_t src = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        const size_t dst = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS;
+        const float vx = flow_samples[src];
+        const float vy = flow_samples[src + 1];
+        const float vz = flow_samples[src + 2];
+        const float pressure = flow_samples[src + 3];
+        atlas.values[dst] = quantize_signed(vx, k_atlas_velocity_quant_range);
+        atlas.values[dst + 1] = quantize_signed(vy, k_atlas_velocity_quant_range);
+        atlas.values[dst + 2] = quantize_signed(vz, k_atlas_velocity_quant_range);
+        atlas.values[dst + 3] = quantize_signed(pressure, k_atlas_pressure_quant_range);
+        const float speed = std::sqrt(vx * vx + vy * vy + vz * vz);
+        if (std::isfinite(speed) && speed > max_speed) {
+            max_speed = speed;
+        }
+    }
+    return max_speed;
+}
+
 float sync_dynamic_region_from_native(long long region_key, DynamicRegionData& dynamic, AtlasData* atlas) {
     int cells = 0;
     if (!checked_cell_count(dynamic.nx, dynamic.ny, dynamic.nz, &cells)) {
@@ -2040,10 +2073,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         return 0;
     }
 
+    const bool context_ready = aero_lbm_has_context(region_key) != 0;
     DynamicRegionData dynamic_region;
     std::shared_ptr<const RegionPacketTemplateData> packet_template;
-    std::shared_ptr<const StaticRegionData> static_region;
-    bool context_ready = false;
     {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
         ServiceState* service = lookup_service(service_key);
@@ -2064,11 +2096,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             set_simulation_last_error("simulation_step_region_stored: missing packet template");
             return 0;
         }
-        auto static_it = service->static_regions.find(region_key);
-        if (static_it == service->static_regions.end()) {
-            set_simulation_last_error("simulation_step_region_stored: missing static region");
-            return 0;
-        }
         auto dynamic_it = service->dynamic_regions.find(region_key);
         if (dynamic_it == service->dynamic_regions.end()) {
             DynamicRegionData& dynamic = service->dynamic_regions[region_key];
@@ -2081,10 +2108,18 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             dynamic_it = service->dynamic_regions.find(region_key);
         }
         packet_template = packet_it->second;
-        static_region = static_it->second;
-        dynamic_region = dynamic_it->second;
+        if (context_ready) {
+            // The native context is authoritative on the hot path. Only carry mutable
+            // coarse-side fields that are still consumed outside the solver step.
+            dynamic_region.nx = dynamic_it->second.nx;
+            dynamic_region.ny = dynamic_it->second.ny;
+            dynamic_region.nz = dynamic_it->second.nz;
+            dynamic_region.surface_temperature = dynamic_it->second.surface_temperature;
+            dynamic_region.nested_feedback = dynamic_it->second.nested_feedback;
+        } else {
+            dynamic_region = dynamic_it->second;
+        }
     }
-    context_ready = aero_lbm_has_context(region_key) != 0;
     thread_local std::vector<float> packet;
     if (!packet_template || !build_region_packet_from_template(
         *packet_template,
@@ -2150,18 +2185,34 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             );
         }
     }
-    std::vector<float> output_flow(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
-    if (!aero_lbm_step_rect(packet.data(), nx, ny, nz, region_key, output_flow.data())) {
+    // Hot path keeps the live L2 state inside the native context. Full flow-state
+    // caches are refreshed only on explicit sync/export paths.
+    if (!aero_lbm_step_rect(packet.data(), nx, ny, nz, region_key, nullptr)) {
         set_simulation_last_error(std::string("simulation_step_region_stored failed: ") + aero_lbm_last_error());
         return 0;
     }
-    dynamic_region.flow_state.swap(output_flow);
-    // Keep thermal state authoritative in the native context on the hot path.
-    // Java-side temperature caches are refreshed on cold/diagnostic paths instead.
-    accumulate_nested_feedback(static_region.get(), dynamic_region);
+    const int atlas_sx = (nx + k_default_packed_atlas_stride - 1) / k_default_packed_atlas_stride;
+    const int atlas_sy = (ny + k_default_packed_atlas_stride - 1) / k_default_packed_atlas_stride;
+    const int atlas_sz = (nz + k_default_packed_atlas_stride - 1) / k_default_packed_atlas_stride;
+    const int atlas_cells = atlas_sx * atlas_sy * atlas_sz;
+    thread_local std::vector<float> atlas_flow;
+    atlas_flow.assign(static_cast<size_t>(atlas_cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+    if (!aero_lbm_extract_flow_atlas_rect(
+        nx,
+        ny,
+        nz,
+        region_key,
+        k_default_packed_atlas_stride,
+        atlas_flow.data(),
+        static_cast<int>(atlas_flow.size())
+    )) {
+        set_simulation_last_error(std::string("simulation_step_region_stored atlas extract failed: ") + aero_lbm_last_error());
+        return 0;
+    }
     AtlasData atlas;
-    rebuild_default_packed_atlas(dynamic_region, atlas);
-    float max_speed = compute_max_speed_from_flow_state(dynamic_region);
+    // Region max speed now tracks the published stride atlas rather than a full-field
+    // readback; this keeps the publish path cheap at the cost of being a sampled max.
+    const float max_speed = rebuild_default_packed_atlas_from_flow_samples(atlas_flow.data(), atlas_cells, atlas);
     {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
         ServiceState* service = lookup_service(service_key);
@@ -2169,7 +2220,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
             set_simulation_last_error("simulation_step_region_stored: missing service after step");
             return 0;
         }
-        service->dynamic_regions[region_key] = std::move(dynamic_region);
+        DynamicRegionData& stored = service->dynamic_regions[region_key];
+        stored.surface_temperature = std::move(dynamic_region.surface_temperature);
+        stored.nested_feedback = std::move(dynamic_region.nested_feedback);
         service->atlases[region_key] = std::move(atlas);
     }
     *out_max_speed = max_speed;
@@ -2663,15 +2716,26 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sample_region_point(
         return 0;
     }
     const int cell = grid_cell_index(ny, nz, sample_x, sample_y, sample_z);
-    const size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-    if (region.flow_state.size() < flow_base + AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS
-        || region.surface_temperature.size() <= static_cast<size_t>(cell)) {
+    if (region.surface_temperature.size() <= static_cast<size_t>(cell)) {
         set_simulation_last_error("simulation_sample_region_point: region buffers incomplete");
         return 0;
     }
+    const size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+    float sampled_flow[AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool flow_valid = false;
     float sampled_air_temperature = 0.0f;
     bool air_temperature_valid = false;
     if (aero_lbm_has_context(region_key) != 0) {
+        flow_valid = aero_lbm_sample_flow_point_rect(
+            nx,
+            ny,
+            nz,
+            region_key,
+            sample_x,
+            sample_y,
+            sample_z,
+            sampled_flow
+        ) != 0;
         air_temperature_valid = aero_lbm_sample_temperature_point_rect(
             nx,
             ny,
@@ -2683,6 +2747,16 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sample_region_point(
             &sampled_air_temperature
         ) != 0;
     }
+    if (!flow_valid) {
+        if (region.flow_state.size() < flow_base + AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS) {
+            set_simulation_last_error("simulation_sample_region_point: region buffers incomplete");
+            return 0;
+        }
+        sampled_flow[0] = region.flow_state[flow_base];
+        sampled_flow[1] = region.flow_state[flow_base + 1];
+        sampled_flow[2] = region.flow_state[flow_base + 2];
+        sampled_flow[3] = region.flow_state[flow_base + 3];
+    }
     if (!air_temperature_valid) {
         if (region.air_temperature.size() <= static_cast<size_t>(cell)) {
             set_simulation_last_error("simulation_sample_region_point: region buffers incomplete");
@@ -2690,10 +2764,10 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sample_region_point(
         }
         sampled_air_temperature = region.air_temperature[static_cast<size_t>(cell)];
     }
-    out_probe_values[0] = region.flow_state[flow_base];
-    out_probe_values[1] = region.flow_state[flow_base + 1];
-    out_probe_values[2] = region.flow_state[flow_base + 2];
-    out_probe_values[3] = region.flow_state[flow_base + 3];
+    out_probe_values[0] = sampled_flow[0];
+    out_probe_values[1] = sampled_flow[1];
+    out_probe_values[2] = sampled_flow[2];
+    out_probe_values[3] = sampled_flow[3];
     out_probe_values[4] = sampled_air_temperature;
     out_probe_values[5] = region.surface_temperature[static_cast<size_t>(cell)];
     return 1;

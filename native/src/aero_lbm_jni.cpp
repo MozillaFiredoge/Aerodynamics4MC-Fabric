@@ -522,6 +522,7 @@ struct ContextState {
     std::vector<float> ref_temperature;
 
     std::vector<float> packet; // reused host-side payload buffer (floats)
+    std::vector<float> payload_cache; // last payload uploaded to the GPU runtime
     std::vector<float> fan_mask;
     std::vector<float> fan_ux;
     std::vector<float> fan_uy;
@@ -1418,6 +1419,7 @@ void allocate_cpu_context(ContextState& ctx, int nx, int ny, int nz) {
     ctx.ref_pressure.assign(ctx.cells, 0.0f);
     ctx.ref_temperature.assign(ctx.cells, 0.0f);
     ctx.packet.assign(ctx.cells * g_cfg.input_channels, 0.0f);
+    ctx.payload_cache.clear();
 
     ctx.fan_mask.assign(ctx.cells, 0.0f);
     ctx.fan_ux.assign(ctx.cells, 0.0f);
@@ -1982,7 +1984,7 @@ void collide(ContextState& ctx) {
         bool non_finite_distribution = false;
         for (int q = 0; q < kQ; ++q) {
             const float fq = ctx.f[dist_index(cell, q, ctx.cells)];
-            if (!finitef(fq)) {
+            if (!std::isfinite(fq)) {
                 non_finite_distribution = true;
                 break;
             }
@@ -2307,7 +2309,7 @@ void write_output(const ContextState& ctx, float* out, int out_channels) {
         float rho = 0.0f, ux = 0.0f, uy = 0.0f, uz = 0.0f;
         for (int q = 0; q < kQ; ++q) {
             const float fq = ctx.f[dist_index(cell, q, ctx.cells)];
-            if (!finitef(fq)) {
+            if (!std::isfinite(fq)) {
                 rho = 1.0f;
                 ux = uy = uz = 0.0f;
                 for (int c = 0; c < out_channels; ++c) out[out_base + c] = 0.0f;
@@ -2316,17 +2318,17 @@ void write_output(const ContextState& ctx, float* out, int out_channels) {
             rho += fq;
             ux += fq * kCx[q]; uy += fq * kCy[q]; uz += fq * kCz[q];
         }
-        if (!finitef(rho) || !finitef(ux) || !finitef(uy) || !finitef(uz)) {
+        if (!std::isfinite(rho) || !std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
             for (int c = 0; c < out_channels; ++c) out[out_base + c] = 0.0f;
             goto next_cell;
         }
         rho = clampf(rho, kRhoMin, kRhoMax);
-        if (!finitef(rho) || rho <= 1e-6f) {
+        if (!std::isfinite(rho) || rho <= 1e-6f) {
             for (int c = 0; c < out_channels; ++c) out[out_base + c] = 0.0f;
             goto next_cell;
         }
         ux /= rho; uy /= rho; uz /= rho;
-        if (!finitef(ux) || !finitef(uy) || !finitef(uz)) {
+        if (!std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
             ux = uy = uz = 0.0f;
         }
         if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
@@ -2364,6 +2366,7 @@ struct OpenClRuntime {
     cl_kernel k_stream_collide_hydro_bench = nullptr;
     cl_kernel k_stream_collide_hydro_forced = nullptr;
     cl_kernel k_output = nullptr;
+    cl_kernel k_output_strided = nullptr;
 };
 
 OpenClRuntime g_opencl;
@@ -4128,6 +4131,72 @@ kernel void output_macro(
     out[out_base + 3] = rho - 1.0f;
     for (int c = 4; c < out_ch; ++c) out[out_base + c] = 0.0f;
 }
+
+kernel void output_macro_strided(
+    __global const float* f,
+    __global const float* payload,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int stride,
+    int sx,
+    int sy,
+    int sz,
+    __global float* out
+) {
+    int atlas_cell = (int)get_global_id(0);
+    int atlas_cells = sx * sy * sz;
+    if (atlas_cell >= atlas_cells) return;
+
+    int ayz = sy * sz;
+    int ax = atlas_cell / ayz;
+    int rem = atlas_cell - ax * ayz;
+    int ay = rem / sz;
+    int az = rem - ay * sz;
+
+    int gx = min(nx - 1, ax * stride);
+    int gy = min(ny - 1, ay * stride);
+    int gz = min(nz - 1, az * stride);
+    int cell = (gx * ny + gy) * nz + gz;
+    int cells = nx * ny * nz;
+    int out_base = atlas_cell * 4;
+
+    if (payload[cell * in_ch + 0] > 0.5f) {
+        out[out_base + 0] = 0.0f;
+        out[out_base + 1] = 0.0f;
+        out[out_base + 2] = 0.0f;
+        out[out_base + 3] = 0.0f;
+        return;
+    }
+
+    float rho = 0.0f;
+    float ux = 0.0f;
+    float uy = 0.0f;
+    float uz = 0.0f;
+    for (int q = 0; q < KQ; ++q) {
+        float fq = f[q * cells + cell];
+        rho += fq;
+        ux += fq * (float)CX[q];
+        uy += fq * (float)CY[q];
+        uz += fq * (float)CZ[q];
+    }
+
+    rho = clampf(rho, RHO_MIN, RHO_MAX);
+    float inv_rho = 1.0f / fmax(1e-6f, rho);
+    float vx = ux * inv_rho;
+    float vy = uy * inv_rho;
+    float vz = uz * inv_rho;
+    if (fabs(vx) < 1e-7f) vx = 0.0f;
+    if (fabs(vy) < 1e-7f) vy = 0.0f;
+    if (fabs(vz) < 1e-7f) vz = 0.0f;
+    if (fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
+
+    out[out_base + 0] = vx;
+    out[out_base + 1] = vy;
+    out[out_base + 2] = vz;
+    out[out_base + 3] = rho - 1.0f;
+}
 )CLC";
 
 // const char* cl_error_to_string(cl_int err) {
@@ -4189,6 +4258,7 @@ std::string format_opencl_api_error(const char* api, cl_int err) {
 }
 
 void release_opencl_runtime() {
+    if (g_opencl.k_output_strided) clReleaseKernel(g_opencl.k_output_strided);
     if (g_opencl.k_apply_temperature_reference) clReleaseKernel(g_opencl.k_apply_temperature_reference);
     if (g_opencl.k_thermal_bfecc_finalize) clReleaseKernel(g_opencl.k_thermal_bfecc_finalize);
     if (g_opencl.k_thermal_bfecc_correct) clReleaseKernel(g_opencl.k_thermal_bfecc_correct);
@@ -4278,9 +4348,11 @@ bool initialize_opencl_runtime() {
     cl_kernel k_stream_collide_hydro_bench = clCreateKernel(program, "stream_collide_hydro_benchmark_step", &err);
     cl_kernel k_stream_collide_hydro_forced = clCreateKernel(program, "stream_collide_hydro_forced_step", &err);
     cl_kernel k_output = clCreateKernel(program, "output_macro", &err);
+    cl_kernel k_output_strided = clCreateKernel(program, "output_macro_strided", &err);
 
     if (!k_init || !k_apply_temperature_reference || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize
-        || !k_stream_collide_tgv || !k_stream_collide_hydro_bench || !k_stream_collide_hydro_forced || !k_output) {
+        || !k_stream_collide_tgv || !k_stream_collide_hydro_bench || !k_stream_collide_hydro_forced || !k_output
+        || !k_output_strided) {
         if (k_init) clReleaseKernel(k_init);
         if (k_apply_temperature_reference) clReleaseKernel(k_apply_temperature_reference);
         if (k_thermal_bfecc_forward) clReleaseKernel(k_thermal_bfecc_forward);
@@ -4290,6 +4362,7 @@ bool initialize_opencl_runtime() {
         if (k_stream_collide_hydro_bench) clReleaseKernel(k_stream_collide_hydro_bench);
         if (k_stream_collide_hydro_forced) clReleaseKernel(k_stream_collide_hydro_forced);
         if (k_output) clReleaseKernel(k_output);
+        if (k_output_strided) clReleaseKernel(k_output_strided);
         clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
         g_opencl.error = "Kernel creation failed"; return false;
     }
@@ -4304,6 +4377,7 @@ bool initialize_opencl_runtime() {
     g_opencl.k_stream_collide_hydro_bench = k_stream_collide_hydro_bench;
     g_opencl.k_stream_collide_hydro_forced = k_stream_collide_hydro_forced;
     g_opencl.k_output = k_output;
+    g_opencl.k_output_strided = k_output_strided;
     g_opencl.platform = selected_platform; g_opencl.device = selected_device;
     g_opencl.available = true; g_opencl.device_name = read_device_name(selected_device);
     return true;
@@ -4413,8 +4487,92 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
 
     auto upload_begin = Clock::now();
     {
-        cl_int upload_err = clEnqueueWriteBuffer(g_opencl.queue, ctx.d_payload, CL_TRUE, 0, payload_bytes, payload, 0, nullptr, nullptr);
-        if (upload_err != CL_SUCCESS) return fail_cl("clEnqueueWriteBuffer(d_payload)", upload_err);
+        constexpr std::size_t kPayloadIncrementalMaxRanges = 96;
+        const std::size_t payload_values = ctx.cells * static_cast<std::size_t>(g_cfg.input_channels);
+        const std::size_t cell_bytes = static_cast<std::size_t>(g_cfg.input_channels) * sizeof(float);
+        auto full_upload = [&]() -> bool {
+            if (ctx.payload_cache.size() != payload_values) {
+                ctx.payload_cache.assign(payload_values, 0.0f);
+            }
+            std::memcpy(ctx.payload_cache.data(), payload, payload_bytes);
+            cl_int upload_err = clEnqueueWriteBuffer(
+                g_opencl.queue,
+                ctx.d_payload,
+                CL_TRUE,
+                0,
+                payload_bytes,
+                ctx.payload_cache.data(),
+                0,
+                nullptr,
+                nullptr
+            );
+            if (upload_err != CL_SUCCESS) return fail_cl("clEnqueueWriteBuffer(d_payload)", upload_err);
+            return true;
+        };
+
+        bool upload_ok = true;
+        if (!ctx.gpu_initialized || ctx.payload_cache.size() != payload_values) {
+            upload_ok = full_upload();
+        } else {
+            std::vector<std::array<std::size_t, 2>> changed_ranges;
+            changed_ranges.reserve(32);
+            const char* payload_bytes_ptr = reinterpret_cast<const char*>(payload);
+            char* cached_bytes_ptr = reinterpret_cast<char*>(ctx.payload_cache.data());
+            bool in_range = false;
+            std::size_t range_start_cell = 0;
+            std::size_t changed_cells = 0;
+            for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+                const std::size_t byte_offset = cell * cell_bytes;
+                const bool changed = std::memcmp(
+                    cached_bytes_ptr + byte_offset,
+                    payload_bytes_ptr + byte_offset,
+                    cell_bytes
+                ) != 0;
+                if (changed) {
+                    ++changed_cells;
+                    if (!in_range) {
+                        range_start_cell = cell;
+                        in_range = true;
+                    }
+                } else if (in_range) {
+                    changed_ranges.push_back({range_start_cell, cell - range_start_cell});
+                    in_range = false;
+                }
+            }
+            if (in_range) {
+                changed_ranges.push_back({range_start_cell, ctx.cells - range_start_cell});
+            }
+
+            if (changed_cells == 0) {
+                upload_ok = true;
+            } else if (changed_ranges.size() > kPayloadIncrementalMaxRanges || changed_cells * 3 >= ctx.cells) {
+                upload_ok = full_upload();
+            } else {
+                for (const std::array<std::size_t, 2>& range : changed_ranges) {
+                    const std::size_t byte_offset = range[0] * cell_bytes;
+                    const std::size_t byte_count = range[1] * cell_bytes;
+                    std::memcpy(cached_bytes_ptr + byte_offset, payload_bytes_ptr + byte_offset, byte_count);
+                    cl_int upload_err = clEnqueueWriteBuffer(
+                        g_opencl.queue,
+                        ctx.d_payload,
+                        CL_TRUE,
+                        byte_offset,
+                        byte_count,
+                        cached_bytes_ptr + byte_offset,
+                        0,
+                        nullptr,
+                        nullptr
+                    );
+                    if (upload_err != CL_SUCCESS) {
+                        upload_ok = fail_cl("clEnqueueWriteBuffer(d_payload_range)", upload_err);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!upload_ok) {
+            return false;
+        }
     }
     if (!stage_fence("after_payload_upload")) return false;
     timing.payload_copy_ms += elapsed_ms(upload_begin, Clock::now());
@@ -4679,21 +4837,25 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     }
     if (!stage_fence("after_stream_collide")) return false;
 
-    err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
-    err |= clSetKernelArg(g_opencl.k_output, 1, sizeof(cl_mem), &ctx.d_payload);
-    err |= clSetKernelArg(g_opencl.k_output, 2, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_output, 3, sizeof(int), &g_cfg.output_channels);
-    err |= clSetKernelArg(g_opencl.k_output, 4, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(g_opencl.k_output, 5, sizeof(cl_mem), &ctx.d_output);
-    if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_output)", err);
-    err = enqueue_kernel_1d(g_opencl.k_output, cells_i32);
-    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_output)", err);
-    if (!stage_fence("after_output")) return false;
+    if (out) {
+        err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
+        err |= clSetKernelArg(g_opencl.k_output, 1, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_output, 2, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_output, 3, sizeof(int), &g_cfg.output_channels);
+        err |= clSetKernelArg(g_opencl.k_output, 4, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_output, 5, sizeof(cl_mem), &ctx.d_output);
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_output)", err);
+        err = enqueue_kernel_1d(g_opencl.k_output, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_output)", err);
+        if (!stage_fence("after_output")) return false;
+    }
     timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
 
     auto readback_begin = Clock::now();
-    err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_output, CL_TRUE, 0, output_bytes, out, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) return fail_cl("clEnqueueReadBuffer(d_output)", err);
+    if (out) {
+        err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_output, CL_TRUE, 0, output_bytes, out, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueReadBuffer(d_output)", err);
+    }
     if (benchmark_mode_active() && g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
         const std::size_t dist_bytes = ctx.cells * kQ * sizeof(float);
         if (ctx.f.size() != ctx.cells * kQ) {
@@ -5711,7 +5873,9 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
     collide(ctx);
     compute_benchmark_force(ctx);
     stream_and_bounce(ctx);
-    write_output(ctx, out, g_cfg.output_channels);
+    if (out) {
+        write_output(ctx, out, g_cfg.output_channels);
+    }
     ctx.step_counter += 1;
 }
 
@@ -5775,7 +5939,7 @@ static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jin
     auto tick_begin = Clock::now();
     StepTiming timing;
 
-    if (!g_cfg.initialized || !packet || !output_flow) return false;
+    if (!g_cfg.initialized || !packet) return false;
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
@@ -5931,6 +6095,292 @@ static bool native_sample_temperature_point_raw_dims_impl(
     }
     if (ctx.temperature.size() != cells) return false;
     *out_temperature = ctx.temperature[cell];
+    return true;
+}
+
+static bool native_sample_flow_point_raw_dims_impl(
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    jint sample_x,
+    jint sample_y,
+    jint sample_z,
+    float* out_flow
+) {
+    if (!g_cfg.initialized || !out_flow) return false;
+    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (sample_x < 0 || sample_y < 0 || sample_z < 0 || sample_x >= nx || sample_y >= ny || sample_z >= nz) {
+        return false;
+    }
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    const std::size_t cell = cell_index(sample_x, sample_y, sample_z, nx, ny, nz);
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+
+    auto write_zero = [&]() {
+        out_flow[0] = 0.0f;
+        out_flow[1] = 0.0f;
+        out_flow[2] = 0.0f;
+        out_flow[3] = 0.0f;
+    };
+
+#if defined(AERO_LBM_OPENCL)
+    if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
+        float obstacle = 0.0f;
+        const std::size_t obstacle_offset =
+            (cell * static_cast<std::size_t>(g_cfg.input_channels) + kChannelObstacle) * sizeof(float);
+        cl_int err = clEnqueueReadBuffer(
+            g_opencl.queue,
+            ctx.d_payload,
+            CL_TRUE,
+            obstacle_offset,
+            sizeof(float),
+            &obstacle,
+            0,
+            nullptr,
+            nullptr
+        );
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(sample_flow_point:obstacle)", err);
+            return false;
+        }
+        if (obstacle > 0.5f) {
+            write_zero();
+            return true;
+        }
+
+        cl_mem current_flow = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
+        float rho = 0.0f;
+        float ux = 0.0f;
+        float uy = 0.0f;
+        float uz = 0.0f;
+        for (int q = 0; q < kQ; ++q) {
+            float fq = 0.0f;
+            const std::size_t offset = dist_index(cell, q, cells) * sizeof(float);
+            err = clEnqueueReadBuffer(g_opencl.queue, current_flow, CL_TRUE, offset, sizeof(float), &fq, 0, nullptr, nullptr);
+            if (err != CL_SUCCESS) {
+                g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(sample_flow_point:f)", err);
+                return false;
+            }
+            if (!std::isfinite(fq)) {
+                write_zero();
+                return true;
+            }
+            rho += fq;
+            ux += fq * static_cast<float>(kCx[q]);
+            uy += fq * static_cast<float>(kCy[q]);
+            uz += fq * static_cast<float>(kCz[q]);
+        }
+        if (!std::isfinite(rho) || !std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+            write_zero();
+            return true;
+        }
+        rho = clampf(rho, kRhoMin, kRhoMax);
+        if (!std::isfinite(rho) || rho <= 1e-6f) {
+            write_zero();
+            return true;
+        }
+        ux /= rho;
+        uy /= rho;
+        uz /= rho;
+        if (!std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+            ux = 0.0f;
+            uy = 0.0f;
+            uz = 0.0f;
+        }
+        if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
+        if (std::fabs(ux) < 1e-7f) ux = 0.0f;
+        if (std::fabs(uy) < 1e-7f) uy = 0.0f;
+        if (std::fabs(uz) < 1e-7f) uz = 0.0f;
+
+        out_flow[0] = ux;
+        out_flow[1] = uy;
+        out_flow[2] = uz;
+        out_flow[3] = clampf(rho - 1.0f, kPressureMin, kPressureMax);
+        return true;
+    }
+#endif
+
+    if (ctx.f.empty() || ctx.cells == 0 || ctx.obstacle.size() != cells) return false;
+    if (ctx.obstacle[cell]) {
+        write_zero();
+        return true;
+    }
+
+    float rho = 0.0f;
+    float ux = 0.0f;
+    float uy = 0.0f;
+    float uz = 0.0f;
+    for (int q = 0; q < kQ; ++q) {
+        const float fq = ctx.f[dist_index(cell, q, cells)];
+        if (!std::isfinite(fq)) {
+            write_zero();
+            return true;
+        }
+        rho += fq;
+        ux += fq * static_cast<float>(kCx[q]);
+        uy += fq * static_cast<float>(kCy[q]);
+        uz += fq * static_cast<float>(kCz[q]);
+    }
+    if (!std::isfinite(rho) || !std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+        write_zero();
+        return true;
+    }
+    rho = clampf(rho, kRhoMin, kRhoMax);
+    if (!std::isfinite(rho) || rho <= 1e-6f) {
+        write_zero();
+        return true;
+    }
+    ux /= rho;
+    uy /= rho;
+    uz /= rho;
+    if (!std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+        ux = 0.0f;
+        uy = 0.0f;
+        uz = 0.0f;
+    }
+    if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
+    if (std::fabs(ux) < 1e-7f) ux = 0.0f;
+    if (std::fabs(uy) < 1e-7f) uy = 0.0f;
+    if (std::fabs(uz) < 1e-7f) uz = 0.0f;
+
+    out_flow[0] = ux;
+    out_flow[1] = uy;
+    out_flow[2] = uz;
+    out_flow[3] = clampf(rho - 1.0f, kPressureMin, kPressureMax);
+    return true;
+}
+
+static bool native_extract_flow_atlas_raw_dims_impl(
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    jint stride,
+    float* out_flow_atlas,
+    jint value_count
+) {
+    if (!g_cfg.initialized || !out_flow_atlas || stride <= 0) return false;
+    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    const int sx = (nx + stride - 1) / stride;
+    const int sy = (ny + stride - 1) / stride;
+    const int sz = (nz + stride - 1) / stride;
+    const int atlas_cells = sx * sy * sz;
+    if (atlas_cells <= 0 || value_count != atlas_cells * 4) return false;
+
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+
+#if defined(AERO_LBM_OPENCL)
+    if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
+        cl_mem current_flow = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
+        cl_int err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_output_strided, 0, sizeof(cl_mem), &current_flow);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 1, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 2, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 3, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 4, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 5, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 6, sizeof(int), &stride);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 7, sizeof(int), &sx);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 8, sizeof(int), &sy);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 9, sizeof(int), &sz);
+        err |= clSetKernelArg(g_opencl.k_output_strided, 10, sizeof(cl_mem), &ctx.d_output);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clSetKernelArg(k_output_strided)", err);
+            return false;
+        }
+        err = enqueue_kernel_1d(g_opencl.k_output_strided, atlas_cells);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueNDRangeKernel(k_output_strided)", err);
+            return false;
+        }
+        const std::size_t bytes = static_cast<std::size_t>(value_count) * sizeof(float);
+        err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_output, CL_TRUE, 0, bytes, out_flow_atlas, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_output_atlas)", err);
+            return false;
+        }
+        return true;
+    }
+#endif
+
+    if (ctx.f.empty() || ctx.cells == 0 || ctx.obstacle.size() != cells) return false;
+    int dst = 0;
+    for (int ax = 0; ax < sx; ++ax) {
+        const int gx = std::min(nx - 1, ax * stride);
+        for (int ay = 0; ay < sy; ++ay) {
+            const int gy = std::min(ny - 1, ay * stride);
+            for (int az = 0; az < sz; ++az) {
+                const int gz = std::min(nz - 1, az * stride);
+                const std::size_t cell = cell_index(gx, gy, gz, nx, ny, nz);
+                if (ctx.obstacle[cell]) {
+                    out_flow_atlas[dst + 0] = 0.0f;
+                    out_flow_atlas[dst + 1] = 0.0f;
+                    out_flow_atlas[dst + 2] = 0.0f;
+                    out_flow_atlas[dst + 3] = 0.0f;
+                    dst += 4;
+                    continue;
+                }
+                float rho = 0.0f;
+                float ux = 0.0f;
+                float uy = 0.0f;
+                float uz = 0.0f;
+                bool valid = true;
+                for (int q = 0; q < kQ; ++q) {
+                    const float fq = ctx.f[dist_index(cell, q, cells)];
+                    if (!std::isfinite(fq)) {
+                        valid = false;
+                        break;
+                    }
+                    rho += fq;
+                    ux += fq * static_cast<float>(kCx[q]);
+                    uy += fq * static_cast<float>(kCy[q]);
+                    uz += fq * static_cast<float>(kCz[q]);
+                }
+                if (!valid || !std::isfinite(rho) || !std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+                    out_flow_atlas[dst + 0] = 0.0f;
+                    out_flow_atlas[dst + 1] = 0.0f;
+                    out_flow_atlas[dst + 2] = 0.0f;
+                    out_flow_atlas[dst + 3] = 0.0f;
+                    dst += 4;
+                    continue;
+                }
+                rho = clampf(rho, kRhoMin, kRhoMax);
+                if (!std::isfinite(rho) || rho <= 1e-6f) {
+                    out_flow_atlas[dst + 0] = 0.0f;
+                    out_flow_atlas[dst + 1] = 0.0f;
+                    out_flow_atlas[dst + 2] = 0.0f;
+                    out_flow_atlas[dst + 3] = 0.0f;
+                    dst += 4;
+                    continue;
+                }
+                ux /= rho;
+                uy /= rho;
+                uz /= rho;
+                if (!std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+                    ux = 0.0f;
+                    uy = 0.0f;
+                    uz = 0.0f;
+                }
+                if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
+                if (std::fabs(ux) < 1e-7f) ux = 0.0f;
+                if (std::fabs(uy) < 1e-7f) uy = 0.0f;
+                if (std::fabs(uz) < 1e-7f) uz = 0.0f;
+                out_flow_atlas[dst + 0] = ux;
+                out_flow_atlas[dst + 1] = uy;
+                out_flow_atlas[dst + 2] = uz;
+                out_flow_atlas[dst + 3] = clampf(rho - 1.0f, kPressureMin, kPressureMax);
+                dst += 4;
+            }
+        }
+    }
     return true;
 }
 
@@ -6219,6 +6669,48 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_sample_temperature_point_rect(
         sample_y,
         sample_z,
         out_temperature
+    ) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_sample_flow_point_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int sample_x,
+    int sample_y,
+    int sample_z,
+    float* out_flow
+) {
+    return native_sample_flow_point_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        sample_x,
+        sample_y,
+        sample_z,
+        out_flow
+    ) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_extract_flow_atlas_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int stride,
+    float* out_flow_atlas,
+    int value_count
+) {
+    return native_extract_flow_atlas_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        stride,
+        out_flow_atlas,
+        value_count
     ) ? 1 : 0;
 }
 

@@ -7050,7 +7050,6 @@ public final class AeroServerRuntime {
 
                     synchronized (simulationStateLock) {
                         applyCompletedResults(activeWindows);
-                        synchronizeRegionSeams(activeWindows);
                         resetPendingBackends(activeWindows);
                     }
 
@@ -7101,6 +7100,9 @@ public final class AeroServerRuntime {
                         lastCoordinatorState = "applyResults";
                         float maxSpeedThisCycle = applyCompletedResults(activeWindows);
                         lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
+                        // Halo exchange is the dominant post-solve synchronization cost.
+                        // Run it once after the current solve batch completes instead of
+                        // repeating the same work again before the next batch starts.
                         lastCoordinatorState = "syncSeams";
                         maxSpeedThisCycle = Math.max(maxSpeedThisCycle, synchronizeRegionSeams(activeWindows));
                         lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
