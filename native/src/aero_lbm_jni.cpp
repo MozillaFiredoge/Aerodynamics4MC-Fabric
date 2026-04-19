@@ -595,7 +595,10 @@ inline bool benchmark_mode_active() {
 }
 
 inline float effective_state_nudge() {
-    return benchmark_mode_active() ? 0.0f : kRuntimeStateNudge;
+    // In the runtime path, the native context is the authoritative L2 state.
+    // Continuing to nudge toward packet-provided macrostate couples each step
+    // back to the Java-side dynamic mirror and defeats that ownership model.
+    return 0.0f;
 }
 
 bool halo_exchange_slab_bounds(

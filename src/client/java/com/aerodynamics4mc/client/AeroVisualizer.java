@@ -59,11 +59,11 @@ final class AeroVisualizer {
     private static final int MAX_GLYPHS_PER_REGION = 48;
     private static final float GLYPH_MIN_SPEED = 0.02f;
     private static final int GLYPH_BUCKETS_PER_AXIS = 3;
-    private static final int MAX_STREAMLINES_PER_REGION = 18;
-    private static final float STREAMLINE_STEP_LENGTH = 1.9f;
+    private static final int MAX_STREAMLINES_PER_REGION = 5;
+    private static final float STREAMLINE_STEP_LENGTH = 3.8f;
     private static final int STREAMLINE_MAX_STEPS_PER_DIRECTION = 20;
     private static final double STREAMLINE_MAX_LENGTH = 46.0;
-    private static final float STREAMLINE_MIN_SPEED = 0.03f;
+    private static final float STREAMLINE_MIN_SPEED = 0.05f;
     private static final float TUBE_WIDTH = 0.24f;
     private static final float TUBE_BASE_WIDTH = 0.06f;
     private static final int ANALYSIS_SLICE_GLYPH_STEP = 2;

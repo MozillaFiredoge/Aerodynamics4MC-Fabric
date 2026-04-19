@@ -1240,6 +1240,7 @@ void apply_tornado_vortex_descriptors(
 bool build_region_packet_from_template(
     const RegionPacketTemplateData& packet_template,
     const DynamicRegionData& dynamic,
+    bool include_dynamic_state,
     int nx,
     int ny,
     int nz,
@@ -1273,13 +1274,15 @@ bool build_region_packet_from_template(
         packet.resize(packet_values);
     }
     std::copy(packet_template.values.begin(), packet_template.values.end(), packet.begin());
-    for (int cell = 0; cell < cells; ++cell) {
-        size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
-        size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-        packet[packet_base + k_channel_state_vx] = dynamic.flow_state[flow_base];
-        packet[packet_base + k_channel_state_vy] = dynamic.flow_state[flow_base + 1];
-        packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
-        packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
+    if (include_dynamic_state) {
+        for (int cell = 0; cell < cells; ++cell) {
+            size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
+            size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+            packet[packet_base + k_channel_state_vx] = dynamic.flow_state[flow_base];
+            packet[packet_base + k_channel_state_vy] = dynamic.flow_state[flow_base + 1];
+            packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
+            packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
+        }
     }
     if (sponge_thickness_cells <= 0) {
         apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
@@ -2035,6 +2038,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     DynamicRegionData dynamic_region;
     std::shared_ptr<const RegionPacketTemplateData> packet_template;
     std::shared_ptr<const StaticRegionData> static_region;
+    bool context_ready = false;
     {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
         ServiceState* service = lookup_service(service_key);
@@ -2075,10 +2079,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         static_region = static_it->second;
         dynamic_region = dynamic_it->second;
     }
+    context_ready = aero_lbm_has_context(region_key) != 0;
     thread_local std::vector<float> packet;
     if (!packet_template || !build_region_packet_from_template(
         *packet_template,
         dynamic_region,
+        !context_ready,
         nx,
         ny,
         nz,
@@ -2469,10 +2475,24 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_export_dynamic_region(
         set_simulation_last_error("simulation_export_dynamic_region: missing region");
         return 0;
     }
-    const DynamicRegionData& region = region_it->second;
+    DynamicRegionData& region = region_it->second;
     if (region.nx != nx || region.ny != ny || region.nz != nz) {
         set_simulation_last_error("simulation_export_dynamic_region: dimension mismatch");
         return 0;
+    }
+
+    // Hot runtime stepping no longer requires Java-side flow-state mirrors to be
+    // synchronized after every seam exchange. Export remains a cold path, so it
+    // can afford an on-demand sync from the authoritative native context.
+    if (aero_lbm_has_context(region_key)) {
+        if (!sync_dynamic_region_flow_from_native(region_key, region, nullptr, nullptr)) {
+            set_simulation_last_error(std::string("simulation_export_dynamic_region sync failed: ") + aero_lbm_last_error());
+            return 0;
+        }
+        if (!sync_dynamic_region_temperature_from_native(region_key, region)) {
+            set_simulation_last_error(std::string("simulation_export_dynamic_region temperature sync failed: ") + aero_lbm_last_error());
+            return 0;
+        }
     }
 
     std::copy(region.flow_state.begin(), region.flow_state.end(), out_flow_state);

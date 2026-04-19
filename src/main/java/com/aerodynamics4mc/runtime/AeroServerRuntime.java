@@ -3344,32 +3344,11 @@ public final class AeroServerRuntime {
         if (touchedKeys.isEmpty() || simulationServiceId == 0L) {
             return 0.0f;
         }
-        float maxSpeed = 0.0f;
-        for (WindowKey key : touchedKeys) {
-            float syncedMax = simulationBridge.syncRegionFlowState(simulationServiceId, simulationRegionKey(key));
-            if (!Float.isFinite(syncedMax)) {
-                String nativeError = simulationBridge.lastError();
-                String runtimeInfo = simulationBridge.runtimeInfo();
-                StringBuilder message = new StringBuilder("Native region sync failed after seams for ")
-                    .append(formatPos(key.origin()));
-                if (nativeError != null && !nativeError.isBlank()
-                    && !"not_initialized".equals(nativeError)
-                    && !"not_loaded".equals(nativeError)) {
-                    message.append(": ").append(nativeError);
-                }
-                if (runtimeInfo != null && !runtimeInfo.isBlank()
-                    && !"not_initialized".equals(runtimeInfo)
-                    && !"not_loaded".equals(runtimeInfo)) {
-                    message.append(" [runtime=").append(runtimeInfo).append("]");
-                }
-                lastSolverError = message.toString();
-                continue;
-            }
-            float syncedMaxSpeed = syncedMax * NATIVE_VELOCITY_SCALE;
-            maxSpeed = Math.max(maxSpeed, syncedMaxSpeed);
-            publishRegionAtlas(key, syncedMaxSpeed);
-        }
-        return maxSpeed;
+        // Seam exchange updates the authoritative native contexts directly.
+        // Avoid reading full flow-state fields back into Java on this hot path;
+        // compact outputs are published on normal solve completion, and cold
+        // export paths can synchronize on demand.
+        return 0.0f;
     }
 
     private boolean shouldRefreshWindowThermal(RegionRecord region) {
