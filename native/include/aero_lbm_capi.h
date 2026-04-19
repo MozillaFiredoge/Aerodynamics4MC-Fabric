@@ -170,6 +170,16 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
     int offset_z
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature);
+AERO_LBM_CAPI_EXPORT int aero_lbm_sample_temperature_point_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int sample_x,
+    int sample_y,
+    int sample_z,
+    float* out_temperature
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_flow_state_rect(int nx, int ny, int nz, long long context_key, float* out_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_set_temperature_state_rect(int nx, int ny, int nz, long long context_key, const float* temperature);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz);

@@ -1277,7 +1277,7 @@ bool build_region_packet_from_template(
             packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
         }
     }
-    if (dynamic.air_temperature.size() == static_cast<size_t>(cells)) {
+    if (include_dynamic_state && dynamic.air_temperature.size() == static_cast<size_t>(cells)) {
         for (int cell = 0; cell < cells; ++cell) {
             size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
             packet[packet_base + k_channel_state_temp] = dynamic.air_temperature[static_cast<size_t>(cell)];
@@ -2156,10 +2156,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         return 0;
     }
     dynamic_region.flow_state.swap(output_flow);
-    if (!sync_dynamic_region_temperature_from_native(region_key, dynamic_region)) {
-        set_simulation_last_error(std::string("simulation_step_region_stored temperature sync failed: ") + aero_lbm_last_error());
-        return 0;
-    }
+    // Keep thermal state authoritative in the native context on the hot path.
+    // Java-side temperature caches are refreshed on cold/diagnostic paths instead.
     accumulate_nested_feedback(static_region.get(), dynamic_region);
     AtlasData atlas;
     rebuild_default_packed_atlas(dynamic_region, atlas);
@@ -2667,16 +2665,36 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sample_region_point(
     const int cell = grid_cell_index(ny, nz, sample_x, sample_y, sample_z);
     const size_t flow_base = static_cast<size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
     if (region.flow_state.size() < flow_base + AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS
-        || region.air_temperature.size() <= static_cast<size_t>(cell)
         || region.surface_temperature.size() <= static_cast<size_t>(cell)) {
         set_simulation_last_error("simulation_sample_region_point: region buffers incomplete");
         return 0;
+    }
+    float sampled_air_temperature = 0.0f;
+    bool air_temperature_valid = false;
+    if (aero_lbm_has_context(region_key) != 0) {
+        air_temperature_valid = aero_lbm_sample_temperature_point_rect(
+            nx,
+            ny,
+            nz,
+            region_key,
+            sample_x,
+            sample_y,
+            sample_z,
+            &sampled_air_temperature
+        ) != 0;
+    }
+    if (!air_temperature_valid) {
+        if (region.air_temperature.size() <= static_cast<size_t>(cell)) {
+            set_simulation_last_error("simulation_sample_region_point: region buffers incomplete");
+            return 0;
+        }
+        sampled_air_temperature = region.air_temperature[static_cast<size_t>(cell)];
     }
     out_probe_values[0] = region.flow_state[flow_base];
     out_probe_values[1] = region.flow_state[flow_base + 1];
     out_probe_values[2] = region.flow_state[flow_base + 2];
     out_probe_values[3] = region.flow_state[flow_base + 3];
-    out_probe_values[4] = region.air_temperature[static_cast<size_t>(cell)];
+    out_probe_values[4] = sampled_air_temperature;
     out_probe_values[5] = region.surface_temperature[static_cast<size_t>(cell)];
     return 1;
 }

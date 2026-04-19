@@ -3027,18 +3027,34 @@ kernel void apply_temperature_reference(
     __global const float* payload,
     __global float* temperature,
     int in_ch,
-    int cells
+    int nx,
+    int ny,
+    int nz,
+    int cells,
+    float state_nudge
 ) {
     int cell = (int)get_global_id(0);
     if (cell >= cells) return;
-    if (in_ch <= 10) return;
 
     int base = cell * in_ch;
     if (payload[base + 0] > 0.5f) {
         temperature[cell] = 0.0f;
         return;
     }
-    temperature[cell] = clampf(payload[base + 10], THERMAL_MIN, THERMAL_MAX);
+    if (in_ch <= 10 || state_nudge <= 0.0f) return;
+
+    int yz = ny * nz;
+    int x = cell / yz;
+    int rem = cell - x * yz;
+    int y = rem / nz;
+    int z = rem - y * nz;
+    int edge_distance = min(min(min(x, y), z), min(min(nx - 1 - x, ny - 1 - y), nz - 1 - z));
+    if (edge_distance >= 8) return;
+
+    float eta = (8.0f - (float)edge_distance) / 8.0f;
+    float local_state_nudge = state_nudge * eta * eta;
+    float ref_temperature = clampf(payload[base + 10], THERMAL_MIN, THERMAL_MAX);
+    temperature[cell] = clampf(mix(temperature[cell], ref_temperature, local_state_nudge), THERMAL_MIN, THERMAL_MAX);
 }
 
 )CLC"
@@ -4461,11 +4477,16 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     cl_mem write_buf = (ctx.step_counter % 2 == 0) ? ctx.d_f_post : ctx.d_f;
     cl_mem temp_read = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
     cl_mem temp_write = (ctx.step_counter % 2 == 0) ? ctx.d_temp_next : ctx.d_temp;
+    const float state_nudge = effective_state_nudge();
 
     err = CL_SUCCESS;
     err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
     err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &ctx.nx);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 4, sizeof(int), &ctx.ny);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 5, sizeof(int), &ctx.nz);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 6, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 7, sizeof(float), &state_nudge);
     err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_read);
     if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_read)", err);
     err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
@@ -4474,7 +4495,11 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
     err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
     err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_write);
     err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &ctx.nx);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 4, sizeof(int), &ctx.ny);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 5, sizeof(int), &ctx.nz);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 6, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 7, sizeof(float), &state_nudge);
     if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_write)", err);
     err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
     if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_apply_temperature_reference,temp_write)", err);
@@ -4629,7 +4654,6 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 8, sizeof(int), &tick_i32);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 9, sizeof(int), &benchmark_flags);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 10, sizeof(int), &hydro_periodic_mask);
-        const float state_nudge = effective_state_nudge();
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 11, sizeof(float), &tau_pair[0]);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 12, sizeof(float), &tau_pair[1]);
         err |= clSetKernelArg(g_opencl.k_stream_collide_hydro_forced, 13, sizeof(float), &base_nu_shear);
@@ -5244,17 +5268,28 @@ void assign_temperature_state(ContextState& ctx, const float* temperature_state)
 }
 
 void apply_runtime_temperature_reference(ContextState& ctx) {
-    if (g_cfg.input_channels <= kChannelStateTemp) {
+    if (g_cfg.input_channels <= kChannelStateTemp || ctx.ref_temperature.size() != ctx.cells) {
         return;
     }
     ensure_context_temperature_storage(ctx);
-    if (ctx.ref_temperature.size() != ctx.cells) {
-        ctx.ref_temperature.assign(ctx.cells, 0.0f);
-    }
     for (std::size_t i = 0; i < ctx.cells; ++i) {
-        const float ref_temperature = ctx.obstacle[i] ? 0.0f : clampf(ctx.ref_temperature[i], kThermalMin, kThermalMax);
-        ctx.temperature[i] = ref_temperature;
-        ctx.temperature_next[i] = ref_temperature;
+        if (ctx.obstacle[i]) {
+            ctx.temperature[i] = 0.0f;
+            ctx.temperature_next[i] = 0.0f;
+            continue;
+        }
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        decode_cell(i, ctx.nx, ctx.ny, ctx.nz, x, y, z);
+        const float temperature_nudge = effective_runtime_state_nudge(ctx.nx, ctx.ny, ctx.nz, x, y, z);
+        if (temperature_nudge <= 0.0f) {
+            continue;
+        }
+        const float ref_temperature = clampf(ctx.ref_temperature[i], kThermalMin, kThermalMax);
+        const float keep = 1.0f - temperature_nudge;
+        ctx.temperature[i] = clampf(ctx.temperature[i] * keep + ref_temperature * temperature_nudge, kThermalMin, kThermalMax);
+        ctx.temperature_next[i] = ctx.temperature[i];
     }
     if (thermal_ddf_benchmark_active()) {
         rebuild_thermal_distributions_from_temperature(ctx);
@@ -5861,6 +5896,44 @@ static bool native_get_temperature_state_raw_dims_impl(jint nx, jint ny, jint nz
     return true;
 }
 
+static bool native_sample_temperature_point_raw_dims_impl(
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    jint sample_x,
+    jint sample_y,
+    jint sample_z,
+    float* out_temperature
+) {
+    if (!g_cfg.initialized || !out_temperature) return false;
+    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (sample_x < 0 || sample_y < 0 || sample_z < 0 || sample_x >= nx || sample_y >= ny || sample_z >= nz) {
+        return false;
+    }
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    const std::size_t cell = cell_index(sample_x, sample_y, sample_z, nx, ny, nz);
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
+        cl_mem current_temp = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
+        const std::size_t offset = cell * sizeof(float);
+        float sampled = 0.0f;
+        cl_int err = clEnqueueReadBuffer(g_opencl.queue, current_temp, CL_TRUE, offset, sizeof(float), &sampled, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(sample_temperature_point)", err);
+            return false;
+        }
+        *out_temperature = sampled;
+        return true;
+    }
+    if (ctx.temperature.size() != cells) return false;
+    *out_temperature = ctx.temperature[cell];
+    return true;
+}
+
 static bool native_get_flow_state_raw_dims_impl(jint nx, jint ny, jint nz, jlong context_key, float* flow_out) {
     if (!g_cfg.initialized || !flow_out) return false;
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
@@ -6125,6 +6198,28 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature) {
     return native_get_temperature_state_raw_dims_impl(nx, ny, nz, static_cast<jlong>(context_key), out_temperature) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_sample_temperature_point_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int sample_x,
+    int sample_y,
+    int sample_z,
+    float* out_temperature
+) {
+    return native_sample_temperature_point_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        sample_x,
+        sample_y,
+        sample_z,
+        out_temperature
+    ) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_flow_state_rect(int nx, int ny, int nz, long long context_key, float* out_flow) {
