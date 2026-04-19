@@ -5175,7 +5175,13 @@ public final class AeroServerRuntime {
         long generation,
         Set<WindowKey> activeKeys
     ) {
-        NestedBoundaryCoupler.BoundarySample boundarySample = sampleNestedBoundaryAtWindow(key);
+        int externalFaceMask = computeExternalFaceMask(key, activeKeys);
+        NestedBoundaryCoupler.BoundarySample boundarySample = null;
+        BoundaryFieldData boundaryField = null;
+        if (externalFaceMask != 0) {
+            boundarySample = sampleNestedBoundaryAtWindow(key);
+            boundaryField = sampleNestedBoundaryFieldAtWindow(key, externalFaceMask, boundarySample);
+        }
         return new SolveSnapshot(
             key,
             region,
@@ -5184,7 +5190,7 @@ public final class AeroServerRuntime {
             speedCap,
             generation,
             boundarySample,
-            sampleNestedBoundaryFieldAtWindow(key, activeKeys, boundarySample),
+            boundaryField,
             collectTornadoRegionDescriptors(key)
         );
     }
@@ -5233,13 +5239,9 @@ public final class AeroServerRuntime {
 
     private BoundaryFieldData sampleNestedBoundaryFieldAtWindow(
         WindowKey key,
-        Set<WindowKey> activeKeys,
+        int externalFaceMask,
         NestedBoundaryCoupler.BoundarySample fallback
     ) {
-        int externalFaceMask = computeExternalFaceMask(key, activeKeys);
-        if (externalFaceMask == 0) {
-            return null;
-        }
         int res = NESTED_BOUNDARY_FACE_RESOLUTION;
         int faceCells = FACE_COUNT * res * res;
         float[] windX = new float[faceCells];

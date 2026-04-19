@@ -1316,7 +1316,7 @@ bool build_region_packet_from_template(
             packet[packet_base + k_channel_state_temp] = dynamic.air_temperature[static_cast<size_t>(cell)];
         }
     }
-    if (sponge_thickness_cells <= 0) {
+    if (sponge_thickness_cells <= 0 && external_face_mask != 0) {
         apply_boundary_wind(packet, nx, ny, nz, boundary_wind_x, boundary_wind_y, boundary_wind_z);
     }
     apply_tornado_vortex_descriptors(packet, nx, ny, nz, tornado_descriptor_count, tornado_descriptors);
@@ -2121,73 +2121,88 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         }
     }
     thread_local std::vector<float> packet;
-    if (!packet_template || !build_region_packet_from_template(
-        *packet_template,
-        dynamic_region,
-        !context_ready,
-        nx,
-        ny,
-        nz,
-        boundary_wind_x,
-        boundary_wind_y,
-        boundary_wind_z,
-        fallback_boundary_air_temperature_k,
-        external_face_mask,
-        boundary_face_resolution,
-        boundary_wind_face_x,
-        boundary_wind_face_y,
-        boundary_wind_face_z,
-        boundary_air_temperature_k,
-        sponge_thickness_cells,
-        tornado_descriptor_count,
-        tornado_descriptors,
-        packet
-    )) {
+    if (!packet_template
+        || packet_template->values.size() != static_cast<size_t>(cells) * k_packet_channels) {
+        set_simulation_last_error("simulation_step_region_stored: invalid packet template");
         return 0;
     }
-    if (boundary_face_resolution > 0 && external_face_mask != 0) {
-        if (sponge_thickness_cells > 0) {
-            apply_sponge_boundary_fields(
-                packet,
-                nx,
-                ny,
-                nz,
-                boundary_wind_x,
-                boundary_wind_y,
-                boundary_wind_z,
-                fallback_boundary_air_temperature_k,
-                external_face_mask,
-                boundary_face_resolution,
-                boundary_wind_face_x,
-                boundary_wind_face_y,
-                boundary_wind_face_z,
-                boundary_air_temperature_k,
-                sponge_thickness_cells,
-                sponge_velocity_relaxation,
-                sponge_temperature_relaxation
-            );
-        } else {
-            apply_nested_boundary_fields(
-                packet,
-                nx,
-                ny,
-                nz,
-                boundary_wind_x,
-                boundary_wind_y,
-                boundary_wind_z,
-                fallback_boundary_air_temperature_k,
-                external_face_mask,
-                boundary_face_resolution,
-                boundary_wind_face_x,
-                boundary_wind_face_y,
-                boundary_wind_face_z,
-                boundary_air_temperature_k
-            );
+    const bool needs_dynamic_seed = !context_ready;
+    const bool has_boundary_override = boundary_face_resolution > 0 && external_face_mask != 0;
+    const bool has_global_edge_stabilization = sponge_thickness_cells <= 0 && external_face_mask != 0;
+    const bool has_tornado_override = tornado_descriptor_count > 0 && tornado_descriptors != nullptr;
+    const bool needs_materialized_packet =
+        needs_dynamic_seed || has_boundary_override || has_global_edge_stabilization || has_tornado_override;
+    const float* packet_data = packet_template->values.data();
+    if (needs_materialized_packet) {
+        if (!build_region_packet_from_template(
+            *packet_template,
+            dynamic_region,
+            needs_dynamic_seed,
+            nx,
+            ny,
+            nz,
+            boundary_wind_x,
+            boundary_wind_y,
+            boundary_wind_z,
+            fallback_boundary_air_temperature_k,
+            external_face_mask,
+            boundary_face_resolution,
+            boundary_wind_face_x,
+            boundary_wind_face_y,
+            boundary_wind_face_z,
+            boundary_air_temperature_k,
+            sponge_thickness_cells,
+            tornado_descriptor_count,
+            tornado_descriptors,
+            packet
+        )) {
+            return 0;
         }
+        if (has_boundary_override) {
+            if (sponge_thickness_cells > 0) {
+                apply_sponge_boundary_fields(
+                    packet,
+                    nx,
+                    ny,
+                    nz,
+                    boundary_wind_x,
+                    boundary_wind_y,
+                    boundary_wind_z,
+                    fallback_boundary_air_temperature_k,
+                    external_face_mask,
+                    boundary_face_resolution,
+                    boundary_wind_face_x,
+                    boundary_wind_face_y,
+                    boundary_wind_face_z,
+                    boundary_air_temperature_k,
+                    sponge_thickness_cells,
+                    sponge_velocity_relaxation,
+                    sponge_temperature_relaxation
+                );
+            } else {
+                apply_nested_boundary_fields(
+                    packet,
+                    nx,
+                    ny,
+                    nz,
+                    boundary_wind_x,
+                    boundary_wind_y,
+                    boundary_wind_z,
+                    fallback_boundary_air_temperature_k,
+                    external_face_mask,
+                    boundary_face_resolution,
+                    boundary_wind_face_x,
+                    boundary_wind_face_y,
+                    boundary_wind_face_z,
+                    boundary_air_temperature_k
+                );
+            }
+        }
+        packet_data = packet.data();
     }
     // Hot path keeps the live L2 state inside the native context. Full flow-state
     // caches are refreshed only on explicit sync/export paths.
-    if (!aero_lbm_step_rect(packet.data(), nx, ny, nz, region_key, nullptr)) {
+    if (!aero_lbm_step_rect(packet_data, nx, ny, nz, region_key, nullptr)) {
         set_simulation_last_error(std::string("simulation_step_region_stored failed: ") + aero_lbm_last_error());
         return 0;
     }
