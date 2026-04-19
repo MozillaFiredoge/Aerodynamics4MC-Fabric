@@ -448,6 +448,28 @@ public final class NativeSimulationBridge {
             && nativeExchangeRegionHalo(serviceKey, firstRegionKey, secondRegionKey, gridSize, offsetX, offsetY, offsetZ);
     }
 
+    public int exchangeRegionHaloBatch(
+        long serviceKey,
+        long[] regionPairs,
+        int[] offsets,
+        int exchangeCount
+    ) {
+        if (!LOADED || serviceKey == 0L) {
+            return -1;
+        }
+        if (exchangeCount < 0
+            || regionPairs == null
+            || offsets == null
+            || regionPairs.length < exchangeCount * 2
+            || offsets.length < exchangeCount * 3) {
+            return -1;
+        }
+        if (exchangeCount == 0) {
+            return 0;
+        }
+        return nativeExchangeRegionHaloBatch(serviceKey, regionPairs, offsets, exchangeCount);
+    }
+
     public float syncRegionState(long serviceKey, long regionKey) {
         if (!LOADED || serviceKey == 0L || regionKey == 0L) {
             return Float.NaN;
@@ -886,6 +908,13 @@ public final class NativeSimulationBridge {
         int offsetX,
         int offsetY,
         int offsetZ
+    );
+
+    private static native int nativeExchangeRegionHaloBatch(
+        long serviceKey,
+        long[] regionPairs,
+        int[] offsets,
+        int exchangeCount
     );
 
     private static native boolean nativeSyncRegionState(

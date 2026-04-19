@@ -2790,6 +2790,68 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo(
     return 1;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_exchange_region_halo_batch(
+    long long service_key,
+    const long long* region_pairs,
+    const int* offsets,
+    int exchange_count,
+    int* out_applied_count
+) {
+    if (!out_applied_count) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_exchange_region_halo_batch: out_applied_count is null");
+        return 0;
+    }
+    *out_applied_count = 0;
+    if (exchange_count < 0) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_exchange_region_halo_batch: negative exchange_count");
+        return 0;
+    }
+    if (exchange_count == 0) {
+        return 1;
+    }
+    if (!region_pairs || !offsets) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_exchange_region_halo_batch: null exchange buffers");
+        return 0;
+    }
+    int grid_size = 0;
+    {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        ServiceState* service = lookup_service(service_key);
+        if (!service) {
+            set_simulation_last_error("simulation_exchange_region_halo_batch: missing service");
+            return 0;
+        }
+        grid_size = service->l2_nx;
+    }
+    int applied_count = 0;
+    for (int index = 0; index < exchange_count; ++index) {
+        const long long first_region_key = region_pairs[index * 2];
+        const long long second_region_key = region_pairs[index * 2 + 1];
+        const int offset_x = offsets[index * 3];
+        const int offset_y = offsets[index * 3 + 1];
+        const int offset_z = offsets[index * 3 + 2];
+        if (first_region_key == 0L || second_region_key == 0L) {
+            continue;
+        }
+        if (!aero_lbm_has_context(first_region_key) || !aero_lbm_has_context(second_region_key)) {
+            continue;
+        }
+        if (!aero_lbm_exchange_halo(grid_size, first_region_key, second_region_key, offset_x, offset_y, offset_z)) {
+            set_simulation_last_error(
+                std::string("simulation_exchange_region_halo_batch failed at exchange ")
+                    + std::to_string(index) + ": " + aero_lbm_last_error()
+            );
+            return 0;
+        }
+        applied_count++;
+    }
+    *out_applied_count = applied_count;
+    return 1;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_state(
     long long service_key,
     long long region_key,
@@ -4020,6 +4082,50 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         offset_y,
         offset_z
     ) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeExchangeRegionHaloBatch(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlongArray region_pairs,
+    jintArray offsets,
+    jint exchange_count
+) {
+    if (!region_pairs || !offsets || exchange_count < 0) {
+        return -1;
+    }
+    if (exchange_count == 0) {
+        return 0;
+    }
+    if (env->GetArrayLength(region_pairs) < static_cast<jsize>(exchange_count * 2)
+        || env->GetArrayLength(offsets) < static_cast<jsize>(exchange_count * 3)) {
+        return -1;
+    }
+    jboolean region_copy = JNI_FALSE;
+    jboolean offset_copy = JNI_FALSE;
+    jlong* region_pairs_ptr = env->GetLongArrayElements(region_pairs, &region_copy);
+    jint* offsets_ptr = env->GetIntArrayElements(offsets, &offset_copy);
+    if (!region_pairs_ptr || !offsets_ptr) {
+        if (region_pairs_ptr) {
+            env->ReleaseLongArrayElements(region_pairs, region_pairs_ptr, JNI_ABORT);
+        }
+        if (offsets_ptr) {
+            env->ReleaseIntArrayElements(offsets, offsets_ptr, JNI_ABORT);
+        }
+        return -1;
+    }
+    int applied_count = 0;
+    const int ok = aero_lbm_simulation_exchange_region_halo_batch(
+        static_cast<long long>(service_key),
+        reinterpret_cast<const long long*>(region_pairs_ptr),
+        reinterpret_cast<const int*>(offsets_ptr),
+        exchange_count,
+        &applied_count
+    );
+    env->ReleaseLongArrayElements(region_pairs, region_pairs_ptr, JNI_ABORT);
+    env->ReleaseIntArrayElements(offsets, offsets_ptr, JNI_ABORT);
+    return ok ? applied_count : -1;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeSyncRegionState(

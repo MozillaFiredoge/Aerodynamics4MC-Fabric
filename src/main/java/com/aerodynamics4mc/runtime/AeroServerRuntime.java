@@ -3245,32 +3245,57 @@ public final class AeroServerRuntime {
     }
 
     private float synchronizeRegionSeams(List<ActiveWindow> activeWindows) {
-        if (activeWindows.isEmpty()) {
+        if (activeWindows.isEmpty() || simulationServiceId == 0L) {
             return 0.0f;
         }
         Map<WindowKey, ActiveWindow> activeByKey = new HashMap<>(activeWindows.size());
-        Set<WindowKey> touchedKeys = new HashSet<>();
         for (ActiveWindow active : activeWindows) {
             activeByKey.put(active.key(), active);
         }
+        int maxPairs = activeWindows.size() * 3;
+        long[] regionPairs = new long[Math.max(0, maxPairs * 2)];
+        int[] offsets = new int[Math.max(0, maxPairs * 3)];
+        int exchangeCount = 0;
         for (ActiveWindow active : activeWindows) {
             if (active.region().sections == null || active.region().busy.get()) {
                 continue;
             }
-            synchronizePositiveNeighbor(activeByKey, active, 1, 0, 0, touchedKeys);
-            synchronizePositiveNeighbor(activeByKey, active, 0, 1, 0, touchedKeys);
-            synchronizePositiveNeighbor(activeByKey, active, 0, 0, 1, touchedKeys);
+            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, active, 1, 0, 0, regionPairs, offsets, exchangeCount);
+            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, active, 0, 1, 0, regionPairs, offsets, exchangeCount);
+            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, active, 0, 0, 1, regionPairs, offsets, exchangeCount);
         }
-        return syncTouchedRegionsAfterSeams(touchedKeys);
+        if (exchangeCount == 0) {
+            return 0.0f;
+        }
+        int appliedCount = simulationBridge.exchangeRegionHaloBatch(simulationServiceId, regionPairs, offsets, exchangeCount);
+        if (appliedCount < 0) {
+            String nativeError = simulationBridge.lastError();
+            String runtimeInfo = simulationBridge.runtimeInfo();
+            StringBuilder message = new StringBuilder("Native halo batch exchange failed");
+            if (nativeError != null && !nativeError.isBlank()
+                && !"not_initialized".equals(nativeError)
+                && !"not_loaded".equals(nativeError)) {
+                message.append(": ").append(nativeError);
+            }
+            if (runtimeInfo != null && !runtimeInfo.isBlank()
+                && !"not_initialized".equals(runtimeInfo)
+                && !"not_loaded".equals(runtimeInfo)) {
+                message.append(" [runtime=").append(runtimeInfo).append("]");
+            }
+            lastSolverError = message.toString();
+        }
+        return 0.0f;
     }
 
-    private void synchronizePositiveNeighbor(
+    private int appendPositiveNeighborHaloBatch(
         Map<WindowKey, ActiveWindow> activeByKey,
         ActiveWindow active,
         int dx,
         int dy,
         int dz,
-        Set<WindowKey> touchedKeys
+        long[] regionPairs,
+        int[] offsets,
+        int exchangeCount
     ) {
         WindowKey key = active.key();
         BlockPos neighborOrigin = key.origin().add(
@@ -3285,70 +3310,16 @@ public final class AeroServerRuntime {
             || neighborActive.region().busy.get()
             || active.region().backendResetPending()
             || neighborActive.region().backendResetPending()) {
-            return;
+            return exchangeCount;
         }
-        if (synchronizeNeighborHalo(key, active.region(), neighborKey, neighborActive.region(), dx, dy, dz)) {
-            touchedKeys.add(key);
-            touchedKeys.add(neighborKey);
-        }
-    }
-
-    private boolean synchronizeNeighborHalo(
-        WindowKey firstKey,
-        RegionRecord first,
-        WindowKey secondKey,
-        RegionRecord second,
-        int offsetX,
-        int offsetY,
-        int offsetZ
-    ) {
-        boolean nativeHaloSynced = false;
-        if (ensureSimulationL2Runtime()) {
-            long firstRegionKey = simulationRegionKey(firstKey);
-            long secondRegionKey = simulationRegionKey(secondKey);
-            boolean firstContextReady = simulationBridge.hasRegionContext(simulationServiceId, firstRegionKey);
-            boolean secondContextReady = simulationBridge.hasRegionContext(simulationServiceId, secondRegionKey);
-            if (firstContextReady && secondContextReady) {
-                nativeHaloSynced = simulationBridge.exchangeRegionHalo(
-                    simulationServiceId,
-                    firstRegionKey,
-                    secondRegionKey,
-                    GRID_SIZE,
-                    offsetX,
-                    offsetY,
-                    offsetZ
-                );
-                if (!nativeHaloSynced) {
-                    String nativeError = simulationBridge.lastError();
-                    String runtimeInfo = simulationBridge.runtimeInfo();
-                    StringBuilder message = new StringBuilder("Native halo exchange failed for offset ")
-                        .append(offsetX).append(",").append(offsetY).append(",").append(offsetZ);
-                    if (nativeError != null && !nativeError.isBlank()
-                        && !"not_initialized".equals(nativeError)
-                        && !"not_loaded".equals(nativeError)) {
-                        message.append(": ").append(nativeError);
-                    }
-                    if (runtimeInfo != null && !runtimeInfo.isBlank()
-                        && !"not_initialized".equals(runtimeInfo)
-                        && !"not_loaded".equals(runtimeInfo)) {
-                        message.append(" [runtime=").append(runtimeInfo).append("]");
-                    }
-                    lastSolverError = message.toString();
-                }
-            }
-        }
-        return nativeHaloSynced;
-    }
-
-    private float syncTouchedRegionsAfterSeams(Set<WindowKey> touchedKeys) {
-        if (touchedKeys.isEmpty() || simulationServiceId == 0L) {
-            return 0.0f;
-        }
-        // Seam exchange updates the authoritative native contexts directly.
-        // Avoid reading full flow-state fields back into Java on this hot path;
-        // compact outputs are published on normal solve completion, and cold
-        // export paths can synchronize on demand.
-        return 0.0f;
+        int pairBase = exchangeCount * 2;
+        int offsetBase = exchangeCount * 3;
+        regionPairs[pairBase] = simulationRegionKey(key);
+        regionPairs[pairBase + 1] = simulationRegionKey(neighborKey);
+        offsets[offsetBase] = dx;
+        offsets[offsetBase + 1] = dy;
+        offsets[offsetBase + 2] = dz;
+        return exchangeCount + 1;
     }
 
     private boolean shouldRefreshWindowThermal(RegionRecord region) {
