@@ -153,6 +153,13 @@ constexpr int k_channel_state_vz = 7;
 constexpr int k_channel_state_p = 8;
 constexpr int k_channel_thermal_source = 9;
 constexpr int k_channel_state_temp = 10;
+constexpr int k_sparse_overlay_channels = 6;
+constexpr int k_sparse_overlay_state_vx = 0;
+constexpr int k_sparse_overlay_state_vy = 1;
+constexpr int k_sparse_overlay_state_vz = 2;
+constexpr int k_sparse_overlay_state_p = 3;
+constexpr int k_sparse_overlay_state_temp = 4;
+constexpr int k_sparse_overlay_thermal_source = 5;
 constexpr int k_window_edge_stabilization_layers = 8;
 constexpr float k_window_edge_stabilization_min_keep = 0.15f;
 constexpr int k_nested_boundary_layers = 3;
@@ -214,6 +221,58 @@ constexpr uint8_t k_surface_kind_snow_ice = 4;
 constexpr uint8_t k_surface_kind_water = 5;
 constexpr uint8_t k_surface_kind_molten = 6;
 constexpr float k_thermal_stefan_boltzmann = 5.6703744e-8f;
+
+struct SparsePacketOverlayBuilder {
+    std::vector<int> lookup;
+    std::vector<int> touched_lookup_slots;
+    std::vector<int> cells;
+    std::vector<float> values;
+
+    void reset(int cell_count) {
+        if (cell_count <= 0) {
+            lookup.clear();
+            touched_lookup_slots.clear();
+            cells.clear();
+            values.clear();
+            return;
+        }
+        if (lookup.size() != static_cast<size_t>(cell_count)) {
+            lookup.assign(static_cast<size_t>(cell_count), -1);
+        } else {
+            for (int cell : touched_lookup_slots) {
+                if (cell >= 0 && cell < cell_count) {
+                    lookup[static_cast<size_t>(cell)] = -1;
+                }
+            }
+        }
+        touched_lookup_slots.clear();
+        cells.clear();
+        values.clear();
+    }
+
+    float* touch(const float* base_packet, int cell) {
+        if (!base_packet || cell < 0 || static_cast<size_t>(cell) >= lookup.size()) {
+            return nullptr;
+        }
+        int& slot = lookup[static_cast<size_t>(cell)];
+        if (slot < 0) {
+            slot = static_cast<int>(cells.size());
+            cells.push_back(cell);
+            touched_lookup_slots.push_back(cell);
+            values.resize(static_cast<size_t>(slot + 1) * k_sparse_overlay_channels);
+            float* entry = values.data() + static_cast<size_t>(slot) * k_sparse_overlay_channels;
+            const size_t base = static_cast<size_t>(cell) * k_packet_channels;
+            entry[k_sparse_overlay_state_vx] = base_packet[base + k_channel_state_vx];
+            entry[k_sparse_overlay_state_vy] = base_packet[base + k_channel_state_vy];
+            entry[k_sparse_overlay_state_vz] = base_packet[base + k_channel_state_vz];
+            entry[k_sparse_overlay_state_p] = base_packet[base + k_channel_state_p];
+            entry[k_sparse_overlay_state_temp] = base_packet[base + k_channel_state_temp];
+            entry[k_sparse_overlay_thermal_source] = base_packet[base + k_channel_thermal_source];
+            return entry;
+        }
+        return values.data() + static_cast<size_t>(slot) * k_sparse_overlay_channels;
+    }
+};
 
 struct ThermalMaterialProperties {
     float solar_absorptivity;
@@ -1263,6 +1322,388 @@ void apply_tornado_vortex_descriptors(
     }
 }
 
+void apply_boundary_wind_overlay(
+    SparsePacketOverlayBuilder& overlay,
+    const float* base_packet,
+    int nx,
+    int ny,
+    int nz,
+    float boundary_wind_x,
+    float boundary_wind_y,
+    float boundary_wind_z
+) {
+    if (!base_packet || nx <= 0 || ny <= 0 || nz <= 0) {
+        return;
+    }
+    for (int x = 0; x < nx; ++x) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                const int edge_distance = std::min(
+                    std::min(std::min(x, y), z),
+                    std::min(std::min(nx - 1 - x, ny - 1 - y), nz - 1 - z)
+                );
+                if (edge_distance >= k_window_edge_stabilization_layers) {
+                    continue;
+                }
+                const int cell = grid_cell_index(ny, nz, x, y, z);
+                const size_t base = static_cast<size_t>(cell) * k_packet_channels;
+                if (base_packet[base + k_channel_obstacle] > 0.5f) {
+                    continue;
+                }
+                float* entry = overlay.touch(base_packet, cell);
+                if (!entry) {
+                    continue;
+                }
+                const float eta = (k_window_edge_stabilization_layers - edge_distance)
+                    / static_cast<float>(k_window_edge_stabilization_layers);
+                const float keep = k_window_edge_stabilization_min_keep
+                    + (1.0f - k_window_edge_stabilization_min_keep) * (1.0f - eta * eta);
+                const float relax = 1.0f - keep;
+                entry[k_sparse_overlay_state_vx] = entry[k_sparse_overlay_state_vx] * keep + boundary_wind_x * relax;
+                entry[k_sparse_overlay_state_vy] = entry[k_sparse_overlay_state_vy] * keep + boundary_wind_y * relax;
+                entry[k_sparse_overlay_state_vz] = entry[k_sparse_overlay_state_vz] * keep + boundary_wind_z * relax;
+                entry[k_sparse_overlay_state_p] *= keep;
+            }
+        }
+    }
+}
+
+void apply_nested_boundary_field_overlay(
+    SparsePacketOverlayBuilder& overlay,
+    const float* base_packet,
+    int nx,
+    int ny,
+    int nz,
+    float fallback_boundary_wind_x,
+    float fallback_boundary_wind_y,
+    float fallback_boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k
+) {
+    if (!base_packet || nx <= 0 || ny <= 0 || nz <= 0) {
+        return;
+    }
+    auto apply_face = [&](int face, int x, int y, int z, int layer_index, double u, double v) {
+        const int cell = grid_cell_index(ny, nz, x, y, z);
+        const size_t base = static_cast<size_t>(cell) * k_packet_channels;
+        if (base_packet[base + k_channel_obstacle] > 0.5f) {
+            return;
+        }
+        float* entry = overlay.touch(base_packet, cell);
+        if (!entry) {
+            return;
+        }
+        const float eta = (k_nested_boundary_layers - layer_index) / static_cast<float>(k_nested_boundary_layers);
+        const float keep = k_nested_boundary_min_keep + (1.0f - k_nested_boundary_min_keep) * (1.0f - eta * eta);
+        const float relax = 1.0f - keep;
+        float vx = 0.0f;
+        float vy = 0.0f;
+        float vz = 0.0f;
+        float air_k = 0.0f;
+        sample_boundary_face_target(
+            face,
+            boundary_face_resolution,
+            external_face_mask,
+            boundary_wind_face_x,
+            boundary_wind_face_y,
+            boundary_wind_face_z,
+            boundary_air_temperature_k,
+            fallback_boundary_wind_x,
+            fallback_boundary_wind_y,
+            fallback_boundary_wind_z,
+            fallback_boundary_air_temperature_k,
+            u,
+            v,
+            vx,
+            vy,
+            vz,
+            air_k
+        );
+        entry[k_sparse_overlay_state_vx] = entry[k_sparse_overlay_state_vx] * keep + vx * relax;
+        entry[k_sparse_overlay_state_vy] = entry[k_sparse_overlay_state_vy] * keep + vy * relax;
+        entry[k_sparse_overlay_state_vz] = entry[k_sparse_overlay_state_vz] * keep + vz * relax;
+        entry[k_sparse_overlay_state_p] *= keep;
+        entry[k_sparse_overlay_state_temp] = entry[k_sparse_overlay_state_temp] * keep
+            + ((air_k - fallback_boundary_air_temperature_k) / k_runtime_temperature_scale_kelvin) * relax;
+    };
+
+    for (int layer = 0; layer < k_nested_boundary_layers; ++layer) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                const double u = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                apply_face(4, layer, y, z, layer, u, v);
+                apply_face(5, nx - 1 - layer, y, z, layer, u, v);
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int y = 0; y < ny; ++y) {
+                const double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                apply_face(2, x, y, layer, layer, u, v);
+                apply_face(3, x, y, nz - 1 - layer, layer, u, v);
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int z = 0; z < nz; ++z) {
+                const double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                apply_face(0, x, layer, z, layer, u, v);
+                apply_face(1, x, ny - 1 - layer, z, layer, u, v);
+            }
+        }
+    }
+}
+
+void apply_sponge_boundary_field_overlay(
+    SparsePacketOverlayBuilder& overlay,
+    const float* base_packet,
+    int nx,
+    int ny,
+    int nz,
+    float fallback_boundary_wind_x,
+    float fallback_boundary_wind_y,
+    float fallback_boundary_wind_z,
+    float fallback_boundary_air_temperature_k,
+    int external_face_mask,
+    int boundary_face_resolution,
+    const float* boundary_wind_face_x,
+    const float* boundary_wind_face_y,
+    const float* boundary_wind_face_z,
+    const float* boundary_air_temperature_k,
+    int sponge_thickness_cells,
+    float sponge_velocity_relaxation,
+    float sponge_temperature_relaxation
+) {
+    if (!base_packet || nx <= 0 || ny <= 0 || nz <= 0) {
+        return;
+    }
+    if (sponge_thickness_cells <= 0 || external_face_mask == 0) {
+        return;
+    }
+    const float velocity_relaxation = std::max(0.0f, sponge_velocity_relaxation);
+    const float temperature_relaxation = std::max(0.0f, sponge_temperature_relaxation);
+    if (velocity_relaxation <= 0.0f && temperature_relaxation <= 0.0f) {
+        return;
+    }
+
+    auto apply_face = [&](int face, int x, int y, int z, int layer_index, double u, double v) {
+        if (layer_index < 0 || layer_index >= sponge_thickness_cells) {
+            return;
+        }
+        const int cell = grid_cell_index(ny, nz, x, y, z);
+        const size_t base = static_cast<size_t>(cell) * k_packet_channels;
+        if (base_packet[base + k_channel_obstacle] > 0.5f) {
+            return;
+        }
+        float* entry = overlay.touch(base_packet, cell);
+        if (!entry) {
+            return;
+        }
+        const float normalized = 1.0f - (layer_index / static_cast<float>(sponge_thickness_cells));
+        const float weight = normalized * normalized;
+        const float velocity_relax = std::clamp(velocity_relaxation * weight, 0.0f, k_sponge_relaxation_max);
+        const float temperature_relax = std::clamp(temperature_relaxation * weight, 0.0f, k_sponge_relaxation_max);
+        if (velocity_relax <= 0.0f && temperature_relax <= 0.0f) {
+            return;
+        }
+
+        float target_vx = 0.0f;
+        float target_vy = 0.0f;
+        float target_vz = 0.0f;
+        float target_air_k = 0.0f;
+        sample_boundary_face_target(
+            face,
+            boundary_face_resolution,
+            external_face_mask,
+            boundary_wind_face_x,
+            boundary_wind_face_y,
+            boundary_wind_face_z,
+            boundary_air_temperature_k,
+            fallback_boundary_wind_x,
+            fallback_boundary_wind_y,
+            fallback_boundary_wind_z,
+            fallback_boundary_air_temperature_k,
+            u,
+            v,
+            target_vx,
+            target_vy,
+            target_vz,
+            target_air_k
+        );
+
+        if (velocity_relax > 0.0f) {
+            const float velocity_keep = 1.0f - velocity_relax;
+            entry[k_sparse_overlay_state_vx] = entry[k_sparse_overlay_state_vx] * velocity_keep + target_vx * velocity_relax;
+            entry[k_sparse_overlay_state_vy] = entry[k_sparse_overlay_state_vy] * velocity_keep + target_vy * velocity_relax;
+            entry[k_sparse_overlay_state_vz] = entry[k_sparse_overlay_state_vz] * velocity_keep + target_vz * velocity_relax;
+        }
+        if (temperature_relax > 0.0f) {
+            const float temperature_keep = 1.0f - temperature_relax;
+            const float target_temp = (target_air_k - fallback_boundary_air_temperature_k) / k_runtime_temperature_scale_kelvin;
+            entry[k_sparse_overlay_state_temp] = entry[k_sparse_overlay_state_temp] * temperature_keep
+                + target_temp * temperature_relax;
+        }
+    };
+
+    for (int layer = 0; layer < sponge_thickness_cells; ++layer) {
+        for (int y = 0; y < ny; ++y) {
+            for (int z = 0; z < nz; ++z) {
+                const double u = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                if ((external_face_mask & (1 << 4)) != 0) {
+                    apply_face(4, layer, y, z, layer, u, v);
+                }
+                if ((external_face_mask & (1 << 5)) != 0) {
+                    apply_face(5, nx - 1 - layer, y, z, layer, u, v);
+                }
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int y = 0; y < ny; ++y) {
+                const double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((y + 0.5) / ny) * std::max(1, boundary_face_resolution - 1);
+                if ((external_face_mask & (1 << 2)) != 0) {
+                    apply_face(2, x, y, layer, layer, u, v);
+                }
+                if ((external_face_mask & (1 << 3)) != 0) {
+                    apply_face(3, x, y, nz - 1 - layer, layer, u, v);
+                }
+            }
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int z = 0; z < nz; ++z) {
+                const double u = ((x + 0.5) / nx) * std::max(1, boundary_face_resolution - 1);
+                const double v = ((z + 0.5) / nz) * std::max(1, boundary_face_resolution - 1);
+                if ((external_face_mask & (1 << 0)) != 0) {
+                    apply_face(0, x, layer, z, layer, u, v);
+                }
+                if ((external_face_mask & (1 << 1)) != 0) {
+                    apply_face(1, x, ny - 1 - layer, z, layer, u, v);
+                }
+            }
+        }
+    }
+}
+
+void apply_tornado_vortex_descriptor_overlay(
+    SparsePacketOverlayBuilder& overlay,
+    const float* base_packet,
+    int nx,
+    int ny,
+    int nz,
+    int tornado_descriptor_count,
+    const float* tornado_descriptors
+) {
+    if (!base_packet || nx <= 0 || ny <= 0 || nz <= 0 || tornado_descriptor_count <= 0 || !tornado_descriptors) {
+        return;
+    }
+    for (int descriptor_index = 0; descriptor_index < tornado_descriptor_count; ++descriptor_index) {
+        const float* descriptor = tornado_descriptors + descriptor_index * k_tornado_descriptor_floats;
+        const float center_x = descriptor[k_tornado_desc_center_x];
+        const float center_y = descriptor[k_tornado_desc_center_y];
+        const float center_z = descriptor[k_tornado_desc_center_z];
+        const float core_radius = std::max(1.0f, descriptor[k_tornado_desc_core_radius]);
+        const float influence_radius = std::max(core_radius, descriptor[k_tornado_desc_influence_radius]);
+        const float tangential_lattice = descriptor[k_tornado_desc_tangential_lattice];
+        const float radial_lattice = descriptor[k_tornado_desc_radial_lattice];
+        const float updraft_lattice = descriptor[k_tornado_desc_updraft_lattice];
+        const float condensation_bias = descriptor[k_tornado_desc_condensation_bias];
+        const float intensity = std::max(0.0f, descriptor[k_tornado_desc_intensity]);
+        const float rotation_sign = descriptor[k_tornado_desc_rotation_sign] >= 0.0f ? 1.0f : -1.0f;
+        const float lifecycle_envelope = std::clamp(descriptor[k_tornado_desc_lifecycle_envelope], 0.0f, 1.0f);
+        const float effective_intensity = intensity * lifecycle_envelope;
+        if (effective_intensity <= 1.0e-4f) {
+            continue;
+        }
+
+        const int min_x = std::max(0, static_cast<int>(std::floor(center_x - influence_radius - 1.0f)));
+        const int max_x = std::min(nx - 1, static_cast<int>(std::ceil(center_x + influence_radius + 1.0f)));
+        const int min_z = std::max(0, static_cast<int>(std::floor(center_z - influence_radius - 1.0f)));
+        const int max_z = std::min(nz - 1, static_cast<int>(std::ceil(center_z + influence_radius + 1.0f)));
+        const int min_y = std::max(0, static_cast<int>(std::floor(center_y - core_radius * 0.75f - 1.0f)));
+        const int max_y = std::min(ny - 1, static_cast<int>(std::ceil(center_y + influence_radius * 1.25f + 1.0f)));
+
+        for (int x = min_x; x <= max_x; ++x) {
+            for (int y = min_y; y <= max_y; ++y) {
+                for (int z = min_z; z <= max_z; ++z) {
+                    const int cell = grid_cell_index(ny, nz, x, y, z);
+                    const size_t base = static_cast<size_t>(cell) * k_packet_channels;
+                    if (base_packet[base + k_channel_obstacle] > 0.5f) {
+                        continue;
+                    }
+                    const float px = static_cast<float>(x) + 0.5f;
+                    const float py = static_cast<float>(y) + 0.5f;
+                    const float pz = static_cast<float>(z) + 0.5f;
+                    const float dx = px - center_x;
+                    const float dy = py - center_y;
+                    const float dz = pz - center_z;
+                    const float horizontal_distance_sq = dx * dx + dz * dz;
+                    if (horizontal_distance_sq >= influence_radius * influence_radius) {
+                        continue;
+                    }
+
+                    const float horizontal_distance = std::max(1.0e-3f, std::sqrt(horizontal_distance_sq));
+                    const float outer_norm = horizontal_distance / std::max(1.0f, influence_radius);
+                    const float core_norm = horizontal_distance / std::max(1.0f, core_radius);
+                    const float outer_envelope = std::exp(-outer_norm * outer_norm * 1.2f);
+                    const float core_envelope = std::exp(-core_norm * core_norm * 2.2f);
+                    const float above_envelope = dy <= 0.0f
+                        ? 1.0f
+                        : std::exp(-(dy / std::max(1.0f, influence_radius * 0.80f)) * (dy / std::max(1.0f, influence_radius * 0.80f)));
+                    const float below_envelope = dy >= 0.0f
+                        ? 1.0f
+                        : std::exp(-(dy / std::max(1.0f, core_radius * 0.75f)) * (dy / std::max(1.0f, core_radius * 0.75f)));
+                    const float vertical_envelope = above_envelope * below_envelope;
+                    const float envelope = effective_intensity * vertical_envelope;
+                    if (envelope <= 1.0e-4f) {
+                        continue;
+                    }
+
+                    float* entry = overlay.touch(base_packet, cell);
+                    if (!entry) {
+                        continue;
+                    }
+                    const float tangent_x = (-dz / horizontal_distance) * rotation_sign;
+                    const float tangent_z = (dx / horizontal_distance) * rotation_sign;
+                    const float radial_x = -dx / horizontal_distance;
+                    const float radial_z = -dz / horizontal_distance;
+                    const float swirl = tangential_lattice * envelope * (0.30f * outer_envelope + 1.10f * core_envelope);
+                    const float inflow = radial_lattice * envelope * (0.55f * outer_envelope + 0.35f * core_envelope);
+                    const float updraft = updraft_lattice * envelope * (0.30f * outer_envelope + 0.90f * core_envelope);
+                    const float heating = 0.0012f * condensation_bias * envelope * (0.20f * outer_envelope + 0.65f * core_envelope);
+
+                    entry[k_sparse_overlay_state_vx] = std::clamp(
+                        entry[k_sparse_overlay_state_vx] + tangent_x * swirl + radial_x * inflow,
+                        -k_tornado_lattice_speed_cap,
+                        k_tornado_lattice_speed_cap
+                    );
+                    entry[k_sparse_overlay_state_vy] = std::clamp(
+                        entry[k_sparse_overlay_state_vy] + updraft,
+                        -k_tornado_lattice_speed_cap,
+                        k_tornado_lattice_speed_cap
+                    );
+                    entry[k_sparse_overlay_state_vz] = std::clamp(
+                        entry[k_sparse_overlay_state_vz] + tangent_z * swirl + radial_z * inflow,
+                        -k_tornado_lattice_speed_cap,
+                        k_tornado_lattice_speed_cap
+                    );
+                    entry[k_sparse_overlay_thermal_source] = std::clamp(
+                        entry[k_sparse_overlay_thermal_source] + heating,
+                        -k_native_thermal_source_max,
+                        k_native_thermal_source_max
+                    );
+                }
+            }
+        }
+    }
+}
+
 bool build_region_packet_from_template(
     const RegionPacketTemplateData& packet_template,
     const DynamicRegionData& dynamic,
@@ -2130,8 +2571,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     const bool has_boundary_override = boundary_face_resolution > 0 && external_face_mask != 0;
     const bool has_global_edge_stabilization = sponge_thickness_cells <= 0 && external_face_mask != 0;
     const bool has_tornado_override = tornado_descriptor_count > 0 && tornado_descriptors != nullptr;
-    const bool needs_materialized_packet =
-        needs_dynamic_seed || has_boundary_override || has_global_edge_stabilization || has_tornado_override;
+    const bool needs_materialized_packet = needs_dynamic_seed;
     const float* packet_data = packet_template->values.data();
     if (needs_materialized_packet) {
         if (!build_region_packet_from_template(
@@ -2200,9 +2640,91 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
         }
         packet_data = packet.data();
     }
+    thread_local SparsePacketOverlayBuilder overlay_builder;
+    overlay_builder.reset(cells);
+    if (!needs_materialized_packet) {
+        if (has_global_edge_stabilization) {
+            apply_boundary_wind_overlay(
+                overlay_builder,
+                packet_data,
+                nx,
+                ny,
+                nz,
+                boundary_wind_x,
+                boundary_wind_y,
+                boundary_wind_z
+            );
+        }
+        if (has_tornado_override) {
+            apply_tornado_vortex_descriptor_overlay(
+                overlay_builder,
+                packet_data,
+                nx,
+                ny,
+                nz,
+                tornado_descriptor_count,
+                tornado_descriptors
+            );
+        }
+        if (has_boundary_override) {
+            if (sponge_thickness_cells > 0) {
+                apply_sponge_boundary_field_overlay(
+                    overlay_builder,
+                    packet_data,
+                    nx,
+                    ny,
+                    nz,
+                    boundary_wind_x,
+                    boundary_wind_y,
+                    boundary_wind_z,
+                    fallback_boundary_air_temperature_k,
+                    external_face_mask,
+                    boundary_face_resolution,
+                    boundary_wind_face_x,
+                    boundary_wind_face_y,
+                    boundary_wind_face_z,
+                    boundary_air_temperature_k,
+                    sponge_thickness_cells,
+                    sponge_velocity_relaxation,
+                    sponge_temperature_relaxation
+                );
+            } else {
+                apply_nested_boundary_field_overlay(
+                    overlay_builder,
+                    packet_data,
+                    nx,
+                    ny,
+                    nz,
+                    boundary_wind_x,
+                    boundary_wind_y,
+                    boundary_wind_z,
+                    fallback_boundary_air_temperature_k,
+                    external_face_mask,
+                    boundary_face_resolution,
+                    boundary_wind_face_x,
+                    boundary_wind_face_y,
+                    boundary_wind_face_z,
+                    boundary_air_temperature_k
+                );
+            }
+        }
+    }
     // Hot path keeps the live L2 state inside the native context. Full flow-state
     // caches are refreshed only on explicit sync/export paths.
-    if (!aero_lbm_step_rect(packet_data, nx, ny, nz, region_key, nullptr)) {
+    const bool step_ok = overlay_builder.cells.empty()
+        ? aero_lbm_step_rect(packet_data, nx, ny, nz, region_key, nullptr) != 0
+        : aero_lbm_step_rect_with_sparse_overlays(
+            packet_data,
+            nx,
+            ny,
+            nz,
+            region_key,
+            overlay_builder.cells.data(),
+            overlay_builder.values.data(),
+            static_cast<int>(overlay_builder.cells.size()),
+            nullptr
+        ) != 0;
+    if (!step_ok) {
         set_simulation_last_error(std::string("simulation_step_region_stored failed: ") + aero_lbm_last_error());
         return 0;
     }

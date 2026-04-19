@@ -66,6 +66,13 @@ constexpr int kChannelStateVz = 7;
 constexpr int kChannelStateP = 8;
 constexpr int kChannelThermalSource = 9;
 constexpr int kChannelStateTemp = 10;
+constexpr int kSparseOverlayChannels = 6;
+constexpr int kSparseOverlayStateVx = 0;
+constexpr int kSparseOverlayStateVy = 1;
+constexpr int kSparseOverlayStateVz = 2;
+constexpr int kSparseOverlayStateP = 3;
+constexpr int kSparseOverlayStateTemp = 4;
+constexpr int kSparseOverlayThermalSource = 5;
 
 constexpr float kLatticeSoundSpeed = 0.57735026919f;
 constexpr float kMaxMach = 0.60f;
@@ -1488,6 +1495,34 @@ void ingest_payload(ContextState& ctx, const float* payload, int in_channels) {
             thermal_src = payload[base + kChannelThermalSource];
         }
         ctx.thermal_source[cell] = clampf(thermal_src, -kThermalSourceMax, kThermalSourceMax);
+    }
+}
+
+void apply_sparse_payload_overlays(
+    ContextState& ctx,
+    const int* overlay_cells,
+    const float* overlay_values,
+    int overlay_count
+) {
+    if (overlay_count <= 0 || !overlay_cells || !overlay_values) {
+        return;
+    }
+    for (int overlay_index = 0; overlay_index < overlay_count; ++overlay_index) {
+        const int cell = overlay_cells[overlay_index];
+        if (cell < 0 || static_cast<std::size_t>(cell) >= ctx.cells) {
+            continue;
+        }
+        const float* values = overlay_values + static_cast<std::size_t>(overlay_index) * kSparseOverlayChannels;
+        ctx.ref_ux[static_cast<std::size_t>(cell)] = finite_or(values[kSparseOverlayStateVx], 0.0f);
+        ctx.ref_uy[static_cast<std::size_t>(cell)] = finite_or(values[kSparseOverlayStateVy], 0.0f);
+        ctx.ref_uz[static_cast<std::size_t>(cell)] = finite_or(values[kSparseOverlayStateVz], 0.0f);
+        ctx.ref_pressure[static_cast<std::size_t>(cell)] = clampf(values[kSparseOverlayStateP], kPressureMin, kPressureMax);
+        ctx.ref_temperature[static_cast<std::size_t>(cell)] = clampf(values[kSparseOverlayStateTemp], kThermalMin, kThermalMax);
+        ctx.thermal_source[static_cast<std::size_t>(cell)] = clampf(
+            values[kSparseOverlayThermalSource],
+            -kThermalSourceMax,
+            kThermalSourceMax
+        );
     }
 }
 
@@ -4456,7 +4491,15 @@ cl_int enqueue_kernel_1d(cl_kernel kernel, int cells) {
     return clEnqueueNDRangeKernel(g_opencl.queue, kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
 }
 
-bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
+bool opencl_step(
+    ContextState& ctx,
+    const float* payload,
+    const int* overlay_cells,
+    const float* overlay_values,
+    int overlay_count,
+    float* out,
+    StepTiming& timing
+) {
     if (!ensure_context_gpu_buffers(ctx)) return false;
 
     auto fail_cl = [&](const char* api, cl_int err) -> bool {
@@ -4490,11 +4533,62 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         constexpr std::size_t kPayloadIncrementalMaxRanges = 96;
         const std::size_t payload_values = ctx.cells * static_cast<std::size_t>(g_cfg.input_channels);
         const std::size_t cell_bytes = static_cast<std::size_t>(g_cfg.input_channels) * sizeof(float);
+        thread_local std::vector<int> overlay_lookup;
+        thread_local std::vector<int> overlay_lookup_touched;
+        thread_local std::vector<float> upload_staging;
+        if (overlay_lookup.size() != ctx.cells) {
+            overlay_lookup.assign(ctx.cells, -1);
+        } else {
+            for (int cell : overlay_lookup_touched) {
+                if (cell >= 0 && static_cast<std::size_t>(cell) < overlay_lookup.size()) {
+                    overlay_lookup[static_cast<std::size_t>(cell)] = -1;
+                }
+            }
+        }
+        overlay_lookup_touched.clear();
+        for (int overlay_index = 0; overlay_index < overlay_count; ++overlay_index) {
+            const int cell = overlay_cells[overlay_index];
+            if (cell < 0 || static_cast<std::size_t>(cell) >= ctx.cells) {
+                continue;
+            }
+            if (overlay_lookup[static_cast<std::size_t>(cell)] < 0) {
+                overlay_lookup_touched.push_back(cell);
+            }
+            overlay_lookup[static_cast<std::size_t>(cell)] = overlay_index;
+        }
+        auto write_effective_cell = [&](std::size_t cell, float* dst) {
+            const std::size_t base = cell * static_cast<std::size_t>(g_cfg.input_channels);
+            std::memcpy(dst, payload + base, cell_bytes);
+            if (cell >= overlay_lookup.size()) {
+                return;
+            }
+            const int overlay_index = overlay_lookup[cell];
+            if (overlay_index < 0) {
+                return;
+            }
+            const float* overlay = overlay_values + static_cast<std::size_t>(overlay_index) * kSparseOverlayChannels;
+            dst[kChannelStateVx] = overlay[kSparseOverlayStateVx];
+            dst[kChannelStateVy] = overlay[kSparseOverlayStateVy];
+            dst[kChannelStateVz] = overlay[kSparseOverlayStateVz];
+            dst[kChannelStateP] = overlay[kSparseOverlayStateP];
+            if (g_cfg.input_channels > kChannelThermalSource) {
+                dst[kChannelThermalSource] = overlay[kSparseOverlayThermalSource];
+            }
+            if (g_cfg.input_channels > kChannelStateTemp) {
+                dst[kChannelStateTemp] = overlay[kSparseOverlayStateTemp];
+            }
+        };
         auto full_upload = [&]() -> bool {
             if (ctx.payload_cache.size() != payload_values) {
                 ctx.payload_cache.assign(payload_values, 0.0f);
             }
-            std::memcpy(ctx.payload_cache.data(), payload, payload_bytes);
+            if (overlay_count <= 0) {
+                std::memcpy(ctx.payload_cache.data(), payload, payload_bytes);
+            } else {
+                for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+                    write_effective_cell(cell, ctx.payload_cache.data() + cell * static_cast<std::size_t>(g_cfg.input_channels));
+                }
+            }
             cl_int upload_err = clEnqueueWriteBuffer(
                 g_opencl.queue,
                 ctx.d_payload,
@@ -4516,18 +4610,24 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
         } else {
             std::vector<std::array<std::size_t, 2>> changed_ranges;
             changed_ranges.reserve(32);
-            const char* payload_bytes_ptr = reinterpret_cast<const char*>(payload);
             char* cached_bytes_ptr = reinterpret_cast<char*>(ctx.payload_cache.data());
+            std::vector<float> desired_cell_buffer(static_cast<std::size_t>(g_cfg.input_channels), 0.0f);
             bool in_range = false;
             std::size_t range_start_cell = 0;
             std::size_t changed_cells = 0;
             for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
                 const std::size_t byte_offset = cell * cell_bytes;
-                const bool changed = std::memcmp(
-                    cached_bytes_ptr + byte_offset,
-                    payload_bytes_ptr + byte_offset,
-                    cell_bytes
-                ) != 0;
+                bool changed = false;
+                if (overlay_count <= 0 || overlay_lookup[cell] < 0) {
+                    changed = std::memcmp(
+                        cached_bytes_ptr + byte_offset,
+                        reinterpret_cast<const char*>(payload) + byte_offset,
+                        cell_bytes
+                    ) != 0;
+                } else {
+                    write_effective_cell(cell, desired_cell_buffer.data());
+                    changed = std::memcmp(cached_bytes_ptr + byte_offset, desired_cell_buffer.data(), cell_bytes) != 0;
+                }
                 if (changed) {
                     ++changed_cells;
                     if (!in_range) {
@@ -4550,15 +4650,25 @@ bool opencl_step(ContextState& ctx, const float* payload, float* out, StepTiming
             } else {
                 for (const std::array<std::size_t, 2>& range : changed_ranges) {
                     const std::size_t byte_offset = range[0] * cell_bytes;
-                    const std::size_t byte_count = range[1] * cell_bytes;
-                    std::memcpy(cached_bytes_ptr + byte_offset, payload_bytes_ptr + byte_offset, byte_count);
+                    const std::size_t cells_in_range = range[1];
+                    const std::size_t values_in_range = cells_in_range * static_cast<std::size_t>(g_cfg.input_channels);
+                    upload_staging.resize(values_in_range);
+                    for (std::size_t local = 0; local < cells_in_range; ++local) {
+                        const std::size_t cell = range[0] + local;
+                        write_effective_cell(
+                            cell,
+                            upload_staging.data() + local * static_cast<std::size_t>(g_cfg.input_channels)
+                        );
+                    }
+                    const std::size_t byte_count = values_in_range * sizeof(float);
+                    std::memcpy(cached_bytes_ptr + byte_offset, upload_staging.data(), byte_count);
                     cl_int upload_err = clEnqueueWriteBuffer(
                         g_opencl.queue,
                         ctx.d_payload,
                         CL_TRUE,
                         byte_offset,
                         byte_count,
-                        cached_bytes_ptr + byte_offset,
+                        upload_staging.data(),
                         0,
                         nullptr,
                         nullptr
@@ -5298,7 +5408,7 @@ OpenClRuntime g_opencl;
 void release_context_gpu_buffers(ContextState&) {}
 void release_opencl_runtime() {}
 bool initialize_opencl_runtime() { g_opencl.error = "Disabled"; return false; }
-bool opencl_step(ContextState&, const float*, float*, StepTiming&) { return false; }
+bool opencl_step(ContextState&, const float*, const int*, const float*, int, float*, StepTiming&) { return false; }
 bool sync_context_temperature_from_gpu(ContextState&) { return true; }
 bool sync_context_temperature_to_gpu(ContextState&) { return true; }
 bool sync_context_state_from_gpu(ContextState&) { return true; }
@@ -5859,9 +5969,17 @@ bool shift_context_cpu_state(ContextState& ctx, int dx, int dy, int dz) {
     return true;
 }
 
-void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
+void run_cpu_step(
+    ContextState& ctx,
+    const float* packet,
+    const int* overlay_cells,
+    const float* overlay_values,
+    int overlay_count,
+    float* out
+) {
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     ingest_payload(ctx, packet, g_cfg.input_channels);
+    apply_sparse_payload_overlays(ctx, overlay_cells, overlay_values, overlay_count);
     if (!ctx.cpu_initialized) {
         initialize_distributions(ctx);
     } else {
@@ -5879,16 +5997,24 @@ void run_cpu_step(ContextState& ctx, const float* packet, float* out) {
     ctx.step_counter += 1;
 }
 
-bool run_solver_step(ContextState& ctx, const float* packet, float* out, StepTiming& timing) {
+bool run_solver_step(
+    ContextState& ctx,
+    const float* packet,
+    const int* overlay_cells,
+    const float* overlay_values,
+    int overlay_count,
+    float* out,
+    StepTiming& timing
+) {
     bool ok = false;
     if (g_cfg.opencl_enabled && benchmark_opencl_supported()) {
-        if (!(ok = opencl_step(ctx, packet, out, timing))) {
+        if (!(ok = opencl_step(ctx, packet, overlay_cells, overlay_values, overlay_count, out, timing))) {
             disable_opencl_runtime(g_opencl.error.empty() ? "OpenCL fail" : g_opencl.error);
         }
     }
     if (!ok) {
         auto solver_begin = Clock::now();
-        run_cpu_step(ctx, packet, out);
+        run_cpu_step(ctx, packet, overlay_cells, overlay_values, overlay_count, out);
         timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
         ok = true;
     }
@@ -5949,7 +6075,39 @@ static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jin
     ensure_context_shape(ctx, nx, ny, nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
 
-    const bool ok = run_solver_step(ctx, packet, output_flow, timing);
+    const bool ok = run_solver_step(ctx, packet, nullptr, nullptr, 0, output_flow, timing);
+    timing.total_ms = elapsed_ms(tick_begin, Clock::now());
+    record_timing(timing);
+    return ok;
+}
+
+static bool native_step_raw_dims_with_sparse_overlays_impl(
+    const float* packet,
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    const int* overlay_cells,
+    const float* overlay_values,
+    jint overlay_count,
+    float* output_flow
+) {
+    auto tick_begin = Clock::now();
+    StepTiming timing;
+
+    if (!g_cfg.initialized || !packet) return false;
+    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (overlay_count < 0) return false;
+    if (overlay_count > 0 && (!overlay_cells || !overlay_values)) return false;
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+
+    LockedContext locked_context(context_key, true);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
+    ensure_context_shape(ctx, nx, ny, nz, cells);
+    if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
+
+    const bool ok = run_solver_step(ctx, packet, overlay_cells, overlay_values, overlay_count, output_flow, timing);
     timing.total_ms = elapsed_ms(tick_begin, Clock::now());
     record_timing(timing);
     return ok;
@@ -5998,7 +6156,7 @@ static jboolean native_step_impl(
     env->ReleaseByteArrayElements(payload, payload_bytes_ptr, JNI_ABORT);
     timing.payload_copy_ms += elapsed_ms(copy_begin, Clock::now());
 
-    bool ok = run_solver_step(ctx, ctx.packet.data(), out, timing);
+    bool ok = run_solver_step(ctx, ctx.packet.data(), nullptr, nullptr, 0, out, timing);
 
     env->ReleaseFloatArrayElements(output_flow, out, 0);
     timing.total_ms = elapsed_ms(tick_begin, Clock::now());
@@ -6034,7 +6192,7 @@ static jboolean native_step_direct_impl(
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
 
     const float* packet = reinterpret_cast<const float*>(payload_raw);
-    bool ok = run_solver_step(ctx, packet, out, timing);
+    bool ok = run_solver_step(ctx, packet, nullptr, nullptr, 0, out, timing);
 
     env->ReleaseFloatArrayElements(output_flow, out, 0);
     timing.total_ms = elapsed_ms(tick_begin, Clock::now());
@@ -6618,6 +6776,30 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_ch
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny, int nz, long long context_key, float* output_flow) {
     return native_step_raw_dims_impl(packet, nx, ny, nz, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(
+    const float* packet,
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    const int* overlay_cells,
+    const float* overlay_values,
+    int overlay_count,
+    float* output_flow
+) {
+    return native_step_raw_dims_with_sparse_overlays_impl(
+        packet,
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        overlay_cells,
+        overlay_values,
+        overlay_count,
+        output_flow
+    ) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_shift_context(int grid_size, long long context_key, int dx, int dy, int dz) {
