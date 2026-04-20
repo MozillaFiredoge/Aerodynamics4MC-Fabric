@@ -21,7 +21,8 @@ enum {
     AERO_LBM_MESOSCALE_STATE_CHANNELS = 5,
     AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS = 4,
     AERO_LBM_SIMULATION_PACKED_ATLAS_CHANNELS = 4,
-    AERO_LBM_SIMULATION_PLAYER_PROBE_CHANNELS = 6
+    AERO_LBM_SIMULATION_PLAYER_PROBE_CHANNELS = 6,
+    AERO_LBM_SIMULATION_BRICK_RUNTIME_STATUS_FIELDS = 8
 };
 
 typedef enum AeroLbmBenchmarkPreset {
@@ -250,6 +251,31 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_submit_world_deltas(
     long long service_key,
     const AeroLbmWorldDelta* deltas,
     int delta_count
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_brick_world_runtime(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    float dx_meters,
+    float dt_seconds
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_brick_world_active_hints(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    const int* brick_coords,
+    int brick_count
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_brick_world_runtime_status(
+    long long service_key,
+    long long world_key,
+    int* out_status,
+    int status_count
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_brick_world_runtime(
+    long long service_key,
+    long long world_key,
+    int step_count
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     long long service_key,

@@ -11,6 +11,8 @@ public final class NativeSimulationBridge {
     public static final int NESTED_FEEDBACK_LAYOUT_INTS_PER_BIN = 9;
     public static final int NESTED_FEEDBACK_VALUES_PER_BIN = 10;
     public static final int NESTED_FEEDBACK_STATUS_FIELDS = 6;
+    public static final int BRICK_HINT_COORDS_PER_BRICK = 3;
+    public static final int BRICK_RUNTIME_STATUS_FIELDS = 8;
     private static final int FACE_COUNT = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
@@ -99,6 +101,67 @@ public final class NativeSimulationBridge {
 
     public boolean submitWorldDelta(long serviceKey, WorldDelta delta) {
         return submitWorldDeltas(serviceKey, new WorldDelta[] {delta});
+    }
+
+    public boolean ensureBrickWorldRuntime(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        float dxMeters,
+        float dtSeconds
+    ) {
+        return LOADED && serviceKey != 0L && worldKey != 0L
+            && brickSize > 0
+            && Float.isFinite(dxMeters) && dxMeters > 0.0f
+            && Float.isFinite(dtSeconds) && dtSeconds > 0.0f
+            && nativeEnsureBrickWorldRuntime(serviceKey, worldKey, brickSize, dxMeters, dtSeconds);
+    }
+
+    public boolean setBrickWorldActiveHints(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int[] brickCoords
+    ) {
+        if (!LOADED || serviceKey == 0L || worldKey == 0L || brickSize <= 0 || brickCoords == null) {
+            return false;
+        }
+        if ((brickCoords.length % BRICK_HINT_COORDS_PER_BRICK) != 0) {
+            return false;
+        }
+        return nativeSetBrickWorldActiveHints(
+            serviceKey,
+            worldKey,
+            brickSize,
+            brickCoords,
+            brickCoords.length / BRICK_HINT_COORDS_PER_BRICK
+        );
+    }
+
+    public BrickWorldRuntimeStatus getBrickWorldRuntimeStatus(long serviceKey, long worldKey) {
+        if (!LOADED || serviceKey == 0L || worldKey == 0L) {
+            return null;
+        }
+        int[] status = new int[BRICK_RUNTIME_STATUS_FIELDS];
+        if (!nativeGetBrickWorldRuntimeStatus(serviceKey, worldKey, status)) {
+            return null;
+        }
+        return new BrickWorldRuntimeStatus(
+            status[0],
+            status[1],
+            status[2],
+            status[3],
+            status[4],
+            status[5],
+            status[6],
+            status[7]
+        );
+    }
+
+    public boolean stepBrickWorldRuntime(long serviceKey, long worldKey, int stepCount) {
+        return LOADED && serviceKey != 0L && worldKey != 0L
+            && stepCount > 0
+            && nativeStepBrickWorldRuntime(serviceKey, worldKey, stepCount);
     }
 
     public boolean uploadStaticRegion(
@@ -766,6 +829,18 @@ public final class NativeSimulationBridge {
     ) {
     }
 
+    public record BrickWorldRuntimeStatus(
+        int brickSize,
+        int knownBrickCount,
+        int activeHintCount,
+        int activeBrickCount,
+        int geometryDirtyCount,
+        int forcingDirtyCount,
+        int pendingReinitCount,
+        int epoch
+    ) {
+    }
+
     private static native long nativeCreateService();
 
     private static native void nativeReleaseService(long serviceKey);
@@ -773,6 +848,34 @@ public final class NativeSimulationBridge {
     private static native boolean nativeSetFocus(long serviceKey, int blockX, int blockY, int blockZ, int radiusBlocks);
 
     private static native boolean nativeSubmitWorldDeltas(long serviceKey, int[] encodedInts, float[] encodedFloats);
+
+    private static native boolean nativeEnsureBrickWorldRuntime(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        float dxMeters,
+        float dtSeconds
+    );
+
+    private static native boolean nativeSetBrickWorldActiveHints(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int[] brickCoords,
+        int brickCount
+    );
+
+    private static native boolean nativeGetBrickWorldRuntimeStatus(
+        long serviceKey,
+        long worldKey,
+        int[] outStatus
+    );
+
+    private static native boolean nativeStepBrickWorldRuntime(
+        long serviceKey,
+        long worldKey,
+        int stepCount
+    );
 
     private static native boolean nativeUploadStaticRegion(
         long serviceKey,

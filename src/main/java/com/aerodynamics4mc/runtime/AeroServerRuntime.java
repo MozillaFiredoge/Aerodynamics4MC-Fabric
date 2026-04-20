@@ -10,6 +10,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -237,6 +238,12 @@ public final class AeroServerRuntime {
     private static final int REGION_HALO_CELLS = CHUNK_SIZE;
     private static final int REGION_CORE_SIZE = GRID_SIZE - REGION_HALO_CELLS * 2;
     private static final int REGION_LATTICE_STRIDE = REGION_CORE_SIZE;
+    private static final int BRICK_RUNTIME_SIZE = REGION_CORE_SIZE;
+    private static final int HORIZONTAL_ATTACH_MARGIN_CELLS = Math.max(4, REGION_CORE_SIZE / 4);
+    private static final int VERTICAL_SOLVE_MARGIN_CELLS = Math.max(4, REGION_CORE_SIZE / 4);
+    private static final int VERTICAL_ATTACH_MARGIN_CELLS = Math.max(VERTICAL_SOLVE_MARGIN_CELLS + 4, REGION_CORE_SIZE / 3);
+    private static final int SHELL_WINDOW_RETENTION_TICKS = 8;
+    private static final int BOUNDARY_FIELD_REFRESH_TICKS = 4;
     private static final int CORE_SECTION_MIN = REGION_HALO_CELLS / CHUNK_SIZE;
     private static final int CORE_SECTION_MAX = CORE_SECTION_MIN + (REGION_CORE_SIZE / CHUNK_SIZE) - 1;
     private static final int CORE_SECTION_COUNT = (CORE_SECTION_MAX - CORE_SECTION_MIN + 1)
@@ -255,6 +262,8 @@ public final class AeroServerRuntime {
     private final Map<RegistryKey<World>, MesoscaleGrid> mesoscaleMetGrids = new HashMap<>();
     private final Map<RegistryKey<World>, ConcurrentLinkedQueue<MesoscaleGrid.NestedFeedbackBin>> pendingNestedFeedbackBins = new ConcurrentHashMap<>();
     private final Map<RegistryKey<World>, NestedFeedbackRuntimeDiagnostics> nestedFeedbackRuntimeDiagnostics = new ConcurrentHashMap<>();
+    private final Set<RegistryKey<World>> brickRuntimeHintWorldKeys = new HashSet<>();
+    private final Set<RegistryKey<World>> brickRuntimeKnownWorldKeys = new HashSet<>();
     private final Object simulationStateLock = new Object();
     private final Object coordinatorLifecycleLock = new Object();
     private final Object pendingWorldDeltasLock = new Object();
@@ -279,6 +288,7 @@ public final class AeroServerRuntime {
     private final AtomicReference<Map<UUID, EntitySample>> publishedEntitySamples = new AtomicReference<>(Map.of());
     private volatile Set<WindowKey> desiredWindowKeys = Set.of();
     private volatile Set<WindowKey> desiredSolveWindowKeys = Set.of();
+    private final Map<WindowKey, Integer> shellWindowRetainUntilTick = new HashMap<>();
     private volatile Map<RegistryKey<World>, WorldEnvironmentSnapshot> worldEnvironmentSnapshots = Map.of();
     private volatile List<PlayerProbeRequest> activePlayerProbeRequests = List.of();
     private volatile List<EntitySampleRequest> activeEntitySampleRequests = List.of();
@@ -460,6 +470,10 @@ public final class AeroServerRuntime {
             }
             pendingNestedFeedbackBins.remove(world.getRegistryKey());
             nestedFeedbackRuntimeDiagnostics.remove(world.getRegistryKey());
+            synchronized (simulationStateLock) {
+                brickRuntimeHintWorldKeys.remove(world.getRegistryKey());
+                brickRuntimeKnownWorldKeys.remove(world.getRegistryKey());
+            }
             submitWorldDeltaToSimulation(new NativeSimulationBridge.WorldDelta(
                 NativeSimulationBridge.WORLD_DELTA_WORLD_UNLOADED,
                 0,
@@ -791,7 +805,7 @@ public final class AeroServerRuntime {
         ServerWorld world = source.getWorld();
         BlockPos focus = BlockPos.ofFloored(source.getPosition());
         BlockPos anchorCoreOrigin = coreOriginForPosition(focus);
-        List<L2CaptureRegionSpec> captureRegions = activeRegionKeys(List.of(new PlayerRegionAnchor(world.getRegistryKey(), anchorCoreOrigin)))
+        List<L2CaptureRegionSpec> captureRegions = activeRegionKeys(List.of(new PlayerRegionAnchor(world.getRegistryKey(), anchorCoreOrigin, focus)))
             .stream()
             .sorted(Comparator
                 .comparingInt((WindowKey key) -> key.origin().getY())
@@ -2546,6 +2560,9 @@ public final class AeroServerRuntime {
         nestedFeedbackRuntimeDiagnostics.clear();
         desiredWindowKeys = Set.of();
         desiredSolveWindowKeys = Set.of();
+        shellWindowRetainUntilTick.clear();
+        brickRuntimeHintWorldKeys.clear();
+        brickRuntimeKnownWorldKeys.clear();
         activePlayerProbeRequests = List.of();
         activeEntitySampleRequests = List.of();
         worldEnvironmentSnapshots = Map.of();
@@ -2944,11 +2961,12 @@ public final class AeroServerRuntime {
             );
             for (ServerPlayerEntity player : players) {
                 BlockPos playerPos = player.getBlockPos();
-                anchors.add(new PlayerRegionAnchor(worldKey, coreOriginForPosition(playerPos)));
+                anchors.add(new PlayerRegionAnchor(worldKey, coreOriginForPosition(playerPos), playerPos.toImmutable()));
                 probeRequests.add(new PlayerProbeRequest(player.getUuid(), worldKey, playerPos.toImmutable()));
             }
         }
         Set<WindowKey> activeKeys = activeRegionKeys(anchors);
+        Map<RegistryKey<World>, int[]> brickRuntimeHintCoordsByWorld = brickRuntimeHintCoords(anchors);
         List<EntitySampleRequest> entityRequests = ENTITY_SAMPLE_COLLECTION_ENABLED
             ? collectEntitySampleRequests(server, activeKeys)
             : List.of();
@@ -2957,7 +2975,8 @@ public final class AeroServerRuntime {
             List.copyOf(anchors),
             List.copyOf(probeRequests),
             List.copyOf(entityRequests),
-            Map.copyOf(snapshots)
+            Map.copyOf(snapshots),
+            brickRuntimeHintCoordsByWorld
         );
     }
 
@@ -3029,7 +3048,17 @@ public final class AeroServerRuntime {
     }
 
     private void synchronizeDesiredRegions() {
-        Set<WindowKey> desiredWindows = desiredWindowKeys;
+        Set<WindowKey> desiredWindows = new HashSet<>(desiredWindowKeys);
+        Set<WindowKey> solveWindows = desiredSolveWindowKeys;
+        Iterator<Map.Entry<WindowKey, Integer>> retainIterator = shellWindowRetainUntilTick.entrySet().iterator();
+        while (retainIterator.hasNext()) {
+            Map.Entry<WindowKey, Integer> entry = retainIterator.next();
+            if (entry.getValue() < tickCounter || solveWindows.contains(entry.getKey())) {
+                retainIterator.remove();
+                continue;
+            }
+            desiredWindows.add(entry.getKey());
+        }
         MinecraftServer server = currentServer;
         Iterator<Map.Entry<WindowKey, RegionRecord>> iterator = regions.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -3037,6 +3066,7 @@ public final class AeroServerRuntime {
             if (desiredWindows.contains(entry.getKey())) {
                 continue;
             }
+            shellWindowRetainUntilTick.remove(entry.getKey());
             RegionRecord region = entry.getValue();
             if (region.attached()) {
                 deactivateWindow(entry.getKey(), region, true, false);
@@ -3424,20 +3454,76 @@ public final class AeroServerRuntime {
         for (PlayerRegionAnchor anchor : anchors) {
             RegistryKey<World> worldKey = anchor.worldKey();
             BlockPos baseCore = anchor.coreOrigin();
-            for (int dx = -1; dx <= 1; dx++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    BlockPos regionCore = baseCore.add(dx * REGION_LATTICE_STRIDE, 0, dz * REGION_LATTICE_STRIDE);
-                    keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(regionCore)));
-                }
+            int localX = MathHelper.clamp(anchor.blockPos().getX() - baseCore.getX(), 0, REGION_CORE_SIZE - 1);
+            int localY = MathHelper.clamp(anchor.blockPos().getY() - baseCore.getY(), 0, REGION_CORE_SIZE - 1);
+            int localZ = MathHelper.clamp(anchor.blockPos().getZ() - baseCore.getZ(), 0, REGION_CORE_SIZE - 1);
+            boolean attachWest = localX < HORIZONTAL_ATTACH_MARGIN_CELLS;
+            boolean attachEast = localX >= REGION_CORE_SIZE - HORIZONTAL_ATTACH_MARGIN_CELLS;
+            boolean attachDown = localY < VERTICAL_ATTACH_MARGIN_CELLS;
+            boolean attachUp = localY >= REGION_CORE_SIZE - VERTICAL_ATTACH_MARGIN_CELLS;
+            boolean attachNorth = localZ < HORIZONTAL_ATTACH_MARGIN_CELLS;
+            boolean attachSouth = localZ >= REGION_CORE_SIZE - HORIZONTAL_ATTACH_MARGIN_CELLS;
+            keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore)));
+            if (attachWest) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(-REGION_LATTICE_STRIDE, 0, 0))
+                ));
             }
-            keys.add(new WindowKey(
-                worldKey,
-                windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))
-            ));
-            keys.add(new WindowKey(
-                worldKey,
-                windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))
-            ));
+            if (attachEast) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(REGION_LATTICE_STRIDE, 0, 0))
+                ));
+            }
+            if (attachNorth) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, 0, -REGION_LATTICE_STRIDE))
+                ));
+            }
+            if (attachSouth) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, 0, REGION_LATTICE_STRIDE))
+                ));
+            }
+            if (attachWest && attachNorth) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(-REGION_LATTICE_STRIDE, 0, -REGION_LATTICE_STRIDE))
+                ));
+            }
+            if (attachWest && attachSouth) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(-REGION_LATTICE_STRIDE, 0, REGION_LATTICE_STRIDE))
+                ));
+            }
+            if (attachEast && attachNorth) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(REGION_LATTICE_STRIDE, 0, -REGION_LATTICE_STRIDE))
+                ));
+            }
+            if (attachEast && attachSouth) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(REGION_LATTICE_STRIDE, 0, REGION_LATTICE_STRIDE))
+                ));
+            }
+            if (attachUp) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))
+                ));
+            }
+            if (attachDown) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))
+                ));
+            }
         }
         return keys;
     }
@@ -3448,14 +3534,19 @@ public final class AeroServerRuntime {
             RegistryKey<World> worldKey = anchor.worldKey();
             BlockPos baseCore = anchor.coreOrigin();
             keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore)));
-            keys.add(new WindowKey(
-                worldKey,
-                windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))
-            ));
-            keys.add(new WindowKey(
-                worldKey,
-                windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))
-            ));
+            int localY = MathHelper.clamp(anchor.blockPos().getY() - baseCore.getY(), 0, REGION_CORE_SIZE - 1);
+            if (localY >= REGION_CORE_SIZE - VERTICAL_SOLVE_MARGIN_CELLS) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))
+                ));
+            }
+            if (localY < VERTICAL_SOLVE_MARGIN_CELLS) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))
+                ));
+            }
         }
         return keys;
     }
@@ -3874,6 +3965,131 @@ public final class AeroServerRuntime {
         value = (value ^ key.origin().getY()) * 1099511628211L;
         value = (value ^ key.origin().getZ()) * 1099511628211L;
         return value == 0L ? 1L : value;
+    }
+
+    private long simulationWorldKey(RegistryKey<World> worldKey) {
+        long value = worldKey.getValue().hashCode();
+        return value == 0L ? 1L : value;
+    }
+
+    private void syncBrickRuntimeHints(Map<RegistryKey<World>, int[]> hintCoordsByWorld) {
+        if (simulationServiceId == 0L || !simulationBridge.isLoaded()) {
+            return;
+        }
+        Set<RegistryKey<World>> activeWorldKeys = hintCoordsByWorld.keySet();
+        for (RegistryKey<World> staleWorldKey : new HashSet<>(brickRuntimeHintWorldKeys)) {
+            if (activeWorldKeys.contains(staleWorldKey)) {
+                continue;
+            }
+            simulationBridge.setBrickWorldActiveHints(
+                simulationServiceId,
+                simulationWorldKey(staleWorldKey),
+                BRICK_RUNTIME_SIZE,
+                new int[0]
+            );
+        }
+        Set<RegistryKey<World>> syncedWorldKeys = new HashSet<>();
+        for (RegistryKey<World> worldKey : activeWorldKeys) {
+            long worldRuntimeKey = simulationWorldKey(worldKey);
+            if (!simulationBridge.ensureBrickWorldRuntime(
+                simulationServiceId,
+                worldRuntimeKey,
+                BRICK_RUNTIME_SIZE,
+                1.0f,
+                SOLVER_STEP_SECONDS
+            )) {
+                continue;
+            }
+            brickRuntimeKnownWorldKeys.add(worldKey);
+            int[] hintCoords = hintCoordsByWorld.getOrDefault(worldKey, new int[0]);
+            if (simulationBridge.setBrickWorldActiveHints(
+                simulationServiceId,
+                worldRuntimeKey,
+                BRICK_RUNTIME_SIZE,
+                hintCoords
+            )) {
+                syncedWorldKeys.add(worldKey);
+            }
+        }
+        brickRuntimeHintWorldKeys.clear();
+        brickRuntimeHintWorldKeys.addAll(syncedWorldKeys);
+    }
+
+    private Map<RegistryKey<World>, int[]> brickRuntimeHintCoords(List<PlayerRegionAnchor> anchors) {
+        Map<RegistryKey<World>, LinkedHashSet<BrickRuntimeHint>> hintsByWorld = new HashMap<>();
+        for (PlayerRegionAnchor anchor : anchors) {
+            RegistryKey<World> worldKey = anchor.worldKey();
+            BlockPos baseCore = anchor.coreOrigin();
+            int localX = MathHelper.clamp(anchor.blockPos().getX() - baseCore.getX(), 0, REGION_CORE_SIZE - 1);
+            int localY = MathHelper.clamp(anchor.blockPos().getY() - baseCore.getY(), 0, REGION_CORE_SIZE - 1);
+            int localZ = MathHelper.clamp(anchor.blockPos().getZ() - baseCore.getZ(), 0, REGION_CORE_SIZE - 1);
+            boolean attachWest = localX < HORIZONTAL_ATTACH_MARGIN_CELLS;
+            boolean attachEast = localX >= REGION_CORE_SIZE - HORIZONTAL_ATTACH_MARGIN_CELLS;
+            boolean attachDown = localY < VERTICAL_ATTACH_MARGIN_CELLS;
+            boolean attachUp = localY >= REGION_CORE_SIZE - VERTICAL_ATTACH_MARGIN_CELLS;
+            boolean attachNorth = localZ < HORIZONTAL_ATTACH_MARGIN_CELLS;
+            boolean attachSouth = localZ >= REGION_CORE_SIZE - HORIZONTAL_ATTACH_MARGIN_CELLS;
+            int baseBrickX = Math.floorDiv(baseCore.getX(), BRICK_RUNTIME_SIZE);
+            int baseBrickY = Math.floorDiv(baseCore.getY(), BRICK_RUNTIME_SIZE);
+            int baseBrickZ = Math.floorDiv(baseCore.getZ(), BRICK_RUNTIME_SIZE);
+            LinkedHashSet<BrickRuntimeHint> hints = hintsByWorld.computeIfAbsent(worldKey, ignored -> new LinkedHashSet<>());
+            hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY, baseBrickZ));
+            if (attachWest) {
+                hints.add(new BrickRuntimeHint(baseBrickX - 1, baseBrickY, baseBrickZ));
+            }
+            if (attachEast) {
+                hints.add(new BrickRuntimeHint(baseBrickX + 1, baseBrickY, baseBrickZ));
+            }
+            if (attachNorth) {
+                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY, baseBrickZ - 1));
+            }
+            if (attachSouth) {
+                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY, baseBrickZ + 1));
+            }
+            if (attachWest && attachNorth) {
+                hints.add(new BrickRuntimeHint(baseBrickX - 1, baseBrickY, baseBrickZ - 1));
+            }
+            if (attachWest && attachSouth) {
+                hints.add(new BrickRuntimeHint(baseBrickX - 1, baseBrickY, baseBrickZ + 1));
+            }
+            if (attachEast && attachNorth) {
+                hints.add(new BrickRuntimeHint(baseBrickX + 1, baseBrickY, baseBrickZ - 1));
+            }
+            if (attachEast && attachSouth) {
+                hints.add(new BrickRuntimeHint(baseBrickX + 1, baseBrickY, baseBrickZ + 1));
+            }
+            if (attachUp) {
+                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY + 1, baseBrickZ));
+            }
+            if (attachDown) {
+                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY - 1, baseBrickZ));
+            }
+        }
+        Map<RegistryKey<World>, int[]> coordsByWorld = new HashMap<>();
+        for (Map.Entry<RegistryKey<World>, LinkedHashSet<BrickRuntimeHint>> entry : hintsByWorld.entrySet()) {
+            int[] coords = new int[entry.getValue().size() * NativeSimulationBridge.BRICK_HINT_COORDS_PER_BRICK];
+            int index = 0;
+            for (BrickRuntimeHint hint : entry.getValue()) {
+                coords[index++] = hint.brickX();
+                coords[index++] = hint.brickY();
+                coords[index++] = hint.brickZ();
+            }
+            coordsByWorld.put(entry.getKey(), coords);
+        }
+        return Map.copyOf(coordsByWorld);
+    }
+
+    private void stepBrickRuntimeWorlds() {
+        if (simulationServiceId == 0L || !simulationBridge.isLoaded()) {
+            return;
+        }
+        for (RegistryKey<World> worldKey : new HashSet<>(brickRuntimeKnownWorldKeys)) {
+            simulationBridge.stepBrickWorldRuntime(
+                simulationServiceId,
+                simulationWorldKey(worldKey),
+                1
+            );
+        }
     }
 
     private List<NestedFeedbackAxisSpan> buildHorizontalNestedFeedbackSpans(
@@ -5182,12 +5398,7 @@ public final class AeroServerRuntime {
         Set<WindowKey> activeKeys
     ) {
         int externalFaceMask = computeExternalFaceMask(key, activeKeys);
-        NestedBoundaryCoupler.BoundarySample boundarySample = null;
-        BoundaryFieldData boundaryField = null;
-        if (externalFaceMask != 0) {
-            boundarySample = sampleNestedBoundaryAtWindow(key);
-            boundaryField = sampleNestedBoundaryFieldAtWindow(key, externalFaceMask, boundarySample);
-        }
+        CachedBoundaryData boundaryData = cachedBoundaryDataForWindow(key, region, externalFaceMask);
         return new SolveSnapshot(
             key,
             region,
@@ -5195,10 +5406,27 @@ public final class AeroServerRuntime {
             List.copyOf(region.fans),
             speedCap,
             generation,
-            boundarySample,
-            boundaryField,
+            boundaryData.boundarySample(),
+            boundaryData.boundaryField(),
             collectTornadoRegionDescriptors(key)
         );
+    }
+
+    private CachedBoundaryData cachedBoundaryDataForWindow(WindowKey key, RegionRecord region, int externalFaceMask) {
+        if (externalFaceMask == 0) {
+            region.clearBoundaryCache();
+            return new CachedBoundaryData(null, null);
+        }
+        boolean refreshBoundary = region.cachedBoundarySample() == null
+            || region.cachedBoundaryField() == null
+            || region.cachedBoundaryExternalFaceMask() != externalFaceMask
+            || tickCounter - region.lastBoundaryRefreshTick() >= BOUNDARY_FIELD_REFRESH_TICKS;
+        if (refreshBoundary) {
+            NestedBoundaryCoupler.BoundarySample boundarySample = sampleNestedBoundaryAtWindow(key);
+            BoundaryFieldData boundaryField = sampleNestedBoundaryFieldAtWindow(key, externalFaceMask, boundarySample);
+            region.updateBoundaryCache(boundarySample, boundaryField, externalFaceMask, tickCounter);
+        }
+        return new CachedBoundaryData(region.cachedBoundarySample(), region.cachedBoundaryField());
     }
 
     private BackgroundMetGrid.Sample sampleBackgroundMetAtWindow(WindowKey key) {
@@ -6673,7 +6901,8 @@ public final class AeroServerRuntime {
 
     private record PlayerRegionAnchor(
         RegistryKey<World> worldKey,
-        BlockPos coreOrigin
+        BlockPos coreOrigin,
+        BlockPos blockPos
     ) {
     }
 
@@ -6691,12 +6920,20 @@ public final class AeroServerRuntime {
     ) {
     }
 
+    private record BrickRuntimeHint(
+        int brickX,
+        int brickY,
+        int brickZ
+    ) {
+    }
+
     private record ActiveRegionBatch(
         int tickCounter,
         List<PlayerRegionAnchor> anchors,
         List<PlayerProbeRequest> playerProbeRequests,
         List<EntitySampleRequest> entitySampleRequests,
-        Map<RegistryKey<World>, WorldEnvironmentSnapshot> environmentSnapshots
+        Map<RegistryKey<World>, WorldEnvironmentSnapshot> environmentSnapshots,
+        Map<RegistryKey<World>, int[]> brickRuntimeHintCoordsByWorld
     ) {
     }
 
@@ -6773,6 +7010,12 @@ public final class AeroServerRuntime {
         NestedBoundaryCoupler.BoundarySample boundarySample,
         BoundaryFieldData boundaryField,
         List<TornadoRegionDescriptor> tornadoDescriptors
+    ) {
+    }
+
+    private record CachedBoundaryData(
+        NestedBoundaryCoupler.BoundarySample boundarySample,
+        BoundaryFieldData boundaryField
     ) {
     }
 
@@ -6890,6 +7133,10 @@ public final class AeroServerRuntime {
         private long nestedFeedbackLayoutServiceId;
         private long backendResetCount;
         private int lastBackendResetTick = Integer.MIN_VALUE;
+        private NestedBoundaryCoupler.BoundarySample cachedBoundarySample;
+        private BoundaryFieldData cachedBoundaryField;
+        private int cachedBoundaryExternalFaceMask;
+        private int lastBoundaryRefreshTick = Integer.MIN_VALUE;
 
         private RegionRecord() {
             Arrays.fill(uploadedSectionVersions, Long.MIN_VALUE);
@@ -6910,6 +7157,7 @@ public final class AeroServerRuntime {
 
         private void markDetached() {
             attached = false;
+            clearBoundaryCache();
         }
 
         private void markBackendResetPending() {
@@ -6922,6 +7170,41 @@ public final class AeroServerRuntime {
 
         private void clearBackendResetPending() {
             backendResetPending = false;
+        }
+
+        private NestedBoundaryCoupler.BoundarySample cachedBoundarySample() {
+            return cachedBoundarySample;
+        }
+
+        private BoundaryFieldData cachedBoundaryField() {
+            return cachedBoundaryField;
+        }
+
+        private int cachedBoundaryExternalFaceMask() {
+            return cachedBoundaryExternalFaceMask;
+        }
+
+        private int lastBoundaryRefreshTick() {
+            return lastBoundaryRefreshTick;
+        }
+
+        private void updateBoundaryCache(
+            NestedBoundaryCoupler.BoundarySample boundarySample,
+            BoundaryFieldData boundaryField,
+            int externalFaceMask,
+            int tick
+        ) {
+            cachedBoundarySample = boundarySample;
+            cachedBoundaryField = boundaryField;
+            cachedBoundaryExternalFaceMask = externalFaceMask;
+            lastBoundaryRefreshTick = tick;
+        }
+
+        private void clearBoundaryCache() {
+            cachedBoundarySample = null;
+            cachedBoundaryField = null;
+            cachedBoundaryExternalFaceMask = 0;
+            lastBoundaryRefreshTick = Integer.MIN_VALUE;
         }
 
         private void noteBackendReset(int tick) {
@@ -7040,6 +7323,7 @@ public final class AeroServerRuntime {
                         synchronized (simulationStateLock) {
                             applyPendingActiveRegionBatchIfNeeded();
                             applyPendingBackgroundRefreshIfNeeded();
+                            stepBrickRuntimeWorlds();
                         }
                         runMesoscaleStepCycle();
                         synchronized (simulationStateLock) {
@@ -7203,6 +7487,16 @@ public final class AeroServerRuntime {
             }
             desiredWindowKeys = Set.copyOf(activeRegionKeys(batch.anchors()));
             desiredSolveWindowKeys = Set.copyOf(solveRegionKeys(batch.anchors()));
+            int retainUntilTick = batch.tickCounter() + SHELL_WINDOW_RETENTION_TICKS;
+            shellWindowRetainUntilTick.entrySet().removeIf(entry -> entry.getValue() < batch.tickCounter());
+            for (WindowKey key : desiredWindowKeys) {
+                if (!desiredSolveWindowKeys.contains(key)) {
+                    shellWindowRetainUntilTick.put(key, retainUntilTick);
+                } else {
+                    shellWindowRetainUntilTick.remove(key);
+                }
+            }
+            syncBrickRuntimeHints(batch.brickRuntimeHintCoordsByWorld());
             activePlayerProbeRequests = batch.playerProbeRequests();
             activeEntitySampleRequests = batch.entitySampleRequests();
             worldEnvironmentSnapshots = batch.environmentSnapshots();
