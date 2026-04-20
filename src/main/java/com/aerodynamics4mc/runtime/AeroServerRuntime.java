@@ -288,7 +288,10 @@ public final class AeroServerRuntime {
     private final AtomicReference<Map<UUID, EntitySample>> publishedEntitySamples = new AtomicReference<>(Map.of());
     private volatile Set<WindowKey> desiredWindowKeys = Set.of();
     private volatile Set<WindowKey> desiredSolveWindowKeys = Set.of();
+    private volatile Set<WindowKey> anchorSolveWindowKeys = Set.of();
     private final Map<WindowKey, Integer> shellWindowRetainUntilTick = new HashMap<>();
+    private final Set<WindowKey> mirrorOnlyPrewarmedWindowKeys = new HashSet<>();
+    private final Map<WindowKey, Long> mirrorOnlyUploadedBrickStaticSignatures = new HashMap<>();
     private volatile Map<RegistryKey<World>, WorldEnvironmentSnapshot> worldEnvironmentSnapshots = Map.of();
     private volatile List<PlayerProbeRequest> activePlayerProbeRequests = List.of();
     private volatile List<EntitySampleRequest> activeEntitySampleRequests = List.of();
@@ -312,6 +315,7 @@ public final class AeroServerRuntime {
     private volatile String lastCoordinatorError = "";
     private volatile int lastCoordinatorObservedTick = Integer.MIN_VALUE;
     private volatile int lastCoordinatorActiveWindowCount = 0;
+    private volatile int lastCoordinatorSolveWindowCount = 0;
     private volatile int lastCoordinatorScheduledWindowCount = 0;
     private volatile int lastCoordinatorBusyWindowCount = 0;
     private volatile int lastCoordinatorPublishTick = Integer.MIN_VALUE;
@@ -604,6 +608,7 @@ public final class AeroServerRuntime {
                             + " coordTick=" + lastCoordinatorObservedTick
                             + " coordState=" + lastCoordinatorState
                             + " coordWindows=" + lastCoordinatorActiveWindowCount
+                            + " coordSolveWindows=" + lastCoordinatorSolveWindowCount
                             + " coordScheduled=" + lastCoordinatorScheduledWindowCount
                             + " coordBusy=" + lastCoordinatorBusyWindowCount
                             + " coordPublishAge=" + currentCoordinatorPublishAgeTicks()
@@ -805,7 +810,7 @@ public final class AeroServerRuntime {
         ServerWorld world = source.getWorld();
         BlockPos focus = BlockPos.ofFloored(source.getPosition());
         BlockPos anchorCoreOrigin = coreOriginForPosition(focus);
-        List<L2CaptureRegionSpec> captureRegions = activeRegionKeys(List.of(new PlayerRegionAnchor(world.getRegistryKey(), anchorCoreOrigin, focus)))
+        List<L2CaptureRegionSpec> captureRegions = solveRegionKeys(List.of(new PlayerRegionAnchor(world.getRegistryKey(), anchorCoreOrigin, focus)))
             .stream()
             .sorted(Comparator
                 .comparingInt((WindowKey key) -> key.origin().getY())
@@ -2560,7 +2565,10 @@ public final class AeroServerRuntime {
         nestedFeedbackRuntimeDiagnostics.clear();
         desiredWindowKeys = Set.of();
         desiredSolveWindowKeys = Set.of();
+        anchorSolveWindowKeys = Set.of();
         shellWindowRetainUntilTick.clear();
+        mirrorOnlyPrewarmedWindowKeys.clear();
+        mirrorOnlyUploadedBrickStaticSignatures.clear();
         brickRuntimeHintWorldKeys.clear();
         brickRuntimeKnownWorldKeys.clear();
         activePlayerProbeRequests = List.of();
@@ -3027,10 +3035,35 @@ public final class AeroServerRuntime {
 
     private void synchronizeActiveWindowsFromMirror() {
         synchronizeDesiredRegions();
+        Set<WindowKey> solveWindows = desiredSolveWindowKeys;
+        List<WindowKey> mirrorOnlyWindowKeysToRemove = new ArrayList<>();
 
         for (Map.Entry<WindowKey, RegionRecord> regionEntry : regions.entrySet()) {
             WindowKey key = regionEntry.getKey();
             RegionRecord region = regionEntry.getValue();
+            boolean solveWindow = solveWindows.contains(key);
+            if (!shouldActivelyRefreshWindowThisTick(region, solveWindow)) {
+                continue;
+            }
+            if (!solveWindow) {
+                if (region.attached() || region.serviceActive || region.serviceReady) {
+                    downgradeWindowToMirrorOnly(key, region);
+                    continue;
+                }
+                if (region.sections == null) {
+                    initializeWindowFromMirror(key, region);
+                } else {
+                    refreshWindowFromMirror(key, region);
+                }
+                if (!region.busy.get() && !region.attached() && !region.serviceActive && !region.serviceReady) {
+                    mirrorOnlyWindowKeysToRemove.add(key);
+                }
+                continue;
+            }
+            if (!region.fullWindowSectionsRequested && currentServer != null) {
+                requestWindowSections(currentServer, key, true);
+                region.fullWindowSectionsRequested = true;
+            }
             if (!synchronizeRegionRecordFromMirror(key, region)) {
                 continue;
             }
@@ -3045,6 +3078,41 @@ public final class AeroServerRuntime {
                 uploadRegionFanForcingToSimulation(key, region);
             }
         }
+        for (WindowKey key : mirrorOnlyWindowKeysToRemove) {
+            RegionRecord region = regions.get(key);
+            if (region == null || region.busy.get() || region.attached() || region.serviceActive || region.serviceReady) {
+                continue;
+            }
+            mirrorOnlyPrewarmedWindowKeys.add(key);
+            regions.remove(key);
+        }
+    }
+
+    private boolean shouldActivelyRefreshWindowThisTick(RegionRecord region, boolean solveWindow) {
+        if (solveWindow) {
+            return true;
+        }
+        return region.attached()
+            || region.serviceReady
+            || region.serviceActive
+            || region.sections == null;
+    }
+
+    private void downgradeWindowToMirrorOnly(WindowKey key, RegionRecord region) {
+        if (region.busy.get()) {
+            return;
+        }
+        if (region.attached()) {
+            deactivateWindow(key, region, true, false);
+        } else {
+            removePublishedRegionAtlas(key);
+            if (region.serviceActive || region.serviceReady) {
+                deactivateWindowRegionInSimulation(key);
+            }
+            releaseWindow(key, region);
+        }
+        region.dynamicRestoreAttempted = false;
+        region.completedMaxSpeed = 0.0f;
     }
 
     private void synchronizeDesiredRegions() {
@@ -3059,6 +3127,7 @@ public final class AeroServerRuntime {
             }
             desiredWindows.add(entry.getKey());
         }
+        mirrorOnlyUploadedBrickStaticSignatures.keySet().retainAll(desiredWindows);
         MinecraftServer server = currentServer;
         Iterator<Map.Entry<WindowKey, RegionRecord>> iterator = regions.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -3067,6 +3136,8 @@ public final class AeroServerRuntime {
                 continue;
             }
             shellWindowRetainUntilTick.remove(entry.getKey());
+            mirrorOnlyPrewarmedWindowKeys.remove(entry.getKey());
+            mirrorOnlyUploadedBrickStaticSignatures.remove(entry.getKey());
             RegionRecord region = entry.getValue();
             if (region.attached()) {
                 deactivateWindow(entry.getKey(), region, true, false);
@@ -3076,17 +3147,33 @@ public final class AeroServerRuntime {
             iterator.remove();
         }
         for (WindowKey key : desiredWindows) {
-            if (regions.containsKey(key)) {
+            RegionRecord existingRegion = regions.get(key);
+            if (existingRegion != null) {
+                if (!solveWindows.contains(key)) {
+                    prewarmMirrorOnlyWindowCoreStaticBrick(key);
+                }
                 continue;
             }
-            regions.put(key, new RegionRecord());
+            boolean solveWindow = solveWindows.contains(key);
+            if (!solveWindow) {
+                if (server != null && mirrorOnlyPrewarmedWindowKeys.add(key)) {
+                    requestWindowSections(server, key, false);
+                }
+                prewarmMirrorOnlyWindowCoreStaticBrick(key);
+                continue;
+            }
+            mirrorOnlyPrewarmedWindowKeys.remove(key);
+            mirrorOnlyUploadedBrickStaticSignatures.remove(key);
+            RegionRecord region = new RegionRecord();
+            regions.put(key, region);
             if (server != null) {
-                requestWindowSections(server, key);
+                requestWindowSections(server, key, true);
+                region.fullWindowSectionsRequested = true;
             }
         }
     }
 
-    private void requestWindowSections(MinecraftServer server, WindowKey key) {
+    private void requestWindowSections(MinecraftServer server, WindowKey key, boolean includeHaloSections) {
         for (int sx = CORE_SECTION_MIN; sx <= CORE_SECTION_MAX; sx++) {
             for (int sy = CORE_SECTION_MIN; sy <= CORE_SECTION_MAX; sy++) {
                 for (int sz = CORE_SECTION_MIN; sz <= CORE_SECTION_MAX; sz++) {
@@ -3094,6 +3181,9 @@ public final class AeroServerRuntime {
                     worldMirror.requestSectionBuild(server, key.worldKey(), localOrigin, true);
                 }
             }
+        }
+        if (!includeHaloSections) {
+            return;
         }
         for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
             for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
@@ -3110,6 +3200,9 @@ public final class AeroServerRuntime {
 
     private boolean synchronizeRegionRecordFromMirror(WindowKey key, RegionRecord region) {
         if (!uploadRegionStaticFromMirror(key, region)) {
+            return false;
+        }
+        if (!uploadSolveWindowCoreStaticBrickToRuntime(key, region)) {
             return false;
         }
         if (!region.serviceActive) {
@@ -3276,32 +3369,26 @@ public final class AeroServerRuntime {
         }
     }
 
-    private float synchronizeRegionSeams(List<ActiveWindow> activeWindows) {
-        if (activeWindows.isEmpty() || simulationServiceId == 0L) {
+    private float synchronizeRegionSeams(List<ActiveWindow> solveWindows) {
+        if (solveWindows.isEmpty() || simulationServiceId == 0L) {
             return 0.0f;
         }
-        Set<WindowKey> desiredSolveKeys = desiredSolveWindowKeys;
-        Set<WindowKey> solveKeys = new HashSet<>(activeWindows.size());
-        for (ActiveWindow active : activeWindows) {
-            if (desiredSolveKeys.contains(active.key())) {
-                solveKeys.add(active.key());
-            }
+        Set<WindowKey> solveKeys = new HashSet<>(solveWindows.size());
+        for (ActiveWindow active : solveWindows) {
+            solveKeys.add(active.key());
         }
         if (solveKeys.isEmpty()) {
             return 0.0f;
         }
-        Map<WindowKey, ActiveWindow> activeByKey = new HashMap<>(activeWindows.size());
-        for (ActiveWindow active : activeWindows) {
+        Map<WindowKey, ActiveWindow> activeByKey = new HashMap<>(solveWindows.size());
+        for (ActiveWindow active : solveWindows) {
             activeByKey.put(active.key(), active);
         }
-        int maxPairs = activeWindows.size() * 3;
+        int maxPairs = solveWindows.size() * 3;
         long[] regionPairs = new long[Math.max(0, maxPairs * 2)];
         int[] offsets = new int[Math.max(0, maxPairs * 3)];
         int exchangeCount = 0;
-        for (ActiveWindow active : activeWindows) {
-            if (!solveKeys.contains(active.key())) {
-                continue;
-            }
+        for (ActiveWindow active : solveWindows) {
             if (active.region().sections == null || active.region().busy.get()) {
                 continue;
             }
@@ -4092,27 +4179,45 @@ public final class AeroServerRuntime {
         }
     }
 
+    private void appendBrickWindowCoords(Set<WindowKey> windows, RegistryKey<World> worldKey, int[] brickCoords) {
+        if (brickCoords == null) {
+            return;
+        }
+        for (int i = 0; i + 2 < brickCoords.length; i += NativeSimulationBridge.BRICK_HINT_COORDS_PER_BRICK) {
+            BlockPos coreOrigin = new BlockPos(
+                brickCoords[i] * BRICK_RUNTIME_SIZE,
+                brickCoords[i + 1] * BRICK_RUNTIME_SIZE,
+                brickCoords[i + 2] * BRICK_RUNTIME_SIZE
+            );
+            windows.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(coreOrigin)));
+        }
+    }
+
     private void refreshDesiredWindowsFromBrickRuntime() {
-        Set<WindowKey> desiredWindows = new HashSet<>(desiredSolveWindowKeys);
+        Set<WindowKey> solveWindows = new HashSet<>(anchorSolveWindowKeys);
+        Set<WindowKey> desiredWindows = new HashSet<>(solveWindows);
         if (simulationServiceId != 0L && simulationBridge.isLoaded()) {
             for (RegistryKey<World> worldKey : new HashSet<>(brickRuntimeKnownWorldKeys)) {
-                int[] brickCoords = simulationBridge.getBrickWorldResidentBrickCoords(
-                    simulationServiceId,
-                    simulationWorldKey(worldKey)
+                appendBrickWindowCoords(
+                    solveWindows,
+                    worldKey,
+                    simulationBridge.getBrickWorldActiveBrickCoords(
+                        simulationServiceId,
+                        simulationWorldKey(worldKey)
+                    )
                 );
-                if (brickCoords == null) {
-                    continue;
-                }
-                for (int i = 0; i + 2 < brickCoords.length; i += NativeSimulationBridge.BRICK_HINT_COORDS_PER_BRICK) {
-                    BlockPos coreOrigin = new BlockPos(
-                        brickCoords[i] * BRICK_RUNTIME_SIZE,
-                        brickCoords[i + 1] * BRICK_RUNTIME_SIZE,
-                        brickCoords[i + 2] * BRICK_RUNTIME_SIZE
-                    );
-                    desiredWindows.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(coreOrigin)));
-                }
+                appendBrickWindowCoords(
+                    desiredWindows,
+                    worldKey,
+                    simulationBridge.getBrickWorldResidentBrickCoords(
+                        simulationServiceId,
+                        simulationWorldKey(worldKey)
+                    )
+                );
             }
         }
+        desiredWindows.addAll(solveWindows);
+        desiredSolveWindowKeys = Set.copyOf(solveWindows);
         desiredWindowKeys = Set.copyOf(desiredWindows);
         int retainUntilTick = tickCounter + SHELL_WINDOW_RETENTION_TICKS;
         shellWindowRetainUntilTick.entrySet().removeIf(entry -> entry.getValue() < tickCounter);
@@ -4539,6 +4644,165 @@ public final class AeroServerRuntime {
         return true;
     }
 
+    private boolean uploadSolveWindowCoreStaticBrickToRuntime(WindowKey key, RegionRecord region) {
+        if (simulationServiceId == 0L || region.sections == null) {
+            return false;
+        }
+        WorldMirror.SectionSnapshot[] coreSnapshots = coreSectionSnapshotsFromRegion(region);
+        long signature = coreStaticBrickSignature(coreSnapshots);
+        if (signature == Long.MIN_VALUE) {
+            return false;
+        }
+        if (region.uploadedBrickStaticServiceId == simulationServiceId
+            && region.uploadedBrickStaticSignature == signature) {
+            return true;
+        }
+        boolean uploaded = uploadWindowCoreStaticBrickToRuntime(key, coreSnapshots);
+        if (uploaded) {
+            region.uploadedBrickStaticSignature = signature;
+            region.uploadedBrickStaticServiceId = simulationServiceId;
+        }
+        return uploaded;
+    }
+
+    private void prewarmMirrorOnlyWindowCoreStaticBrick(WindowKey key) {
+        if (simulationServiceId == 0L || !simulationBridge.isLoaded() || desiredSolveWindowKeys.contains(key)) {
+            return;
+        }
+        WorldMirror.SectionSnapshot[] coreSnapshots = coreSectionSnapshotsFromMirror(key, true);
+        if (coreSnapshots == null) {
+            return;
+        }
+        long signature = coreStaticBrickSignature(coreSnapshots);
+        if (signature == Long.MIN_VALUE) {
+            return;
+        }
+        if (Long.valueOf(signature).equals(mirrorOnlyUploadedBrickStaticSignatures.get(key))) {
+            return;
+        }
+        if (uploadWindowCoreStaticBrickToRuntime(key, coreSnapshots)) {
+            mirrorOnlyUploadedBrickStaticSignatures.put(key, signature);
+        }
+    }
+
+    private boolean uploadWindowCoreStaticBrickToRuntime(
+        WindowKey key,
+        WorldMirror.SectionSnapshot[] coreSnapshots
+    ) {
+        if (simulationServiceId == 0L || coreSnapshots == null || coreSnapshots.length != CORE_SECTION_COUNT) {
+            return false;
+        }
+        long worldRuntimeKey = simulationWorldKey(key.worldKey());
+        if (!simulationBridge.ensureBrickWorldRuntime(
+            simulationServiceId,
+            worldRuntimeKey,
+            BRICK_RUNTIME_SIZE,
+            1.0f,
+            SOLVER_STEP_SECONDS
+        )) {
+            return false;
+        }
+        int cells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
+        byte[] obstacle = new byte[cells];
+        byte[] surfaceKind = new byte[cells];
+        short[] openFaceMask = new short[cells];
+        float[] emitterPower = new float[cells];
+        byte[] faceSkyExposure = new byte[cells * FACE_COUNT];
+        byte[] faceDirectExposure = new byte[cells * FACE_COUNT];
+        int sectionAxisCount = REGION_CORE_SIZE / CHUNK_SIZE;
+        int snapshotIndex = 0;
+        for (int sx = 0; sx < sectionAxisCount; sx++) {
+            for (int sy = 0; sy < sectionAxisCount; sy++) {
+                for (int sz = 0; sz < sectionAxisCount; sz++) {
+                    WorldMirror.SectionSnapshot snapshot = coreSnapshots[snapshotIndex++];
+                    if (snapshot == null) {
+                        return false;
+                    }
+                    writeSectionSnapshotIntoBrickBuffers(
+                        snapshot,
+                        sx * CHUNK_SIZE,
+                        sy * CHUNK_SIZE,
+                        sz * CHUNK_SIZE,
+                        obstacle,
+                        surfaceKind,
+                        openFaceMask,
+                        emitterPower,
+                        faceSkyExposure,
+                        faceDirectExposure
+                    );
+                }
+            }
+        }
+        BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
+        return simulationBridge.uploadBrickWorldStaticBrick(
+            simulationServiceId,
+            worldRuntimeKey,
+            BRICK_RUNTIME_SIZE,
+            Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE),
+            obstacle,
+            surfaceKind,
+            openFaceMask,
+            emitterPower,
+            faceSkyExposure,
+            faceDirectExposure
+        );
+    }
+
+    private WorldMirror.SectionSnapshot[] coreSectionSnapshotsFromRegion(RegionRecord region) {
+        if (region.sections == null) {
+            return null;
+        }
+        WorldMirror.SectionSnapshot[] snapshots = new WorldMirror.SectionSnapshot[CORE_SECTION_COUNT];
+        int index = 0;
+        for (int sx = CORE_SECTION_MIN; sx <= CORE_SECTION_MAX; sx++) {
+            for (int sy = CORE_SECTION_MIN; sy <= CORE_SECTION_MAX; sy++) {
+                for (int sz = CORE_SECTION_MIN; sz <= CORE_SECTION_MAX; sz++) {
+                    snapshots[index++] = region.sectionAt(sx, sy, sz);
+                }
+            }
+        }
+        return snapshots;
+    }
+
+    private WorldMirror.SectionSnapshot[] coreSectionSnapshotsFromMirror(WindowKey key, boolean requestMissing) {
+        WorldMirror.SectionSnapshot[] snapshots = new WorldMirror.SectionSnapshot[CORE_SECTION_COUNT];
+        int index = 0;
+        for (int sx = CORE_SECTION_MIN; sx <= CORE_SECTION_MAX; sx++) {
+            for (int sy = CORE_SECTION_MIN; sy <= CORE_SECTION_MAX; sy++) {
+                for (int sz = CORE_SECTION_MIN; sz <= CORE_SECTION_MAX; sz++) {
+                    WorldMirror.SectionSnapshot snapshot = worldMirror.peekSection(
+                        key.worldKey(),
+                        sectionOrigin(key.origin(), sx, sy, sz)
+                    );
+                    if (snapshot == null) {
+                        if (requestMissing) {
+                            requestWindowSectionIfNeeded(key, sx, sy, sz);
+                        }
+                        return null;
+                    }
+                    snapshots[index++] = snapshot;
+                }
+            }
+        }
+        return snapshots;
+    }
+
+    private long coreStaticBrickSignature(WorldMirror.SectionSnapshot[] coreSnapshots) {
+        if (coreSnapshots == null || coreSnapshots.length != CORE_SECTION_COUNT) {
+            return Long.MIN_VALUE;
+        }
+        long value = 1469598103934665603L;
+        for (WorldMirror.SectionSnapshot snapshot : coreSnapshots) {
+            if (snapshot == null) {
+                return Long.MIN_VALUE;
+            }
+            value = (value ^ snapshot.version()) * 1099511628211L;
+        }
+        return value == 0L ? 1L : value;
+    }
+
     private void writeSectionSnapshotIntoRegionBuffers(
         WorldMirror.SectionSnapshot snapshot,
         int baseX,
@@ -4559,6 +4823,39 @@ public final class AeroServerRuntime {
                     int z = baseZ + lz;
                     int local = localSectionCellIndex(lx, ly, lz);
                     int cell = gridCellIndex(x, y, z);
+                    obstacle[cell] = snapshot.obstacle()[local] >= 0.5f ? (byte) 1 : (byte) 0;
+                    surfaceKind[cell] = snapshot.surfaceKind()[local];
+                    openFaceMask[cell] = (short) Byte.toUnsignedInt(snapshot.openFaceMask()[local]);
+                    emitterPower[cell] = snapshot.emitterPowerWatts()[local];
+                    int faceBase = cell * FACE_COUNT;
+                    int localFaceBase = local * FACE_COUNT;
+                    System.arraycopy(snapshot.faceSkyExposure(), localFaceBase, faceSkyExposure, faceBase, FACE_COUNT);
+                    System.arraycopy(snapshot.faceDirectExposure(), localFaceBase, faceDirectExposure, faceBase, FACE_COUNT);
+                }
+            }
+        }
+    }
+
+    private void writeSectionSnapshotIntoBrickBuffers(
+        WorldMirror.SectionSnapshot snapshot,
+        int baseX,
+        int baseY,
+        int baseZ,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPower,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    ) {
+        for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+            int x = baseX + lx;
+            for (int ly = 0; ly < CHUNK_SIZE; ly++) {
+                int y = baseY + ly;
+                for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                    int z = baseZ + lz;
+                    int local = localSectionCellIndex(lx, ly, lz);
+                    int cell = patchCellIndex(x, y, z, BRICK_RUNTIME_SIZE);
                     obstacle[cell] = snapshot.obstacle()[local] >= 0.5f ? (byte) 1 : (byte) 0;
                     surfaceKind[cell] = snapshot.surfaceKind()[local];
                     openFaceMask[cell] = (short) Byte.toUnsignedInt(snapshot.openFaceMask()[local]);
@@ -6359,20 +6656,23 @@ public final class AeroServerRuntime {
         }
     }
 
-    private List<ActiveWindow> snapshotActiveWindowsForCoordinatorLocked() {
-        if (regions.isEmpty()) {
+    private List<ActiveWindow> snapshotWindowsForCoordinatorLocked(Set<WindowKey> keys) {
+        if (regions.isEmpty() || keys.isEmpty()) {
             return List.of();
         }
-        List<ActiveWindow> snapshot = new ArrayList<>(regions.size());
-        for (Map.Entry<WindowKey, RegionRecord> entry : regions.entrySet()) {
-            RegionRecord region = entry.getValue();
+        List<ActiveWindow> snapshot = new ArrayList<>(keys.size());
+        for (WindowKey key : keys) {
+            RegionRecord region = regions.get(key);
+            if (region == null) {
+                continue;
+            }
             if (!region.serviceReady || !region.attached()) {
                 continue;
             }
             if (region.sections == null) {
                 continue;
             }
-            snapshot.add(new ActiveWindow(entry.getKey(), region));
+            snapshot.add(new ActiveWindow(key, region));
         }
         return snapshot;
     }
@@ -6400,19 +6700,16 @@ public final class AeroServerRuntime {
         }
     }
 
-    private CountDownLatch scheduleSolveCycle(List<ActiveWindow> activeWindows) {
-        List<SolveSnapshot> scheduled = new ArrayList<>(activeWindows.size());
-        Set<WindowKey> desiredSolveKeys = desiredSolveWindowKeys;
-        Set<WindowKey> solveKeys = new HashSet<>(activeWindows.size());
-        for (ActiveWindow active : activeWindows) {
-            if (desiredSolveKeys.contains(active.key())) {
-                solveKeys.add(active.key());
-            }
+    private CountDownLatch scheduleSolveCycle(List<ActiveWindow> solveWindows) {
+        if (solveWindows.isEmpty()) {
+            return null;
         }
-        for (ActiveWindow active : activeWindows) {
-            if (!solveKeys.contains(active.key())) {
-                continue;
-            }
+        List<SolveSnapshot> scheduled = new ArrayList<>(solveWindows.size());
+        Set<WindowKey> solveKeys = new HashSet<>(solveWindows.size());
+        for (ActiveWindow active : solveWindows) {
+            solveKeys.add(active.key());
+        }
+        for (ActiveWindow active : solveWindows) {
             RegionRecord region = active.region();
             if (!region.busy.compareAndSet(false, true)) {
                 continue;
@@ -7158,6 +7455,7 @@ public final class AeroServerRuntime {
         private boolean attached;
         private boolean staticUploaded;
         private boolean dynamicRestoreAttempted;
+        private boolean fullWindowSectionsRequested;
         private boolean fansDirty = true;
         private boolean forcingDirty = true;
         private boolean backendResetPending;
@@ -7175,6 +7473,8 @@ public final class AeroServerRuntime {
         private BoundaryFieldData cachedBoundaryField;
         private int cachedBoundaryExternalFaceMask;
         private int lastBoundaryRefreshTick = Integer.MIN_VALUE;
+        private long uploadedBrickStaticSignature = Long.MIN_VALUE;
+        private long uploadedBrickStaticServiceId;
 
         private RegionRecord() {
             Arrays.fill(uploadedSectionVersions, Long.MIN_VALUE);
@@ -7371,12 +7671,15 @@ public final class AeroServerRuntime {
                         lastSynchronizedTick = observedTick;
                     }
 
-                    List<ActiveWindow> activeWindows;
+                    List<ActiveWindow> residentWindows;
+                    List<ActiveWindow> solveWindows;
                     synchronized (simulationStateLock) {
-                        activeWindows = snapshotActiveWindowsForCoordinatorLocked();
+                        residentWindows = snapshotWindowsForCoordinatorLocked(desiredWindowKeys);
+                        solveWindows = snapshotWindowsForCoordinatorLocked(desiredSolveWindowKeys);
                     }
-                    lastCoordinatorActiveWindowCount = activeWindows.size();
-                    if (activeWindows.isEmpty()) {
+                    lastCoordinatorActiveWindowCount = residentWindows.size();
+                    lastCoordinatorSolveWindowCount = solveWindows.size();
+                    if (residentWindows.isEmpty()) {
                         lastCoordinatorState = "noActiveWindows";
                         lastCoordinatorNoPublishReason = "noActiveWindows";
                         lastCoordinatorBusyWindowCount = 0;
@@ -7386,15 +7689,22 @@ public final class AeroServerRuntime {
                     }
 
                     synchronized (simulationStateLock) {
-                        applyCompletedResults(activeWindows);
-                        resetPendingBackends(activeWindows);
+                        applyCompletedResults(residentWindows);
+                        resetPendingBackends(residentWindows);
                     }
 
-                    int busyWindowCount = busyWindowCount(activeWindows);
+                    int busyWindowCount = busyWindowCount(solveWindows);
                     lastCoordinatorBusyWindowCount = busyWindowCount;
                     if (busyWindowCount > 0) {
                         lastCoordinatorState = "busyWindows";
                         lastCoordinatorNoPublishReason = "busyWindows:" + busyWindowCount;
+                        sleepQuietly(5L);
+                        continue;
+                    }
+
+                    if (solveWindows.isEmpty()) {
+                        lastCoordinatorState = "noSolveWindows";
+                        lastCoordinatorNoPublishReason = "noSolveWindows";
                         sleepQuietly(5L);
                         continue;
                     }
@@ -7412,7 +7722,7 @@ public final class AeroServerRuntime {
 
                     CountDownLatch completionLatch;
                     synchronized (simulationStateLock) {
-                        completionLatch = scheduleSolveCycle(activeWindows);
+                        completionLatch = scheduleSolveCycle(solveWindows);
                     }
                     lastCoordinatorScheduledWindowCount = completionLatch == null ? 0 : (int) completionLatch.getCount();
                     if (completionLatch == null) {
@@ -7435,16 +7745,16 @@ public final class AeroServerRuntime {
                     long postSolveStartNanos = System.nanoTime();
                     synchronized (simulationStateLock) {
                         lastCoordinatorState = "applyResults";
-                        float maxSpeedThisCycle = applyCompletedResults(activeWindows);
+                        float maxSpeedThisCycle = applyCompletedResults(residentWindows);
                         lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
                         // Halo exchange is the dominant post-solve synchronization cost.
                         // Run it once after the current solve batch completes instead of
                         // repeating the same work again before the next batch starts.
                         lastCoordinatorState = "syncSeams";
-                        maxSpeedThisCycle = Math.max(maxSpeedThisCycle, synchronizeRegionSeams(activeWindows));
+                        maxSpeedThisCycle = Math.max(maxSpeedThisCycle, synchronizeRegionSeams(solveWindows));
                         lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
                         lastCoordinatorState = "resetBackends";
-                        resetPendingBackends(activeWindows);
+                        resetPendingBackends(residentWindows);
                         lastCoordinatorState = "sampleProbes";
                         publishedPlayerProbes.set(samplePlayerProbesLocked());
                         publishedEntitySamples.set(sampleEntitySamplesLocked());
@@ -7524,7 +7834,7 @@ public final class AeroServerRuntime {
             if (batch == null || batch.tickCounter() <= lastActiveRegionBatchTick) {
                 return;
             }
-            desiredSolveWindowKeys = Set.copyOf(solveRegionKeys(batch.anchors()));
+            anchorSolveWindowKeys = Set.copyOf(solveRegionKeys(batch.anchors()));
             syncBrickRuntimeHints(batch.brickRuntimeHintCoordsByWorld());
             activePlayerProbeRequests = batch.playerProbeRequests();
             activeEntitySampleRequests = batch.entitySampleRequests();

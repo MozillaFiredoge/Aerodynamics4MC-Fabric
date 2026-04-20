@@ -287,6 +287,30 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_copy_brick_world_resident_bricks(
     int* out_coords,
     int brick_capacity
 );
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_brick_world_active_brick_count(
+    long long service_key,
+    long long world_key
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_copy_brick_world_active_bricks(
+    long long service_key,
+    long long world_key,
+    int* out_coords,
+    int brick_capacity
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    int brick_x,
+    int brick_y,
+    int brick_z,
+    const uint8_t* obstacle,
+    const uint8_t* surface_kind,
+    const uint16_t* open_face_mask,
+    const float* emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     long long service_key,
     long long region_key,
