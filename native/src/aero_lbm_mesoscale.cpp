@@ -20,7 +20,11 @@
 #endif
 
 #if defined(AERO_LBM_OPENCL)
+#if defined(__APPLE__)
+#include <OpenCL/opencl.h>
+#else
 #include <CL/cl.h>
+#endif
 #endif
 
 namespace aero_lbm::mesoscale {

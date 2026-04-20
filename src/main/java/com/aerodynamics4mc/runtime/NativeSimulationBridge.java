@@ -164,6 +164,13 @@ public final class NativeSimulationBridge {
             && nativeStepBrickWorldRuntime(serviceKey, worldKey, stepCount);
     }
 
+    public int[] getBrickWorldResidentBrickCoords(long serviceKey, long worldKey) {
+        if (!LOADED || serviceKey == 0L || worldKey == 0L) {
+            return null;
+        }
+        return nativeGetBrickWorldResidentBrickCoords(serviceKey, worldKey);
+    }
+
     public boolean uploadStaticRegion(
         long serviceKey,
         long regionKey,
@@ -875,6 +882,11 @@ public final class NativeSimulationBridge {
         long serviceKey,
         long worldKey,
         int stepCount
+    );
+
+    private static native int[] nativeGetBrickWorldResidentBrickCoords(
+        long serviceKey,
+        long worldKey
     );
 
     private static native boolean nativeUploadStaticRegion(

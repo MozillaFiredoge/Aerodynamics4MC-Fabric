@@ -414,6 +414,45 @@ int count_pending_reinit_bricks(const FluidWorldRuntime& runtime) {
     return count;
 }
 
+bool brick_is_resident_for_windows(const BrickData& brick) {
+    return brick.active_hint
+        || brick.active
+        || brick.geometry_dirty
+        || brick.forcing_dirty
+        || brick.pending_reinit;
+}
+
+int count_resident_bricks(const FluidWorldRuntime& runtime) {
+    int count = 0;
+    for (const auto& entry : runtime.bricks) {
+        if (brick_is_resident_for_windows(entry.second)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int copy_resident_bricks(const FluidWorldRuntime& runtime, int* out_coords, int brick_capacity) {
+    if ((brick_capacity > 0) && !out_coords) {
+        return -1;
+    }
+    int written = 0;
+    for (const auto& entry : runtime.bricks) {
+        if (!brick_is_resident_for_windows(entry.second)) {
+            continue;
+        }
+        if (written >= brick_capacity) {
+            return -1;
+        }
+        const int base = written * 3;
+        out_coords[base] = entry.first.x;
+        out_coords[base + 1] = entry.first.y;
+        out_coords[base + 2] = entry.first.z;
+        ++written;
+    }
+    return written;
+}
+
 int floor_div_int(int value, int divisor) {
     if (divisor <= 0) {
         return 0;
@@ -2477,6 +2516,50 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_brick_world_runtime(
     return 1;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_brick_world_resident_brick_count(
+    long long service_key,
+    long long world_key
+) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_get_brick_world_resident_brick_count: missing service");
+        return -1;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        return 0;
+    }
+    return count_resident_bricks(runtime_iterator->second);
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_copy_brick_world_resident_bricks(
+    long long service_key,
+    long long world_key,
+    int* out_coords,
+    int brick_capacity
+) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_copy_brick_world_resident_bricks: missing service");
+        return -1;
+    }
+    if (brick_capacity < 0) {
+        set_simulation_last_error("simulation_copy_brick_world_resident_bricks: invalid brick capacity");
+        return -1;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        return 0;
+    }
+    const int copied = copy_resident_bricks(runtime_iterator->second, out_coords, brick_capacity);
+    if (copied < 0) {
+        set_simulation_last_error("simulation_copy_brick_world_resident_bricks: output buffer too small");
+    }
+    return copied;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     long long service_key,
     long long region_key,
@@ -4006,6 +4089,45 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         static_cast<long long>(world_key),
         step_count
     ) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jintArray JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeGetBrickWorldResidentBrickCoords(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong world_key
+) {
+    const int brick_count = aero_lbm_simulation_get_brick_world_resident_brick_count(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key)
+    );
+    if (brick_count < 0) {
+        return nullptr;
+    }
+    jintArray result = env->NewIntArray(brick_count * 3);
+    if (!result) {
+        return nullptr;
+    }
+    if (brick_count == 0) {
+        return result;
+    }
+    std::vector<int> coords(static_cast<std::size_t>(brick_count) * 3u, 0);
+    const int copied = aero_lbm_simulation_copy_brick_world_resident_bricks(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key),
+        coords.data(),
+        brick_count
+    );
+    if (copied != brick_count) {
+        return nullptr;
+    }
+    env->SetIntArrayRegion(
+        result,
+        0,
+        brick_count * 3,
+        reinterpret_cast<const jint*>(coords.data())
+    );
+    return result;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeUploadStaticRegion(

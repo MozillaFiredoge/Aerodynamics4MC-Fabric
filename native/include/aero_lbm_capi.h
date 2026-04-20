@@ -277,6 +277,16 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_brick_world_runtime(
     long long world_key,
     int step_count
 );
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_brick_world_resident_brick_count(
+    long long service_key,
+    long long world_key
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_copy_brick_world_resident_bricks(
+    long long service_key,
+    long long world_key,
+    int* out_coords,
+    int brick_capacity
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     long long service_key,
     long long region_key,

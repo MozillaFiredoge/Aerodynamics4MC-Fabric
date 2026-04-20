@@ -4092,6 +4092,44 @@ public final class AeroServerRuntime {
         }
     }
 
+    private void refreshDesiredWindowsFromBrickRuntime() {
+        Set<WindowKey> desiredWindows = new HashSet<>(desiredSolveWindowKeys);
+        if (simulationServiceId != 0L && simulationBridge.isLoaded()) {
+            for (RegistryKey<World> worldKey : new HashSet<>(brickRuntimeKnownWorldKeys)) {
+                int[] brickCoords = simulationBridge.getBrickWorldResidentBrickCoords(
+                    simulationServiceId,
+                    simulationWorldKey(worldKey)
+                );
+                if (brickCoords == null) {
+                    continue;
+                }
+                for (int i = 0; i + 2 < brickCoords.length; i += NativeSimulationBridge.BRICK_HINT_COORDS_PER_BRICK) {
+                    BlockPos coreOrigin = new BlockPos(
+                        brickCoords[i] * BRICK_RUNTIME_SIZE,
+                        brickCoords[i + 1] * BRICK_RUNTIME_SIZE,
+                        brickCoords[i + 2] * BRICK_RUNTIME_SIZE
+                    );
+                    desiredWindows.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(coreOrigin)));
+                }
+            }
+        }
+        desiredWindowKeys = Set.copyOf(desiredWindows);
+        int retainUntilTick = tickCounter + SHELL_WINDOW_RETENTION_TICKS;
+        shellWindowRetainUntilTick.entrySet().removeIf(entry -> entry.getValue() < tickCounter);
+        for (WindowKey key : desiredWindowKeys) {
+            if (!desiredSolveWindowKeys.contains(key)) {
+                shellWindowRetainUntilTick.put(key, retainUntilTick);
+            } else {
+                shellWindowRetainUntilTick.remove(key);
+            }
+        }
+        for (WindowKey key : desiredWindowKeys) {
+            if (!desiredSolveWindowKeys.contains(key)) {
+                removePublishedRegionAtlas(key);
+            }
+        }
+    }
+
     private List<NestedFeedbackAxisSpan> buildHorizontalNestedFeedbackSpans(
         int worldMinInclusive,
         int worldMaxExclusive,
@@ -7324,6 +7362,7 @@ public final class AeroServerRuntime {
                             applyPendingActiveRegionBatchIfNeeded();
                             applyPendingBackgroundRefreshIfNeeded();
                             stepBrickRuntimeWorlds();
+                            refreshDesiredWindowsFromBrickRuntime();
                         }
                         runMesoscaleStepCycle();
                         synchronized (simulationStateLock) {
@@ -7485,26 +7524,11 @@ public final class AeroServerRuntime {
             if (batch == null || batch.tickCounter() <= lastActiveRegionBatchTick) {
                 return;
             }
-            desiredWindowKeys = Set.copyOf(activeRegionKeys(batch.anchors()));
             desiredSolveWindowKeys = Set.copyOf(solveRegionKeys(batch.anchors()));
-            int retainUntilTick = batch.tickCounter() + SHELL_WINDOW_RETENTION_TICKS;
-            shellWindowRetainUntilTick.entrySet().removeIf(entry -> entry.getValue() < batch.tickCounter());
-            for (WindowKey key : desiredWindowKeys) {
-                if (!desiredSolveWindowKeys.contains(key)) {
-                    shellWindowRetainUntilTick.put(key, retainUntilTick);
-                } else {
-                    shellWindowRetainUntilTick.remove(key);
-                }
-            }
             syncBrickRuntimeHints(batch.brickRuntimeHintCoordsByWorld());
             activePlayerProbeRequests = batch.playerProbeRequests();
             activeEntitySampleRequests = batch.entitySampleRequests();
             worldEnvironmentSnapshots = batch.environmentSnapshots();
-            for (WindowKey key : desiredWindowKeys) {
-                if (!desiredSolveWindowKeys.contains(key)) {
-                    removePublishedRegionAtlas(key);
-                }
-            }
             lastActiveRegionBatchTick = batch.tickCounter();
         }
 
