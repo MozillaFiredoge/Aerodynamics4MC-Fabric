@@ -278,6 +278,7 @@ public final class AeroServerRuntime {
     private final AtomicReference<Map<UUID, PlayerProbe>> publishedPlayerProbes = new AtomicReference<>(Map.of());
     private final AtomicReference<Map<UUID, EntitySample>> publishedEntitySamples = new AtomicReference<>(Map.of());
     private volatile Set<WindowKey> desiredWindowKeys = Set.of();
+    private volatile Set<WindowKey> desiredSolveWindowKeys = Set.of();
     private volatile Map<RegistryKey<World>, WorldEnvironmentSnapshot> worldEnvironmentSnapshots = Map.of();
     private volatile List<PlayerProbeRequest> activePlayerProbeRequests = List.of();
     private volatile List<EntitySampleRequest> activeEntitySampleRequests = List.of();
@@ -2544,6 +2545,7 @@ public final class AeroServerRuntime {
         pendingNestedFeedbackBins.clear();
         nestedFeedbackRuntimeDiagnostics.clear();
         desiredWindowKeys = Set.of();
+        desiredSolveWindowKeys = Set.of();
         activePlayerProbeRequests = List.of();
         activeEntitySampleRequests = List.of();
         worldEnvironmentSnapshots = Map.of();
@@ -3248,6 +3250,16 @@ public final class AeroServerRuntime {
         if (activeWindows.isEmpty() || simulationServiceId == 0L) {
             return 0.0f;
         }
+        Set<WindowKey> desiredSolveKeys = desiredSolveWindowKeys;
+        Set<WindowKey> solveKeys = new HashSet<>(activeWindows.size());
+        for (ActiveWindow active : activeWindows) {
+            if (desiredSolveKeys.contains(active.key())) {
+                solveKeys.add(active.key());
+            }
+        }
+        if (solveKeys.isEmpty()) {
+            return 0.0f;
+        }
         Map<WindowKey, ActiveWindow> activeByKey = new HashMap<>(activeWindows.size());
         for (ActiveWindow active : activeWindows) {
             activeByKey.put(active.key(), active);
@@ -3257,12 +3269,15 @@ public final class AeroServerRuntime {
         int[] offsets = new int[Math.max(0, maxPairs * 3)];
         int exchangeCount = 0;
         for (ActiveWindow active : activeWindows) {
+            if (!solveKeys.contains(active.key())) {
+                continue;
+            }
             if (active.region().sections == null || active.region().busy.get()) {
                 continue;
             }
-            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, active, 1, 0, 0, regionPairs, offsets, exchangeCount);
-            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, active, 0, 1, 0, regionPairs, offsets, exchangeCount);
-            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, active, 0, 0, 1, regionPairs, offsets, exchangeCount);
+            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, solveKeys, active, 1, 0, 0, regionPairs, offsets, exchangeCount);
+            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, solveKeys, active, 0, 1, 0, regionPairs, offsets, exchangeCount);
+            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, solveKeys, active, 0, 0, 1, regionPairs, offsets, exchangeCount);
         }
         if (exchangeCount == 0) {
             return 0.0f;
@@ -3289,6 +3304,7 @@ public final class AeroServerRuntime {
 
     private int appendPositiveNeighborHaloBatch(
         Map<WindowKey, ActiveWindow> activeByKey,
+        Set<WindowKey> solveKeys,
         ActiveWindow active,
         int dx,
         int dy,
@@ -3305,7 +3321,8 @@ public final class AeroServerRuntime {
         );
         WindowKey neighborKey = new WindowKey(key.worldKey(), neighborOrigin);
         ActiveWindow neighborActive = activeByKey.get(neighborKey);
-        if (neighborActive == null
+        if (!solveKeys.contains(neighborKey)
+            || neighborActive == null
             || neighborActive.region().sections == null
             || neighborActive.region().busy.get()
             || active.region().backendResetPending()
@@ -3413,6 +3430,24 @@ public final class AeroServerRuntime {
                     keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(regionCore)));
                 }
             }
+            keys.add(new WindowKey(
+                worldKey,
+                windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))
+            ));
+            keys.add(new WindowKey(
+                worldKey,
+                windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))
+            ));
+        }
+        return keys;
+    }
+
+    private Set<WindowKey> solveRegionKeys(List<PlayerRegionAnchor> anchors) {
+        Set<WindowKey> keys = new HashSet<>();
+        for (PlayerRegionAnchor anchor : anchors) {
+            RegistryKey<World> worldKey = anchor.worldKey();
+            BlockPos baseCore = anchor.coreOrigin();
+            keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore)));
             keys.add(new WindowKey(
                 worldKey,
                 windowOriginFromCoreOrigin(baseCore.add(0, REGION_LATTICE_STRIDE, 0))
@@ -6101,11 +6136,17 @@ public final class AeroServerRuntime {
 
     private CountDownLatch scheduleSolveCycle(List<ActiveWindow> activeWindows) {
         List<SolveSnapshot> scheduled = new ArrayList<>(activeWindows.size());
-        Set<WindowKey> activeKeys = new HashSet<>(activeWindows.size());
+        Set<WindowKey> desiredSolveKeys = desiredSolveWindowKeys;
+        Set<WindowKey> solveKeys = new HashSet<>(activeWindows.size());
         for (ActiveWindow active : activeWindows) {
-            activeKeys.add(active.key());
+            if (desiredSolveKeys.contains(active.key())) {
+                solveKeys.add(active.key());
+            }
         }
         for (ActiveWindow active : activeWindows) {
+            if (!solveKeys.contains(active.key())) {
+                continue;
+            }
             RegionRecord region = active.region();
             if (!region.busy.compareAndSet(false, true)) {
                 continue;
@@ -6115,7 +6156,7 @@ public final class AeroServerRuntime {
                 region,
                 MAX_RUNTIME_WIND_SPEED,
                 runtimeGeneration.get(),
-                activeKeys
+                solveKeys
             );
             scheduled.add(snapshot);
         }
@@ -7161,9 +7202,15 @@ public final class AeroServerRuntime {
                 return;
             }
             desiredWindowKeys = Set.copyOf(activeRegionKeys(batch.anchors()));
+            desiredSolveWindowKeys = Set.copyOf(solveRegionKeys(batch.anchors()));
             activePlayerProbeRequests = batch.playerProbeRequests();
             activeEntitySampleRequests = batch.entitySampleRequests();
             worldEnvironmentSnapshots = batch.environmentSnapshots();
+            for (WindowKey key : desiredWindowKeys) {
+                if (!desiredSolveWindowKeys.contains(key)) {
+                    removePublishedRegionAtlas(key);
+                }
+            }
             lastActiveRegionBatchTick = batch.tickCounter();
         }
 

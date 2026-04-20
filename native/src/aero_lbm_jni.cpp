@@ -1999,6 +1999,17 @@ inline bool should_update_temperature(std::uint64_t step_counter) {
     return (step_counter % static_cast<std::uint64_t>(stride)) == 0;
 }
 
+inline bool temperature_was_updated_last_step(const ContextState& ctx) {
+    const int stride = effective_thermal_update_stride();
+    if (stride <= 1) return true;
+    if (ctx.step_counter == 0) return true;
+    return ((ctx.step_counter - 1) % static_cast<std::uint64_t>(stride)) == 0;
+}
+
+inline bool should_exchange_temperature_halo(const ContextState& first, const ContextState& second) {
+    return temperature_was_updated_last_step(first) || temperature_was_updated_last_step(second);
+}
+
 void collide(ContextState& ctx) {
     const float boussinesq_beta = effective_boussinesq_beta();
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
@@ -5355,49 +5366,51 @@ bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int of
         }
     }
 
-    cl_mem first_temp_current = (first.step_counter % 2 == 0) ? first.d_temp : first.d_temp_next;
-    cl_mem second_temp_current = (second.step_counter % 2 == 0) ? second.d_temp : second.d_temp_next;
-    if (!copy_buffer_face_slab(
-        first_temp_current,
-        0,
-        second_temp_current,
-        0,
-        nx,
-        ny,
-        nz,
-        neg_src_x0,
-        neg_src_y0,
-        neg_src_z0,
-        pos_dst_x0,
-        pos_dst_y0,
-        pos_dst_z0,
-        size_x,
-        size_y,
-        size_z,
-        "clEnqueueCopyBufferRect(halo_temp_first_to_second)"
-    )) {
-        return false;
-    }
-    if (!copy_buffer_face_slab(
-        second_temp_current,
-        0,
-        first_temp_current,
-        0,
-        nx,
-        ny,
-        nz,
-        pos_src_x0,
-        pos_src_y0,
-        pos_src_z0,
-        neg_dst_x0,
-        neg_dst_y0,
-        neg_dst_z0,
-        size_x,
-        size_y,
-        size_z,
-        "clEnqueueCopyBufferRect(halo_temp_second_to_first)"
-    )) {
-        return false;
+    if (should_exchange_temperature_halo(first, second)) {
+        cl_mem first_temp_current = (first.step_counter % 2 == 0) ? first.d_temp : first.d_temp_next;
+        cl_mem second_temp_current = (second.step_counter % 2 == 0) ? second.d_temp : second.d_temp_next;
+        if (!copy_buffer_face_slab(
+            first_temp_current,
+            0,
+            second_temp_current,
+            0,
+            nx,
+            ny,
+            nz,
+            neg_src_x0,
+            neg_src_y0,
+            neg_src_z0,
+            pos_dst_x0,
+            pos_dst_y0,
+            pos_dst_z0,
+            size_x,
+            size_y,
+            size_z,
+            "clEnqueueCopyBufferRect(halo_temp_first_to_second)"
+        )) {
+            return false;
+        }
+        if (!copy_buffer_face_slab(
+            second_temp_current,
+            0,
+            first_temp_current,
+            0,
+            nx,
+            ny,
+            nz,
+            pos_src_x0,
+            pos_src_y0,
+            pos_src_z0,
+            neg_dst_x0,
+            neg_dst_y0,
+            neg_dst_z0,
+            size_x,
+            size_y,
+            size_z,
+            "clEnqueueCopyBufferRect(halo_temp_second_to_first)"
+        )) {
+            return false;
+        }
     }
     return true;
 }
@@ -5878,7 +5891,9 @@ bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int of
         size_y,
         size_z
     );
-    if (first.temperature.size() == first.cells && second.temperature.size() == second.cells) {
+    if (should_exchange_temperature_halo(first, second)
+        && first.temperature.size() == first.cells
+        && second.temperature.size() == second.cells) {
         copy_scalar_slab(
             first.temperature,
             second.temperature,
