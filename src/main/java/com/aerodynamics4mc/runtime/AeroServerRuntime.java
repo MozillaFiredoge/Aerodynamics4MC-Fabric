@@ -63,6 +63,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.shape.VoxelShape;
@@ -288,6 +289,7 @@ public final class AeroServerRuntime {
     private final AtomicReference<Map<UUID, EntitySample>> publishedEntitySamples = new AtomicReference<>(Map.of());
     private volatile Set<WindowKey> desiredWindowKeys = Set.of();
     private volatile Set<WindowKey> desiredSolveWindowKeys = Set.of();
+    private volatile Set<WindowKey> anchorDesiredWindowKeys = Set.of();
     private volatile Set<WindowKey> anchorSolveWindowKeys = Set.of();
     private final Map<WindowKey, Integer> shellWindowRetainUntilTick = new HashMap<>();
     private final Set<WindowKey> mirrorOnlyPrewarmedWindowKeys = new HashSet<>();
@@ -397,6 +399,7 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
+            refreshResidentBrickStaticsForChunk(world, chunk.getPos());
         });
     }
 
@@ -417,7 +420,29 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
+            refreshResidentBrickStaticsForChunk(world, chunk.getPos());
         });
+    }
+
+    private void refreshResidentBrickStaticsForChunk(ServerWorld world, ChunkPos chunkPos) {
+        long serviceId = simulationServiceId;
+        if (serviceId == 0L || !simulationBridge.isLoaded()) {
+            return;
+        }
+        long worldRuntimeKey = simulationWorldKey(world.getRegistryKey());
+        int[] residentBrickCoords = simulationBridge.getBrickWorldResidentBrickCoords(serviceId, worldRuntimeKey);
+        if (residentBrickCoords == null || residentBrickCoords.length == 0) {
+            return;
+        }
+        for (int i = 0; i + 2 < residentBrickCoords.length; i += 3) {
+            int brickX = residentBrickCoords[i];
+            int brickY = residentBrickCoords[i + 1];
+            int brickZ = residentBrickCoords[i + 2];
+            if (!chunkOverlapsBrickColumn(chunkPos, brickX, brickZ)) {
+                continue;
+            }
+            uploadResidentBrickStaticFromMirror(world.getRegistryKey(), brickX, brickY, brickZ);
+        }
     }
 
     private void onBlockEntityLoad(BlockEntity blockEntity, ServerWorld world) {
@@ -513,7 +538,48 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
+            submitBrickStaticCellPatchDeltas(world, pos);
         });
+    }
+
+    private void submitBrickStaticCellPatchDeltas(ServerWorld world, BlockPos centerPos) {
+        submitBrickStaticCellPatchDelta(world, centerPos);
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            submitBrickStaticCellPatchDelta(world, centerPos.offset(direction));
+        }
+    }
+
+    private void submitBrickStaticCellPatchDelta(ServerWorld world, BlockPos pos) {
+        long serviceId = simulationServiceId;
+        if (serviceId == 0L) {
+            return;
+        }
+        NativeSimulationBridge.WorldDelta delta = buildBrickStaticCellPatchDelta(world, pos);
+        if (delta != null) {
+            submitWorldDeltaToSimulation(delta);
+        }
+    }
+
+    private NativeSimulationBridge.WorldDelta buildBrickStaticCellPatchDelta(ServerWorld world, BlockPos pos) {
+        BlockState state = world.getBlockState(pos);
+        boolean solid = isSolidObstacle(world, pos, state);
+        ThermalMaterial material = thermalMaterial(state);
+        byte openFaceMask = sampleStaticOpenFaceMask(world, pos, state, material);
+        int packedState = (solid ? 1 : 0) | (Byte.toUnsignedInt(material == null ? SURFACE_KIND_NONE : material.kind()) << 8);
+        return new NativeSimulationBridge.WorldDelta(
+            NativeSimulationBridge.WORLD_DELTA_BRICK_STATIC_CELL_PATCH,
+            pos.getX(),
+            pos.getY(),
+            pos.getZ(),
+            world.getRegistryKey().getValue().hashCode(),
+            packedState,
+            Byte.toUnsignedInt(openFaceMask),
+            0,
+            sampleEmitterThermalPowerWatts(state),
+            0.0f,
+            0.0f,
+            0.0f
+        );
     }
 
     private void invalidateDynamicRegionsForBlock(ServerWorld world, BlockPos pos) {
@@ -556,6 +622,55 @@ public final class AeroServerRuntime {
         return pos.getX() >= windowOrigin.getX() && pos.getX() < windowOrigin.getX() + GRID_SIZE
             && pos.getY() >= windowOrigin.getY() && pos.getY() < windowOrigin.getY() + GRID_SIZE
             && pos.getZ() >= windowOrigin.getZ() && pos.getZ() < windowOrigin.getZ() + GRID_SIZE;
+    }
+
+    private boolean chunkOverlapsBrickColumn(ChunkPos chunkPos, int brickX, int brickZ) {
+        int chunkMinX = chunkPos.getStartX();
+        int chunkMinZ = chunkPos.getStartZ();
+        int chunkMaxX = chunkMinX + CHUNK_SIZE;
+        int chunkMaxZ = chunkMinZ + CHUNK_SIZE;
+        int brickMinX = brickX * BRICK_RUNTIME_SIZE;
+        int brickMinZ = brickZ * BRICK_RUNTIME_SIZE;
+        int brickMaxX = brickMinX + BRICK_RUNTIME_SIZE;
+        int brickMaxZ = brickMinZ + BRICK_RUNTIME_SIZE;
+        return chunkMinX < brickMaxX
+            && chunkMaxX > brickMinX
+            && chunkMinZ < brickMaxZ
+            && chunkMaxZ > brickMinZ;
+    }
+
+    private byte sampleStaticOpenFaceMask(
+        ServerWorld world,
+        BlockPos pos,
+        BlockState state,
+        ThermalMaterial material
+    ) {
+        float emitterPower = sampleEmitterThermalPowerWatts(state);
+        if (material == null && emitterPower <= 0.0f) {
+            return 0;
+        }
+        byte openFaceMask = 0;
+        BlockPos.Mutable neighborCursor = new BlockPos.Mutable();
+        for (Direction direction : CARDINAL_DIRECTIONS) {
+            neighborCursor.set(
+                pos.getX() + direction.getOffsetX(),
+                pos.getY() + direction.getOffsetY(),
+                pos.getZ() + direction.getOffsetZ()
+            );
+            BlockState neighborState = world.getBlockState(neighborCursor);
+            boolean openFace;
+            if (material != null) {
+                openFace = material.atmosphericExchangeRequiresAirNeighbor()
+                    ? neighborState.isAir()
+                    : !isSolidObstacle(world, neighborCursor, neighborState);
+            } else {
+                openFace = neighborState.isAir();
+            }
+            if (openFace) {
+                openFaceMask = setFaceBit(openFaceMask, direction);
+            }
+        }
+        return openFaceMask;
     }
 
     private void registerCommands(
@@ -2565,6 +2680,7 @@ public final class AeroServerRuntime {
         nestedFeedbackRuntimeDiagnostics.clear();
         desiredWindowKeys = Set.of();
         desiredSolveWindowKeys = Set.of();
+        anchorDesiredWindowKeys = Set.of();
         anchorSolveWindowKeys = Set.of();
         shellWindowRetainUntilTick.clear();
         mirrorOnlyPrewarmedWindowKeys.clear();
@@ -4195,27 +4311,7 @@ public final class AeroServerRuntime {
 
     private void refreshDesiredWindowsFromBrickRuntime() {
         Set<WindowKey> solveWindows = new HashSet<>(anchorSolveWindowKeys);
-        Set<WindowKey> desiredWindows = new HashSet<>(solveWindows);
-        if (simulationServiceId != 0L && simulationBridge.isLoaded()) {
-            for (RegistryKey<World> worldKey : new HashSet<>(brickRuntimeKnownWorldKeys)) {
-                appendBrickWindowCoords(
-                    solveWindows,
-                    worldKey,
-                    simulationBridge.getBrickWorldActiveBrickCoords(
-                        simulationServiceId,
-                        simulationWorldKey(worldKey)
-                    )
-                );
-                appendBrickWindowCoords(
-                    desiredWindows,
-                    worldKey,
-                    simulationBridge.getBrickWorldResidentBrickCoords(
-                        simulationServiceId,
-                        simulationWorldKey(worldKey)
-                    )
-                );
-            }
-        }
+        Set<WindowKey> desiredWindows = new HashSet<>(anchorDesiredWindowKeys);
         desiredWindows.addAll(solveWindows);
         desiredSolveWindowKeys = Set.copyOf(solveWindows);
         desiredWindowKeys = Set.copyOf(desiredWindows);
@@ -4533,6 +4629,7 @@ public final class AeroServerRuntime {
                                 }
                             }
                         }
+                        region.setSection(sx, sy, sz, null);
                         region.uploadedSectionVersions[sectionIndex] = Long.MIN_VALUE;
                         continue;
                     }
@@ -4548,6 +4645,7 @@ public final class AeroServerRuntime {
                         faceSkyExposure,
                         faceDirectExposure
                     );
+                    region.setSection(sx, sy, sz, snapshot);
                     region.uploadedSectionVersions[sectionIndex] = snapshot.version();
                 }
             }
@@ -4692,7 +4790,68 @@ public final class AeroServerRuntime {
         if (simulationServiceId == 0L || coreSnapshots == null || coreSnapshots.length != CORE_SECTION_COUNT) {
             return false;
         }
-        long worldRuntimeKey = simulationWorldKey(key.worldKey());
+        BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
+        return uploadBrickStaticSnapshotsToRuntime(
+            key.worldKey(),
+            Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE),
+            coreSnapshots,
+            false
+        );
+    }
+
+    private boolean uploadResidentBrickStaticFromMirror(
+        RegistryKey<World> worldKey,
+        int brickX,
+        int brickY,
+        int brickZ
+    ) {
+        WorldMirror.SectionSnapshot[] snapshots = brickSectionSnapshotsFromMirror(worldKey, brickX, brickY, brickZ);
+        return uploadBrickStaticSnapshotsToRuntime(worldKey, brickX, brickY, brickZ, snapshots, true);
+    }
+
+    private WorldMirror.SectionSnapshot[] brickSectionSnapshotsFromMirror(
+        RegistryKey<World> worldKey,
+        int brickX,
+        int brickY,
+        int brickZ
+    ) {
+        int sectionAxisCount = BRICK_RUNTIME_SIZE / CHUNK_SIZE;
+        WorldMirror.SectionSnapshot[] snapshots = new WorldMirror.SectionSnapshot[sectionAxisCount * sectionAxisCount * sectionAxisCount];
+        int index = 0;
+        int originX = brickX * BRICK_RUNTIME_SIZE;
+        int originY = brickY * BRICK_RUNTIME_SIZE;
+        int originZ = brickZ * BRICK_RUNTIME_SIZE;
+        for (int sx = 0; sx < sectionAxisCount; sx++) {
+            for (int sy = 0; sy < sectionAxisCount; sy++) {
+                for (int sz = 0; sz < sectionAxisCount; sz++) {
+                    snapshots[index++] = worldMirror.peekSection(
+                        worldKey,
+                        new BlockPos(
+                            originX + sx * CHUNK_SIZE,
+                            originY + sy * CHUNK_SIZE,
+                            originZ + sz * CHUNK_SIZE
+                        )
+                    );
+                }
+            }
+        }
+        return snapshots;
+    }
+
+    private boolean uploadBrickStaticSnapshotsToRuntime(
+        RegistryKey<World> worldKey,
+        int brickX,
+        int brickY,
+        int brickZ,
+        WorldMirror.SectionSnapshot[] snapshots,
+        boolean fillMissingAsSolid
+    ) {
+        if (simulationServiceId == 0L || snapshots == null) {
+            return false;
+        }
+        long worldRuntimeKey = simulationWorldKey(worldKey);
         if (!simulationBridge.ensureBrickWorldRuntime(
             simulationServiceId,
             worldRuntimeKey,
@@ -4702,6 +4861,10 @@ public final class AeroServerRuntime {
         )) {
             return false;
         }
+        int sectionAxisCount = BRICK_RUNTIME_SIZE / CHUNK_SIZE;
+        if (snapshots.length != sectionAxisCount * sectionAxisCount * sectionAxisCount) {
+            return false;
+        }
         int cells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
         byte[] obstacle = new byte[cells];
         byte[] surfaceKind = new byte[cells];
@@ -4709,20 +4872,26 @@ public final class AeroServerRuntime {
         float[] emitterPower = new float[cells];
         byte[] faceSkyExposure = new byte[cells * FACE_COUNT];
         byte[] faceDirectExposure = new byte[cells * FACE_COUNT];
-        int sectionAxisCount = REGION_CORE_SIZE / CHUNK_SIZE;
         int snapshotIndex = 0;
         for (int sx = 0; sx < sectionAxisCount; sx++) {
             for (int sy = 0; sy < sectionAxisCount; sy++) {
                 for (int sz = 0; sz < sectionAxisCount; sz++) {
-                    WorldMirror.SectionSnapshot snapshot = coreSnapshots[snapshotIndex++];
+                    WorldMirror.SectionSnapshot snapshot = snapshots[snapshotIndex++];
+                    int baseX = sx * CHUNK_SIZE;
+                    int baseY = sy * CHUNK_SIZE;
+                    int baseZ = sz * CHUNK_SIZE;
                     if (snapshot == null) {
-                        return false;
+                        if (!fillMissingAsSolid) {
+                            return false;
+                        }
+                        fillBrickSectionAsSolid(baseX, baseY, baseZ, obstacle);
+                        continue;
                     }
                     writeSectionSnapshotIntoBrickBuffers(
                         snapshot,
-                        sx * CHUNK_SIZE,
-                        sy * CHUNK_SIZE,
-                        sz * CHUNK_SIZE,
+                        baseX,
+                        baseY,
+                        baseZ,
                         obstacle,
                         surfaceKind,
                         openFaceMask,
@@ -4733,14 +4902,13 @@ public final class AeroServerRuntime {
                 }
             }
         }
-        BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
         return simulationBridge.uploadBrickWorldStaticBrick(
             simulationServiceId,
             worldRuntimeKey,
             BRICK_RUNTIME_SIZE,
-            Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE),
-            Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
-            Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE),
+            brickX,
+            brickY,
+            brickZ,
             obstacle,
             surfaceKind,
             openFaceMask,
@@ -4748,6 +4916,19 @@ public final class AeroServerRuntime {
             faceSkyExposure,
             faceDirectExposure
         );
+    }
+
+    private void fillBrickSectionAsSolid(int baseX, int baseY, int baseZ, byte[] obstacle) {
+        for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+            int x = baseX + lx;
+            for (int ly = 0; ly < CHUNK_SIZE; ly++) {
+                int y = baseY + ly;
+                for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                    int z = baseZ + lz;
+                    obstacle[patchCellIndex(x, y, z, BRICK_RUNTIME_SIZE)] = 1;
+                }
+            }
+        }
     }
 
     private WorldMirror.SectionSnapshot[] coreSectionSnapshotsFromRegion(RegionRecord region) {
@@ -7919,6 +8100,7 @@ public final class AeroServerRuntime {
             if (batch == null || batch.tickCounter() <= lastActiveRegionBatchTick) {
                 return;
             }
+            anchorDesiredWindowKeys = Set.copyOf(activeRegionKeys(batch.anchors()));
             anchorSolveWindowKeys = Set.copyOf(solveRegionKeys(batch.anchors()));
             syncBrickRuntimeHints(batch.brickRuntimeHintCoordsByWorld());
             activePlayerProbeRequests = batch.playerProbeRequests();

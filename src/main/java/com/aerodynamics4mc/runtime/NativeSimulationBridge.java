@@ -21,6 +21,7 @@ public final class NativeSimulationBridge {
     public static final int WORLD_DELTA_BLOCK_ENTITY_UNLOADED = 5;
     public static final int WORLD_DELTA_WORLD_UNLOADED = 6;
     public static final int WORLD_DELTA_FOCUS_CHANGED = 7;
+    public static final int WORLD_DELTA_BRICK_STATIC_CELL_PATCH = 8;
     private static final int WORLD_DELTA_INTS_PER_ENTRY = 8;
     private static final int WORLD_DELTA_FLOATS_PER_ENTRY = 4;
 

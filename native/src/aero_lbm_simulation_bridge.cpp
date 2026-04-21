@@ -418,6 +418,8 @@ int count_pending_reinit_bricks(const FluidWorldRuntime& runtime) {
     return count;
 }
 
+constexpr int k_world_delta_brick_static_cell_patch = 8;
+
 bool brick_is_resident_for_windows(const BrickData& brick) {
     return brick.active_hint
         || brick.active
@@ -926,6 +928,43 @@ void apply_world_delta_to_brick_runtimes(ServiceState& service, const AeroLbmWor
     FluidWorldRuntime& runtime = runtime_iterator->second;
     const BrickCoord coord = brick_coord_for_block(delta.x, delta.y, delta.z, runtime.brick_size);
     switch (delta.type) {
+        case k_world_delta_brick_static_cell_patch: {
+            auto brick_it = runtime.bricks.find(coord);
+            if (brick_it == runtime.bricks.end()) {
+                break;
+            }
+            BrickData& brick = brick_it->second;
+            if (!brick.static_region
+                || brick.static_region->nx != runtime.brick_size
+                || brick.static_region->ny != runtime.brick_size
+                || brick.static_region->nz != runtime.brick_size) {
+                break;
+            }
+            const int local_x = delta.x - coord.x * runtime.brick_size;
+            const int local_y = delta.y - coord.y * runtime.brick_size;
+            const int local_z = delta.z - coord.z * runtime.brick_size;
+            if (local_x < 0 || local_y < 0 || local_z < 0
+                || local_x >= runtime.brick_size
+                || local_y >= runtime.brick_size
+                || local_z >= runtime.brick_size) {
+                break;
+            }
+            const int cell = (local_x * runtime.brick_size + local_y) * runtime.brick_size + local_z;
+            auto updated_static = std::make_shared<StaticRegionData>(*brick.static_region);
+            StaticRegionData& stat = *updated_static;
+            stat.obstacle[static_cast<size_t>(cell)] = (delta.data1 & 0x1) != 0 ? 1u : 0u;
+            stat.surface_kind[static_cast<size_t>(cell)] = static_cast<uint8_t>((delta.data1 >> 8) & 0xFF);
+            stat.open_face_mask[static_cast<size_t>(cell)] = static_cast<uint16_t>(delta.data2 & 0xFF);
+            stat.emitter_power_watts[static_cast<size_t>(cell)] = std::isfinite(delta.value0) ? delta.value0 : 0.0f;
+            const size_t face_base = static_cast<size_t>(cell) * k_face_count;
+            std::fill_n(stat.face_sky_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
+            std::fill_n(stat.face_direct_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
+            brick.static_region = std::move(updated_static);
+            if (brick.dynamic_region) {
+                apply_brick_static_constraints(runtime, brick);
+            }
+            break;
+        }
         case 1:
         case 2:
         case 3:
