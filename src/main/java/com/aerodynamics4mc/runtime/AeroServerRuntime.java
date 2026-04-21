@@ -5015,6 +5015,7 @@ public final class AeroServerRuntime {
             airTemperatureState,
             surfaceTemperatureState
         )) {
+            overlaySeedWindowCoreFromBrickRuntime(key, buildRegionObstacleMask(region), flowState, airTemperatureState, surfaceTemperatureState);
             if (simulationBridge.importDynamicRegion(
                 simulationServiceId,
                 regionKey,
@@ -5058,6 +5059,7 @@ public final class AeroServerRuntime {
                 surfaceTemperatureState
             );
         }
+        overlaySeedWindowCoreFromBrickRuntime(key, obstacleMask, flowState, airTemperatureState, surfaceTemperatureState);
         return simulationBridge.importDynamicRegion(
             simulationServiceId,
             simulationRegionKey(key),
@@ -5068,6 +5070,58 @@ public final class AeroServerRuntime {
             airTemperatureState,
             surfaceTemperatureState
         );
+    }
+
+    private void overlaySeedWindowCoreFromBrickRuntime(
+        WindowKey key,
+        byte[] obstacleMask,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState
+    ) {
+        if (simulationServiceId == 0L || !simulationBridge.isLoaded()) {
+            return;
+        }
+        int coreCells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
+        float[] coreFlowState = new float[coreCells * RESPONSE_CHANNELS];
+        float[] coreAirTemperatureState = new float[coreCells];
+        float[] coreSurfaceTemperatureState = new float[coreCells];
+        BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
+        boolean copied = simulationBridge.copyBrickWorldDynamicBrick(
+            simulationServiceId,
+            simulationWorldKey(key.worldKey()),
+            BRICK_RUNTIME_SIZE,
+            Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE),
+            coreFlowState,
+            coreAirTemperatureState,
+            coreSurfaceTemperatureState
+        );
+        if (!copied) {
+            return;
+        }
+        for (int x = 0; x < BRICK_RUNTIME_SIZE; x++) {
+            for (int y = 0; y < BRICK_RUNTIME_SIZE; y++) {
+                for (int z = 0; z < BRICK_RUNTIME_SIZE; z++) {
+                    int dstX = REGION_HALO_CELLS + x;
+                    int dstY = REGION_HALO_CELLS + y;
+                    int dstZ = REGION_HALO_CELLS + z;
+                    int dstCell = gridCellIndex(dstX, dstY, dstZ);
+                    if (obstacleMask[dstCell] != 0) {
+                        continue;
+                    }
+                    int srcCell = patchCellIndex(x, y, z, BRICK_RUNTIME_SIZE);
+                    int dstBase = dstCell * RESPONSE_CHANNELS;
+                    int srcBase = srcCell * RESPONSE_CHANNELS;
+                    for (int channel = 0; channel < RESPONSE_CHANNELS; channel++) {
+                        flowState[dstBase + channel] = coreFlowState[srcBase + channel];
+                    }
+                    airTemperatureState[dstCell] = coreAirTemperatureState[srcCell];
+                    surfaceTemperatureState[dstCell] = coreSurfaceTemperatureState[srcCell];
+                }
+            }
+        }
     }
 
     private boolean seedWindowDynamicRegionFromMesoscale(
@@ -6506,6 +6560,36 @@ public final class AeroServerRuntime {
         return maxSpeed * NATIVE_VELOCITY_SCALE;
     }
 
+    private void syncSolveWindowCoreDynamicBrick(SolveSnapshot snapshot) {
+        if (simulationServiceId == 0L || !simulationBridge.isLoaded()) {
+            return;
+        }
+        BlockPos coreOrigin = snapshot.key().origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
+        boolean synced = simulationBridge.syncRegionCoreToBrickWorld(
+            simulationServiceId,
+            simulationRegionKey(snapshot.key()),
+            simulationWorldKey(snapshot.key().worldKey()),
+            GRID_SIZE,
+            GRID_SIZE,
+            GRID_SIZE,
+            REGION_HALO_CELLS,
+            REGION_HALO_CELLS,
+            REGION_HALO_CELLS,
+            BRICK_RUNTIME_SIZE,
+            BRICK_RUNTIME_SIZE,
+            BRICK_RUNTIME_SIZE,
+            Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
+            Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE)
+        );
+        if (!synced) {
+            String error = simulationBridge.lastError();
+            if (error != null && !error.isBlank()) {
+                log("Brick core dynamic sync failed for window " + formatPos(snapshot.origin()) + ": " + error);
+            }
+        }
+    }
+
     private float[] flattenTornadoDescriptors(List<TornadoRegionDescriptor> descriptors) {
         if (descriptors == null || descriptors.isEmpty()) {
             return null;
@@ -6610,6 +6694,7 @@ public final class AeroServerRuntime {
                 completedSolveCounter.incrementAndGet();
                 lastCoordinatorSolveCompleteTick = tickCounter;
                 lastSolverError = "";
+                syncSolveWindowCoreDynamicBrick(snapshot);
                 publishPlayerProbesForSolvedRegion(snapshot);
                 publishRegionAtlas(snapshot.key(), maxSpeed);
                 pollRegionNestedFeedback(snapshot.key(), region);

@@ -227,6 +227,83 @@ public final class NativeSimulationBridge {
         );
     }
 
+    public boolean syncRegionCoreToBrickWorld(
+        long serviceKey,
+        long regionKey,
+        long worldKey,
+        int regionNx,
+        int regionNy,
+        int regionNz,
+        int coreOffsetX,
+        int coreOffsetY,
+        int coreOffsetZ,
+        int coreNx,
+        int coreNy,
+        int coreNz,
+        int brickX,
+        int brickY,
+        int brickZ
+    ) {
+        return LOADED
+            && serviceKey != 0L
+            && regionKey != 0L
+            && worldKey != 0L
+            && nativeSyncRegionCoreToBrickWorld(
+                serviceKey,
+                regionKey,
+                worldKey,
+                regionNx,
+                regionNy,
+                regionNz,
+                coreOffsetX,
+                coreOffsetY,
+                coreOffsetZ,
+                coreNx,
+                coreNy,
+                coreNz,
+                brickX,
+                brickY,
+                brickZ
+            );
+    }
+
+    public boolean copyBrickWorldDynamicBrick(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int brickX,
+        int brickY,
+        int brickZ,
+        float[] outFlowState,
+        float[] outAirTemperature,
+        float[] outSurfaceTemperature
+    ) {
+        if (!LOADED || serviceKey == 0L || worldKey == 0L || brickSize <= 0) {
+            return false;
+        }
+        int cells = checkedCellCount(brickSize, brickSize, brickSize);
+        if (cells <= 0
+            || outFlowState == null
+            || outAirTemperature == null
+            || outSurfaceTemperature == null
+            || outFlowState.length != cells * FLOW_STATE_CHANNELS
+            || outAirTemperature.length != cells
+            || outSurfaceTemperature.length != cells) {
+            return false;
+        }
+        return nativeCopyBrickWorldDynamicBrick(
+            serviceKey,
+            worldKey,
+            brickSize,
+            brickX,
+            brickY,
+            brickZ,
+            outFlowState,
+            outAirTemperature,
+            outSurfaceTemperature
+        );
+    }
+
     public boolean uploadStaticRegion(
         long serviceKey,
         long regionKey,
@@ -963,6 +1040,36 @@ public final class NativeSimulationBridge {
         float[] emitterPowerWatts,
         byte[] faceSkyExposure,
         byte[] faceDirectExposure
+    );
+
+    private static native boolean nativeSyncRegionCoreToBrickWorld(
+        long serviceKey,
+        long regionKey,
+        long worldKey,
+        int regionNx,
+        int regionNy,
+        int regionNz,
+        int coreOffsetX,
+        int coreOffsetY,
+        int coreOffsetZ,
+        int coreNx,
+        int coreNy,
+        int coreNz,
+        int brickX,
+        int brickY,
+        int brickZ
+    );
+
+    private static native boolean nativeCopyBrickWorldDynamicBrick(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int brickX,
+        int brickY,
+        int brickZ,
+        float[] outFlowState,
+        float[] outAirTemperature,
+        float[] outSurfaceTemperature
     );
 
     private static native boolean nativeUploadStaticRegion(

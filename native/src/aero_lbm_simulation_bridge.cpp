@@ -130,6 +130,7 @@ struct BrickData {
     std::uint64_t last_hint_epoch = 0;
     std::uint64_t last_active_epoch = 0;
     std::shared_ptr<const StaticRegionData> static_region;
+    std::shared_ptr<DynamicRegionData> dynamic_region;
 };
 
 struct FluidWorldRuntime {
@@ -257,6 +258,8 @@ constexpr float k_air_specific_heat_j_per_kg_k = 1005.0f;
 constexpr float k_native_thermal_source_max = 0.006f;
 constexpr float k_thermal_surface_init_min_k = 220.0f;
 constexpr float k_thermal_surface_max_k = 1800.0f;
+constexpr int k_brick_face_coupling_layers = 2;
+constexpr float k_brick_face_relaxation = 0.25f;
 constexpr std::uint64_t k_brick_inactive_retention_epochs = 16;
 constexpr uint8_t k_surface_kind_none = 0;
 constexpr uint8_t k_surface_kind_rock = 1;
@@ -533,6 +536,28 @@ void prune_inactive_bricks(FluidWorldRuntime& runtime) {
     }
 }
 
+bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicRegionData* dynamic);
+void ensure_brick_dynamic_region_storage(FluidWorldRuntime& runtime, BrickData& brick);
+void reset_brick_dynamic_region_state(FluidWorldRuntime& runtime, BrickData& brick);
+void apply_brick_static_constraints(FluidWorldRuntime& runtime, BrickData& brick);
+struct BrickMeanState;
+BrickMeanState compute_brick_mean_state(const DynamicRegionData& dynamic);
+void seed_brick_from_neighbor_means(
+    const FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
+    const std::unordered_map<BrickCoord, std::shared_ptr<const DynamicRegionData>, BrickCoordHash>& snapshots,
+    DynamicRegionData& dynamic
+);
+void relax_brick_face_from_neighbor(
+    const FluidWorldRuntime& runtime,
+    const DynamicRegionData& neighbor,
+    int axis,
+    bool positive_face,
+    float relax,
+    int layers,
+    DynamicRegionData& dynamic
+);
+
 void step_brick_world_runtime(FluidWorldRuntime& runtime, int step_count) {
     if (step_count <= 0) {
         return;
@@ -540,11 +565,76 @@ void step_brick_world_runtime(FluidWorldRuntime& runtime, int step_count) {
     for (int step = 0; step < step_count; ++step) {
         runtime.epoch++;
         recompute_runtime_active_flags(runtime);
+        std::unordered_map<BrickCoord, bool, BrickCoordHash> needs_seed;
         for (auto& entry : runtime.bricks) {
             BrickData& brick = entry.second;
             if (!brick.active) {
                 continue;
             }
+            const bool had_dynamic = brick.dynamic_region != nullptr;
+            if ((brick.pending_reinit || !had_dynamic) && brick.static_region) {
+                reset_brick_dynamic_region_state(runtime, brick);
+                apply_brick_static_constraints(runtime, brick);
+                needs_seed[entry.first] = true;
+            } else if (brick.dynamic_region) {
+                ensure_brick_dynamic_region_storage(runtime, brick);
+            } else {
+                ensure_brick_dynamic_region_storage(runtime, brick);
+                needs_seed[entry.first] = true;
+            }
+        }
+
+        std::unordered_map<BrickCoord, std::shared_ptr<const DynamicRegionData>, BrickCoordHash> snapshots;
+        snapshots.reserve(runtime.bricks.size());
+        for (const auto& entry : runtime.bricks) {
+            if (!entry.second.active || !brick_dynamic_region_valid(runtime, entry.second.dynamic_region.get())) {
+                continue;
+            }
+            snapshots.emplace(entry.first, entry.second.dynamic_region);
+        }
+
+        static constexpr int neighbor_offsets[6][3] = {
+            {-1, 0, 0}, {1, 0, 0},
+            {0, -1, 0}, {0, 1, 0},
+            {0, 0, -1}, {0, 0, 1}
+        };
+        static constexpr int neighbor_axes[6] = {0, 0, 1, 1, 2, 2};
+        static constexpr bool neighbor_positive_faces[6] = {false, true, false, true, false, true};
+
+        for (auto& entry : runtime.bricks) {
+            BrickData& brick = entry.second;
+            if (!brick.active || !brick.dynamic_region) {
+                continue;
+            }
+            ensure_brick_dynamic_region_storage(runtime, brick);
+            auto next_dynamic = std::make_shared<DynamicRegionData>(*brick.dynamic_region);
+            if (needs_seed.find(entry.first) != needs_seed.end()) {
+                seed_brick_from_neighbor_means(runtime, entry.first, snapshots, *next_dynamic);
+            }
+            for (int i = 0; i < 6; ++i) {
+                BrickCoord neighbor_coord{
+                    entry.first.x + neighbor_offsets[i][0],
+                    entry.first.y + neighbor_offsets[i][1],
+                    entry.first.z + neighbor_offsets[i][2]
+                };
+                auto neighbor_it = snapshots.find(neighbor_coord);
+                if (neighbor_it == snapshots.end() || !neighbor_it->second) {
+                    continue;
+                }
+                relax_brick_face_from_neighbor(
+                    runtime,
+                    *neighbor_it->second,
+                    neighbor_axes[i],
+                    neighbor_positive_faces[i],
+                    k_brick_face_relaxation,
+                    k_brick_face_coupling_layers,
+                    *next_dynamic
+                );
+            }
+            BrickData constrained_brick = brick;
+            constrained_brick.dynamic_region = next_dynamic;
+            apply_brick_static_constraints(runtime, constrained_brick);
+            brick.dynamic_region = std::move(constrained_brick.dynamic_region);
             if (brick.pending_reinit) {
                 brick.pending_reinit = false;
             }
@@ -557,6 +647,224 @@ void step_brick_world_runtime(FluidWorldRuntime& runtime, int step_count) {
         }
         recompute_runtime_active_flags(runtime);
         prune_inactive_bricks(runtime);
+    }
+}
+
+bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicRegionData* dynamic) {
+    if (!dynamic) {
+        return false;
+    }
+    if (dynamic->nx != runtime.brick_size || dynamic->ny != runtime.brick_size || dynamic->nz != runtime.brick_size) {
+        return false;
+    }
+    const int cells = runtime.brick_size > 0
+        ? runtime.brick_size * runtime.brick_size * runtime.brick_size
+        : 0;
+    return cells > 0
+        && dynamic->flow_state.size() == static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS
+        && dynamic->air_temperature.size() == static_cast<size_t>(cells)
+        && dynamic->surface_temperature.size() == static_cast<size_t>(cells);
+}
+
+void ensure_brick_dynamic_region_storage(FluidWorldRuntime& runtime, BrickData& brick) {
+    if (brick_dynamic_region_valid(runtime, brick.dynamic_region.get())) {
+        return;
+    }
+    const int cells = runtime.brick_size * runtime.brick_size * runtime.brick_size;
+    auto dynamic = std::make_shared<DynamicRegionData>();
+    dynamic->nx = runtime.brick_size;
+    dynamic->ny = runtime.brick_size;
+    dynamic->nz = runtime.brick_size;
+    dynamic->flow_state.assign(static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS, 0.0f);
+    dynamic->air_temperature.assign(static_cast<size_t>(cells), 0.0f);
+    dynamic->surface_temperature.assign(static_cast<size_t>(cells), 0.0f);
+    brick.dynamic_region = std::move(dynamic);
+}
+
+void reset_brick_dynamic_region_state(FluidWorldRuntime& runtime, BrickData& brick) {
+    ensure_brick_dynamic_region_storage(runtime, brick);
+    DynamicRegionData& dynamic = *brick.dynamic_region;
+    std::fill(dynamic.flow_state.begin(), dynamic.flow_state.end(), 0.0f);
+    std::fill(dynamic.air_temperature.begin(), dynamic.air_temperature.end(), 0.0f);
+    std::fill(dynamic.surface_temperature.begin(), dynamic.surface_temperature.end(), 0.0f);
+}
+
+void apply_brick_static_constraints(FluidWorldRuntime& runtime, BrickData& brick) {
+    if (!brick.static_region || !brick.dynamic_region) {
+        return;
+    }
+    const StaticRegionData& stat = *brick.static_region;
+    DynamicRegionData& dynamic = *brick.dynamic_region;
+    if (!brick_dynamic_region_valid(runtime, &dynamic)
+        || stat.nx != runtime.brick_size
+        || stat.ny != runtime.brick_size
+        || stat.nz != runtime.brick_size
+        || stat.obstacle.size() != dynamic.air_temperature.size()
+        || stat.surface_kind.size() != dynamic.air_temperature.size()
+        || stat.open_face_mask.size() != dynamic.air_temperature.size()
+        || stat.emitter_power_watts.size() != dynamic.air_temperature.size()) {
+        return;
+    }
+    const size_t cells = dynamic.air_temperature.size();
+    for (size_t cell = 0; cell < cells; ++cell) {
+        const bool obstacle = stat.obstacle[cell] != 0;
+        const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        if (obstacle) {
+            std::fill_n(
+                dynamic.flow_state.begin() + static_cast<std::ptrdiff_t>(flow_base),
+                AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS,
+                0.0f
+            );
+            dynamic.air_temperature[cell] = 0.0f;
+            dynamic.surface_temperature[cell] = 0.0f;
+            continue;
+        }
+        if (stat.open_face_mask[cell] == 0
+            && stat.surface_kind[cell] == 0
+            && !(stat.emitter_power_watts[cell] > 0.0f)) {
+            dynamic.surface_temperature[cell] = 0.0f;
+        }
+    }
+}
+
+struct BrickMeanState {
+    float flow[AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float air_temperature = 0.0f;
+    float surface_temperature = 0.0f;
+    bool valid = false;
+};
+
+BrickMeanState compute_brick_mean_state(const DynamicRegionData& dynamic) {
+    BrickMeanState mean;
+    const size_t cells = dynamic.air_temperature.size();
+    if (cells == 0 || dynamic.flow_state.size() != cells * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS) {
+        return mean;
+    }
+    for (size_t cell = 0; cell < cells; ++cell) {
+        const size_t base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
+            mean.flow[channel] += dynamic.flow_state[base + channel];
+        }
+        mean.air_temperature += dynamic.air_temperature[cell];
+        mean.surface_temperature += dynamic.surface_temperature[cell];
+    }
+    const float inv_cells = 1.0f / static_cast<float>(cells);
+    for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
+        mean.flow[channel] *= inv_cells;
+    }
+    mean.air_temperature *= inv_cells;
+    mean.surface_temperature *= inv_cells;
+    mean.valid = true;
+    return mean;
+}
+
+void seed_brick_from_neighbor_means(
+    const FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
+    const std::unordered_map<BrickCoord, std::shared_ptr<const DynamicRegionData>, BrickCoordHash>& snapshots,
+    DynamicRegionData& dynamic
+) {
+    BrickMeanState accum;
+    int contributing_neighbors = 0;
+    static constexpr int neighbor_offsets[6][3] = {
+        {-1, 0, 0}, {1, 0, 0},
+        {0, -1, 0}, {0, 1, 0},
+        {0, 0, -1}, {0, 0, 1}
+    };
+    for (const auto& offset : neighbor_offsets) {
+        BrickCoord neighbor_coord{coord.x + offset[0], coord.y + offset[1], coord.z + offset[2]};
+        auto it = snapshots.find(neighbor_coord);
+        if (it == snapshots.end() || !brick_dynamic_region_valid(runtime, it->second.get())) {
+            continue;
+        }
+        BrickMeanState mean = compute_brick_mean_state(*it->second);
+        if (!mean.valid) {
+            continue;
+        }
+        for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
+            accum.flow[channel] += mean.flow[channel];
+        }
+        accum.air_temperature += mean.air_temperature;
+        accum.surface_temperature += mean.surface_temperature;
+        contributing_neighbors++;
+    }
+    if (contributing_neighbors <= 0) {
+        return;
+    }
+    const float inv_neighbors = 1.0f / static_cast<float>(contributing_neighbors);
+    for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
+        accum.flow[channel] *= inv_neighbors;
+    }
+    accum.air_temperature *= inv_neighbors;
+    accum.surface_temperature *= inv_neighbors;
+    const size_t cells = dynamic.air_temperature.size();
+    for (size_t cell = 0; cell < cells; ++cell) {
+        const size_t base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
+            dynamic.flow_state[base + channel] = accum.flow[channel];
+        }
+        dynamic.air_temperature[cell] = accum.air_temperature;
+        dynamic.surface_temperature[cell] = accum.surface_temperature;
+    }
+}
+
+void relax_brick_face_from_neighbor(
+    const FluidWorldRuntime& runtime,
+    const DynamicRegionData& neighbor,
+    int axis,
+    bool positive_face,
+    float relax,
+    int layers,
+    DynamicRegionData& dynamic
+) {
+    if (!brick_dynamic_region_valid(runtime, &dynamic) || !brick_dynamic_region_valid(runtime, &neighbor)) {
+        return;
+    }
+    const int size = runtime.brick_size;
+    const int clamped_layers = std::max(1, std::min(layers, size));
+    auto cell_index = [size](int x, int y, int z) {
+        return (x * size + y) * size + z;
+    };
+    auto relax_cell = [&](int dst_x, int dst_y, int dst_z, int src_x, int src_y, int src_z) {
+        const int dst_cell = cell_index(dst_x, dst_y, dst_z);
+        const int src_cell = cell_index(src_x, src_y, src_z);
+        const size_t dst_base = static_cast<size_t>(dst_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        const size_t src_base = static_cast<size_t>(src_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
+            dynamic.flow_state[dst_base + channel] =
+                dynamic.flow_state[dst_base + channel] * (1.0f - relax)
+                + neighbor.flow_state[src_base + channel] * relax;
+        }
+        dynamic.air_temperature[static_cast<size_t>(dst_cell)] =
+            dynamic.air_temperature[static_cast<size_t>(dst_cell)] * (1.0f - relax)
+            + neighbor.air_temperature[static_cast<size_t>(src_cell)] * relax;
+        dynamic.surface_temperature[static_cast<size_t>(dst_cell)] =
+            dynamic.surface_temperature[static_cast<size_t>(dst_cell)] * (1.0f - relax)
+            + neighbor.surface_temperature[static_cast<size_t>(src_cell)] * relax;
+    };
+
+    for (int layer = 0; layer < clamped_layers; ++layer) {
+        const int dst_face = positive_face ? size - 1 - layer : layer;
+        const int src_face = positive_face ? layer : size - 1 - layer;
+        if (axis == 0) {
+            for (int y = 0; y < size; ++y) {
+                for (int z = 0; z < size; ++z) {
+                    relax_cell(dst_face, y, z, src_face, y, z);
+                }
+            }
+        } else if (axis == 1) {
+            for (int x = 0; x < size; ++x) {
+                for (int z = 0; z < size; ++z) {
+                    relax_cell(x, dst_face, z, x, src_face, z);
+                }
+            }
+        } else {
+            for (int x = 0; x < size; ++x) {
+                for (int y = 0; y < size; ++y) {
+                    relax_cell(x, y, dst_face, x, y, src_face);
+                }
+            }
+        }
     }
 }
 
@@ -646,6 +954,27 @@ bool checked_cell_count(int nx, int ny, int nz, int* out_cells) {
 
 void rebuild_region_packet_template(ServiceState& service, long long region_key);
 int grid_cell_index(int ny, int nz, int x, int y, int z);
+bool region_core_bounds_valid(
+    int region_nx,
+    int region_ny,
+    int region_nz,
+    int core_offset_x,
+    int core_offset_y,
+    int core_offset_z,
+    int core_nx,
+    int core_ny,
+    int core_nz
+) {
+    return core_offset_x >= 0
+        && core_offset_y >= 0
+        && core_offset_z >= 0
+        && core_nx > 0
+        && core_ny > 0
+        && core_nz > 0
+        && core_offset_x + core_nx <= region_nx
+        && core_offset_y + core_ny <= region_ny
+        && core_offset_z + core_nz <= region_nz;
+}
 
 void clear_nested_feedback_accumulators(DynamicRegionData::NestedFeedbackData& nested_feedback) {
     nested_feedback.steps_accumulated = 0;
@@ -2701,6 +3030,177 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick(
     return 1;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_core_to_brick_world(
+    long long service_key,
+    long long region_key,
+    long long world_key,
+    int region_nx,
+    int region_ny,
+    int region_nz,
+    int core_offset_x,
+    int core_offset_y,
+    int core_offset_z,
+    int core_nx,
+    int core_ny,
+    int core_nz,
+    int brick_x,
+    int brick_y,
+    int brick_z
+) {
+    int region_cells = 0;
+    int core_cells = 0;
+    if (!checked_cell_count(region_nx, region_ny, region_nz, &region_cells)
+        || !checked_cell_count(core_nx, core_ny, core_nz, &core_cells)) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: invalid dimensions");
+        return 0;
+    }
+    if (!region_core_bounds_valid(
+        region_nx,
+        region_ny,
+        region_nz,
+        core_offset_x,
+        core_offset_y,
+        core_offset_z,
+        core_nx,
+        core_ny,
+        core_nz
+    )) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: invalid core bounds");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: missing service");
+        return 0;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: missing brick runtime");
+        return 0;
+    }
+    FluidWorldRuntime& runtime = runtime_iterator->second;
+    if (runtime.brick_size != core_nx || runtime.brick_size != core_ny || runtime.brick_size != core_nz) {
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: brick size mismatch");
+        return 0;
+    }
+    auto dynamic_region_iterator = service->dynamic_regions.find(region_key);
+    if (dynamic_region_iterator == service->dynamic_regions.end()) {
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: missing dynamic region");
+        return 0;
+    }
+    const DynamicRegionData& source_dynamic = dynamic_region_iterator->second;
+    if (source_dynamic.nx != region_nx || source_dynamic.ny != region_ny || source_dynamic.nz != region_nz) {
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: region dimension mismatch");
+        return 0;
+    }
+    if (aero_lbm_has_context(region_key) == 0) {
+        set_simulation_last_error("simulation_sync_region_core_to_brick_world: missing native context");
+        return 0;
+    }
+
+    std::vector<float> region_flow(static_cast<size_t>(region_cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS);
+    std::vector<float> region_air_temperature(static_cast<size_t>(region_cells));
+    if (!aero_lbm_get_flow_state_rect(region_nx, region_ny, region_nz, region_key, region_flow.data())) {
+        set_simulation_last_error(std::string("simulation_sync_region_core_to_brick_world flow sync failed: ") + aero_lbm_last_error());
+        return 0;
+    }
+    if (!aero_lbm_get_temperature_state_rect(region_nx, region_ny, region_nz, region_key, region_air_temperature.data())) {
+        set_simulation_last_error(std::string("simulation_sync_region_core_to_brick_world temperature sync failed: ") + aero_lbm_last_error());
+        return 0;
+    }
+
+    auto brick_dynamic = std::make_shared<DynamicRegionData>();
+    brick_dynamic->nx = core_nx;
+    brick_dynamic->ny = core_ny;
+    brick_dynamic->nz = core_nz;
+    brick_dynamic->flow_state.resize(static_cast<size_t>(core_cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS);
+    brick_dynamic->air_temperature.resize(static_cast<size_t>(core_cells));
+    brick_dynamic->surface_temperature.resize(static_cast<size_t>(core_cells));
+
+    for (int x = 0; x < core_nx; ++x) {
+        for (int y = 0; y < core_ny; ++y) {
+            for (int z = 0; z < core_nz; ++z) {
+                const int src_x = core_offset_x + x;
+                const int src_y = core_offset_y + y;
+                const int src_z = core_offset_z + z;
+                const int src_cell = grid_cell_index(region_ny, region_nz, src_x, src_y, src_z);
+                const int dst_cell = grid_cell_index(core_ny, core_nz, x, y, z);
+                const size_t src_flow_base = static_cast<size_t>(src_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+                const size_t dst_flow_base = static_cast<size_t>(dst_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+                for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
+                    brick_dynamic->flow_state[dst_flow_base + channel] = region_flow[src_flow_base + channel];
+                }
+                brick_dynamic->air_temperature[static_cast<size_t>(dst_cell)] =
+                    region_air_temperature[static_cast<size_t>(src_cell)];
+                brick_dynamic->surface_temperature[static_cast<size_t>(dst_cell)] =
+                    source_dynamic.surface_temperature[static_cast<size_t>(src_cell)];
+            }
+        }
+    }
+
+    BrickData& brick = runtime.bricks[BrickCoord{brick_x, brick_y, brick_z}];
+    brick.dynamic_region = std::move(brick_dynamic);
+    brick.active = true;
+    brick.last_active_epoch = runtime.epoch;
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_copy_brick_world_dynamic_brick(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    int brick_x,
+    int brick_y,
+    int brick_z,
+    float* out_flow_state,
+    float* out_air_temperature,
+    float* out_surface_temperature
+) {
+    int cells = 0;
+    if (!checked_cell_count(brick_size, brick_size, brick_size, &cells)
+        || !out_flow_state
+        || !out_air_temperature
+        || !out_surface_temperature) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_copy_brick_world_dynamic_brick: invalid arguments");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_copy_brick_world_dynamic_brick: missing service");
+        return 0;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        set_simulation_last_error("simulation_copy_brick_world_dynamic_brick: missing brick runtime");
+        return 0;
+    }
+    const FluidWorldRuntime& runtime = runtime_iterator->second;
+    if (runtime.brick_size != brick_size) {
+        set_simulation_last_error("simulation_copy_brick_world_dynamic_brick: brick size mismatch");
+        return 0;
+    }
+    auto brick_iterator = runtime.bricks.find(BrickCoord{brick_x, brick_y, brick_z});
+    if (brick_iterator == runtime.bricks.end() || !brick_iterator->second.dynamic_region) {
+        return 0;
+    }
+    const DynamicRegionData& dynamic = *brick_iterator->second.dynamic_region;
+    if (!brick_dynamic_region_valid(runtime, &dynamic)) {
+        set_simulation_last_error("simulation_copy_brick_world_dynamic_brick: invalid stored brick dynamic state");
+        return 0;
+    }
+    std::copy(dynamic.flow_state.begin(), dynamic.flow_state.end(), out_flow_state);
+    std::copy(dynamic.air_temperature.begin(), dynamic.air_temperature.end(), out_air_temperature);
+    std::copy(dynamic.surface_temperature.begin(), dynamic.surface_temperature.end(), out_surface_temperature);
+    return 1;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     long long service_key,
     long long region_key,
@@ -4393,6 +4893,102 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
     env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
     env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeSyncRegionCoreToBrickWorld(
+    JNIEnv*,
+    jclass,
+    jlong service_key,
+    jlong region_key,
+    jlong world_key,
+    jint region_nx,
+    jint region_ny,
+    jint region_nz,
+    jint core_offset_x,
+    jint core_offset_y,
+    jint core_offset_z,
+    jint core_nx,
+    jint core_ny,
+    jint core_nz,
+    jint brick_x,
+    jint brick_y,
+    jint brick_z
+) {
+    return aero_lbm_simulation_sync_region_core_to_brick_world(
+        static_cast<long long>(service_key),
+        static_cast<long long>(region_key),
+        static_cast<long long>(world_key),
+        region_nx,
+        region_ny,
+        region_nz,
+        core_offset_x,
+        core_offset_y,
+        core_offset_z,
+        core_nx,
+        core_ny,
+        core_nz,
+        brick_x,
+        brick_y,
+        brick_z
+    ) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeCopyBrickWorldDynamicBrick(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong world_key,
+    jint brick_size,
+    jint brick_x,
+    jint brick_y,
+    jint brick_z,
+    jfloatArray out_flow_state,
+    jfloatArray out_air_temperature,
+    jfloatArray out_surface_temperature
+) {
+    if (!out_flow_state || !out_air_temperature || !out_surface_temperature) {
+        return JNI_FALSE;
+    }
+    const int cells = brick_size * brick_size * brick_size;
+    if (cells <= 0
+        || env->GetArrayLength(out_flow_state) != static_cast<jsize>(cells * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS)
+        || env->GetArrayLength(out_air_temperature) != static_cast<jsize>(cells)
+        || env->GetArrayLength(out_surface_temperature) != static_cast<jsize>(cells)) {
+        return JNI_FALSE;
+    }
+    jboolean flow_copy = JNI_FALSE;
+    jboolean air_copy = JNI_FALSE;
+    jboolean surface_copy = JNI_FALSE;
+    jfloat* flow_ptr = env->GetFloatArrayElements(out_flow_state, &flow_copy);
+    jfloat* air_ptr = env->GetFloatArrayElements(out_air_temperature, &air_copy);
+    jfloat* surface_ptr = env->GetFloatArrayElements(out_surface_temperature, &surface_copy);
+    if (!flow_ptr || !air_ptr || !surface_ptr) {
+        if (flow_ptr) {
+            env->ReleaseFloatArrayElements(out_flow_state, flow_ptr, JNI_ABORT);
+        }
+        if (air_ptr) {
+            env->ReleaseFloatArrayElements(out_air_temperature, air_ptr, JNI_ABORT);
+        }
+        if (surface_ptr) {
+            env->ReleaseFloatArrayElements(out_surface_temperature, surface_ptr, JNI_ABORT);
+        }
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_copy_brick_world_dynamic_brick(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key),
+        brick_size,
+        brick_x,
+        brick_y,
+        brick_z,
+        flow_ptr,
+        air_ptr,
+        surface_ptr
+    );
+    env->ReleaseFloatArrayElements(out_flow_state, flow_ptr, ok ? 0 : JNI_ABORT);
+    env->ReleaseFloatArrayElements(out_air_temperature, air_ptr, ok ? 0 : JNI_ABORT);
+    env->ReleaseFloatArrayElements(out_surface_temperature, surface_ptr, ok ? 0 : JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
