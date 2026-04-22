@@ -246,6 +246,7 @@ public final class AeroServerRuntime {
     private static final int SHELL_WINDOW_RETENTION_TICKS = 8;
     private static final int BOUNDARY_FIELD_REFRESH_TICKS = 4;
     private static final int BRICK_DYNAMIC_SYNC_INTERVAL_TICKS = 4;
+    private static final int BRICK_BOUNDARY_REFERENCE_REFRESH_INTERVAL_TICKS = 4;
     private static final String DEPRECATED_ANALYSIS_CAPTURE_MESSAGE =
         "Deprecated: analysis/capture tooling is no longer on the primary roadmap and may lag behind brick-runtime changes.";
     private static final int CORE_SECTION_MIN = REGION_HALO_CELLS / CHUNK_SIZE;
@@ -268,6 +269,7 @@ public final class AeroServerRuntime {
     private final Map<RegistryKey<World>, NestedFeedbackRuntimeDiagnostics> nestedFeedbackRuntimeDiagnostics = new ConcurrentHashMap<>();
     private final Set<RegistryKey<World>> brickRuntimeHintWorldKeys = new HashSet<>();
     private final Set<RegistryKey<World>> brickRuntimeKnownWorldKeys = new HashSet<>();
+    private final Map<RegistryKey<World>, Map<BrickRuntimeHint, Integer>> brickBoundaryReferenceRefreshTicks = new HashMap<>();
     private final Object simulationStateLock = new Object();
     private final Object coordinatorLifecycleLock = new Object();
     private final Object pendingWorldDeltasLock = new Object();
@@ -3735,6 +3737,10 @@ public final class AeroServerRuntime {
         return (x * size + y) * size + z;
     }
 
+    private int patchCellIndex3d(int x, int y, int z, int sizeY, int sizeZ) {
+        return (x * sizeY + y) * sizeZ + z;
+    }
+
     private int defaultInspectionPatchGridResolution(int domainBlocks) {
         return Math.min(INSPECTION_PATCH_MAX_GRID_RESOLUTION, domainBlocks * 2);
     }
@@ -4153,6 +4159,111 @@ public final class AeroServerRuntime {
         }
         brickRuntimeHintWorldKeys.clear();
         brickRuntimeHintWorldKeys.addAll(syncedWorldKeys);
+        brickBoundaryReferenceRefreshTicks.keySet().removeIf(worldKey -> !activeWorldKeys.contains(worldKey));
+        refreshBrickRuntimeBoundaryReferences(hintCoordsByWorld);
+    }
+
+    private void refreshBrickRuntimeBoundaryReferences(Map<RegistryKey<World>, int[]> hintCoordsByWorld) {
+        if (simulationServiceId == 0L || !simulationBridge.isLoaded()) {
+            return;
+        }
+        for (Map.Entry<RegistryKey<World>, int[]> entry : hintCoordsByWorld.entrySet()) {
+            RegistryKey<World> worldKey = entry.getKey();
+            Map<BrickRuntimeHint, Integer> refreshTicks = brickBoundaryReferenceRefreshTicks.computeIfAbsent(
+                worldKey,
+                ignored -> new HashMap<>()
+            );
+            Set<BrickRuntimeHint> closure = expandBrickHintClosure(entry.getValue());
+            refreshTicks.keySet().removeIf(hint -> !closure.contains(hint));
+            for (BrickRuntimeHint hint : closure) {
+                int lastTick = refreshTicks.getOrDefault(hint, Integer.MIN_VALUE);
+                if (tickCounter - lastTick < BRICK_BOUNDARY_REFERENCE_REFRESH_INTERVAL_TICKS) {
+                    continue;
+                }
+                if (uploadBrickBoundaryReference(worldKey, hint)) {
+                    refreshTicks.put(hint, tickCounter);
+                }
+            }
+        }
+    }
+
+    private Set<BrickRuntimeHint> expandBrickHintClosure(int[] hintCoords) {
+        LinkedHashSet<BrickRuntimeHint> closure = new LinkedHashSet<>();
+        if (hintCoords == null) {
+            return closure;
+        }
+        for (int i = 0; i + 2 < hintCoords.length; i += NativeSimulationBridge.BRICK_HINT_COORDS_PER_BRICK) {
+            int brickX = hintCoords[i];
+            int brickY = hintCoords[i + 1];
+            int brickZ = hintCoords[i + 2];
+            closure.add(new BrickRuntimeHint(brickX, brickY, brickZ));
+            closure.add(new BrickRuntimeHint(brickX - 1, brickY, brickZ));
+            closure.add(new BrickRuntimeHint(brickX + 1, brickY, brickZ));
+            closure.add(new BrickRuntimeHint(brickX, brickY - 1, brickZ));
+            closure.add(new BrickRuntimeHint(brickX, brickY + 1, brickZ));
+            closure.add(new BrickRuntimeHint(brickX, brickY, brickZ - 1));
+            closure.add(new BrickRuntimeHint(brickX, brickY, brickZ + 1));
+        }
+        return closure;
+    }
+
+    private boolean uploadBrickBoundaryReference(RegistryKey<World> worldKey, BrickRuntimeHint hint) {
+        WorldMirror.SectionSnapshot[] snapshots = brickSectionSnapshotsFromMirror(
+            worldKey,
+            hint.brickX(),
+            hint.brickY(),
+            hint.brickZ()
+        );
+        byte[] obstacleMask = buildBrickObstacleMask(snapshots, true);
+        if (obstacleMask == null) {
+            return false;
+        }
+        int cells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
+        float[] flowState = new float[cells * RESPONSE_CHANNELS];
+        float[] airTemperatureState = new float[cells];
+        float[] surfaceTemperatureState = new float[cells];
+        BlockPos origin = new BlockPos(
+            hint.brickX() * BRICK_RUNTIME_SIZE,
+            hint.brickY() * BRICK_RUNTIME_SIZE,
+            hint.brickZ() * BRICK_RUNTIME_SIZE
+        );
+        MesoscaleGrid mesoscaleGrid = mesoscaleMetGrids.get(worldKey);
+        boolean seeded = mesoscaleGrid != null
+            && seedDynamicRegionFromMesoscale(
+                origin,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                obstacleMask,
+                flowState,
+                airTemperatureState,
+                surfaceTemperatureState,
+                mesoscaleGrid
+            );
+        if (!seeded) {
+            seedDynamicRegionFromBoundarySample(
+                worldKey,
+                origin,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                obstacleMask,
+                flowState,
+                airTemperatureState,
+                surfaceTemperatureState
+            );
+        }
+        return simulationBridge.uploadBrickWorldBoundaryReferenceBrick(
+            simulationServiceId,
+            simulationWorldKey(worldKey),
+            BRICK_RUNTIME_SIZE,
+            hint.brickX(),
+            hint.brickY(),
+            hint.brickZ(),
+            flowState,
+            airTemperatureState,
+            surfaceTemperatureState
+        );
     }
 
     private Map<RegistryKey<World>, int[]> brickRuntimeHintCoords(List<PlayerRegionAnchor> anchors) {
@@ -4669,6 +4780,7 @@ public final class AeroServerRuntime {
         if (uploaded) {
             region.uploadedBrickStaticSignature = signature;
             region.uploadedBrickStaticServiceId = simulationServiceId;
+            ensureWindowCoreDynamicBrickSeeded(key, coreSnapshots);
         }
         return uploaded;
     }
@@ -4690,7 +4802,79 @@ public final class AeroServerRuntime {
         }
         if (uploadWindowCoreStaticBrickToRuntime(key, coreSnapshots)) {
             mirrorOnlyUploadedBrickStaticSignatures.put(key, signature);
+            ensureWindowCoreDynamicBrickSeeded(key, coreSnapshots);
         }
+    }
+
+    private void ensureWindowCoreDynamicBrickSeeded(WindowKey key, WorldMirror.SectionSnapshot[] coreSnapshots) {
+        if (simulationServiceId == 0L || !simulationBridge.isLoaded() || coreSnapshots == null || coreSnapshots.length != CORE_SECTION_COUNT) {
+            return;
+        }
+        BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
+        int brickX = Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE);
+        int brickY = Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE);
+        int brickZ = Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE);
+        int brickCells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
+        float[] existingFlow = new float[brickCells * RESPONSE_CHANNELS];
+        float[] existingAir = new float[brickCells];
+        float[] existingSurface = new float[brickCells];
+        if (simulationBridge.copyBrickWorldDynamicBrick(
+            simulationServiceId,
+            simulationWorldKey(key.worldKey()),
+            BRICK_RUNTIME_SIZE,
+            brickX,
+            brickY,
+            brickZ,
+            existingFlow,
+            existingAir,
+            existingSurface
+        )) {
+            return;
+        }
+        byte[] obstacleMask = buildCoreBrickObstacleMask(coreSnapshots);
+        if (obstacleMask == null) {
+            return;
+        }
+        float[] flowState = new float[brickCells * RESPONSE_CHANNELS];
+        float[] airTemperatureState = new float[brickCells];
+        float[] surfaceTemperatureState = new float[brickCells];
+        MesoscaleGrid mesoscaleGrid = mesoscaleMetGrids.get(key.worldKey());
+        boolean seeded = mesoscaleGrid != null
+            && seedDynamicRegionFromMesoscale(
+                coreOrigin,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                obstacleMask,
+                flowState,
+                airTemperatureState,
+                surfaceTemperatureState,
+                mesoscaleGrid
+            );
+        if (!seeded) {
+            seedDynamicRegionFromBoundarySample(
+                key.worldKey(),
+                coreOrigin,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                BRICK_RUNTIME_SIZE,
+                obstacleMask,
+                flowState,
+                airTemperatureState,
+                surfaceTemperatureState
+            );
+        }
+        simulationBridge.uploadBrickWorldDynamicBrick(
+            simulationServiceId,
+            simulationWorldKey(key.worldKey()),
+            BRICK_RUNTIME_SIZE,
+            brickX,
+            brickY,
+            brickZ,
+            flowState,
+            airTemperatureState,
+            surfaceTemperatureState
+        );
     }
 
     private boolean uploadWindowCoreStaticBrickToRuntime(
@@ -4720,6 +4904,41 @@ public final class AeroServerRuntime {
     ) {
         WorldMirror.SectionSnapshot[] snapshots = brickSectionSnapshotsFromMirror(worldKey, brickX, brickY, brickZ);
         return uploadBrickStaticSnapshotsToRuntime(worldKey, brickX, brickY, brickZ, snapshots, true, true);
+    }
+
+    private byte[] buildCoreBrickObstacleMask(WorldMirror.SectionSnapshot[] coreSnapshots) {
+        return buildBrickObstacleMask(coreSnapshots, true);
+    }
+
+    private byte[] buildBrickObstacleMask(WorldMirror.SectionSnapshot[] snapshots, boolean fillMissingAsSolid) {
+        if (snapshots == null) {
+            return null;
+        }
+        int sectionAxisCount = BRICK_RUNTIME_SIZE / CHUNK_SIZE;
+        if (snapshots.length != sectionAxisCount * sectionAxisCount * sectionAxisCount) {
+            return null;
+        }
+        byte[] obstacle = new byte[BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE];
+        int snapshotIndex = 0;
+        for (int sx = 0; sx < sectionAxisCount; sx++) {
+            for (int sy = 0; sy < sectionAxisCount; sy++) {
+                for (int sz = 0; sz < sectionAxisCount; sz++) {
+                    WorldMirror.SectionSnapshot snapshot = snapshots[snapshotIndex++];
+                    int baseX = sx * CHUNK_SIZE;
+                    int baseY = sy * CHUNK_SIZE;
+                    int baseZ = sz * CHUNK_SIZE;
+                    if (snapshot == null) {
+                        if (!fillMissingAsSolid) {
+                            return null;
+                        }
+                        fillBrickSectionAsSolid(baseX, baseY, baseZ, obstacle);
+                    } else {
+                        writeSectionSnapshotIntoBrickObstacleBuffer(snapshot, baseX, baseY, baseZ, obstacle);
+                    }
+                }
+            }
+        }
+        return obstacle;
     }
 
     private WorldMirror.SectionSnapshot[] brickSectionSnapshotsFromMirror(
@@ -4972,6 +5191,27 @@ public final class AeroServerRuntime {
                     int localFaceBase = local * FACE_COUNT;
                     System.arraycopy(snapshot.faceSkyExposure(), localFaceBase, faceSkyExposure, faceBase, FACE_COUNT);
                     System.arraycopy(snapshot.faceDirectExposure(), localFaceBase, faceDirectExposure, faceBase, FACE_COUNT);
+                }
+            }
+        }
+    }
+
+    private void writeSectionSnapshotIntoBrickObstacleBuffer(
+        WorldMirror.SectionSnapshot snapshot,
+        int baseX,
+        int baseY,
+        int baseZ,
+        byte[] obstacle
+    ) {
+        for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+            int x = baseX + lx;
+            for (int ly = 0; ly < CHUNK_SIZE; ly++) {
+                int y = baseY + ly;
+                for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                    int z = baseZ + lz;
+                    int local = localSectionCellIndex(lx, ly, lz);
+                    int cell = patchCellIndex(x, y, z, BRICK_RUNTIME_SIZE);
+                    obstacle[cell] = snapshot.obstacle()[local] >= 0.5f ? (byte) 1 : (byte) 0;
                 }
             }
         }
@@ -5240,14 +5480,58 @@ public final class AeroServerRuntime {
         float[] surfaceTemperatureState,
         MesoscaleGrid mesoscaleGrid
     ) {
-        int cells = GRID_SIZE * GRID_SIZE * GRID_SIZE;
-        float[] windX = new float[cells];
-        float[] windZ = new float[cells];
-        if (!mesoscaleGrid.seedL2Window(
+        return seedDynamicRegionFromMesoscale(
             key.origin(),
             GRID_SIZE,
             GRID_SIZE,
             GRID_SIZE,
+            obstacleMask,
+            flowState,
+            airTemperatureState,
+            surfaceTemperatureState,
+            mesoscaleGrid
+        );
+    }
+
+    private void seedWindowDynamicRegionFromBoundarySample(
+        WindowKey key,
+        byte[] obstacleMask,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState
+    ) {
+        seedDynamicRegionFromBoundarySample(
+            key.worldKey(),
+            key.origin(),
+            GRID_SIZE,
+            GRID_SIZE,
+            GRID_SIZE,
+            obstacleMask,
+            flowState,
+            airTemperatureState,
+            surfaceTemperatureState
+        );
+    }
+
+    private boolean seedDynamicRegionFromMesoscale(
+        BlockPos origin,
+        int sizeX,
+        int sizeY,
+        int sizeZ,
+        byte[] obstacleMask,
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState,
+        MesoscaleGrid mesoscaleGrid
+    ) {
+        int cells = sizeX * sizeY * sizeZ;
+        float[] windX = new float[cells];
+        float[] windZ = new float[cells];
+        if (!mesoscaleGrid.seedL2Window(
+            origin,
+            sizeX,
+            sizeY,
+            sizeZ,
             windX,
             windZ,
             airTemperatureState,
@@ -5263,18 +5547,23 @@ public final class AeroServerRuntime {
             flowState[base] = windX[cell] / NATIVE_VELOCITY_SCALE;
             flowState[base + 2] = windZ[cell] / NATIVE_VELOCITY_SCALE;
         }
-        deriveSeedVerticalVelocity(obstacleMask, flowState);
+        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, obstacleMask, flowState);
         return true;
     }
 
-    private void seedWindowDynamicRegionFromBoundarySample(
-        WindowKey key,
+    private void seedDynamicRegionFromBoundarySample(
+        RegistryKey<World> worldKey,
+        BlockPos origin,
+        int sizeX,
+        int sizeY,
+        int sizeZ,
         byte[] obstacleMask,
         float[] flowState,
         float[] airTemperatureState,
         float[] surfaceTemperatureState
     ) {
-        NestedBoundaryCoupler.BoundarySample boundarySample = sampleNestedBoundaryAtWindow(key);
+        BlockPos center = origin.add(sizeX / 2, sizeY / 2, sizeZ / 2);
+        NestedBoundaryCoupler.BoundarySample boundarySample = sampleNestedBoundaryAtPosition(worldKey, center);
         float seedVx = boundarySample == null ? 0.0f : boundarySample.windX() / NATIVE_VELOCITY_SCALE;
         float seedVz = boundarySample == null ? 0.0f : boundarySample.windZ() / NATIVE_VELOCITY_SCALE;
         float seedAirTemperature = boundarySample == null
@@ -5283,7 +5572,7 @@ public final class AeroServerRuntime {
         float seedSurfaceTemperature = boundarySample == null
             ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K + THERMAL_DEEP_GROUND_OFFSET_K
             : boundarySample.deepGroundTemperatureKelvin();
-        int cells = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        int cells = sizeX * sizeY * sizeZ;
         for (int cell = 0; cell < cells; cell++) {
             airTemperatureState[cell] = seedAirTemperature;
             surfaceTemperatureState[cell] = seedSurfaceTemperature;
@@ -5294,17 +5583,17 @@ public final class AeroServerRuntime {
             flowState[base] = seedVx;
             flowState[base + 2] = seedVz;
         }
-        deriveSeedVerticalVelocity(obstacleMask, flowState);
+        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, obstacleMask, flowState);
     }
 
-    private void deriveSeedVerticalVelocity(byte[] obstacleMask, float[] flowState) {
-        float[] divergenceColumn = new float[GRID_SIZE];
-        float[] verticalVelocityColumn = new float[GRID_SIZE];
-        for (int x = 0; x < GRID_SIZE; x++) {
-            for (int z = 0; z < GRID_SIZE; z++) {
+    private void deriveSeedVerticalVelocity(int sizeX, int sizeY, int sizeZ, byte[] obstacleMask, float[] flowState) {
+        float[] divergenceColumn = new float[sizeY];
+        float[] verticalVelocityColumn = new float[sizeY];
+        for (int x = 0; x < sizeX; x++) {
+            for (int z = 0; z < sizeZ; z++) {
                 float maxHorizontalSpeed = 0.0f;
-                for (int y = 0; y < GRID_SIZE; y++) {
-                    int cell = gridCellIndex(x, y, z);
+                for (int y = 0; y < sizeY; y++) {
+                    int cell = patchCellIndex3d(x, y, z, sizeY, sizeZ);
                     int base = cell * RESPONSE_CHANNELS;
                     if (obstacleMask[cell] != 0) {
                         flowState[base + 1] = 0.0f;
@@ -5313,14 +5602,17 @@ public final class AeroServerRuntime {
                     }
                     float vx = flowState[base];
                     float vz = flowState[base + 2];
-                    float vxMinus = sampleSeedFlowComponent(obstacleMask, flowState, x - 1, y, z, 0, vx);
-                    float vxPlus = sampleSeedFlowComponent(obstacleMask, flowState, x + 1, y, z, 0, vx);
-                    float vzMinus = sampleSeedFlowComponent(obstacleMask, flowState, x, y, z - 1, 2, vz);
-                    float vzPlus = sampleSeedFlowComponent(obstacleMask, flowState, x, y, z + 1, 2, vz);
+                    float vxMinus = sampleSeedFlowComponent(sizeX, sizeY, sizeZ, obstacleMask, flowState, x - 1, y, z, 0, vx);
+                    float vxPlus = sampleSeedFlowComponent(sizeX, sizeY, sizeZ, obstacleMask, flowState, x + 1, y, z, 0, vx);
+                    float vzMinus = sampleSeedFlowComponent(sizeX, sizeY, sizeZ, obstacleMask, flowState, x, y, z - 1, 2, vz);
+                    float vzPlus = sampleSeedFlowComponent(sizeX, sizeY, sizeZ, obstacleMask, flowState, x, y, z + 1, 2, vz);
                     divergenceColumn[y] = 0.5f * ((vxPlus - vxMinus) + (vzPlus - vzMinus));
                     maxHorizontalSpeed = Math.max(maxHorizontalSpeed, (float) Math.sqrt(vx * vx + vz * vz));
                 }
                 integrateSeedVerticalVelocityColumn(
+                    sizeX,
+                    sizeY,
+                    sizeZ,
                     x,
                     z,
                     obstacleMask,
@@ -5334,6 +5626,9 @@ public final class AeroServerRuntime {
     }
 
     private float sampleSeedFlowComponent(
+        int sizeX,
+        int sizeY,
+        int sizeZ,
         byte[] obstacleMask,
         float[] flowState,
         int x,
@@ -5342,10 +5637,10 @@ public final class AeroServerRuntime {
         int componentOffset,
         float fallback
     ) {
-        if (!inBounds(x, y, z)) {
+        if (!inBounds(x, y, z, sizeX, sizeY, sizeZ)) {
             return fallback;
         }
-        int cell = gridCellIndex(x, y, z);
+        int cell = patchCellIndex3d(x, y, z, sizeY, sizeZ);
         if (obstacleMask[cell] != 0) {
             return fallback;
         }
@@ -5353,6 +5648,9 @@ public final class AeroServerRuntime {
     }
 
     private void integrateSeedVerticalVelocityColumn(
+        int sizeX,
+        int sizeY,
+        int sizeZ,
         int x,
         int z,
         byte[] obstacleMask,
@@ -5363,15 +5661,15 @@ public final class AeroServerRuntime {
     ) {
         int y = 0;
         float clamp = Math.max(0.15f / NATIVE_VELOCITY_SCALE, maxHorizontalSpeed * NESTED_BOUNDARY_MAX_VY_RATIO);
-        while (y < GRID_SIZE) {
-            int cell = gridCellIndex(x, y, z);
+        while (y < sizeY) {
+            int cell = patchCellIndex3d(x, y, z, sizeY, sizeZ);
             if (obstacleMask[cell] != 0) {
                 flowState[cell * RESPONSE_CHANNELS + 1] = 0.0f;
                 y++;
                 continue;
             }
             int startY = y;
-            while (y < GRID_SIZE && obstacleMask[gridCellIndex(x, y, z)] == 0) {
+            while (y < sizeY && obstacleMask[patchCellIndex3d(x, y, z, sizeY, sizeZ)] == 0) {
                 y++;
             }
             int length = y - startY;
@@ -5389,7 +5687,7 @@ public final class AeroServerRuntime {
             mean /= length;
             for (int i = 0; i < length; i++) {
                 float vy = MathHelper.clamp(verticalVelocityColumn[i] - mean, -clamp, clamp);
-                int runCell = gridCellIndex(x, startY + i, z);
+                int runCell = patchCellIndex3d(x, startY + i, z, sizeY, sizeZ);
                 flowState[runCell * RESPONSE_CHANNELS + 1] = vy;
             }
         }
@@ -5402,6 +5700,10 @@ public final class AeroServerRuntime {
 
     private boolean inBounds(int x, int y, int z) {
         return x >= 0 && y >= 0 && z >= 0 && x < GRID_SIZE && y < GRID_SIZE && z < GRID_SIZE;
+    }
+
+    private boolean inBounds(int x, int y, int z, int sizeX, int sizeY, int sizeZ) {
+        return x >= 0 && y >= 0 && z >= 0 && x < sizeX && y < sizeY && z < sizeZ;
     }
 
     private boolean inSectionBounds(int x, int y, int z) {
@@ -7735,8 +8037,8 @@ public final class AeroServerRuntime {
                     }
 
                     if (!acquireSimulationStepBudget()) {
-                        lastCoordinatorState = "noBudget";
-                        lastCoordinatorNoPublishReason = "noBudget";
+                        lastCoordinatorState = "waitingTick";
+                        lastCoordinatorNoPublishReason = "";
                         sleepQuietly(5L);
                         continue;
                     }

@@ -132,6 +132,7 @@ struct BrickData {
     long long context_key = 0;
     std::shared_ptr<const StaticRegionData> static_region;
     std::shared_ptr<DynamicRegionData> dynamic_region;
+    std::shared_ptr<const DynamicRegionData> boundary_reference_region;
     std::vector<float> packet_cache;
 };
 
@@ -602,6 +603,7 @@ bool exchange_brick_face_context_halo(
 );
 bool build_brick_step_packet(
     const FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
     const BrickData& brick,
     const DynamicRegionData& dynamic,
     std::vector<float>& packet
@@ -610,6 +612,7 @@ bool sync_brick_dynamic_from_context(const FluidWorldRuntime& runtime, BrickData
 bool step_brick_actual(
     ServiceState& service,
     FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
     BrickData& brick,
     DynamicRegionData& dynamic
 );
@@ -720,7 +723,7 @@ void step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             BrickData constrained_brick = brick;
             constrained_brick.dynamic_region = next_dynamic;
             apply_brick_static_constraints(runtime, constrained_brick);
-            if (!step_brick_actual(service, runtime, constrained_brick, *constrained_brick.dynamic_region)) {
+            if (!step_brick_actual(service, runtime, entry.first, constrained_brick, *constrained_brick.dynamic_region)) {
                 brick.dynamic_region = std::move(constrained_brick.dynamic_region);
             } else {
                 brick.context_key = constrained_brick.context_key;
@@ -975,8 +978,27 @@ bool exchange_brick_face_context_halo(
     ) != 0;
 }
 
+bool brick_face_exposed(
+    const FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
+    int axis,
+    bool positive_face
+) {
+    BrickCoord neighbor = coord;
+    if (axis == 0) {
+        neighbor.x += positive_face ? 1 : -1;
+    } else if (axis == 1) {
+        neighbor.y += positive_face ? 1 : -1;
+    } else {
+        neighbor.z += positive_face ? 1 : -1;
+    }
+    auto it = runtime.bricks.find(neighbor);
+    return it == runtime.bricks.end() || !it->second.active;
+}
+
 bool build_brick_step_packet(
     const FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
     const BrickData& brick,
     const DynamicRegionData& dynamic,
     std::vector<float>& packet
@@ -1001,24 +1023,49 @@ bool build_brick_step_packet(
     } else {
         std::fill(packet.begin(), packet.end(), 0.0f);
     }
-    for (size_t cell = 0; cell < cells; ++cell) {
-        const size_t packet_base = cell * k_packet_channels;
-        const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-        const bool obstacle = stat.obstacle[cell] != 0;
-        packet[packet_base + k_channel_obstacle] = obstacle ? 1.0f : 0.0f;
-        packet[packet_base + k_channel_fan_mask] = 0.0f;
-        packet[packet_base + k_channel_fan_vx] = 0.0f;
-        packet[packet_base + k_channel_fan_vy] = 0.0f;
-        packet[packet_base + k_channel_fan_vz] = 0.0f;
-        if (!obstacle) {
-            packet[packet_base + k_channel_state_vx] = dynamic.flow_state[flow_base];
-            packet[packet_base + k_channel_state_vy] = dynamic.flow_state[flow_base + 1];
-            packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
-            packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
-            packet[packet_base + k_channel_state_temp] = dynamic.air_temperature[cell];
-            if (stat.emitter_power_watts[cell] > 0.0f) {
-                packet[packet_base + k_channel_thermal_source] =
-                    temperature_source_from_power_watts(stat.emitter_power_watts[cell]);
+    const DynamicRegionData* boundary_reference = brick.boundary_reference_region.get();
+    const bool boundary_reference_valid = brick_dynamic_region_valid(runtime, boundary_reference);
+    const bool exposed_x_neg = boundary_reference_valid && brick_face_exposed(runtime, coord, 0, false);
+    const bool exposed_x_pos = boundary_reference_valid && brick_face_exposed(runtime, coord, 0, true);
+    const bool exposed_y_neg = boundary_reference_valid && brick_face_exposed(runtime, coord, 1, false);
+    const bool exposed_y_pos = boundary_reference_valid && brick_face_exposed(runtime, coord, 1, true);
+    const bool exposed_z_neg = boundary_reference_valid && brick_face_exposed(runtime, coord, 2, false);
+    const bool exposed_z_pos = boundary_reference_valid && brick_face_exposed(runtime, coord, 2, true);
+    auto cell_index = [runtime](int x, int y, int z) {
+        return (x * runtime.brick_size + y) * runtime.brick_size + z;
+    };
+    for (int x = 0; x < runtime.brick_size; ++x) {
+        for (int y = 0; y < runtime.brick_size; ++y) {
+            for (int z = 0; z < runtime.brick_size; ++z) {
+                const size_t cell = static_cast<size_t>(cell_index(x, y, z));
+                const size_t packet_base = cell * k_packet_channels;
+                const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+                const bool obstacle = stat.obstacle[cell] != 0;
+                packet[packet_base + k_channel_obstacle] = obstacle ? 1.0f : 0.0f;
+                packet[packet_base + k_channel_fan_mask] = 0.0f;
+                packet[packet_base + k_channel_fan_vx] = 0.0f;
+                packet[packet_base + k_channel_fan_vy] = 0.0f;
+                packet[packet_base + k_channel_fan_vz] = 0.0f;
+                if (obstacle) {
+                    continue;
+                }
+                const bool use_boundary_reference = boundary_reference_valid
+                    && ((exposed_x_neg && x == 0)
+                        || (exposed_x_pos && x == runtime.brick_size - 1)
+                        || (exposed_y_neg && y == 0)
+                        || (exposed_y_pos && y == runtime.brick_size - 1)
+                        || (exposed_z_neg && z == 0)
+                        || (exposed_z_pos && z == runtime.brick_size - 1));
+                const DynamicRegionData& source = use_boundary_reference ? *boundary_reference : dynamic;
+                packet[packet_base + k_channel_state_vx] = source.flow_state[flow_base];
+                packet[packet_base + k_channel_state_vy] = source.flow_state[flow_base + 1];
+                packet[packet_base + k_channel_state_vz] = source.flow_state[flow_base + 2];
+                packet[packet_base + k_channel_state_p] = source.flow_state[flow_base + 3];
+                packet[packet_base + k_channel_state_temp] = source.air_temperature[cell];
+                if (stat.emitter_power_watts[cell] > 0.0f) {
+                    packet[packet_base + k_channel_thermal_source] =
+                        temperature_source_from_power_watts(stat.emitter_power_watts[cell]);
+                }
             }
         }
     }
@@ -1046,10 +1093,11 @@ bool sync_brick_dynamic_from_context(const FluidWorldRuntime& runtime, BrickData
 bool step_brick_actual(
     ServiceState& service,
     FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
     BrickData& brick,
     DynamicRegionData& dynamic
 ) {
-    if (!build_brick_step_packet(runtime, brick, dynamic, brick.packet_cache)) {
+    if (!build_brick_step_packet(runtime, coord, brick, dynamic, brick.packet_cache)) {
         return false;
     }
     if (brick.context_key == 0) {
@@ -3553,6 +3601,126 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_copy_brick_world_dynamic_brick(
     return 1;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_dynamic_brick(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    int brick_x,
+    int brick_y,
+    int brick_z,
+    const float* flow_state,
+    const float* air_temperature,
+    const float* surface_temperature
+) {
+    int cells = 0;
+    if (!checked_cell_count(brick_size, brick_size, brick_size, &cells)
+        || !flow_state
+        || !air_temperature
+        || !surface_temperature) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_upload_brick_world_dynamic_brick: invalid arguments");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_upload_brick_world_dynamic_brick: missing service");
+        return 0;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        set_simulation_last_error("simulation_upload_brick_world_dynamic_brick: missing brick runtime");
+        return 0;
+    }
+    FluidWorldRuntime& runtime = runtime_iterator->second;
+    if (runtime.brick_size != brick_size) {
+        set_simulation_last_error("simulation_upload_brick_world_dynamic_brick: brick size mismatch");
+        return 0;
+    }
+
+    auto dynamic = std::make_shared<DynamicRegionData>();
+    dynamic->nx = brick_size;
+    dynamic->ny = brick_size;
+    dynamic->nz = brick_size;
+    dynamic->flow_state.assign(
+        flow_state,
+        flow_state + static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS
+    );
+    dynamic->air_temperature.assign(air_temperature, air_temperature + cells);
+    dynamic->surface_temperature.assign(surface_temperature, surface_temperature + cells);
+
+    BrickData& brick = runtime.bricks[BrickCoord{brick_x, brick_y, brick_z}];
+    brick.dynamic_region = std::move(dynamic);
+    brick.active = true;
+    brick.last_active_epoch = runtime.epoch;
+    if (brick.pending_reinit && brick.context_key != 0) {
+        release_brick_context(brick);
+    }
+    brick.pending_reinit = false;
+    brick.forcing_dirty = false;
+    if (brick.static_region) {
+        apply_brick_static_constraints(runtime, brick);
+    }
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_boundary_reference_brick(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    int brick_x,
+    int brick_y,
+    int brick_z,
+    const float* flow_state,
+    const float* air_temperature,
+    const float* surface_temperature
+) {
+    int cells = 0;
+    if (!checked_cell_count(brick_size, brick_size, brick_size, &cells)
+        || !flow_state
+        || !air_temperature
+        || !surface_temperature) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_upload_brick_world_boundary_reference_brick: invalid arguments");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_upload_brick_world_boundary_reference_brick: missing service");
+        return 0;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        set_simulation_last_error("simulation_upload_brick_world_boundary_reference_brick: missing brick runtime");
+        return 0;
+    }
+    FluidWorldRuntime& runtime = runtime_iterator->second;
+    if (runtime.brick_size != brick_size) {
+        set_simulation_last_error("simulation_upload_brick_world_boundary_reference_brick: brick size mismatch");
+        return 0;
+    }
+
+    auto dynamic = std::make_shared<DynamicRegionData>();
+    dynamic->nx = brick_size;
+    dynamic->ny = brick_size;
+    dynamic->nz = brick_size;
+    dynamic->flow_state.assign(
+        flow_state,
+        flow_state + static_cast<size_t>(cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS
+    );
+    dynamic->air_temperature.assign(air_temperature, air_temperature + cells);
+    dynamic->surface_temperature.assign(surface_temperature, surface_temperature + cells);
+
+    BrickData& brick = runtime.bricks[BrickCoord{brick_x, brick_y, brick_z}];
+    brick.boundary_reference_region = std::move(dynamic);
+    brick.active = true;
+    brick.last_active_epoch = runtime.epoch;
+    return 1;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     long long service_key,
     long long region_key,
@@ -5427,6 +5595,122 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     env->ReleaseFloatArrayElements(out_flow_state, flow_ptr, ok ? 0 : JNI_ABORT);
     env->ReleaseFloatArrayElements(out_air_temperature, air_ptr, ok ? 0 : JNI_ABORT);
     env->ReleaseFloatArrayElements(out_surface_temperature, surface_ptr, ok ? 0 : JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeUploadBrickWorldDynamicBrick(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong world_key,
+    jint brick_size,
+    jint brick_x,
+    jint brick_y,
+    jint brick_z,
+    jfloatArray flow_state,
+    jfloatArray air_temperature,
+    jfloatArray surface_temperature
+) {
+    if (!flow_state || !air_temperature || !surface_temperature) {
+        return JNI_FALSE;
+    }
+    const int cells = brick_size * brick_size * brick_size;
+    if (cells <= 0
+        || env->GetArrayLength(flow_state) != static_cast<jsize>(cells * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS)
+        || env->GetArrayLength(air_temperature) != static_cast<jsize>(cells)
+        || env->GetArrayLength(surface_temperature) != static_cast<jsize>(cells)) {
+        return JNI_FALSE;
+    }
+    jboolean flow_copy = JNI_FALSE;
+    jboolean air_copy = JNI_FALSE;
+    jboolean surface_copy = JNI_FALSE;
+    jfloat* flow_ptr = env->GetFloatArrayElements(flow_state, &flow_copy);
+    jfloat* air_ptr = env->GetFloatArrayElements(air_temperature, &air_copy);
+    jfloat* surface_ptr = env->GetFloatArrayElements(surface_temperature, &surface_copy);
+    if (!flow_ptr || !air_ptr || !surface_ptr) {
+        if (flow_ptr) {
+            env->ReleaseFloatArrayElements(flow_state, flow_ptr, JNI_ABORT);
+        }
+        if (air_ptr) {
+            env->ReleaseFloatArrayElements(air_temperature, air_ptr, JNI_ABORT);
+        }
+        if (surface_ptr) {
+            env->ReleaseFloatArrayElements(surface_temperature, surface_ptr, JNI_ABORT);
+        }
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_upload_brick_world_dynamic_brick(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key),
+        brick_size,
+        brick_x,
+        brick_y,
+        brick_z,
+        flow_ptr,
+        air_ptr,
+        surface_ptr
+    );
+    env->ReleaseFloatArrayElements(flow_state, flow_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(air_temperature, air_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(surface_temperature, surface_ptr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeUploadBrickWorldBoundaryReferenceBrick(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong world_key,
+    jint brick_size,
+    jint brick_x,
+    jint brick_y,
+    jint brick_z,
+    jfloatArray flow_state,
+    jfloatArray air_temperature,
+    jfloatArray surface_temperature
+) {
+    if (!flow_state || !air_temperature || !surface_temperature) {
+        return JNI_FALSE;
+    }
+    const int cells = brick_size * brick_size * brick_size;
+    if (cells <= 0
+        || env->GetArrayLength(flow_state) != static_cast<jsize>(cells * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS)
+        || env->GetArrayLength(air_temperature) != static_cast<jsize>(cells)
+        || env->GetArrayLength(surface_temperature) != static_cast<jsize>(cells)) {
+        return JNI_FALSE;
+    }
+    jboolean flow_copy = JNI_FALSE;
+    jboolean air_copy = JNI_FALSE;
+    jboolean surface_copy = JNI_FALSE;
+    jfloat* flow_ptr = env->GetFloatArrayElements(flow_state, &flow_copy);
+    jfloat* air_ptr = env->GetFloatArrayElements(air_temperature, &air_copy);
+    jfloat* surface_ptr = env->GetFloatArrayElements(surface_temperature, &surface_copy);
+    if (!flow_ptr || !air_ptr || !surface_ptr) {
+        if (flow_ptr) {
+            env->ReleaseFloatArrayElements(flow_state, flow_ptr, JNI_ABORT);
+        }
+        if (air_ptr) {
+            env->ReleaseFloatArrayElements(air_temperature, air_ptr, JNI_ABORT);
+        }
+        if (surface_ptr) {
+            env->ReleaseFloatArrayElements(surface_temperature, surface_ptr, JNI_ABORT);
+        }
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_upload_brick_world_boundary_reference_brick(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key),
+        brick_size,
+        brick_x,
+        brick_y,
+        brick_z,
+        flow_ptr,
+        air_ptr,
+        surface_ptr
+    );
+    env->ReleaseFloatArrayElements(flow_state, flow_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(air_temperature, air_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(surface_temperature, surface_ptr, JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
