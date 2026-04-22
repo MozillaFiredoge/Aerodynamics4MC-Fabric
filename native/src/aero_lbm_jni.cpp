@@ -6561,6 +6561,108 @@ static bool native_extract_flow_atlas_raw_dims_impl(
     return true;
 }
 
+static bool native_copy_flow_temperature_subrect_raw_dims_impl(
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    jint offset_x,
+    jint offset_y,
+    jint offset_z,
+    jint copy_nx,
+    jint copy_ny,
+    jint copy_nz,
+    float* out_flow,
+    float* out_temperature
+) {
+    if (!g_cfg.initialized || !out_flow || !out_temperature) return false;
+    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (copy_nx <= 0 || copy_ny <= 0 || copy_nz <= 0) return false;
+    if (offset_x < 0 || offset_y < 0 || offset_z < 0) return false;
+    if (offset_x + copy_nx > nx || offset_y + copy_ny > ny || offset_z + copy_nz > nz) return false;
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+    const std::size_t copy_cells = static_cast<std::size_t>(copy_nx) * copy_ny * copy_nz;
+
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) return false;
+    ContextState& ctx = *locked_context.ctx;
+    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return false;
+    if (ctx.f.empty() || ctx.cells == 0 || ctx.obstacle.size() != cells || ctx.temperature.size() != cells) {
+        return false;
+    }
+
+    auto write_zero = [](float* flow) {
+        flow[0] = 0.0f;
+        flow[1] = 0.0f;
+        flow[2] = 0.0f;
+        flow[3] = 0.0f;
+    };
+
+    std::size_t dst_cell = 0;
+    for (int x = 0; x < copy_nx; ++x) {
+        const int src_x = offset_x + x;
+        for (int y = 0; y < copy_ny; ++y) {
+            const int src_y = offset_y + y;
+            for (int z = 0; z < copy_nz; ++z, ++dst_cell) {
+                const int src_z = offset_z + z;
+                const std::size_t src_cell = cell_index(src_x, src_y, src_z, nx, ny, nz);
+                float* dst_flow = out_flow + dst_cell * 4;
+                out_temperature[dst_cell] = ctx.obstacle[src_cell]
+                    ? 0.0f
+                    : finite_or(clampf(ctx.temperature[src_cell], kThermalMin, kThermalMax), 0.0f);
+                if (ctx.obstacle[src_cell]) {
+                    write_zero(dst_flow);
+                    continue;
+                }
+
+                float rho = 0.0f;
+                float ux = 0.0f;
+                float uy = 0.0f;
+                float uz = 0.0f;
+                bool valid = true;
+                for (int q = 0; q < kQ; ++q) {
+                    const float fq = ctx.f[dist_index(src_cell, q, cells)];
+                    if (!std::isfinite(fq)) {
+                        valid = false;
+                        break;
+                    }
+                    rho += fq;
+                    ux += fq * static_cast<float>(kCx[q]);
+                    uy += fq * static_cast<float>(kCy[q]);
+                    uz += fq * static_cast<float>(kCz[q]);
+                }
+                if (!valid || !std::isfinite(rho) || !std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+                    write_zero(dst_flow);
+                    continue;
+                }
+                rho = clampf(rho, kRhoMin, kRhoMax);
+                if (!std::isfinite(rho) || rho <= 1e-6f) {
+                    write_zero(dst_flow);
+                    continue;
+                }
+                ux /= rho;
+                uy /= rho;
+                uz /= rho;
+                if (!std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
+                    ux = 0.0f;
+                    uy = 0.0f;
+                    uz = 0.0f;
+                }
+                if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
+                if (std::fabs(ux) < 1e-7f) ux = 0.0f;
+                if (std::fabs(uy) < 1e-7f) uy = 0.0f;
+                if (std::fabs(uz) < 1e-7f) uz = 0.0f;
+                dst_flow[0] = ux;
+                dst_flow[1] = uy;
+                dst_flow[2] = uz;
+                dst_flow[3] = clampf(rho - 1.0f, kPressureMin, kPressureMax);
+            }
+        }
+    }
+    return true;
+}
+
 static bool native_get_flow_state_raw_dims_impl(jint nx, jint ny, jint nz, jlong context_key, float* flow_out) {
     if (!g_cfg.initialized || !flow_out) return false;
     if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
@@ -6912,6 +7014,36 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_extract_flow_atlas_rect(
         stride,
         out_flow_atlas,
         value_count
+    ) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_copy_flow_temperature_subrect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int copy_nx,
+    int copy_ny,
+    int copy_nz,
+    float* out_flow,
+    float* out_temperature
+) {
+    return native_copy_flow_temperature_subrect_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        offset_x,
+        offset_y,
+        offset_z,
+        copy_nx,
+        copy_ny,
+        copy_nz,
+        out_flow,
+        out_temperature
     ) ? 1 : 0;
 }
 

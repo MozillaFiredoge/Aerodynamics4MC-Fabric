@@ -211,6 +211,20 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_extract_flow_atlas_rect(
     float* out_flow_atlas,
     int value_count
 );
+AERO_LBM_CAPI_EXPORT int aero_lbm_copy_flow_temperature_subrect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int copy_nx,
+    int copy_ny,
+    int copy_nz,
+    float* out_flow,
+    float* out_temperature
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_flow_state_rect(int nx, int ny, int nz, long long context_key, float* out_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_set_temperature_state_rect(int nx, int ny, int nz, long long context_key, const float* temperature);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_last_force(long long context_key, float* out_fx, float* out_fy, float* out_fz);

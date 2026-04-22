@@ -3273,14 +3273,23 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_core_to_brick_world(
         return 0;
     }
 
-    std::vector<float> region_flow(static_cast<size_t>(region_cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS);
-    std::vector<float> region_air_temperature(static_cast<size_t>(region_cells));
-    if (!aero_lbm_get_flow_state_rect(region_nx, region_ny, region_nz, region_key, region_flow.data())) {
-        set_simulation_last_error(std::string("simulation_sync_region_core_to_brick_world flow sync failed: ") + aero_lbm_last_error());
-        return 0;
-    }
-    if (!aero_lbm_get_temperature_state_rect(region_nx, region_ny, region_nz, region_key, region_air_temperature.data())) {
-        set_simulation_last_error(std::string("simulation_sync_region_core_to_brick_world temperature sync failed: ") + aero_lbm_last_error());
+    std::vector<float> core_flow(static_cast<size_t>(core_cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS);
+    std::vector<float> core_air_temperature(static_cast<size_t>(core_cells));
+    if (!aero_lbm_copy_flow_temperature_subrect(
+        region_nx,
+        region_ny,
+        region_nz,
+        region_key,
+        core_offset_x,
+        core_offset_y,
+        core_offset_z,
+        core_nx,
+        core_ny,
+        core_nz,
+        core_flow.data(),
+        core_air_temperature.data()
+    )) {
+        set_simulation_last_error(std::string("simulation_sync_region_core_to_brick_world core sync failed: ") + aero_lbm_last_error());
         return 0;
     }
 
@@ -3288,8 +3297,8 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_core_to_brick_world(
     brick_dynamic->nx = core_nx;
     brick_dynamic->ny = core_ny;
     brick_dynamic->nz = core_nz;
-    brick_dynamic->flow_state.resize(static_cast<size_t>(core_cells) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS);
-    brick_dynamic->air_temperature.resize(static_cast<size_t>(core_cells));
+    brick_dynamic->flow_state = std::move(core_flow);
+    brick_dynamic->air_temperature = std::move(core_air_temperature);
     brick_dynamic->surface_temperature.resize(static_cast<size_t>(core_cells));
 
     for (int x = 0; x < core_nx; ++x) {
@@ -3300,13 +3309,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_core_to_brick_world(
                 const int src_z = core_offset_z + z;
                 const int src_cell = grid_cell_index(region_ny, region_nz, src_x, src_y, src_z);
                 const int dst_cell = grid_cell_index(core_ny, core_nz, x, y, z);
-                const size_t src_flow_base = static_cast<size_t>(src_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-                const size_t dst_flow_base = static_cast<size_t>(dst_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-                for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
-                    brick_dynamic->flow_state[dst_flow_base + channel] = region_flow[src_flow_base + channel];
-                }
-                brick_dynamic->air_temperature[static_cast<size_t>(dst_cell)] =
-                    region_air_temperature[static_cast<size_t>(src_cell)];
                 brick_dynamic->surface_temperature[static_cast<size_t>(dst_cell)] =
                     source_dynamic.surface_temperature[static_cast<size_t>(src_cell)];
             }

@@ -245,6 +245,7 @@ public final class AeroServerRuntime {
     private static final int VERTICAL_ATTACH_MARGIN_CELLS = Math.max(VERTICAL_SOLVE_MARGIN_CELLS + 4, REGION_CORE_SIZE / 3);
     private static final int SHELL_WINDOW_RETENTION_TICKS = 8;
     private static final int BOUNDARY_FIELD_REFRESH_TICKS = 4;
+    private static final int BRICK_DYNAMIC_SYNC_INTERVAL_TICKS = 4;
     private static final int CORE_SECTION_MIN = REGION_HALO_CELLS / CHUNK_SIZE;
     private static final int CORE_SECTION_MAX = CORE_SECTION_MIN + (REGION_CORE_SIZE / CHUNK_SIZE) - 1;
     private static final int CORE_SECTION_COUNT = (CORE_SECTION_MAX - CORE_SECTION_MIN + 1)
@@ -6764,9 +6765,9 @@ public final class AeroServerRuntime {
         return maxSpeed * NATIVE_VELOCITY_SCALE;
     }
 
-    private void syncSolveWindowCoreDynamicBrick(SolveSnapshot snapshot) {
+    private boolean syncSolveWindowCoreDynamicBrick(SolveSnapshot snapshot) {
         if (simulationServiceId == 0L || !simulationBridge.isLoaded()) {
-            return;
+            return false;
         }
         BlockPos coreOrigin = snapshot.key().origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
         boolean synced = simulationBridge.syncRegionCoreToBrickWorld(
@@ -6792,6 +6793,7 @@ public final class AeroServerRuntime {
                 log("Brick core dynamic sync failed for window " + formatPos(snapshot.origin()) + ": " + error);
             }
         }
+        return synced;
     }
 
     private float[] flattenTornadoDescriptors(List<TornadoRegionDescriptor> descriptors) {
@@ -6898,7 +6900,9 @@ public final class AeroServerRuntime {
                 completedSolveCounter.incrementAndGet();
                 lastCoordinatorSolveCompleteTick = tickCounter;
                 lastSolverError = "";
-                syncSolveWindowCoreDynamicBrick(snapshot);
+                if (region.shouldSyncBrickDynamic(tickCounter) && syncSolveWindowCoreDynamicBrick(snapshot)) {
+                    region.noteBrickDynamicSynced(tickCounter);
+                }
                 publishPlayerProbesForSolvedRegion(snapshot);
                 publishRegionAtlas(snapshot.key(), maxSpeed);
                 pollRegionNestedFeedback(snapshot.key(), region);
@@ -7771,6 +7775,7 @@ public final class AeroServerRuntime {
         private int lastBoundaryRefreshTick = Integer.MIN_VALUE;
         private long uploadedBrickStaticSignature = Long.MIN_VALUE;
         private long uploadedBrickStaticServiceId;
+        private int lastBrickDynamicSyncTick = Integer.MIN_VALUE;
 
         private RegionRecord() {
             Arrays.fill(uploadedSectionVersions, Long.MIN_VALUE);
@@ -7787,11 +7792,13 @@ public final class AeroServerRuntime {
 
         private void detach() {
             attached = false;
+            invalidateBrickDynamicSync();
         }
 
         private void markDetached() {
             attached = false;
             clearBoundaryCache();
+            invalidateBrickDynamicSync();
         }
 
         private void markBackendResetPending() {
@@ -7844,6 +7851,7 @@ public final class AeroServerRuntime {
         private void noteBackendReset(int tick) {
             backendResetCount++;
             lastBackendResetTick = tick;
+            invalidateBrickDynamicSync();
         }
 
         private long backendResetCount() {
@@ -7852,6 +7860,18 @@ public final class AeroServerRuntime {
 
         private int lastBackendResetTick() {
             return lastBackendResetTick;
+        }
+
+        private boolean shouldSyncBrickDynamic(int tick) {
+            return tick - lastBrickDynamicSyncTick >= BRICK_DYNAMIC_SYNC_INTERVAL_TICKS;
+        }
+
+        private void noteBrickDynamicSynced(int tick) {
+            lastBrickDynamicSyncTick = tick;
+        }
+
+        private void invalidateBrickDynamicSync() {
+            lastBrickDynamicSyncTick = Integer.MIN_VALUE;
         }
 
         private boolean markReleased() {
