@@ -5260,7 +5260,14 @@ bool copy_buffer_face_slab(
     return true;
 }
 
-bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int offset_x, int offset_y, int offset_z) {
+bool exchange_context_halo_gpu_layers(
+    ContextState& first,
+    ContextState& second,
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int halo_layers
+) {
     if (!first.gpu_buffers_ready || !second.gpu_buffers_ready
         || !first.gpu_initialized || !second.gpu_initialized) {
         return true;
@@ -5283,7 +5290,7 @@ bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int of
         set_last_native_error(oss.str());
         return false;
     }
-    const int halo = std::max(1, nx / 4);
+    const int halo = std::max(1, std::min(halo_layers, nx / 2 - 1));
     const int core = nx - halo * 2;
     if (core <= 0) {
         std::ostringstream oss;
@@ -5419,6 +5426,10 @@ bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int of
     return true;
 }
 
+bool exchange_context_halo_gpu(ContextState& first, ContextState& second, int offset_x, int offset_y, int offset_z) {
+    return exchange_context_halo_gpu_layers(first, second, offset_x, offset_y, offset_z, std::max(1, first.nx / 4));
+}
+
 #else
 struct OpenClRuntime { bool available = false; std::string error; std::string device_name; };
 OpenClRuntime g_opencl;
@@ -5430,6 +5441,7 @@ bool sync_context_temperature_from_gpu(ContextState&) { return true; }
 bool sync_context_temperature_to_gpu(ContextState&) { return true; }
 bool sync_context_state_from_gpu(ContextState&) { return true; }
 bool sync_context_state_to_gpu(ContextState&) { return true; }
+bool exchange_context_halo_gpu_layers(ContextState&, ContextState&, int, int, int, int) { return true; }
 bool exchange_context_halo_gpu(ContextState&, ContextState&, int, int, int) { return true; }
 #endif
 
@@ -5785,7 +5797,14 @@ bool halo_exchange_slab_bounds(
         && fill_axis(offset_z, nz, neg_src_z0, pos_dst_z0, pos_src_z0, neg_dst_z0, size_z);
 }
 
-bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int offset_x, int offset_y, int offset_z) {
+bool exchange_context_halo_cpu_layers(
+    ContextState& first,
+    ContextState& second,
+    int offset_x,
+    int offset_y,
+    int offset_z,
+    int halo_layers
+) {
     if (first.cells == 0 || second.cells == 0) return true;
     if (first.nx != second.nx || first.ny != second.ny || first.nz != second.nz) {
         std::ostringstream oss;
@@ -5805,7 +5824,7 @@ bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int of
         set_last_native_error(oss.str());
         return false;
     }
-    const int halo = std::max(1, nx / 4);
+    const int halo = std::max(1, std::min(halo_layers, nx / 2 - 1));
     const int core = nx - halo * 2;
     if (core <= 0) {
         std::ostringstream oss;
@@ -5938,6 +5957,10 @@ bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int of
         }
     }
     return true;
+}
+
+bool exchange_context_halo_cpu(ContextState& first, ContextState& second, int offset_x, int offset_y, int offset_z) {
+    return exchange_context_halo_cpu_layers(first, second, offset_x, offset_y, offset_z, std::max(1, first.nx / 4));
 }
 
 bool shift_context_cpu_state(ContextState& ctx, int dx, int dy, int dz) {
@@ -6085,7 +6108,7 @@ static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jin
     StepTiming timing;
 
     if (!g_cfg.initialized || !packet) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
     LockedContext locked_context(context_key, true);
@@ -6115,7 +6138,7 @@ static bool native_step_raw_dims_with_sparse_overlays_impl(
     StepTiming timing;
 
     if (!g_cfg.initialized || !packet) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     if (overlay_count < 0) return false;
     if (overlay_count > 0 && (!overlay_cells || !overlay_values)) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
@@ -6225,12 +6248,12 @@ static bool native_step_raw_impl(const float* packet, jint grid_size, jlong cont
 
 static bool native_get_temperature_state_raw_dims_impl(jint nx, jint ny, jint nz, jlong context_key, float* temperature_out) {
     if (!g_cfg.initialized || !temperature_out) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
     LockedContext locked_context(context_key, false);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(ctx, nx, ny, nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_temperature_from_gpu(ctx)) return false;
     if (ctx.temperature.size() != cells) return false;
     std::memcpy(temperature_out, ctx.temperature.data(), cells * sizeof(float));
@@ -6248,7 +6271,7 @@ static bool native_sample_temperature_point_raw_dims_impl(
     float* out_temperature
 ) {
     if (!g_cfg.initialized || !out_temperature) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     if (sample_x < 0 || sample_y < 0 || sample_z < 0 || sample_x >= nx || sample_y >= ny || sample_z >= nz) {
         return false;
     }
@@ -6257,7 +6280,7 @@ static bool native_sample_temperature_point_raw_dims_impl(
     LockedContext locked_context(context_key, false);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(ctx, nx, ny, nz, cells);
     if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
         cl_mem current_temp = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
         const std::size_t offset = cell * sizeof(float);
@@ -6286,7 +6309,7 @@ static bool native_sample_flow_point_raw_dims_impl(
     float* out_flow
 ) {
     if (!g_cfg.initialized || !out_flow) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     if (sample_x < 0 || sample_y < 0 || sample_z < 0 || sample_x >= nx || sample_y >= ny || sample_z >= nz) {
         return false;
     }
@@ -6295,7 +6318,7 @@ static bool native_sample_flow_point_raw_dims_impl(
     LockedContext locked_context(context_key, false);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(ctx, nx, ny, nz, cells);
 
     auto write_zero = [&]() {
         out_flow[0] = 0.0f;
@@ -6441,7 +6464,7 @@ static bool native_extract_flow_atlas_raw_dims_impl(
     jint value_count
 ) {
     if (!g_cfg.initialized || !out_flow_atlas || stride <= 0) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     const int sx = (nx + stride - 1) / stride;
     const int sy = (ny + stride - 1) / stride;
     const int sz = (nz + stride - 1) / stride;
@@ -6452,7 +6475,7 @@ static bool native_extract_flow_atlas_raw_dims_impl(
     LockedContext locked_context(context_key, false);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(ctx, nx, ny, nz, cells);
 
 #if defined(AERO_LBM_OPENCL)
     if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
@@ -6576,7 +6599,7 @@ static bool native_copy_flow_temperature_subrect_raw_dims_impl(
     float* out_temperature
 ) {
     if (!g_cfg.initialized || !out_flow || !out_temperature) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     if (copy_nx <= 0 || copy_ny <= 0 || copy_nz <= 0) return false;
     if (offset_x < 0 || offset_y < 0 || offset_z < 0) return false;
     if (offset_x + copy_nx > nx || offset_y + copy_ny > ny || offset_z + copy_nz > nz) return false;
@@ -6586,7 +6609,7 @@ static bool native_copy_flow_temperature_subrect_raw_dims_impl(
     LockedContext locked_context(context_key, false);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(ctx, nx, ny, nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return false;
     if (ctx.f.empty() || ctx.cells == 0 || ctx.obstacle.size() != cells || ctx.temperature.size() != cells) {
         return false;
@@ -6665,12 +6688,12 @@ static bool native_copy_flow_temperature_subrect_raw_dims_impl(
 
 static bool native_get_flow_state_raw_dims_impl(jint nx, jint ny, jint nz, jlong context_key, float* flow_out) {
     if (!g_cfg.initialized || !flow_out) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
     LockedContext locked_context(context_key, false);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(ctx, nx, ny, nz, cells);
     if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return false;
     if (ctx.f.empty() || ctx.cells == 0) return false;
     write_output(ctx, flow_out, 4);
@@ -6723,13 +6746,13 @@ static bool native_set_temperature_state_raw_dims_impl(
     const float* temperature_state
 ) {
     if (!g_cfg.initialized || !temperature_state) return false;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return false;
+    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
     LockedContext locked_context(context_key, true);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, g_cfg.nx, g_cfg.ny, g_cfg.nz, cells);
+    ensure_context_shape(ctx, nx, ny, nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     assign_temperature_state(ctx, temperature_state);
     if (g_cfg.opencl_enabled && !sync_context_temperature_to_gpu(ctx)) return false;
@@ -6822,6 +6845,103 @@ static jboolean native_exchange_halo_impl(
         oss << "native_exchange_halo: CPU halo exchange failed for offset ("
             << offset_x << "," << offset_y << "," << offset_z << ")";
         set_last_native_error(oss.str());
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean native_exchange_halo_rect_layers_impl(
+    jint nx,
+    jint ny,
+    jint nz,
+    jint halo_layers,
+    jlong first_context_key,
+    jlong second_context_key,
+    jint offset_x,
+    jint offset_y,
+    jint offset_z
+) {
+    clear_last_native_error();
+    if (!g_cfg.initialized) {
+        set_last_native_error("native_exchange_halo_rect_layers: runtime not initialized");
+        return JNI_FALSE;
+    }
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        set_last_native_error("native_exchange_halo_rect_layers: invalid dimensions");
+        return JNI_FALSE;
+    }
+    if (halo_layers <= 0) {
+        set_last_native_error("native_exchange_halo_rect_layers: halo_layers must be positive");
+        return JNI_FALSE;
+    }
+    if (offset_x < -1 || offset_x > 1 || offset_y < -1 || offset_y > 1 || offset_z < -1 || offset_z > 1) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo_rect_layers: invalid offset ("
+            << offset_x << "," << offset_y << "," << offset_z << ")";
+        set_last_native_error(oss.str());
+        return JNI_FALSE;
+    }
+    if (offset_x == 0 && offset_y == 0 && offset_z == 0) {
+        set_last_native_error("native_exchange_halo_rect_layers: zero offset is invalid");
+        return JNI_FALSE;
+    }
+    if (nx != ny || ny != nz) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo_rect_layers: only cubic contexts are supported, got "
+            << nx << "x" << ny << "x" << nz;
+        set_last_native_error(oss.str());
+        return JNI_FALSE;
+    }
+    if (halo_layers * 2 >= nx) {
+        std::ostringstream oss;
+        oss << "native_exchange_halo_rect_layers: invalid halo layout nx=" << nx
+            << " halo=" << halo_layers;
+        set_last_native_error(oss.str());
+        return JNI_FALSE;
+    }
+
+    LockedContextPair locked_contexts(first_context_key, second_context_key);
+    if (!locked_contexts.first || !locked_contexts.second) {
+        std::lock_guard<SpinMutex> lock(g_contexts_mutex);
+        auto first_it = g_contexts.find(first_context_key);
+        auto second_it = g_contexts.find(second_context_key);
+        std::ostringstream oss;
+        oss << "native_exchange_halo_rect_layers: missing context(s) first="
+            << static_cast<long long>(first_context_key)
+            << (first_it == g_contexts.end() ? " [missing]" : "")
+            << ", second=" << static_cast<long long>(second_context_key)
+            << (second_it == g_contexts.end() ? " [missing]" : "");
+        set_last_native_error(oss.str());
+        return JNI_FALSE;
+    }
+    ContextState& first = *locked_contexts.first;
+    ContextState& second = *locked_contexts.second;
+    const long long cells_ll = static_cast<long long>(nx) * static_cast<long long>(ny) * static_cast<long long>(nz);
+    if (cells_ll <= 0 || cells_ll > static_cast<long long>(std::numeric_limits<int>::max())) {
+        set_last_native_error("native_exchange_halo_rect_layers: invalid cell count");
+        return JNI_FALSE;
+    }
+    const std::size_t cells = static_cast<std::size_t>(cells_ll);
+    ensure_context_shape(first, nx, ny, nz, cells);
+    ensure_context_shape(second, nx, ny, nz, cells);
+    if (first.cells == 0 || second.cells == 0) {
+        clear_last_native_error();
+        return JNI_TRUE;
+    }
+    bool ok = false;
+    if (g_cfg.opencl_enabled) {
+        ok = exchange_context_halo_gpu_layers(first, second, offset_x, offset_y, offset_z, halo_layers);
+        if (!ok && g_last_native_error.empty()) {
+            set_last_native_error(g_opencl.error.empty() ? "native_exchange_halo_rect_layers: OpenCL halo exchange failed"
+                                                         : g_opencl.error);
+        }
+    } else {
+        ok = exchange_context_halo_cpu_layers(first, second, offset_x, offset_y, offset_z, halo_layers);
+        if (!ok && g_last_native_error.empty()) {
+            std::ostringstream oss;
+            oss << "native_exchange_halo_rect_layers: CPU halo exchange failed for offset ("
+                << offset_x << "," << offset_y << "," << offset_z << ")";
+            set_last_native_error(oss.str());
+        }
     }
     return ok ? JNI_TRUE : JNI_FALSE;
 }
@@ -6941,6 +7061,30 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
 ) {
     return native_exchange_halo_impl(
         grid_size,
+        static_cast<jlong>(first_context_key),
+        static_cast<jlong>(second_context_key),
+        offset_x,
+        offset_y,
+        offset_z
+    ) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo_layers_rect(
+    int nx,
+    int ny,
+    int nz,
+    int halo_layers,
+    long long first_context_key,
+    long long second_context_key,
+    int offset_x,
+    int offset_y,
+    int offset_z
+) {
+    return native_exchange_halo_rect_layers_impl(
+        nx,
+        ny,
+        nz,
+        halo_layers,
         static_cast<jlong>(first_context_key),
         static_cast<jlong>(second_context_key),
         offset_x,

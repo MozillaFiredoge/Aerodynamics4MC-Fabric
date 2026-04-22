@@ -181,6 +181,17 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
     int offset_y,
     int offset_z
 );
+AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo_layers_rect(
+    int nx,
+    int ny,
+    int nz,
+    int halo_layers,
+    long long first_context_key,
+    long long second_context_key,
+    int offset_x,
+    int offset_y,
+    int offset_z
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_temperature_state_rect(int nx, int ny, int nz, long long context_key, float* out_temperature);
 AERO_LBM_CAPI_EXPORT int aero_lbm_sample_temperature_point_rect(
     int nx,

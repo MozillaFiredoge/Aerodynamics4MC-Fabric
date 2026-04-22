@@ -20,10 +20,8 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -113,6 +111,8 @@ public final class AeroServerRuntime {
     private static final int WINDOW_THERMAL_REFRESH_TICKS = 40;
     private static final int PARTICLE_FLOW_SYNC_INTERVAL_TICKS = 4;
     private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 4;
+    private static final float ATLAS_VELOCITY_QUANT_RANGE = 5.6f;
+    private static final float ATLAS_PRESSURE_QUANT_RANGE = 0.03f;
     private static final float ANALYSIS_FLOW_VELOCITY_TOLERANCE = 0.02f;
     private static final float ANALYSIS_FLOW_PRESSURE_TOLERANCE = 0.0005f;
     private static final int L2_CAPTURE_DEFAULT_DURATION_SECONDS = 30;
@@ -246,6 +246,8 @@ public final class AeroServerRuntime {
     private static final int SHELL_WINDOW_RETENTION_TICKS = 8;
     private static final int BOUNDARY_FIELD_REFRESH_TICKS = 4;
     private static final int BRICK_DYNAMIC_SYNC_INTERVAL_TICKS = 4;
+    private static final String DEPRECATED_ANALYSIS_CAPTURE_MESSAGE =
+        "Deprecated: analysis/capture tooling is no longer on the primary roadmap and may lag behind brick-runtime changes.";
     private static final int CORE_SECTION_MIN = REGION_HALO_CELLS / CHUNK_SIZE;
     private static final int CORE_SECTION_MAX = CORE_SECTION_MIN + (REGION_CORE_SIZE / CHUNK_SIZE) - 1;
     private static final int CORE_SECTION_COUNT = (CORE_SECTION_MAX - CORE_SECTION_MIN + 1)
@@ -272,21 +274,14 @@ public final class AeroServerRuntime {
     private final ArrayDeque<NativeSimulationBridge.WorldDelta> pendingWorldDeltas = new ArrayDeque<>();
     private final Object pendingResidentBrickStaticRefreshesLock = new Object();
     private final ArrayDeque<ChunkResidentBrickRefreshRequest> pendingResidentBrickStaticRefreshes = new ArrayDeque<>();
-    private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT, runnable -> {
-        Thread thread = new Thread(runnable, "aero-server-solver");
-        thread.setDaemon(true);
-        return thread;
-    });
     private final ExecutorService diagnosticsExecutor = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "aero-diagnostics-writer");
         thread.setDaemon(true);
         return thread;
     });
-    private final AtomicInteger activeSolveTasks = new AtomicInteger(0);
     private final AtomicInteger simulationStepBudget = new AtomicInteger(0);
     private final AtomicLong runtimeGeneration = new AtomicLong(0L);
     private final AtomicLong publishedFrameCounter = new AtomicLong(0L);
-    private final AtomicLong completedSolveCounter = new AtomicLong(0L);
     private final AtomicReference<PublishedFrame> publishedFrame = new AtomicReference<>(null);
     private final AtomicReference<Map<UUID, PlayerProbe>> publishedPlayerProbes = new AtomicReference<>(Map.of());
     private final AtomicReference<Map<UUID, EntitySample>> publishedEntitySamples = new AtomicReference<>(Map.of());
@@ -307,10 +302,8 @@ public final class AeroServerRuntime {
 
     private volatile boolean streamingEnabled = false;
     private volatile int tickCounter = 0;
-    private int lastWindowRefreshTick = Integer.MIN_VALUE;
     private long simulationTicks = 0L;
     private long lastObservedPublishedFrameId = 0L;
-    private long lastObservedCompletedSolveCount = 0L;
     private volatile int lastPublishedFrameTick = Integer.MIN_VALUE;
     private int secondWindowTotalTicks = 0;
     private int secondWindowSimulationTicks = 0;
@@ -725,8 +718,8 @@ public final class AeroServerRuntime {
                         "SimDetail frameId=" + (currentFrame == null ? 0L : currentFrame.frameId())
                             + " frameAgeTicks=" + currentPublishedFrameAgeTicks()
                             + " stepBudget=" + simulationStepBudget.get()
-                            + " activeSolveTasks=" + activeSolveTasks.get()
-                            + " busyRegions=" + busyRegionCount()
+                            + " activeSolveTasks=0"
+                            + " busyRegions=0"
                             + " attachedReadyRegions=" + attachedWindowCount()
                             + " coordinatorAlive=" + isCoordinatorAlive()
                             + " coordTick=" + lastCoordinatorObservedTick
@@ -922,6 +915,7 @@ public final class AeroServerRuntime {
     }
 
     private int startL2Capture(ServerCommandSource source, int durationSeconds, int fps) {
+        feedback(source, DEPRECATED_ANALYSIS_CAPTURE_MESSAGE);
         if (!streamingEnabled) {
             feedback(source, "Streaming must be enabled before starting L2 capture");
             return 0;
@@ -985,6 +979,7 @@ public final class AeroServerRuntime {
     }
 
     private int stopL2Capture(ServerCommandSource source, boolean explicit) {
+        feedback(source, DEPRECATED_ANALYSIS_CAPTURE_MESSAGE);
         L2CaptureSession session = activeL2CaptureSession;
         if (session == null) {
             feedback(source, "No L2 capture session is active");
@@ -1004,6 +999,7 @@ public final class AeroServerRuntime {
     }
 
     private int l2CaptureStatus(ServerCommandSource source) {
+        feedback(source, DEPRECATED_ANALYSIS_CAPTURE_MESSAGE);
         L2CaptureSession session = activeL2CaptureSession;
         if (session == null) {
             feedback(source, "No L2 capture session is active");
@@ -1031,6 +1027,7 @@ public final class AeroServerRuntime {
     }
 
     private int dumpInspectionPatch(ServerCommandSource source, int domainBlocks, int gridResolution, int faceResolution) {
+        feedback(source, DEPRECATED_ANALYSIS_CAPTURE_MESSAGE);
         InspectionPatchInput input = captureInspectionPatchInput(source, domainBlocks, gridResolution, faceResolution);
         if (input == null) {
             return 0;
@@ -1057,6 +1054,7 @@ public final class AeroServerRuntime {
     }
 
     private int startInspectionPatchSolve(ServerCommandSource source, int domainBlocks, int gridResolution, int faceResolution, int steps) {
+        feedback(source, DEPRECATED_ANALYSIS_CAPTURE_MESSAGE);
         if (!streamingEnabled) {
             feedback(source, "Streaming must be enabled before solving an inspection patch");
             return 0;
@@ -1103,6 +1101,7 @@ public final class AeroServerRuntime {
     }
 
     private int stopInspectionPatchSolve(ServerCommandSource source) {
+        feedback(source, DEPRECATED_ANALYSIS_CAPTURE_MESSAGE);
         InspectionSolveSession session = activeInspectionSolveSession;
         if (session == null) {
             feedback(source, "No inspection solve is active");
@@ -1114,6 +1113,7 @@ public final class AeroServerRuntime {
     }
 
     private int inspectionPatchSolveStatus(ServerCommandSource source) {
+        feedback(source, DEPRECATED_ANALYSIS_CAPTURE_MESSAGE);
         InspectionSolveSession session = activeInspectionSolveSession;
         if (session == null) {
             feedback(source, "No inspection solve is active");
@@ -1783,6 +1783,7 @@ public final class AeroServerRuntime {
         StringBuilder builder = new StringBuilder(1 << 16);
         builder.append("{\n");
         appendJsonField(builder, "format", "a4mc_l2_capture_v2", true);
+        appendJsonField(builder, "deprecated", true, true);
         appendJsonField(builder, "capture_mode", "active_core_bricks", true);
         appendJsonField(builder, "dimension_id", session.dimensionId.toString(), true);
         appendJsonField(builder, "anchor_core_x", session.anchorCoreOrigin.getX(), true);
@@ -2537,12 +2538,10 @@ public final class AeroServerRuntime {
         }
         long frameId = frame.frameId();
         int publishedSteps = 0;
-        long completedSolveCount = completedSolveCounter.get();
-        if (completedSolveCount > lastObservedCompletedSolveCount) {
-            long delta = completedSolveCount - lastObservedCompletedSolveCount;
+        if (frameId > lastObservedPublishedFrameId) {
+            long delta = frameId - lastObservedPublishedFrameId;
             simulationTicks += delta;
             publishedSteps = (int) Math.min(Integer.MAX_VALUE, delta);
-            lastObservedCompletedSolveCount = completedSolveCount;
         }
         if (frameId > lastObservedPublishedFrameId) {
             lastObservedPublishedFrameId = frameId;
@@ -2658,8 +2657,6 @@ public final class AeroServerRuntime {
         simulationStepBudget.set(0);
         simulationTicks = 0L;
         lastObservedPublishedFrameId = 0L;
-        lastObservedCompletedSolveCount = 0L;
-        completedSolveCounter.set(0L);
         lastPublishedFrameTick = Integer.MIN_VALUE;
         secondWindowTotalTicks = 0;
         secondWindowSimulationTicks = 0;
@@ -3195,11 +3192,10 @@ public final class AeroServerRuntime {
             if (!shouldActivelyRefreshWindowThisTick(region, solveWindow)) {
                 continue;
             }
+            if (region.attached() || region.serviceActive || region.serviceReady) {
+                downgradeWindowToMirrorOnly(key, region);
+            }
             if (!solveWindow) {
-                if (region.attached() || region.serviceActive || region.serviceReady) {
-                    downgradeWindowToMirrorOnly(key, region);
-                    continue;
-                }
                 if (region.sections == null) {
                     initializeWindowFromMirror(key, region);
                 } else {
@@ -3211,22 +3207,15 @@ public final class AeroServerRuntime {
                 continue;
             }
             if (!region.fullWindowSectionsRequested && currentServer != null) {
-                requestWindowSections(currentServer, key, true);
+                requestWindowSections(currentServer, key, false);
                 region.fullWindowSectionsRequested = true;
             }
-            if (!synchronizeRegionRecordFromMirror(key, region)) {
-                continue;
+            if (region.sections == null) {
+                initializeWindowFromMirror(key, region);
+            } else {
+                refreshWindowFromMirror(key, region);
             }
-            if (!attachOrRefreshRegionWindow(key, region)) {
-                continue;
-            }
-            refreshRegionFansIfNeeded(key, region);
-            if (!region.busy.get() && shouldRefreshWindowThermal(region)) {
-                refreshRegionThermalInSimulation(key, region);
-            }
-            if (region.forcingDirty) {
-                uploadRegionFanForcingToSimulation(key, region);
-            }
+            prewarmMirrorOnlyWindowCoreStaticBrick(key);
         }
         for (WindowKey key : mirrorOnlyWindowKeysToRemove) {
             RegionRecord region = regions.get(key);
@@ -3317,7 +3306,7 @@ public final class AeroServerRuntime {
             RegionRecord region = new RegionRecord();
             regions.put(key, region);
             if (server != null) {
-                requestWindowSections(server, key, true);
+                requestWindowSections(server, key, false);
                 region.fullWindowSectionsRequested = true;
             }
         }
@@ -3517,93 +3506,6 @@ public final class AeroServerRuntime {
                 }
             }
         }
-    }
-
-    private float synchronizeRegionSeams(List<ActiveWindow> solveWindows) {
-        if (solveWindows.isEmpty() || simulationServiceId == 0L) {
-            return 0.0f;
-        }
-        Set<WindowKey> solveKeys = new HashSet<>(solveWindows.size());
-        for (ActiveWindow active : solveWindows) {
-            solveKeys.add(active.key());
-        }
-        if (solveKeys.isEmpty()) {
-            return 0.0f;
-        }
-        Map<WindowKey, ActiveWindow> activeByKey = new HashMap<>(solveWindows.size());
-        for (ActiveWindow active : solveWindows) {
-            activeByKey.put(active.key(), active);
-        }
-        int maxPairs = solveWindows.size() * 3;
-        long[] regionPairs = new long[Math.max(0, maxPairs * 2)];
-        int[] offsets = new int[Math.max(0, maxPairs * 3)];
-        int exchangeCount = 0;
-        for (ActiveWindow active : solveWindows) {
-            if (active.region().sections == null || active.region().busy.get()) {
-                continue;
-            }
-            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, solveKeys, active, 1, 0, 0, regionPairs, offsets, exchangeCount);
-            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, solveKeys, active, 0, 1, 0, regionPairs, offsets, exchangeCount);
-            exchangeCount = appendPositiveNeighborHaloBatch(activeByKey, solveKeys, active, 0, 0, 1, regionPairs, offsets, exchangeCount);
-        }
-        if (exchangeCount == 0) {
-            return 0.0f;
-        }
-        int appliedCount = simulationBridge.exchangeRegionHaloBatch(simulationServiceId, regionPairs, offsets, exchangeCount);
-        if (appliedCount < 0) {
-            String nativeError = simulationBridge.lastError();
-            String runtimeInfo = simulationBridge.runtimeInfo();
-            StringBuilder message = new StringBuilder("Native halo batch exchange failed");
-            if (nativeError != null && !nativeError.isBlank()
-                && !"not_initialized".equals(nativeError)
-                && !"not_loaded".equals(nativeError)) {
-                message.append(": ").append(nativeError);
-            }
-            if (runtimeInfo != null && !runtimeInfo.isBlank()
-                && !"not_initialized".equals(runtimeInfo)
-                && !"not_loaded".equals(runtimeInfo)) {
-                message.append(" [runtime=").append(runtimeInfo).append("]");
-            }
-            lastSolverError = message.toString();
-        }
-        return 0.0f;
-    }
-
-    private int appendPositiveNeighborHaloBatch(
-        Map<WindowKey, ActiveWindow> activeByKey,
-        Set<WindowKey> solveKeys,
-        ActiveWindow active,
-        int dx,
-        int dy,
-        int dz,
-        long[] regionPairs,
-        int[] offsets,
-        int exchangeCount
-    ) {
-        WindowKey key = active.key();
-        BlockPos neighborOrigin = key.origin().add(
-            dx * REGION_LATTICE_STRIDE,
-            dy * REGION_LATTICE_STRIDE,
-            dz * REGION_LATTICE_STRIDE
-        );
-        WindowKey neighborKey = new WindowKey(key.worldKey(), neighborOrigin);
-        ActiveWindow neighborActive = activeByKey.get(neighborKey);
-        if (!solveKeys.contains(neighborKey)
-            || neighborActive == null
-            || neighborActive.region().sections == null
-            || neighborActive.region().busy.get()
-            || active.region().backendResetPending()
-            || neighborActive.region().backendResetPending()) {
-            return exchangeCount;
-        }
-        int pairBase = exchangeCount * 2;
-        int offsetBase = exchangeCount * 3;
-        regionPairs[pairBase] = simulationRegionKey(key);
-        regionPairs[pairBase + 1] = simulationRegionKey(neighborKey);
-        offsets[offsetBase] = dx;
-        offsets[offsetBase + 1] = dy;
-        offsets[offsetBase + 2] = dz;
-        return exchangeCount + 1;
     }
 
     private boolean shouldRefreshWindowThermal(RegionRecord region) {
@@ -4087,6 +3989,7 @@ public final class AeroServerRuntime {
         StringBuilder builder = new StringBuilder(1 << 15);
         builder.append("{\n");
         appendJsonField(builder, "format", "a4mc_inspection_patch_v2", true);
+        appendJsonField(builder, "deprecated", true, true);
         appendJsonField(builder, "capture_mode", "monolithic_patch_input", true);
         appendJsonField(builder, "dimension_id", worldKey.getValue().toString(), true);
         appendJsonField(builder, "tick", tickCounter, true);
@@ -5984,45 +5887,6 @@ public final class AeroServerRuntime {
         return 0;
     }
 
-    private SolveSnapshot createSolveSnapshot(
-        WindowKey key,
-        RegionRecord region,
-        float speedCap,
-        long generation,
-        Set<WindowKey> activeKeys
-    ) {
-        int externalFaceMask = computeExternalFaceMask(key, activeKeys);
-        CachedBoundaryData boundaryData = cachedBoundaryDataForWindow(key, region, externalFaceMask);
-        return new SolveSnapshot(
-            key,
-            region,
-            key.origin(),
-            List.copyOf(region.fans),
-            speedCap,
-            generation,
-            boundaryData.boundarySample(),
-            boundaryData.boundaryField(),
-            collectTornadoRegionDescriptors(key)
-        );
-    }
-
-    private CachedBoundaryData cachedBoundaryDataForWindow(WindowKey key, RegionRecord region, int externalFaceMask) {
-        if (externalFaceMask == 0) {
-            region.clearBoundaryCache();
-            return new CachedBoundaryData(null, null);
-        }
-        boolean refreshBoundary = region.cachedBoundarySample() == null
-            || region.cachedBoundaryField() == null
-            || region.cachedBoundaryExternalFaceMask() != externalFaceMask
-            || tickCounter - region.lastBoundaryRefreshTick() >= BOUNDARY_FIELD_REFRESH_TICKS;
-        if (refreshBoundary) {
-            NestedBoundaryCoupler.BoundarySample boundarySample = sampleNestedBoundaryAtWindow(key);
-            BoundaryFieldData boundaryField = sampleNestedBoundaryFieldAtWindow(key, externalFaceMask, boundarySample);
-            region.updateBoundaryCache(boundarySample, boundaryField, externalFaceMask, tickCounter);
-        }
-        return new CachedBoundaryData(region.cachedBoundarySample(), region.cachedBoundaryField());
-    }
-
     private BackgroundMetGrid.Sample sampleBackgroundMetAtWindow(WindowKey key) {
         BackgroundMetGrid grid = backgroundMetGrids.get(key.worldKey());
         if (grid == null) {
@@ -6199,29 +6063,6 @@ public final class AeroServerRuntime {
             case 2 -> MathHelper.clamp((1.0f - progress) / 0.25f, 0.0f, 1.0f);
             default -> 0.0f;
         };
-    }
-
-    private int computeExternalFaceMask(WindowKey key, Set<WindowKey> activeKeys) {
-        int mask = 0;
-        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(-REGION_LATTICE_STRIDE, 0, 0)))) {
-            mask |= 1 << Direction.WEST.ordinal();
-        }
-        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(REGION_LATTICE_STRIDE, 0, 0)))) {
-            mask |= 1 << Direction.EAST.ordinal();
-        }
-        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, -REGION_LATTICE_STRIDE, 0)))) {
-            mask |= 1 << Direction.DOWN.ordinal();
-        }
-        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, REGION_LATTICE_STRIDE, 0)))) {
-            mask |= 1 << Direction.UP.ordinal();
-        }
-        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, 0, -REGION_LATTICE_STRIDE)))) {
-            mask |= 1 << Direction.NORTH.ordinal();
-        }
-        if (!activeKeys.contains(new WindowKey(key.worldKey(), key.origin().add(0, 0, REGION_LATTICE_STRIDE)))) {
-            mask |= 1 << Direction.SOUTH.ordinal();
-        }
-        return mask;
     }
 
     private void fillVerticalBoundaryFace(
@@ -6716,117 +6557,188 @@ public final class AeroServerRuntime {
         }
     }
 
-    private float runSolverStep(SolveSnapshot snapshot) throws IOException {
-        if (!simulationBridge.isLoaded()) {
-            throw new IOException("Simulation bridge not loaded: " + simulationBridge.getLoadError());
-        }
-        if (!ensureSimulationL2Runtime()) {
-            throw new IOException("Native backend initialization failed");
-        }
-        float[] tornadoDescriptors = flattenTornadoDescriptors(snapshot.tornadoDescriptors());
-        float maxSpeed = simulationBridge.stepRegionStored(
-            simulationServiceId,
-            simulationRegionKey(snapshot.key()),
-            GRID_SIZE,
-            GRID_SIZE,
-            GRID_SIZE,
-            snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windX() / NATIVE_VELOCITY_SCALE,
-            snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windY() / NATIVE_VELOCITY_SCALE,
-            snapshot.boundarySample() == null ? 0.0f : snapshot.boundarySample().windZ() / NATIVE_VELOCITY_SCALE,
-            snapshot.boundarySample() == null ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K : snapshot.boundarySample().ambientAirTemperatureKelvin(),
-            snapshot.boundaryField() == null ? 0 : snapshot.boundaryField().externalFaceMask(),
-            snapshot.boundaryField() == null ? 0 : snapshot.boundaryField().faceResolution(),
-            snapshot.boundaryField() == null ? null : snapshot.boundaryField().windX(),
-            snapshot.boundaryField() == null ? null : snapshot.boundaryField().windY(),
-            snapshot.boundaryField() == null ? null : snapshot.boundaryField().windZ(),
-            snapshot.boundaryField() == null ? null : snapshot.boundaryField().airTemperatureKelvin(),
-            0,
-            0.0f,
-            0.0f,
-            snapshot.tornadoDescriptors().size(),
-            tornadoDescriptors
-        );
-        if (!Float.isFinite(maxSpeed)) {
-            String nativeError = simulationBridge.lastError();
-            String runtimeInfo = simulationBridge.runtimeInfo();
-            StringBuilder message = new StringBuilder("Native backend returned invalid max speed");
-            if (nativeError != null && !nativeError.isBlank()
-                && !"not_initialized".equals(nativeError)
-                && !"not_loaded".equals(nativeError)) {
-                message.append(": ").append(nativeError);
-            }
-            if (runtimeInfo != null && !runtimeInfo.isBlank()
-                && !"not_initialized".equals(runtimeInfo)
-                && !"not_loaded".equals(runtimeInfo)) {
-                message.append(" [runtime=").append(runtimeInfo).append("]");
-            }
-            throw new IOException(message.toString());
-        }
-        return maxSpeed * NATIVE_VELOCITY_SCALE;
+    private int sanitizeStride(int requested) {
+        return (requested == 1 || requested == 2 || requested == 4 || requested == 8) ? requested : PARTICLE_FLOW_SAMPLE_STRIDE;
     }
 
-    private boolean syncSolveWindowCoreDynamicBrick(SolveSnapshot snapshot) {
+    private BrickRuntimeDynamicState copyBrickRuntimeDynamicState(
+        RegistryKey<World> worldKey,
+        int brickX,
+        int brickY,
+        int brickZ
+    ) {
         if (simulationServiceId == 0L || !simulationBridge.isLoaded()) {
-            return false;
+            return null;
         }
-        BlockPos coreOrigin = snapshot.key().origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
-        boolean synced = simulationBridge.syncRegionCoreToBrickWorld(
+        int brickCells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
+        float[] flowState = new float[brickCells * RESPONSE_CHANNELS];
+        float[] airTemperatureState = new float[brickCells];
+        float[] surfaceTemperatureState = new float[brickCells];
+        boolean copied = simulationBridge.copyBrickWorldDynamicBrick(
             simulationServiceId,
-            simulationRegionKey(snapshot.key()),
-            simulationWorldKey(snapshot.key().worldKey()),
-            GRID_SIZE,
-            GRID_SIZE,
-            GRID_SIZE,
-            REGION_HALO_CELLS,
-            REGION_HALO_CELLS,
-            REGION_HALO_CELLS,
+            simulationWorldKey(worldKey),
             BRICK_RUNTIME_SIZE,
-            BRICK_RUNTIME_SIZE,
-            BRICK_RUNTIME_SIZE,
+            brickX,
+            brickY,
+            brickZ,
+            flowState,
+            airTemperatureState,
+            surfaceTemperatureState
+        );
+        if (!copied) {
+            return null;
+        }
+        return new BrickRuntimeDynamicState(flowState, airTemperatureState, surfaceTemperatureState);
+    }
+
+    private SampledPoint sampleBrickRuntimePointLocked(RegistryKey<World> worldKey, BlockPos probePos) {
+        int brickX = Math.floorDiv(probePos.getX(), BRICK_RUNTIME_SIZE);
+        int brickY = Math.floorDiv(probePos.getY(), BRICK_RUNTIME_SIZE);
+        int brickZ = Math.floorDiv(probePos.getZ(), BRICK_RUNTIME_SIZE);
+        BrickRuntimeDynamicState brickState = copyBrickRuntimeDynamicState(worldKey, brickX, brickY, brickZ);
+        if (brickState == null) {
+            return null;
+        }
+        int localX = probePos.getX() - brickX * BRICK_RUNTIME_SIZE;
+        int localY = probePos.getY() - brickY * BRICK_RUNTIME_SIZE;
+        int localZ = probePos.getZ() - brickZ * BRICK_RUNTIME_SIZE;
+        if (localX < 0 || localX >= BRICK_RUNTIME_SIZE
+            || localY < 0 || localY >= BRICK_RUNTIME_SIZE
+            || localZ < 0 || localZ >= BRICK_RUNTIME_SIZE) {
+            return null;
+        }
+        int cell = patchCellIndex(localX, localY, localZ, BRICK_RUNTIME_SIZE);
+        int base = cell * RESPONSE_CHANNELS;
+        ThermalEnvironment environment = sampleThermalEnvironment(
+            worldEnvironmentSnapshots.get(worldKey),
+            worldKey,
+            probePos,
+            SOLVER_STEP_SECONDS
+        );
+        return new SampledPoint(
+            brickState.flowState()[base] * NATIVE_VELOCITY_SCALE,
+            brickState.flowState()[base + 1] * NATIVE_VELOCITY_SCALE,
+            brickState.flowState()[base + 2] * NATIVE_VELOCITY_SCALE,
+            brickState.flowState()[base + 3],
+            environment.ambientAirTemperatureKelvin()
+                + brickState.airTemperatureState()[cell] * RUNTIME_TEMPERATURE_SCALE_KELVIN,
+            brickState.surfaceTemperatureState()[cell]
+        );
+    }
+
+    private short quantizeSignedToShort(float value, float range) {
+        if (!(range > 0.0f) || !Float.isFinite(value)) {
+            return 0;
+        }
+        float normalized = MathHelper.clamp(value / range, -1.0f, 1.0f);
+        return (short) Math.round(normalized * 32767.0f);
+    }
+
+    private BrickRuntimeAtlasSnapshot sampleBrickRuntimeCoreAtlas(WindowKey key, int sampleStride) {
+        BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
+        BrickRuntimeDynamicState brickState = copyBrickRuntimeDynamicState(
+            key.worldKey(),
             Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE),
             Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
             Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE)
         );
-        if (!synced) {
-            String error = simulationBridge.lastError();
-            if (error != null && !error.isBlank()) {
-                log("Brick core dynamic sync failed for window " + formatPos(snapshot.origin()) + ": " + error);
-            }
-        }
-        return synced;
-    }
-
-    private float[] flattenTornadoDescriptors(List<TornadoRegionDescriptor> descriptors) {
-        if (descriptors == null || descriptors.isEmpty()) {
+        if (brickState == null) {
             return null;
         }
-        float[] flat = new float[descriptors.size() * NativeSimulationBridge.TORNADO_DESCRIPTOR_FLOATS];
-        int base = 0;
-        for (TornadoRegionDescriptor descriptor : descriptors) {
-            flat[base] = descriptor.centerXBlocks();
-            flat[base + 1] = descriptor.centerYBlocks();
-            flat[base + 2] = descriptor.centerZBlocks();
-            flat[base + 3] = descriptor.translationXBlocksPerSecond();
-            flat[base + 4] = descriptor.translationZBlocksPerSecond();
-            flat[base + 5] = descriptor.coreRadiusBlocks();
-            flat[base + 6] = descriptor.influenceRadiusBlocks();
-            flat[base + 7] = descriptor.tangentialWindScaleMps() / NATIVE_VELOCITY_SCALE;
-            flat[base + 8] = descriptor.radialInflowScaleMps() / NATIVE_VELOCITY_SCALE;
-            flat[base + 9] = descriptor.updraftScale() / NATIVE_VELOCITY_SCALE;
-            flat[base + 10] = descriptor.condensationBias();
-            flat[base + 11] = descriptor.intensity();
-            flat[base + 12] = descriptor.rotationSign();
-            flat[base + 13] = descriptor.stateOrdinal();
-            flat[base + 14] = descriptor.lifecycleEnvelope();
-            flat[base + 15] = descriptor.id();
-            flat[base + 16] = descriptor.parentConvectiveClusterId();
-            base += NativeSimulationBridge.TORNADO_DESCRIPTOR_FLOATS;
+        float maxSpeed = 0.0f;
+        for (int cell = 0; cell < BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE; cell++) {
+            int srcBase = cell * RESPONSE_CHANNELS;
+            float vx = brickState.flowState()[srcBase] * NATIVE_VELOCITY_SCALE;
+            float vy = brickState.flowState()[srcBase + 1] * NATIVE_VELOCITY_SCALE;
+            float vz = brickState.flowState()[srcBase + 2] * NATIVE_VELOCITY_SCALE;
+            float speed = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
+            if (Float.isFinite(speed) && speed > maxSpeed) {
+                maxSpeed = speed;
+            }
         }
-        return flat;
+        int n = (GRID_SIZE + sampleStride - 1) / sampleStride;
+        short[] packed = new short[n * n * n * NativeSimulationBridge.PACKED_ATLAS_CHANNELS];
+        boolean hasCoreSamples = false;
+        for (int sx = 0; sx < n; sx++) {
+            int gx = Math.min(GRID_SIZE - 1, sx * sampleStride);
+            if (gx < REGION_HALO_CELLS || gx >= REGION_HALO_CELLS + BRICK_RUNTIME_SIZE) {
+                continue;
+            }
+            int bx = gx - REGION_HALO_CELLS;
+            for (int sy = 0; sy < n; sy++) {
+                int gy = Math.min(GRID_SIZE - 1, sy * sampleStride);
+                if (gy < REGION_HALO_CELLS || gy >= REGION_HALO_CELLS + BRICK_RUNTIME_SIZE) {
+                    continue;
+                }
+                int by = gy - REGION_HALO_CELLS;
+                for (int sz = 0; sz < n; sz++) {
+                    int gz = Math.min(GRID_SIZE - 1, sz * sampleStride);
+                    if (gz < REGION_HALO_CELLS || gz >= REGION_HALO_CELLS + BRICK_RUNTIME_SIZE) {
+                        continue;
+                    }
+                    int bz = gz - REGION_HALO_CELLS;
+                    int srcCell = patchCellIndex(bx, by, bz, BRICK_RUNTIME_SIZE);
+                    int srcBase = srcCell * RESPONSE_CHANNELS;
+                    int dstCell = ((sx * n) + sy) * n + sz;
+                    int dstBase = dstCell * NativeSimulationBridge.PACKED_ATLAS_CHANNELS;
+                    packed[dstBase] = quantizeSignedToShort(
+                        brickState.flowState()[srcBase],
+                        ATLAS_VELOCITY_QUANT_RANGE
+                    );
+                    packed[dstBase + 1] = quantizeSignedToShort(
+                        brickState.flowState()[srcBase + 1],
+                        ATLAS_VELOCITY_QUANT_RANGE
+                    );
+                    packed[dstBase + 2] = quantizeSignedToShort(
+                        brickState.flowState()[srcBase + 2],
+                        ATLAS_VELOCITY_QUANT_RANGE
+                    );
+                    packed[dstBase + 3] = quantizeSignedToShort(
+                        brickState.flowState()[srcBase + 3],
+                        ATLAS_PRESSURE_QUANT_RANGE
+                    );
+                    hasCoreSamples = true;
+                }
+            }
+        }
+        return hasCoreSamples ? new BrickRuntimeAtlasSnapshot(packed, maxSpeed) : null;
     }
 
-    private int sanitizeStride(int requested) {
-        return (requested == 1 || requested == 2 || requested == 4 || requested == 8) ? requested : PARTICLE_FLOW_SAMPLE_STRIDE;
+    private float publishBrickSolveAtlases(Set<WindowKey> solveWindowKeys) {
+        if (solveWindowKeys.isEmpty()) {
+            publishedFrame.set(null);
+            lastPublishedFrameTick = Integer.MIN_VALUE;
+            lastCoordinatorPublishedMaxSpeed = 0.0f;
+            return 0.0f;
+        }
+        Map<WindowKey, short[]> atlases = new HashMap<>();
+        Map<WindowKey, Float> regionMaxSpeeds = new HashMap<>();
+        for (WindowKey key : solveWindowKeys) {
+            BrickRuntimeAtlasSnapshot atlas = sampleBrickRuntimeCoreAtlas(key, PARTICLE_FLOW_SAMPLE_STRIDE);
+            if (atlas == null) {
+                continue;
+            }
+            atlases.put(key, atlas.packed());
+            regionMaxSpeeds.put(key, atlas.maxSpeed());
+        }
+        if (atlases.isEmpty()) {
+            publishedFrame.set(null);
+            lastPublishedFrameTick = Integer.MIN_VALUE;
+            lastCoordinatorPublishedMaxSpeed = 0.0f;
+            return 0.0f;
+        }
+        float maxSpeed = computePublishedMaxSpeed(regionMaxSpeeds);
+        PublishedFrame next = new PublishedFrame(
+            publishedFrameCounter.incrementAndGet(),
+            maxSpeed,
+            Map.copyOf(atlases),
+            Map.copyOf(regionMaxSpeeds)
+        );
+        publishedFrame.set(next);
+        lastPublishedFrameTick = tickCounter;
+        lastCoordinatorPublishedMaxSpeed = maxSpeed;
+        lastCoordinatorPublishTick = tickCounter;
+        return maxSpeed;
     }
 
     private void updateSimulationRate(int steppedTicks) {
@@ -6878,53 +6790,7 @@ public final class AeroServerRuntime {
     }
 
     private void waitForSolverIdle() {
-        while (activeSolveTasks.get() != 0) {
-            try {
-                Thread.sleep(1L);
-            } catch (InterruptedException ex) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-        }
-    }
-
-    private void runSolveTask(SolveSnapshot snapshot, CountDownLatch completionLatch) {
-        RegionRecord region = snapshot.region();
-        try {
-            if (snapshot.generation() != runtimeGeneration.get()) {
-                return;
-            }
-            float maxSpeed = runSolverStep(snapshot);
-            if (snapshot.generation() == runtimeGeneration.get()) {
-                region.completedMaxSpeed = maxSpeed;
-                completedSolveCounter.incrementAndGet();
-                lastCoordinatorSolveCompleteTick = tickCounter;
-                lastSolverError = "";
-                if (region.shouldSyncBrickDynamic(tickCounter) && syncSolveWindowCoreDynamicBrick(snapshot)) {
-                    region.noteBrickDynamicSynced(tickCounter);
-                }
-                publishPlayerProbesForSolvedRegion(snapshot);
-                publishRegionAtlas(snapshot.key(), maxSpeed);
-                pollRegionNestedFeedback(snapshot.key(), region);
-            }
-        } catch (IOException ex) {
-            if (snapshot.generation() == runtimeGeneration.get()) {
-                lastSolverError = ex.getMessage();
-            }
-            log("Solver error for window " + formatPos(snapshot.origin()) + ": " + ex.getMessage());
-            if (simulationServiceId != 0L) {
-                simulationBridge.releaseRegionRuntime(simulationServiceId, simulationRegionKey(snapshot.key()));
-            }
-        } finally {
-            region.busy.set(false);
-            if (!region.attached()) {
-                releaseWindow(snapshot.key(), region);
-            }
-            activeSolveTasks.decrementAndGet();
-            if (completionLatch != null) {
-                completionLatch.countDown();
-            }
-        }
+        // Window solve tasks no longer exist; brick epochs run synchronously in the coordinator.
     }
 
     private void ensureSimulationCoordinatorRunning() {
@@ -6949,125 +6815,8 @@ public final class AeroServerRuntime {
         }
     }
 
-    private List<ActiveWindow> snapshotWindowsForCoordinatorLocked(Set<WindowKey> keys) {
-        if (regions.isEmpty() || keys.isEmpty()) {
-            return List.of();
-        }
-        List<ActiveWindow> snapshot = new ArrayList<>(keys.size());
-        for (WindowKey key : keys) {
-            RegionRecord region = regions.get(key);
-            if (region == null) {
-                continue;
-            }
-            if (!region.serviceReady || !region.attached()) {
-                continue;
-            }
-            if (region.sections == null) {
-                continue;
-            }
-            snapshot.add(new ActiveWindow(key, region));
-        }
-        return snapshot;
-    }
-
-    private float applyCompletedResults(List<ActiveWindow> activeWindows) {
-        float maxSpeedThisCycle = 0.0f;
-        for (ActiveWindow active : activeWindows) {
-            float completedMaxSpeed = active.region().completedMaxSpeed;
-            if (!Float.isFinite(completedMaxSpeed) || completedMaxSpeed <= 0.0f) {
-                continue;
-            }
-            active.region().completedMaxSpeed = 0.0f;
-            maxSpeedThisCycle = Math.max(maxSpeedThisCycle, completedMaxSpeed);
-            lastSolverError = "";
-        }
-        return maxSpeedThisCycle;
-    }
-
-    private void resetPendingBackends(List<ActiveWindow> activeWindows) {
-        for (ActiveWindow active : activeWindows) {
-            RegionRecord region = active.region();
-            if (!region.busy.get() && region.backendResetPending()) {
-                resetWindowBackend(active.key(), region);
-            }
-        }
-    }
-
-    private CountDownLatch scheduleSolveCycle(List<ActiveWindow> solveWindows) {
-        if (solveWindows.isEmpty()) {
-            return null;
-        }
-        List<SolveSnapshot> scheduled = new ArrayList<>(solveWindows.size());
-        Set<WindowKey> solveKeys = new HashSet<>(solveWindows.size());
-        for (ActiveWindow active : solveWindows) {
-            solveKeys.add(active.key());
-        }
-        for (ActiveWindow active : solveWindows) {
-            RegionRecord region = active.region();
-            if (!region.busy.compareAndSet(false, true)) {
-                continue;
-            }
-            SolveSnapshot snapshot = createSolveSnapshot(
-                active.key(),
-                region,
-                MAX_RUNTIME_WIND_SPEED,
-                runtimeGeneration.get(),
-                solveKeys
-            );
-            scheduled.add(snapshot);
-        }
-        if (scheduled.isEmpty()) {
-            return null;
-        }
-        CountDownLatch completionLatch = new CountDownLatch(scheduled.size());
-        for (SolveSnapshot snapshot : scheduled) {
-            activeSolveTasks.incrementAndGet();
-            solverExecutor.execute(() -> runSolveTask(snapshot, completionLatch));
-        }
-        lastCoordinatorScheduleTick = tickCounter;
-        return completionLatch;
-    }
-
-    private void waitForScheduledSnapshots(CountDownLatch completionLatch) {
-        if (completionLatch == null) {
-            return;
-        }
-        try {
-            while (streamingEnabled
-                && !Thread.currentThread().isInterrupted()
-                && !completionLatch.await(5L, TimeUnit.MILLISECONDS)) {
-                if (activeSolveTasks.get() == 0) {
-                    long remaining = completionLatch.getCount();
-                    if (remaining > 0L) {
-                        lastCoordinatorNoPublishReason = "latchDesync:" + remaining;
-                        log("Simulation coordinator detected latch desync, remaining=" + remaining);
-                    }
-                    break;
-                }
-            }
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
     private int attachedWindowCount() {
-        int count = 0;
-        for (RegionRecord region : regions.values()) {
-            if (region.serviceReady && region.attached()) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    private int busyRegionCount() {
-        int count = 0;
-        for (RegionRecord region : regions.values()) {
-            if (region.busy.get()) {
-                count++;
-            }
-        }
-        return count;
+        return desiredWindowKeys.size();
     }
 
     private int currentPublishedFrameAgeTicks() {
@@ -7258,7 +7007,8 @@ public final class AeroServerRuntime {
             && simulationBridge.pollPackedFlowAtlas(simulationServiceId, simulationRegionKey(key), packed)) {
             return packed;
         }
-        return null;
+        BrickRuntimeAtlasSnapshot atlas = sampleBrickRuntimeCoreAtlas(key, sampleStride);
+        return atlas == null ? null : atlas.packed();
     }
 
     private Map<UUID, PlayerProbe> samplePlayerProbesLocked() {
@@ -7307,6 +7057,10 @@ public final class AeroServerRuntime {
     }
 
     private SampledPoint sampleRegionPointLocked(RegistryKey<World> worldKey, BlockPos probePos, float[] rawProbe) {
+        SampledPoint brickSample = sampleBrickRuntimePointLocked(worldKey, probePos);
+        if (brickSample != null) {
+            return brickSample;
+        }
         WindowKey key = new WindowKey(worldKey, windowOriginFromCoreOrigin(coreOriginForPosition(probePos)));
         RegionRecord region = regions.get(key);
         if (region == null || !region.serviceReady) {
@@ -7322,6 +7076,14 @@ public final class AeroServerRuntime {
         int localZ = probePos.getZ() - key.origin().getZ();
         if (!inBounds(localX, localY, localZ)) {
             return null;
+        }
+        if (localX >= REGION_HALO_CELLS && localX < REGION_HALO_CELLS + BRICK_RUNTIME_SIZE
+            && localY >= REGION_HALO_CELLS && localY < REGION_HALO_CELLS + BRICK_RUNTIME_SIZE
+            && localZ >= REGION_HALO_CELLS && localZ < REGION_HALO_CELLS + BRICK_RUNTIME_SIZE) {
+            SampledPoint brickSample = sampleBrickRuntimePointLocked(worldKey, probePos);
+            if (brickSample != null) {
+                return brickSample;
+            }
         }
         if (!simulationBridge.sampleRegionPoint(
             simulationServiceId,
@@ -7366,39 +7128,6 @@ public final class AeroServerRuntime {
         );
     }
 
-    private void publishPlayerProbesForSolvedRegion(SolveSnapshot snapshot) {
-        if (simulationServiceId == 0L) {
-            return;
-        }
-        List<PlayerProbeRequest> requests = activePlayerProbeRequests;
-        if (requests.isEmpty()) {
-            return;
-        }
-        float[] rawProbe = new float[NativeSimulationBridge.PLAYER_PROBE_CHANNELS];
-        Map<UUID, PlayerProbe> updates = new HashMap<>();
-        for (PlayerProbeRequest request : requests) {
-            if (!snapshot.key().worldKey().equals(request.worldKey())) {
-                continue;
-            }
-            SampledPoint sample = sampleRegionPointForKey(snapshot.key(), request.blockPos(), rawProbe);
-            if (sample == null) {
-                continue;
-            }
-            updates.put(request.playerId(), buildPlayerProbe(request, sample));
-        }
-        if (updates.isEmpty()) {
-            return;
-        }
-        while (true) {
-            Map<UUID, PlayerProbe> current = publishedPlayerProbes.get();
-            Map<UUID, PlayerProbe> next = new HashMap<>(current);
-            next.putAll(updates);
-            if (publishedPlayerProbes.compareAndSet(current, Map.copyOf(next))) {
-                return;
-            }
-        }
-    }
-
     private void releaseWindow(WindowKey key, RegionRecord region) {
         if (!region.markReleased()) {
             return;
@@ -7433,9 +7162,6 @@ public final class AeroServerRuntime {
     }
 
     private record WindowKey(RegistryKey<World> worldKey, BlockPos origin) {
-    }
-
-    private record ActiveWindow(WindowKey key, RegionRecord region) {
     }
 
     private record ThermalEnvironment(
@@ -7635,23 +7361,14 @@ public final class AeroServerRuntime {
     ) {
     }
 
-    private record SolveSnapshot(
-        WindowKey key,
-        RegionRecord region,
-        BlockPos origin,
-        List<FanSource> fans,
-        float speedCap,
-        long generation,
-        NestedBoundaryCoupler.BoundarySample boundarySample,
-        BoundaryFieldData boundaryField,
-        List<TornadoRegionDescriptor> tornadoDescriptors
+    private record BrickRuntimeDynamicState(
+        float[] flowState,
+        float[] airTemperatureState,
+        float[] surfaceTemperatureState
     ) {
     }
 
-    private record CachedBoundaryData(
-        NestedBoundaryCoupler.BoundarySample boundarySample,
-        BoundaryFieldData boundaryField
-    ) {
+    private record BrickRuntimeAtlasSnapshot(short[] packed, float maxSpeed) {
     }
 
     private record TornadoRegionDescriptor(
@@ -7978,7 +7695,6 @@ public final class AeroServerRuntime {
                             applyPendingActiveRegionBatchIfNeeded();
                             applyPendingBackgroundRefreshIfNeeded();
                             applyPendingResidentBrickStaticRefreshesIfNeeded();
-                            stepBrickRuntimeWorlds();
                             refreshDesiredWindowsFromBrickRuntime();
                         }
                         runMesoscaleStepCycle();
@@ -7988,15 +7704,15 @@ public final class AeroServerRuntime {
                         lastSynchronizedTick = observedTick;
                     }
 
-                    List<ActiveWindow> residentWindows;
-                    List<ActiveWindow> solveWindows;
+                    Set<WindowKey> residentWindowKeys;
+                    Set<WindowKey> solveWindowKeys;
                     synchronized (simulationStateLock) {
-                        residentWindows = snapshotWindowsForCoordinatorLocked(desiredWindowKeys);
-                        solveWindows = snapshotWindowsForCoordinatorLocked(desiredSolveWindowKeys);
+                        residentWindowKeys = Set.copyOf(desiredWindowKeys);
+                        solveWindowKeys = Set.copyOf(desiredSolveWindowKeys);
                     }
-                    lastCoordinatorActiveWindowCount = residentWindows.size();
-                    lastCoordinatorSolveWindowCount = solveWindows.size();
-                    if (residentWindows.isEmpty()) {
+                    lastCoordinatorActiveWindowCount = residentWindowKeys.size();
+                    lastCoordinatorSolveWindowCount = solveWindowKeys.size();
+                    if (residentWindowKeys.isEmpty()) {
                         lastCoordinatorState = "noActiveWindows";
                         lastCoordinatorNoPublishReason = "noActiveWindows";
                         lastCoordinatorBusyWindowCount = 0;
@@ -8005,21 +7721,9 @@ public final class AeroServerRuntime {
                         continue;
                     }
 
-                    synchronized (simulationStateLock) {
-                        applyCompletedResults(residentWindows);
-                        resetPendingBackends(residentWindows);
-                    }
+                    lastCoordinatorBusyWindowCount = 0;
 
-                    int busyWindowCount = busyWindowCount(solveWindows);
-                    lastCoordinatorBusyWindowCount = busyWindowCount;
-                    if (busyWindowCount > 0) {
-                        lastCoordinatorState = "busyWindows";
-                        lastCoordinatorNoPublishReason = "busyWindows:" + busyWindowCount;
-                        sleepQuietly(5L);
-                        continue;
-                    }
-
-                    if (solveWindows.isEmpty()) {
+                    if (solveWindowKeys.isEmpty()) {
                         lastCoordinatorState = "noSolveWindows";
                         lastCoordinatorNoPublishReason = "noSolveWindows";
                         sleepQuietly(5L);
@@ -8037,22 +7741,12 @@ public final class AeroServerRuntime {
                         continue;
                     }
 
-                    CountDownLatch completionLatch;
-                    synchronized (simulationStateLock) {
-                        completionLatch = scheduleSolveCycle(solveWindows);
-                    }
-                    lastCoordinatorScheduledWindowCount = completionLatch == null ? 0 : (int) completionLatch.getCount();
-                    if (completionLatch == null) {
-                        lastCoordinatorState = "scheduleNull";
-                        lastCoordinatorNoPublishReason = "scheduleNull";
-                        simulationStepBudget.incrementAndGet();
-                        sleepQuietly(5L);
-                        continue;
-                    }
-
-                    lastCoordinatorState = "waitingSolve";
+                    lastCoordinatorScheduledWindowCount = solveWindowKeys.size();
+                    lastCoordinatorState = "brickEpoch";
                     long waitStartNanos = System.nanoTime();
-                    waitForScheduledSnapshots(completionLatch);
+                    synchronized (simulationStateLock) {
+                        stepBrickRuntimeWorlds();
+                    }
                     lastCoordinatorWaitNanos = System.nanoTime() - waitStartNanos;
                     if (!running.get()) {
                         return;
@@ -8061,20 +7755,13 @@ public final class AeroServerRuntime {
                     lastCoordinatorState = "postSolve";
                     long postSolveStartNanos = System.nanoTime();
                     synchronized (simulationStateLock) {
-                        lastCoordinatorState = "applyResults";
-                        float maxSpeedThisCycle = applyCompletedResults(residentWindows);
-                        lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
-                        // Halo exchange is the dominant post-solve synchronization cost.
-                        // Run it once after the current solve batch completes instead of
-                        // repeating the same work again before the next batch starts.
-                        lastCoordinatorState = "syncSeams";
-                        maxSpeedThisCycle = Math.max(maxSpeedThisCycle, synchronizeRegionSeams(solveWindows));
-                        lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
-                        lastCoordinatorState = "resetBackends";
-                        resetPendingBackends(residentWindows);
                         lastCoordinatorState = "sampleProbes";
                         publishedPlayerProbes.set(samplePlayerProbesLocked());
                         publishedEntitySamples.set(sampleEntitySamplesLocked());
+                        lastCoordinatorState = "publishBrickAtlases";
+                        float maxSpeedThisCycle = publishBrickSolveAtlases(solveWindowKeys);
+                        lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
+                        lastCoordinatorSolveCompleteTick = tickCounter;
                         lastCoordinatorState = "published";
                         lastCoordinatorNoPublishReason = "";
                         PublishedFrame currentFrame = publishedFrame.get();
@@ -8093,16 +7780,6 @@ public final class AeroServerRuntime {
             } finally {
                 running.set(false);
             }
-        }
-
-        private int busyWindowCount(List<ActiveWindow> activeWindows) {
-            int count = 0;
-            for (ActiveWindow active : activeWindows) {
-                if (active.region().busy.get()) {
-                    count++;
-                }
-            }
-            return count;
         }
 
         private boolean acquireSimulationStepBudget() {

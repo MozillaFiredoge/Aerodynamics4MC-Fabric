@@ -129,8 +129,10 @@ struct BrickData {
     bool pending_reinit = false;
     std::uint64_t last_hint_epoch = 0;
     std::uint64_t last_active_epoch = 0;
+    long long context_key = 0;
     std::shared_ptr<const StaticRegionData> static_region;
     std::shared_ptr<DynamicRegionData> dynamic_region;
+    std::vector<float> packet_cache;
 };
 
 struct FluidWorldRuntime {
@@ -168,6 +170,7 @@ struct ServiceState {
     std::unordered_map<long long, AtlasData> atlases;
     std::unordered_map<long long, std::shared_ptr<const RegionPacketTemplateData>> packet_templates;
     std::unordered_map<long long, FluidWorldRuntime> brick_world_runtimes;
+    long long next_internal_context_key = -1;
     int next_pending_static_brick_upload_id = 1;
     std::unordered_map<int, PendingStaticBrickUpload> pending_static_brick_uploads;
 };
@@ -267,9 +270,18 @@ constexpr float k_air_specific_heat_j_per_kg_k = 1005.0f;
 constexpr float k_native_thermal_source_max = 0.006f;
 constexpr float k_thermal_surface_init_min_k = 220.0f;
 constexpr float k_thermal_surface_max_k = 1800.0f;
-constexpr int k_brick_face_coupling_layers = 2;
-constexpr float k_brick_face_relaxation = 0.25f;
+constexpr int k_brick_face_ghost_layers = 1;
 constexpr std::uint64_t k_brick_inactive_retention_epochs = 16;
+constexpr int k_brick_face_neighbor_count = 6;
+constexpr int k_brick_face_neighbor_offsets[k_brick_face_neighbor_count][3] = {
+    {-1, 0, 0}, {1, 0, 0},
+    {0, -1, 0}, {0, 1, 0},
+    {0, 0, -1}, {0, 0, 1}
+};
+constexpr int k_brick_face_neighbor_axes[k_brick_face_neighbor_count] = {0, 0, 1, 1, 2, 2};
+constexpr bool k_brick_face_neighbor_positive_faces[k_brick_face_neighbor_count] = {
+    false, true, false, true, false, true
+};
 constexpr uint8_t k_surface_kind_none = 0;
 constexpr uint8_t k_surface_kind_rock = 1;
 constexpr uint8_t k_surface_kind_soil = 2;
@@ -530,6 +542,17 @@ void recompute_runtime_active_flags(FluidWorldRuntime& runtime) {
     }
 }
 
+long long allocate_internal_context_key(ServiceState& service) {
+    return service.next_internal_context_key--;
+}
+
+void release_brick_context(BrickData& brick) {
+    if (brick.context_key != 0) {
+        aero_lbm_release_context(brick.context_key);
+        brick.context_key = 0;
+    }
+}
+
 void prune_inactive_bricks(FluidWorldRuntime& runtime) {
     for (auto iterator = runtime.bricks.begin(); iterator != runtime.bricks.end();) {
         const BrickData& brick = iterator->second;
@@ -543,6 +566,7 @@ void prune_inactive_bricks(FluidWorldRuntime& runtime) {
             ++iterator;
             continue;
         }
+        release_brick_context(iterator->second);
         runtime.active_hint_closure.erase(iterator->first);
         iterator = runtime.bricks.erase(iterator);
     }
@@ -552,6 +576,7 @@ bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicR
 void ensure_brick_dynamic_region_storage(FluidWorldRuntime& runtime, BrickData& brick);
 void reset_brick_dynamic_region_state(FluidWorldRuntime& runtime, BrickData& brick);
 void apply_brick_static_constraints(FluidWorldRuntime& runtime, BrickData& brick);
+float temperature_source_from_power_watts(float thermal_power_watts);
 struct BrickMeanState;
 BrickMeanState compute_brick_mean_state(const DynamicRegionData& dynamic);
 void seed_brick_from_neighbor_means(
@@ -560,13 +585,32 @@ void seed_brick_from_neighbor_means(
     const std::unordered_map<BrickCoord, std::shared_ptr<const DynamicRegionData>, BrickCoordHash>& snapshots,
     DynamicRegionData& dynamic
 );
-void relax_brick_face_from_neighbor(
+void copy_brick_face_ghost_from_neighbor(
     const FluidWorldRuntime& runtime,
     const DynamicRegionData& neighbor,
     int axis,
     bool positive_face,
-    float relax,
-    int layers,
+    DynamicRegionData& dynamic
+);
+bool exchange_brick_face_context_halo(
+    const FluidWorldRuntime& runtime,
+    BrickData& first,
+    BrickData& second,
+    int offset_x,
+    int offset_y,
+    int offset_z
+);
+bool build_brick_step_packet(
+    const FluidWorldRuntime& runtime,
+    const BrickData& brick,
+    const DynamicRegionData& dynamic,
+    std::vector<float>& packet
+);
+bool sync_brick_dynamic_from_context(const FluidWorldRuntime& runtime, BrickData& brick);
+bool step_brick_actual(
+    ServiceState& service,
+    FluidWorldRuntime& runtime,
+    BrickData& brick,
     DynamicRegionData& dynamic
 );
 void apply_pending_world_deltas(ServiceState& service, long long world_key, FluidWorldRuntime& runtime);
@@ -586,6 +630,9 @@ void step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
                 continue;
             }
             const bool had_dynamic = brick.dynamic_region != nullptr;
+            if ((brick.pending_reinit || !had_dynamic) && brick.context_key != 0) {
+                release_brick_context(brick);
+            }
             if ((brick.pending_reinit || !had_dynamic) && brick.static_region) {
                 reset_brick_dynamic_region_state(runtime, brick);
                 apply_brick_static_constraints(runtime, brick);
@@ -607,13 +654,38 @@ void step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             snapshots.emplace(entry.first, entry.second.dynamic_region);
         }
 
-        static constexpr int neighbor_offsets[6][3] = {
-            {-1, 0, 0}, {1, 0, 0},
-            {0, -1, 0}, {0, 1, 0},
-            {0, 0, -1}, {0, 0, 1}
-        };
-        static constexpr int neighbor_axes[6] = {0, 0, 1, 1, 2, 2};
-        static constexpr bool neighbor_positive_faces[6] = {false, true, false, true, false, true};
+        for (auto& entry : runtime.bricks) {
+            BrickData& brick = entry.second;
+            if (!brick.active || brick.context_key == 0) {
+                continue;
+            }
+            for (int i = 0; i < k_brick_face_neighbor_count; ++i) {
+                if (!k_brick_face_neighbor_positive_faces[i]) {
+                    continue;
+                }
+                BrickCoord neighbor_coord{
+                    entry.first.x + k_brick_face_neighbor_offsets[i][0],
+                    entry.first.y + k_brick_face_neighbor_offsets[i][1],
+                    entry.first.z + k_brick_face_neighbor_offsets[i][2]
+                };
+                auto neighbor_it = runtime.bricks.find(neighbor_coord);
+                if (neighbor_it == runtime.bricks.end()) {
+                    continue;
+                }
+                BrickData& neighbor = neighbor_it->second;
+                if (!neighbor.active || neighbor.context_key == 0) {
+                    continue;
+                }
+                exchange_brick_face_context_halo(
+                    runtime,
+                    brick,
+                    neighbor,
+                    k_brick_face_neighbor_offsets[i][0],
+                    k_brick_face_neighbor_offsets[i][1],
+                    k_brick_face_neighbor_offsets[i][2]
+                );
+            }
+        }
 
         for (auto& entry : runtime.bricks) {
             BrickData& brick = entry.second;
@@ -622,33 +694,39 @@ void step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             }
             ensure_brick_dynamic_region_storage(runtime, brick);
             auto next_dynamic = std::make_shared<DynamicRegionData>(*brick.dynamic_region);
-            if (needs_seed.find(entry.first) != needs_seed.end()) {
+            const bool bootstrap_macro_ghost =
+                needs_seed.find(entry.first) != needs_seed.end() || brick.context_key == 0;
+            if (bootstrap_macro_ghost) {
                 seed_brick_from_neighbor_means(runtime, entry.first, snapshots, *next_dynamic);
-            }
-            for (int i = 0; i < 6; ++i) {
-                BrickCoord neighbor_coord{
-                    entry.first.x + neighbor_offsets[i][0],
-                    entry.first.y + neighbor_offsets[i][1],
-                    entry.first.z + neighbor_offsets[i][2]
-                };
-                auto neighbor_it = snapshots.find(neighbor_coord);
-                if (neighbor_it == snapshots.end() || !neighbor_it->second) {
-                    continue;
+                for (int i = 0; i < k_brick_face_neighbor_count; ++i) {
+                    BrickCoord neighbor_coord{
+                        entry.first.x + k_brick_face_neighbor_offsets[i][0],
+                        entry.first.y + k_brick_face_neighbor_offsets[i][1],
+                        entry.first.z + k_brick_face_neighbor_offsets[i][2]
+                    };
+                    auto neighbor_it = snapshots.find(neighbor_coord);
+                    if (neighbor_it == snapshots.end() || !neighbor_it->second) {
+                        continue;
+                    }
+                    copy_brick_face_ghost_from_neighbor(
+                        runtime,
+                        *neighbor_it->second,
+                        k_brick_face_neighbor_axes[i],
+                        k_brick_face_neighbor_positive_faces[i],
+                        *next_dynamic
+                    );
                 }
-                relax_brick_face_from_neighbor(
-                    runtime,
-                    *neighbor_it->second,
-                    neighbor_axes[i],
-                    neighbor_positive_faces[i],
-                    k_brick_face_relaxation,
-                    k_brick_face_coupling_layers,
-                    *next_dynamic
-                );
             }
             BrickData constrained_brick = brick;
             constrained_brick.dynamic_region = next_dynamic;
             apply_brick_static_constraints(runtime, constrained_brick);
-            brick.dynamic_region = std::move(constrained_brick.dynamic_region);
+            if (!step_brick_actual(service, runtime, constrained_brick, *constrained_brick.dynamic_region)) {
+                brick.dynamic_region = std::move(constrained_brick.dynamic_region);
+            } else {
+                brick.context_key = constrained_brick.context_key;
+                brick.packet_cache = std::move(constrained_brick.packet_cache);
+                brick.dynamic_region = std::move(constrained_brick.dynamic_region);
+            }
             if (brick.pending_reinit) {
                 brick.pending_reinit = false;
             }
@@ -780,12 +858,7 @@ void seed_brick_from_neighbor_means(
 ) {
     BrickMeanState accum;
     int contributing_neighbors = 0;
-    static constexpr int neighbor_offsets[6][3] = {
-        {-1, 0, 0}, {1, 0, 0},
-        {0, -1, 0}, {0, 1, 0},
-        {0, 0, -1}, {0, 0, 1}
-    };
-    for (const auto& offset : neighbor_offsets) {
+    for (const auto& offset : k_brick_face_neighbor_offsets) {
         BrickCoord neighbor_coord{coord.x + offset[0], coord.y + offset[1], coord.z + offset[2]};
         auto it = snapshots.find(neighbor_coord);
         if (it == snapshots.end() || !brick_dynamic_region_valid(runtime, it->second.get())) {
@@ -822,39 +895,33 @@ void seed_brick_from_neighbor_means(
     }
 }
 
-void relax_brick_face_from_neighbor(
+void copy_brick_face_ghost_from_neighbor(
     const FluidWorldRuntime& runtime,
     const DynamicRegionData& neighbor,
     int axis,
     bool positive_face,
-    float relax,
-    int layers,
     DynamicRegionData& dynamic
 ) {
     if (!brick_dynamic_region_valid(runtime, &dynamic) || !brick_dynamic_region_valid(runtime, &neighbor)) {
         return;
     }
     const int size = runtime.brick_size;
-    const int clamped_layers = std::max(1, std::min(layers, size));
+    const int clamped_layers = std::max(1, std::min(k_brick_face_ghost_layers, size));
     auto cell_index = [size](int x, int y, int z) {
         return (x * size + y) * size + z;
     };
-    auto relax_cell = [&](int dst_x, int dst_y, int dst_z, int src_x, int src_y, int src_z) {
+    auto copy_cell = [&](int dst_x, int dst_y, int dst_z, int src_x, int src_y, int src_z) {
         const int dst_cell = cell_index(dst_x, dst_y, dst_z);
         const int src_cell = cell_index(src_x, src_y, src_z);
         const size_t dst_base = static_cast<size_t>(dst_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
         const size_t src_base = static_cast<size_t>(src_cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
         for (int channel = 0; channel < AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS; ++channel) {
-            dynamic.flow_state[dst_base + channel] =
-                dynamic.flow_state[dst_base + channel] * (1.0f - relax)
-                + neighbor.flow_state[src_base + channel] * relax;
+            dynamic.flow_state[dst_base + channel] = neighbor.flow_state[src_base + channel];
         }
         dynamic.air_temperature[static_cast<size_t>(dst_cell)] =
-            dynamic.air_temperature[static_cast<size_t>(dst_cell)] * (1.0f - relax)
-            + neighbor.air_temperature[static_cast<size_t>(src_cell)] * relax;
+            neighbor.air_temperature[static_cast<size_t>(src_cell)];
         dynamic.surface_temperature[static_cast<size_t>(dst_cell)] =
-            dynamic.surface_temperature[static_cast<size_t>(dst_cell)] * (1.0f - relax)
-            + neighbor.surface_temperature[static_cast<size_t>(src_cell)] * relax;
+            neighbor.surface_temperature[static_cast<size_t>(src_cell)];
     };
 
     for (int layer = 0; layer < clamped_layers; ++layer) {
@@ -863,23 +930,142 @@ void relax_brick_face_from_neighbor(
         if (axis == 0) {
             for (int y = 0; y < size; ++y) {
                 for (int z = 0; z < size; ++z) {
-                    relax_cell(dst_face, y, z, src_face, y, z);
+                    copy_cell(dst_face, y, z, src_face, y, z);
                 }
             }
         } else if (axis == 1) {
             for (int x = 0; x < size; ++x) {
                 for (int z = 0; z < size; ++z) {
-                    relax_cell(x, dst_face, z, x, src_face, z);
+                    copy_cell(x, dst_face, z, x, src_face, z);
                 }
             }
         } else {
             for (int x = 0; x < size; ++x) {
                 for (int y = 0; y < size; ++y) {
-                    relax_cell(x, y, dst_face, x, y, src_face);
+                    copy_cell(x, y, dst_face, x, y, src_face);
                 }
             }
         }
     }
+}
+
+bool exchange_brick_face_context_halo(
+    const FluidWorldRuntime& runtime,
+    BrickData& first,
+    BrickData& second,
+    int offset_x,
+    int offset_y,
+    int offset_z
+) {
+    if (runtime.brick_size <= 2 * k_brick_face_ghost_layers
+        || first.context_key == 0
+        || second.context_key == 0) {
+        return false;
+    }
+    return aero_lbm_exchange_halo_layers_rect(
+        runtime.brick_size,
+        runtime.brick_size,
+        runtime.brick_size,
+        k_brick_face_ghost_layers,
+        first.context_key,
+        second.context_key,
+        offset_x,
+        offset_y,
+        offset_z
+    ) != 0;
+}
+
+bool build_brick_step_packet(
+    const FluidWorldRuntime& runtime,
+    const BrickData& brick,
+    const DynamicRegionData& dynamic,
+    std::vector<float>& packet
+) {
+    if (!brick.static_region || !brick_dynamic_region_valid(runtime, &dynamic)) {
+        return false;
+    }
+    const StaticRegionData& stat = *brick.static_region;
+    if (stat.nx != runtime.brick_size
+        || stat.ny != runtime.brick_size
+        || stat.nz != runtime.brick_size
+        || stat.obstacle.size() != dynamic.air_temperature.size()
+        || stat.surface_kind.size() != dynamic.air_temperature.size()
+        || stat.open_face_mask.size() != dynamic.air_temperature.size()
+        || stat.emitter_power_watts.size() != dynamic.air_temperature.size()) {
+        return false;
+    }
+    const size_t cells = dynamic.air_temperature.size();
+    const size_t packet_values = cells * k_packet_channels;
+    if (packet.size() != packet_values) {
+        packet.assign(packet_values, 0.0f);
+    } else {
+        std::fill(packet.begin(), packet.end(), 0.0f);
+    }
+    for (size_t cell = 0; cell < cells; ++cell) {
+        const size_t packet_base = cell * k_packet_channels;
+        const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
+        const bool obstacle = stat.obstacle[cell] != 0;
+        packet[packet_base + k_channel_obstacle] = obstacle ? 1.0f : 0.0f;
+        packet[packet_base + k_channel_fan_mask] = 0.0f;
+        packet[packet_base + k_channel_fan_vx] = 0.0f;
+        packet[packet_base + k_channel_fan_vy] = 0.0f;
+        packet[packet_base + k_channel_fan_vz] = 0.0f;
+        if (!obstacle) {
+            packet[packet_base + k_channel_state_vx] = dynamic.flow_state[flow_base];
+            packet[packet_base + k_channel_state_vy] = dynamic.flow_state[flow_base + 1];
+            packet[packet_base + k_channel_state_vz] = dynamic.flow_state[flow_base + 2];
+            packet[packet_base + k_channel_state_p] = dynamic.flow_state[flow_base + 3];
+            packet[packet_base + k_channel_state_temp] = dynamic.air_temperature[cell];
+            if (stat.emitter_power_watts[cell] > 0.0f) {
+                packet[packet_base + k_channel_thermal_source] =
+                    temperature_source_from_power_watts(stat.emitter_power_watts[cell]);
+            }
+        }
+    }
+    return true;
+}
+
+bool sync_brick_dynamic_from_context(const FluidWorldRuntime& runtime, BrickData& brick) {
+    if (!brick.dynamic_region || brick.context_key == 0) {
+        return false;
+    }
+    DynamicRegionData& dynamic = *brick.dynamic_region;
+    if (!brick_dynamic_region_valid(runtime, &dynamic)) {
+        return false;
+    }
+    const int size = runtime.brick_size;
+    if (!aero_lbm_get_flow_state_rect(size, size, size, brick.context_key, dynamic.flow_state.data())) {
+        return false;
+    }
+    if (!aero_lbm_get_temperature_state_rect(size, size, size, brick.context_key, dynamic.air_temperature.data())) {
+        return false;
+    }
+    return true;
+}
+
+bool step_brick_actual(
+    ServiceState& service,
+    FluidWorldRuntime& runtime,
+    BrickData& brick,
+    DynamicRegionData& dynamic
+) {
+    if (!build_brick_step_packet(runtime, brick, dynamic, brick.packet_cache)) {
+        return false;
+    }
+    if (brick.context_key == 0) {
+        brick.context_key = allocate_internal_context_key(service);
+    }
+    const int size = runtime.brick_size;
+    if (!aero_lbm_step_rect(brick.packet_cache.data(), size, size, size, brick.context_key, nullptr)) {
+        release_brick_context(brick);
+        return false;
+    }
+    if (!sync_brick_dynamic_from_context(runtime, brick)) {
+        release_brick_context(brick);
+        return false;
+    }
+    apply_brick_static_constraints(runtime, brick);
+    return true;
 }
 
 void mark_brick_state(
@@ -904,21 +1090,14 @@ void mark_brick_and_neighbor_reinit(
     bool forcing_dirty
 ) {
     mark_brick_state(runtime, center, geometry_dirty, forcing_dirty, true);
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dz = -1; dz <= 1; ++dz) {
-                if (dx == 0 && dy == 0 && dz == 0) {
-                    continue;
-                }
-                mark_brick_state(
-                    runtime,
-                    BrickCoord{center.x + dx, center.y + dy, center.z + dz},
-                    false,
-                    false,
-                    true
-                );
-            }
-        }
+    for (const auto& offset : k_brick_face_neighbor_offsets) {
+        mark_brick_state(
+            runtime,
+            BrickCoord{center.x + offset[0], center.y + offset[1], center.z + offset[2]},
+            false,
+            false,
+            true
+        );
     }
 }
 
