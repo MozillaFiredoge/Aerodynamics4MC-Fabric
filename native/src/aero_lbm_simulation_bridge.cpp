@@ -2891,17 +2891,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_brick_world_active_hints(
         brick.active_hint = true;
         brick.last_hint_epoch = runtime.epoch;
         brick.last_active_epoch = runtime.epoch;
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dz = -1; dz <= 1; ++dz) {
-                    runtime.active_hint_closure.insert(BrickCoord{
-                        coord.x + dx,
-                        coord.y + dy,
-                        coord.z + dz
-                    });
-                }
-            }
-        }
+        runtime.active_hint_closure.insert(coord);
+        runtime.active_hint_closure.insert(BrickCoord{coord.x - 1, coord.y, coord.z});
+        runtime.active_hint_closure.insert(BrickCoord{coord.x + 1, coord.y, coord.z});
+        runtime.active_hint_closure.insert(BrickCoord{coord.x, coord.y - 1, coord.z});
+        runtime.active_hint_closure.insert(BrickCoord{coord.x, coord.y + 1, coord.z});
+        runtime.active_hint_closure.insert(BrickCoord{coord.x, coord.y, coord.z - 1});
+        runtime.active_hint_closure.insert(BrickCoord{coord.x, coord.y, coord.z + 1});
     }
     for (const BrickCoord& coord : runtime.active_hint_closure) {
         runtime.bricks.try_emplace(coord);

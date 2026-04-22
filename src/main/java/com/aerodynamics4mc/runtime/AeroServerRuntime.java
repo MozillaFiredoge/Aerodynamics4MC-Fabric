@@ -4253,52 +4253,25 @@ public final class AeroServerRuntime {
 
     private Map<RegistryKey<World>, int[]> brickRuntimeHintCoords(List<PlayerRegionAnchor> anchors) {
         Map<RegistryKey<World>, LinkedHashSet<BrickRuntimeHint>> hintsByWorld = new HashMap<>();
-        for (PlayerRegionAnchor anchor : anchors) {
-            RegistryKey<World> worldKey = anchor.worldKey();
-            BlockPos baseCore = anchor.coreOrigin();
-            int localX = MathHelper.clamp(anchor.blockPos().getX() - baseCore.getX(), 0, REGION_CORE_SIZE - 1);
-            int localY = MathHelper.clamp(anchor.blockPos().getY() - baseCore.getY(), 0, REGION_CORE_SIZE - 1);
-            int localZ = MathHelper.clamp(anchor.blockPos().getZ() - baseCore.getZ(), 0, REGION_CORE_SIZE - 1);
-            boolean attachWest = localX < HORIZONTAL_ATTACH_MARGIN_CELLS;
-            boolean attachEast = localX >= REGION_CORE_SIZE - HORIZONTAL_ATTACH_MARGIN_CELLS;
-            boolean attachDown = localY < VERTICAL_ATTACH_MARGIN_CELLS;
-            boolean attachUp = localY >= REGION_CORE_SIZE - VERTICAL_ATTACH_MARGIN_CELLS;
-            boolean attachNorth = localZ < HORIZONTAL_ATTACH_MARGIN_CELLS;
-            boolean attachSouth = localZ >= REGION_CORE_SIZE - HORIZONTAL_ATTACH_MARGIN_CELLS;
-            int baseBrickX = Math.floorDiv(baseCore.getX(), BRICK_RUNTIME_SIZE);
-            int baseBrickY = Math.floorDiv(baseCore.getY(), BRICK_RUNTIME_SIZE);
-            int baseBrickZ = Math.floorDiv(baseCore.getZ(), BRICK_RUNTIME_SIZE);
+        for (WindowKey solveKey : solveRegionKeys(anchors)) {
+            RegistryKey<World> worldKey = solveKey.worldKey();
+            BlockPos coreOrigin = solveKey.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
             LinkedHashSet<BrickRuntimeHint> hints = hintsByWorld.computeIfAbsent(worldKey, ignored -> new LinkedHashSet<>());
-            hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY, baseBrickZ));
-            if (attachWest) {
-                hints.add(new BrickRuntimeHint(baseBrickX - 1, baseBrickY, baseBrickZ));
-            }
-            if (attachEast) {
-                hints.add(new BrickRuntimeHint(baseBrickX + 1, baseBrickY, baseBrickZ));
-            }
-            if (attachNorth) {
-                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY, baseBrickZ - 1));
-            }
-            if (attachSouth) {
-                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY, baseBrickZ + 1));
-            }
-            if (attachWest && attachNorth) {
-                hints.add(new BrickRuntimeHint(baseBrickX - 1, baseBrickY, baseBrickZ - 1));
-            }
-            if (attachWest && attachSouth) {
-                hints.add(new BrickRuntimeHint(baseBrickX - 1, baseBrickY, baseBrickZ + 1));
-            }
-            if (attachEast && attachNorth) {
-                hints.add(new BrickRuntimeHint(baseBrickX + 1, baseBrickY, baseBrickZ - 1));
-            }
-            if (attachEast && attachSouth) {
-                hints.add(new BrickRuntimeHint(baseBrickX + 1, baseBrickY, baseBrickZ + 1));
-            }
-            if (attachUp) {
-                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY + 1, baseBrickZ));
-            }
-            if (attachDown) {
-                hints.add(new BrickRuntimeHint(baseBrickX, baseBrickY - 1, baseBrickZ));
+            hints.add(new BrickRuntimeHint(
+                Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE),
+                Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
+                Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE)
+            ));
+        }
+        if (hintsByWorld.isEmpty()) {
+            for (PlayerRegionAnchor anchor : anchors) {
+                RegistryKey<World> worldKey = anchor.worldKey();
+                BlockPos baseCore = anchor.coreOrigin();
+                hintsByWorld.computeIfAbsent(worldKey, ignored -> new LinkedHashSet<>()).add(new BrickRuntimeHint(
+                    Math.floorDiv(baseCore.getX(), BRICK_RUNTIME_SIZE),
+                    Math.floorDiv(baseCore.getY(), BRICK_RUNTIME_SIZE),
+                    Math.floorDiv(baseCore.getZ(), BRICK_RUNTIME_SIZE)
+                ));
             }
         }
         Map<RegistryKey<World>, int[]> coordsByWorld = new HashMap<>();
