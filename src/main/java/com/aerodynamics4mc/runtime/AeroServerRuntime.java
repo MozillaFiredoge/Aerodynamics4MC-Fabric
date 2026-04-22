@@ -269,6 +269,8 @@ public final class AeroServerRuntime {
     private final Object coordinatorLifecycleLock = new Object();
     private final Object pendingWorldDeltasLock = new Object();
     private final ArrayDeque<NativeSimulationBridge.WorldDelta> pendingWorldDeltas = new ArrayDeque<>();
+    private final Object pendingResidentBrickStaticRefreshesLock = new Object();
+    private final ArrayDeque<ChunkResidentBrickRefreshRequest> pendingResidentBrickStaticRefreshes = new ArrayDeque<>();
     private final ExecutorService solverExecutor = Executors.newFixedThreadPool(SOLVER_WORKER_COUNT, runnable -> {
         Thread thread = new Thread(runnable, "aero-server-solver");
         thread.setDaemon(true);
@@ -399,7 +401,7 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-            refreshResidentBrickStaticsForChunk(world, chunk.getPos());
+            queueResidentBrickStaticRefreshForChunk(world.getRegistryKey(), chunk.getPos());
         });
     }
 
@@ -420,8 +422,14 @@ public final class AeroServerRuntime {
                 0.0f,
                 0.0f
             ));
-            refreshResidentBrickStaticsForChunk(world, chunk.getPos());
+            queueResidentBrickStaticRefreshForChunk(world.getRegistryKey(), chunk.getPos());
         });
+    }
+
+    private void queueResidentBrickStaticRefreshForChunk(RegistryKey<World> worldKey, ChunkPos chunkPos) {
+        synchronized (pendingResidentBrickStaticRefreshesLock) {
+            pendingResidentBrickStaticRefreshes.addLast(new ChunkResidentBrickRefreshRequest(worldKey, chunkPos.x, chunkPos.z));
+        }
     }
 
     private void refreshResidentBrickStaticsForChunk(ServerWorld world, ChunkPos chunkPos) {
@@ -2696,6 +2704,9 @@ public final class AeroServerRuntime {
         synchronized (pendingWorldDeltasLock) {
             pendingWorldDeltas.clear();
         }
+        synchronized (pendingResidentBrickStaticRefreshesLock) {
+            pendingResidentBrickStaticRefreshes.clear();
+        }
         waitForSolverIdle();
         releaseSimulationService();
     }
@@ -2894,6 +2905,28 @@ public final class AeroServerRuntime {
                 }
             }
             simulationBridge.submitWorldDeltas(serviceId, batch);
+        }
+    }
+
+    private void applyPendingResidentBrickStaticRefreshesIfNeeded() {
+        long serviceId = simulationServiceId;
+        MinecraftServer server = currentServer;
+        if (serviceId == 0L || server == null) {
+            return;
+        }
+        while (true) {
+            ChunkResidentBrickRefreshRequest request;
+            synchronized (pendingResidentBrickStaticRefreshesLock) {
+                request = pendingResidentBrickStaticRefreshes.pollFirst();
+            }
+            if (request == null) {
+                return;
+            }
+            ServerWorld world = server.getWorld(request.worldKey());
+            if (world == null) {
+                continue;
+            }
+            refreshResidentBrickStaticsForChunk(world, new ChunkPos(request.chunkX(), request.chunkZ()));
         }
     }
 
@@ -4797,6 +4830,7 @@ public final class AeroServerRuntime {
             Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
             Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE),
             coreSnapshots,
+            false,
             false
         );
     }
@@ -4808,7 +4842,7 @@ public final class AeroServerRuntime {
         int brickZ
     ) {
         WorldMirror.SectionSnapshot[] snapshots = brickSectionSnapshotsFromMirror(worldKey, brickX, brickY, brickZ);
-        return uploadBrickStaticSnapshotsToRuntime(worldKey, brickX, brickY, brickZ, snapshots, true);
+        return uploadBrickStaticSnapshotsToRuntime(worldKey, brickX, brickY, brickZ, snapshots, true, true);
     }
 
     private WorldMirror.SectionSnapshot[] brickSectionSnapshotsFromMirror(
@@ -4846,7 +4880,8 @@ public final class AeroServerRuntime {
         int brickY,
         int brickZ,
         WorldMirror.SectionSnapshot[] snapshots,
-        boolean fillMissingAsSolid
+        boolean fillMissingAsSolid,
+        boolean deferred
     ) {
         if (simulationServiceId == 0L || snapshots == null) {
             return false;
@@ -4902,20 +4937,35 @@ public final class AeroServerRuntime {
                 }
             }
         }
-        return simulationBridge.uploadBrickWorldStaticBrick(
-            simulationServiceId,
-            worldRuntimeKey,
-            BRICK_RUNTIME_SIZE,
-            brickX,
-            brickY,
-            brickZ,
-            obstacle,
-            surfaceKind,
-            openFaceMask,
-            emitterPower,
-            faceSkyExposure,
-            faceDirectExposure
-        );
+        return deferred
+            ? simulationBridge.queueBrickWorldStaticBrickUpload(
+                simulationServiceId,
+                worldRuntimeKey,
+                BRICK_RUNTIME_SIZE,
+                brickX,
+                brickY,
+                brickZ,
+                obstacle,
+                surfaceKind,
+                openFaceMask,
+                emitterPower,
+                faceSkyExposure,
+                faceDirectExposure
+            )
+            : simulationBridge.uploadBrickWorldStaticBrick(
+                simulationServiceId,
+                worldRuntimeKey,
+                BRICK_RUNTIME_SIZE,
+                brickX,
+                brickY,
+                brickZ,
+                obstacle,
+                surfaceKind,
+                openFaceMask,
+                emitterPower,
+                faceSkyExposure,
+                faceDirectExposure
+            );
     }
 
     private void fillBrickSectionAsSolid(int baseX, int baseY, int baseZ, byte[] obstacle) {
@@ -7521,6 +7571,13 @@ public final class AeroServerRuntime {
     ) {
     }
 
+    private record ChunkResidentBrickRefreshRequest(
+        RegistryKey<World> worldKey,
+        int chunkX,
+        int chunkZ
+    ) {
+    }
+
     private record BrickRuntimeHint(
         int brickX,
         int brickY,
@@ -7927,6 +7984,7 @@ public final class AeroServerRuntime {
                         synchronized (simulationStateLock) {
                             applyPendingActiveRegionBatchIfNeeded();
                             applyPendingBackgroundRefreshIfNeeded();
+                            applyPendingResidentBrickStaticRefreshesIfNeeded();
                             stepBrickRuntimeWorlds();
                             refreshDesiredWindowsFromBrickRuntime();
                         }

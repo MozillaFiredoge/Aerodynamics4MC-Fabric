@@ -140,6 +140,13 @@ struct FluidWorldRuntime {
     std::uint64_t epoch = 0;
     std::unordered_map<BrickCoord, BrickData, BrickCoordHash> bricks;
     std::unordered_set<BrickCoord, BrickCoordHash> active_hint_closure;
+    std::vector<AeroLbmWorldDelta> pending_world_deltas;
+};
+
+struct PendingStaticBrickUpload {
+    long long world_key = 0;
+    BrickCoord coord;
+    std::shared_ptr<const StaticRegionData> static_region;
 };
 
 struct ServiceState {
@@ -161,6 +168,8 @@ struct ServiceState {
     std::unordered_map<long long, AtlasData> atlases;
     std::unordered_map<long long, std::shared_ptr<const RegionPacketTemplateData>> packet_templates;
     std::unordered_map<long long, FluidWorldRuntime> brick_world_runtimes;
+    int next_pending_static_brick_upload_id = 1;
+    std::unordered_map<int, PendingStaticBrickUpload> pending_static_brick_uploads;
 };
 
 struct SpinMutex {
@@ -419,6 +428,7 @@ int count_pending_reinit_bricks(const FluidWorldRuntime& runtime) {
 }
 
 constexpr int k_world_delta_brick_static_cell_patch = 8;
+constexpr int k_world_delta_brick_static_brick_upload = 9;
 
 bool brick_is_resident_for_windows(const BrickData& brick) {
     return brick.active_hint
@@ -559,11 +569,13 @@ void relax_brick_face_from_neighbor(
     int layers,
     DynamicRegionData& dynamic
 );
+void apply_pending_world_deltas(ServiceState& service, long long world_key, FluidWorldRuntime& runtime);
 
-void step_brick_world_runtime(FluidWorldRuntime& runtime, int step_count) {
+void step_brick_world_runtime(ServiceState& service, long long world_key, FluidWorldRuntime& runtime, int step_count) {
     if (step_count <= 0) {
         return;
     }
+    apply_pending_world_deltas(service, world_key, runtime);
     for (int step = 0; step < step_count; ++step) {
         runtime.epoch++;
         recompute_runtime_active_flags(runtime);
@@ -908,24 +920,9 @@ void mark_brick_and_neighbor_reinit(
             }
         }
     }
-    recompute_runtime_active_flags(runtime);
-    prune_inactive_bricks(runtime);
 }
 
-void apply_world_delta_to_brick_runtimes(ServiceState& service, const AeroLbmWorldDelta& delta) {
-    long long world_key = static_cast<long long>(delta.data0);
-    if (world_key == 0) {
-        world_key = 1;
-    }
-    if (delta.type == 6) {
-        service.brick_world_runtimes.erase(world_key);
-        return;
-    }
-    auto runtime_iterator = service.brick_world_runtimes.find(world_key);
-    if (runtime_iterator == service.brick_world_runtimes.end()) {
-        return;
-    }
-    FluidWorldRuntime& runtime = runtime_iterator->second;
+void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta& delta) {
     const BrickCoord coord = brick_coord_for_block(delta.x, delta.y, delta.z, runtime.brick_size);
     switch (delta.type) {
         case k_world_delta_brick_static_cell_patch: {
@@ -977,6 +974,64 @@ void apply_world_delta_to_brick_runtimes(ServiceState& service, const AeroLbmWor
         default:
             break;
     }
+}
+
+void apply_pending_world_deltas(ServiceState& service, long long world_key, FluidWorldRuntime& runtime) {
+    if (runtime.pending_world_deltas.empty()) {
+        return;
+    }
+    std::vector<AeroLbmWorldDelta> pending;
+    pending.swap(runtime.pending_world_deltas);
+    std::vector<int> consumed_upload_ids;
+    consumed_upload_ids.reserve(pending.size());
+    bool touched_runtime_state = false;
+    for (const AeroLbmWorldDelta& delta : pending) {
+        if (delta.type == k_world_delta_brick_static_brick_upload) {
+            auto upload_it = service.pending_static_brick_uploads.find(delta.data1);
+            if (upload_it == service.pending_static_brick_uploads.end()) {
+                continue;
+            }
+            const PendingStaticBrickUpload& upload = upload_it->second;
+            if (upload.world_key != world_key || !upload.static_region) {
+                consumed_upload_ids.push_back(delta.data1);
+                continue;
+            }
+            BrickData& brick = runtime.bricks[upload.coord];
+            brick.static_region = upload.static_region;
+            brick.geometry_dirty = true;
+            brick.pending_reinit = true;
+            brick.active = true;
+            brick.last_active_epoch = runtime.epoch;
+            consumed_upload_ids.push_back(delta.data1);
+            touched_runtime_state = true;
+            continue;
+        }
+        apply_brick_world_delta(runtime, delta);
+        touched_runtime_state = true;
+    }
+    for (int upload_id : consumed_upload_ids) {
+        service.pending_static_brick_uploads.erase(upload_id);
+    }
+    if (touched_runtime_state) {
+        recompute_runtime_active_flags(runtime);
+        prune_inactive_bricks(runtime);
+    }
+}
+
+void apply_world_delta_to_brick_runtimes(ServiceState& service, const AeroLbmWorldDelta& delta) {
+    long long world_key = static_cast<long long>(delta.data0);
+    if (world_key == 0) {
+        world_key = 1;
+    }
+    if (delta.type == 6) {
+        service.brick_world_runtimes.erase(world_key);
+        return;
+    }
+    auto runtime_iterator = service.brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service.brick_world_runtimes.end()) {
+        return;
+    }
+    runtime_iterator->second.pending_world_deltas.push_back(delta);
 }
 
 bool checked_cell_count(int nx, int ny, int nz, int* out_cells) {
@@ -2912,7 +2967,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_brick_world_runtime(
         set_simulation_last_error("simulation_step_brick_world_runtime: missing brick runtime");
         return 0;
     }
-    step_brick_world_runtime(runtime_iterator->second, step_count);
+    step_brick_world_runtime(*service, world_key, runtime_iterator->second, step_count);
     return 1;
 }
 
@@ -3066,6 +3121,87 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick(
     brick.pending_reinit = true;
     brick.active = true;
     brick.last_active_epoch = runtime.epoch;
+    return 1;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_queue_brick_world_static_brick_upload(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    int brick_x,
+    int brick_y,
+    int brick_z,
+    const uint8_t* obstacle,
+    const uint8_t* surface_kind,
+    const uint16_t* open_face_mask,
+    const float* emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
+) {
+    int cells = 0;
+    if (!checked_cell_count(brick_size, brick_size, brick_size, &cells)) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_queue_brick_world_static_brick_upload: invalid brick size");
+        return 0;
+    }
+    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts
+        || !face_sky_exposure || !face_direct_exposure) {
+        std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+        set_simulation_last_error("simulation_queue_brick_world_static_brick_upload: null brick buffers");
+        return 0;
+    }
+
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_queue_brick_world_static_brick_upload: missing service");
+        return 0;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        set_simulation_last_error("simulation_queue_brick_world_static_brick_upload: missing brick runtime");
+        return 0;
+    }
+    FluidWorldRuntime& runtime = runtime_iterator->second;
+    if (runtime.brick_size != brick_size) {
+        set_simulation_last_error("simulation_queue_brick_world_static_brick_upload: brick size mismatch");
+        return 0;
+    }
+
+    auto region = std::make_shared<StaticRegionData>();
+    region->nx = brick_size;
+    region->ny = brick_size;
+    region->nz = brick_size;
+    region->obstacle.assign(obstacle, obstacle + cells);
+    region->surface_kind.assign(surface_kind, surface_kind + cells);
+    region->open_face_mask.assign(open_face_mask, open_face_mask + cells);
+    region->emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
+    region->face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
+    region->face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
+
+    int upload_id = service->next_pending_static_brick_upload_id++;
+    if (upload_id <= 0) {
+        upload_id = service->next_pending_static_brick_upload_id = 1;
+    }
+    service->pending_static_brick_uploads[upload_id] = PendingStaticBrickUpload{
+        world_key,
+        BrickCoord{brick_x, brick_y, brick_z},
+        std::move(region)
+    };
+    runtime.pending_world_deltas.push_back(AeroLbmWorldDelta{
+        k_world_delta_brick_static_brick_upload,
+        brick_x,
+        brick_y,
+        brick_z,
+        static_cast<int>(world_key),
+        upload_id,
+        0,
+        0,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f
+    });
     return 1;
 }
 
@@ -4913,6 +5049,92 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         return JNI_FALSE;
     }
     const int ok = aero_lbm_simulation_upload_brick_world_static_brick(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key),
+        brick_size,
+        brick_x,
+        brick_y,
+        brick_z,
+        reinterpret_cast<const uint8_t*>(obstacle_ptr),
+        reinterpret_cast<const uint8_t*>(surface_ptr),
+        reinterpret_cast<const uint16_t*>(open_ptr),
+        emitter_ptr,
+        reinterpret_cast<const uint8_t*>(sky_ptr),
+        reinterpret_cast<const uint8_t*>(direct_ptr)
+    );
+    env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
+    env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeQueueBrickWorldStaticBrickUpload(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong world_key,
+    jint brick_size,
+    jint brick_x,
+    jint brick_y,
+    jint brick_z,
+    jbyteArray obstacle,
+    jbyteArray surface_kind,
+    jshortArray open_face_mask,
+    jfloatArray emitter_power_watts,
+    jbyteArray face_sky_exposure,
+    jbyteArray face_direct_exposure
+) {
+    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts
+        || !face_sky_exposure || !face_direct_exposure) {
+        return JNI_FALSE;
+    }
+    const int cells = brick_size * brick_size * brick_size;
+    if (cells <= 0
+        || env->GetArrayLength(obstacle) != static_cast<jsize>(cells)
+        || env->GetArrayLength(surface_kind) != static_cast<jsize>(cells)
+        || env->GetArrayLength(open_face_mask) != static_cast<jsize>(cells)
+        || env->GetArrayLength(emitter_power_watts) != static_cast<jsize>(cells)
+        || env->GetArrayLength(face_sky_exposure) != static_cast<jsize>(cells * k_face_count)
+        || env->GetArrayLength(face_direct_exposure) != static_cast<jsize>(cells * k_face_count)) {
+        return JNI_FALSE;
+    }
+    jboolean obstacle_copy = JNI_FALSE;
+    jboolean surface_copy = JNI_FALSE;
+    jboolean open_copy = JNI_FALSE;
+    jboolean emitter_copy = JNI_FALSE;
+    jboolean sky_copy = JNI_FALSE;
+    jboolean direct_copy = JNI_FALSE;
+    jbyte* obstacle_ptr = env->GetByteArrayElements(obstacle, &obstacle_copy);
+    jbyte* surface_ptr = env->GetByteArrayElements(surface_kind, &surface_copy);
+    jshort* open_ptr = env->GetShortArrayElements(open_face_mask, &open_copy);
+    jfloat* emitter_ptr = env->GetFloatArrayElements(emitter_power_watts, &emitter_copy);
+    jbyte* sky_ptr = env->GetByteArrayElements(face_sky_exposure, &sky_copy);
+    jbyte* direct_ptr = env->GetByteArrayElements(face_direct_exposure, &direct_copy);
+    if (!obstacle_ptr || !surface_ptr || !open_ptr || !emitter_ptr || !sky_ptr || !direct_ptr) {
+        if (obstacle_ptr) {
+            env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
+        }
+        if (surface_ptr) {
+            env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
+        }
+        if (open_ptr) {
+            env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
+        }
+        if (emitter_ptr) {
+            env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+        }
+        if (sky_ptr) {
+            env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+        }
+        if (direct_ptr) {
+            env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+        }
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_queue_brick_world_static_brick_upload(
         static_cast<long long>(service_key),
         static_cast<long long>(world_key),
         brick_size,

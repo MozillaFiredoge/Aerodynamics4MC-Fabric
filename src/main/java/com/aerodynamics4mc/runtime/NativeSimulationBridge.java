@@ -228,6 +228,55 @@ public final class NativeSimulationBridge {
         );
     }
 
+    public boolean queueBrickWorldStaticBrickUpload(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int brickX,
+        int brickY,
+        int brickZ,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    ) {
+        if (!LOADED || serviceKey == 0L || worldKey == 0L || brickSize <= 0) {
+            return false;
+        }
+        int cells = checkedCellCount(brickSize, brickSize, brickSize);
+        if (cells <= 0
+            || obstacle == null
+            || surfaceKind == null
+            || openFaceMask == null
+            || emitterPowerWatts == null
+            || faceSkyExposure == null
+            || faceDirectExposure == null
+            || obstacle.length != cells
+            || surfaceKind.length != cells
+            || openFaceMask.length != cells
+            || emitterPowerWatts.length != cells
+            || faceSkyExposure.length != cells * FACE_COUNT
+            || faceDirectExposure.length != cells * FACE_COUNT) {
+            return false;
+        }
+        return nativeQueueBrickWorldStaticBrickUpload(
+            serviceKey,
+            worldKey,
+            brickSize,
+            brickX,
+            brickY,
+            brickZ,
+            obstacle,
+            surfaceKind,
+            openFaceMask,
+            emitterPowerWatts,
+            faceSkyExposure,
+            faceDirectExposure
+        );
+    }
+
     public boolean syncRegionCoreToBrickWorld(
         long serviceKey,
         long regionKey,
@@ -1029,6 +1078,21 @@ public final class NativeSimulationBridge {
     );
 
     private static native boolean nativeUploadBrickWorldStaticBrick(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int brickX,
+        int brickY,
+        int brickZ,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    );
+
+    private static native boolean nativeQueueBrickWorldStaticBrickUpload(
         long serviceKey,
         long worldKey,
         int brickSize,
