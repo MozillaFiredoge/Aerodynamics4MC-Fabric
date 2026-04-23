@@ -4313,11 +4313,14 @@ public final class AeroServerRuntime {
             return;
         }
         for (RegistryKey<World> worldKey : new HashSet<>(brickRuntimeKnownWorldKeys)) {
-            simulationBridge.stepBrickWorldRuntime(
+            boolean stepped = simulationBridge.stepBrickWorldRuntime(
                 simulationServiceId,
                 simulationWorldKey(worldKey),
                 1
             );
+            if (!stepped) {
+                lastSolverError = simulationBridge.lastError();
+            }
         }
     }
 

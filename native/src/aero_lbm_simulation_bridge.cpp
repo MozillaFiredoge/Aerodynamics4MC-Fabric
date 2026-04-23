@@ -673,10 +673,11 @@ bool step_brick_actual(
 );
 void apply_pending_world_deltas(ServiceState& service, long long world_key, FluidWorldRuntime& runtime);
 
-void step_brick_world_runtime(ServiceState& service, long long world_key, FluidWorldRuntime& runtime, int step_count) {
+bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidWorldRuntime& runtime, int step_count) {
     if (step_count <= 0) {
-        return;
+        return false;
     }
+    bool overall_success = true;
     apply_pending_world_deltas(service, world_key, runtime);
     for (int step = 0; step < step_count; ++step) {
         runtime.epoch++;
@@ -781,6 +782,7 @@ void step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             constrained_brick.dynamic_region = next_dynamic;
             apply_brick_static_constraints(runtime, constrained_brick);
             if (!step_brick_actual(service, runtime, entry.first, constrained_brick, *constrained_brick.dynamic_region)) {
+                overall_success = false;
                 brick.dynamic_region = std::move(constrained_brick.dynamic_region);
             } else {
                 brick.context_key = constrained_brick.context_key;
@@ -800,6 +802,7 @@ void step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
         recompute_runtime_active_flags(runtime);
         prune_inactive_bricks(runtime);
     }
+    return overall_success;
 }
 
 bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicRegionData* dynamic) {
@@ -1061,6 +1064,12 @@ bool build_brick_step_packet(
     std::vector<float>& packet
 ) {
     if (!brick.static_region || !brick_dynamic_region_valid(runtime, &dynamic)) {
+        set_simulation_last_error(
+            "brick_step_packet: missing or invalid brick state at ("
+                + std::to_string(coord.x) + ","
+                + std::to_string(coord.y) + ","
+                + std::to_string(coord.z) + ")"
+        );
         return false;
     }
     const StaticRegionData& stat = *brick.static_region;
@@ -1071,6 +1080,12 @@ bool build_brick_step_packet(
         || stat.surface_kind.size() != dynamic.air_temperature.size()
         || stat.open_face_mask.size() != dynamic.air_temperature.size()
         || stat.emitter_power_watts.size() != dynamic.air_temperature.size()) {
+        set_simulation_last_error(
+            "brick_step_packet: dimension mismatch at ("
+                + std::to_string(coord.x) + ","
+                + std::to_string(coord.y) + ","
+                + std::to_string(coord.z) + ")"
+        );
         return false;
     }
     const size_t cells = dynamic.air_temperature.size();
@@ -1162,10 +1177,24 @@ bool step_brick_actual(
     }
     const int size = runtime.brick_size;
     if (!aero_lbm_step_rect(brick.packet_cache.data(), size, size, size, brick.context_key, nullptr)) {
+        set_simulation_last_error(
+            "brick_step_actual: aero_lbm_step_rect failed at ("
+                + std::to_string(coord.x) + ","
+                + std::to_string(coord.y) + ","
+                + std::to_string(coord.z) + "): "
+                + aero_lbm_last_error()
+        );
         release_brick_context(brick);
         return false;
     }
     if (!sync_brick_dynamic_from_context(runtime, brick)) {
+        set_simulation_last_error(
+            "brick_step_actual: sync from context failed at ("
+                + std::to_string(coord.x) + ","
+                + std::to_string(coord.y) + ","
+                + std::to_string(coord.z) + "): "
+                + aero_lbm_last_error()
+        );
         release_brick_context(brick);
         return false;
     }
@@ -3247,8 +3276,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_brick_world_runtime(
         set_simulation_last_error("simulation_step_brick_world_runtime: missing brick runtime");
         return 0;
     }
-    step_brick_world_runtime(*service, world_key, runtime_iterator->second, step_count);
-    return 1;
+    return step_brick_world_runtime(*service, world_key, runtime_iterator->second, step_count) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_get_brick_world_resident_brick_count(
