@@ -699,14 +699,16 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             if (!brick_is_solver_active(runtime, brick)) {
                 continue;
             }
-            const bool had_dynamic = brick.dynamic_region != nullptr;
-            if ((brick.pending_reinit || !had_dynamic) && brick.context_key != 0) {
+            const bool had_dynamic = brick_dynamic_region_valid(runtime, brick.dynamic_region.get());
+            if ((brick.pending_reinit || brick.geometry_dirty || !had_dynamic) && brick.context_key != 0) {
                 release_brick_context(brick);
             }
             if ((brick.pending_reinit || !had_dynamic) && brick.static_region) {
                 reset_brick_dynamic_region_state(runtime, brick);
                 apply_brick_static_constraints(runtime, brick);
                 needs_seed[entry.first] = true;
+            } else if (brick.geometry_dirty && brick.static_region && brick.dynamic_region) {
+                apply_brick_static_constraints(runtime, brick);
             } else if (brick.dynamic_region) {
                 ensure_brick_dynamic_region_storage(runtime, brick);
             } else {
@@ -1302,14 +1304,21 @@ void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta
             if (brick.dynamic_region) {
                 apply_brick_static_constraints(runtime, brick);
             }
+            brick.geometry_dirty = true;
+            brick.active = true;
+            brick.last_active_epoch = runtime.epoch;
             break;
         }
         case 1:
+            mark_brick_state(runtime, coord, true, false, false);
+            break;
         case 2:
         case 3:
             mark_brick_and_neighbor_reinit(runtime, coord, true, false);
             break;
         case 4:
+            mark_brick_state(runtime, coord, false, true, false);
+            break;
         case 5:
             mark_brick_and_neighbor_reinit(runtime, coord, false, true);
             break;

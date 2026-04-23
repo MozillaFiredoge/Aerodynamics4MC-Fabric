@@ -8011,7 +8011,6 @@ public final class AeroServerRuntime {
                         lastCoordinatorState = "noActiveWindows";
                         lastCoordinatorNoPublishReason = "noActiveWindows";
                         lastCoordinatorBusyWindowCount = 0;
-                        publishedFrame.set(null);
                         sleepQuietly(10L);
                         continue;
                     }
