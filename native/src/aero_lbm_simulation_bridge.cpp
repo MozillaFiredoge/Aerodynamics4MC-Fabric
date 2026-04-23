@@ -390,6 +390,10 @@ FluidWorldRuntime* ensure_brick_world_runtime(
     return &runtime;
 }
 
+bool brick_has_solver_static(const FluidWorldRuntime& runtime, const BrickData& brick);
+bool brick_is_solver_active(const FluidWorldRuntime& runtime, const BrickData& brick);
+bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicRegionData* dynamic);
+
 int count_active_hint_bricks(const FluidWorldRuntime& runtime) {
     int count = 0;
     for (const auto& entry : runtime.bricks) {
@@ -404,6 +408,46 @@ int count_active_bricks(const FluidWorldRuntime& runtime) {
     int count = 0;
     for (const auto& entry : runtime.bricks) {
         if (entry.second.active) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int count_solver_active_bricks(const FluidWorldRuntime& runtime) {
+    int count = 0;
+    for (const auto& entry : runtime.bricks) {
+        if (brick_is_solver_active(runtime, entry.second)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int count_static_bricks(const FluidWorldRuntime& runtime) {
+    int count = 0;
+    for (const auto& entry : runtime.bricks) {
+        if (brick_has_solver_static(runtime, entry.second)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int count_dynamic_bricks(const FluidWorldRuntime& runtime) {
+    int count = 0;
+    for (const auto& entry : runtime.bricks) {
+        if (brick_dynamic_region_valid(runtime, entry.second.dynamic_region.get())) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int count_context_bricks(const FluidWorldRuntime& runtime) {
+    int count = 0;
+    for (const auto& entry : runtime.bricks) {
+        if (entry.second.context_key != 0) {
             ++count;
         }
     }
@@ -5051,6 +5095,10 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     size_t brick_world_count = 0;
     size_t brick_count = 0;
     size_t active_brick_count = 0;
+    size_t solver_active_brick_count = 0;
+    size_t static_brick_count = 0;
+    size_t dynamic_brick_count = 0;
+    size_t context_brick_count = 0;
     std::uint64_t max_brick_epoch = 0;
     if (g_service) {
         for (const auto& region : g_service->regions) {
@@ -5065,6 +5113,10 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         for (const auto& entry : g_service->brick_world_runtimes) {
             brick_count += entry.second.bricks.size();
             active_brick_count += static_cast<size_t>(count_active_bricks(entry.second));
+            solver_active_brick_count += static_cast<size_t>(count_solver_active_bricks(entry.second));
+            static_brick_count += static_cast<size_t>(count_static_bricks(entry.second));
+            dynamic_brick_count += static_cast<size_t>(count_dynamic_bricks(entry.second));
+            context_brick_count += static_cast<size_t>(count_context_bricks(entry.second));
             max_brick_epoch = std::max(max_brick_epoch, entry.second.epoch);
         }
     }
@@ -5076,6 +5128,10 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         + "|brick_worlds=" + std::to_string(brick_world_count)
         + "|bricks=" + std::to_string(brick_count)
         + "|active_bricks=" + std::to_string(active_brick_count)
+        + "|solver_active_bricks=" + std::to_string(solver_active_brick_count)
+        + "|static_bricks=" + std::to_string(static_brick_count)
+        + "|dynamic_bricks=" + std::to_string(dynamic_brick_count)
+        + "|context_bricks=" + std::to_string(context_brick_count)
         + "|brick_epoch_max=" + std::to_string(max_brick_epoch);
     return text.c_str();
 }

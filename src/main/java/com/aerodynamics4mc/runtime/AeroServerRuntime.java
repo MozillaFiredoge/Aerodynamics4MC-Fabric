@@ -3416,9 +3416,9 @@ public final class AeroServerRuntime {
     private boolean initializeWindowFromMirror(WindowKey key, RegionRecord region) {
         region.ensureSectionsInitialized();
         int readyCoreSections = 0;
-        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
-            for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
-                for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+        for (int sx = CORE_SECTION_MIN; sx <= CORE_SECTION_MAX; sx++) {
+            for (int sy = CORE_SECTION_MIN; sy <= CORE_SECTION_MAX; sy++) {
+                for (int sz = CORE_SECTION_MIN; sz <= CORE_SECTION_MAX; sz++) {
                     BlockPos localOrigin = sectionOrigin(key.origin(), sx, sy, sz);
                     WorldMirror.SectionSnapshot snapshot = worldMirror.peekSection(key.worldKey(), localOrigin);
                     if (snapshot == null) {
@@ -3426,9 +3426,7 @@ public final class AeroServerRuntime {
                         continue;
                     }
                     region.setSection(sx, sy, sz, snapshot);
-                    if (isCoreSection(sx, sy, sz)) {
-                        readyCoreSections++;
-                    }
+                    readyCoreSections++;
                 }
             }
         }
@@ -3448,9 +3446,9 @@ public final class AeroServerRuntime {
             return;
         }
         boolean sectionUpdated = false;
-        for (int sx = 0; sx < WINDOW_SECTION_COUNT; sx++) {
-            for (int sy = 0; sy < WINDOW_SECTION_COUNT; sy++) {
-                for (int sz = 0; sz < WINDOW_SECTION_COUNT; sz++) {
+        for (int sx = CORE_SECTION_MIN; sx <= CORE_SECTION_MAX; sx++) {
+            for (int sy = CORE_SECTION_MIN; sy <= CORE_SECTION_MAX; sy++) {
+                for (int sz = CORE_SECTION_MIN; sz <= CORE_SECTION_MAX; sz++) {
                     BlockPos localOrigin = sectionOrigin(key.origin(), sx, sy, sz);
                     WorldMirror.SectionSnapshot snapshot = worldMirror.peekSection(key.worldKey(), localOrigin);
                     if (snapshot == null) {
