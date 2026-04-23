@@ -673,6 +673,7 @@ bool step_brick_actual(
 );
 void apply_pending_world_deltas(ServiceState& service, long long world_key, FluidWorldRuntime& runtime);
 bool ensure_l2_runtime(ServiceState& service, int nx, int ny, int nz, int input_channels, int output_channels);
+void clear_unbacked_placeholder_bricks(FluidWorldRuntime& runtime);
 
 bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidWorldRuntime& runtime, int step_count) {
     if (step_count <= 0) {
@@ -688,6 +689,7 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
     }
     bool overall_success = true;
     apply_pending_world_deltas(service, world_key, runtime);
+    clear_unbacked_placeholder_bricks(runtime);
     for (int step = 0; step < step_count; ++step) {
         runtime.epoch++;
         recompute_runtime_active_flags(runtime);
@@ -1235,13 +1237,30 @@ void mark_brick_and_neighbor_reinit(
 ) {
     mark_brick_state(runtime, center, geometry_dirty, forcing_dirty, true);
     for (const auto& offset : k_brick_face_neighbor_offsets) {
-        mark_brick_state(
-            runtime,
-            BrickCoord{center.x + offset[0], center.y + offset[1], center.z + offset[2]},
-            false,
-            false,
-            true
-        );
+        BrickCoord neighbor{center.x + offset[0], center.y + offset[1], center.z + offset[2]};
+        if (runtime.bricks.find(neighbor) == runtime.bricks.end()) {
+            continue;
+        }
+        mark_brick_state(runtime, neighbor, false, false, true);
+    }
+}
+
+void clear_unbacked_placeholder_bricks(FluidWorldRuntime& runtime) {
+    for (auto& entry : runtime.bricks) {
+        BrickData& brick = entry.second;
+        if (brick.active_hint || brick_has_solver_static(runtime, brick)) {
+            continue;
+        }
+        if (brick.context_key != 0) {
+            release_brick_context(brick);
+        }
+        brick.geometry_dirty = false;
+        brick.forcing_dirty = false;
+        brick.pending_reinit = false;
+        brick.active = false;
+        brick.dynamic_region.reset();
+        brick.boundary_reference_region.reset();
+        brick.packet_cache.clear();
     }
 }
 

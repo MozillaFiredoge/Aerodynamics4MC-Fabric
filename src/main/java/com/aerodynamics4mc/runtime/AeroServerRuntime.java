@@ -7024,9 +7024,6 @@ public final class AeroServerRuntime {
             regionMaxSpeeds.put(key, atlas.maxSpeed());
         }
         if (atlases.isEmpty()) {
-            publishedFrame.set(null);
-            lastPublishedFrameTick = Integer.MIN_VALUE;
-            lastCoordinatorPublishedMaxSpeed = 0.0f;
             return 0.0f;
         }
         float maxSpeed = computePublishedMaxSpeed(regionMaxSpeeds);
