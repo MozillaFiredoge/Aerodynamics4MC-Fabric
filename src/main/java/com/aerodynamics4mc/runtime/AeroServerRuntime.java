@@ -294,6 +294,7 @@ public final class AeroServerRuntime {
     private final Map<WindowKey, Integer> shellWindowRetainUntilTick = new HashMap<>();
     private final Set<WindowKey> mirrorOnlyPrewarmedWindowKeys = new HashSet<>();
     private final Map<WindowKey, Long> mirrorOnlyUploadedBrickStaticSignatures = new HashMap<>();
+    private final Map<WindowKey, Long> uploadedBrickDynamicSeedSignatures = new HashMap<>();
     private volatile Map<RegistryKey<World>, WorldEnvironmentSnapshot> worldEnvironmentSnapshots = Map.of();
     private volatile List<PlayerProbeRequest> activePlayerProbeRequests = List.of();
     private volatile List<EntitySampleRequest> activeEntitySampleRequests = List.of();
@@ -696,6 +697,9 @@ public final class AeroServerRuntime {
             .then(CommandManager.literal("status")
                 .executes(ctx -> {
                     PublishedFrame currentFrame = publishedFrame.get();
+                    float reportedMaxFlow = currentFrame == null
+                        ? lastMaxFlowSpeed
+                        : Math.max(lastMaxFlowSpeed, currentFrame.maxSpeed());
                     feedback(
                         ctx.getSource(),
                         "Status streaming=" + streamingEnabled
@@ -707,7 +711,7 @@ public final class AeroServerRuntime {
                             + " windows=" + attachedWindowCount()
                             + " simTicks=" + simulationTicks
                             + " simTickPerSec=" + format2(simulationTicksPerSecond)
-                            + " maxFlow=" + format2(lastMaxFlowSpeed)
+                            + " maxFlow=" + format2(reportedMaxFlow)
                             + " publishedRegions=" + (currentFrame == null ? 0 : currentFrame.regionAtlases().size())
                             + " probes=" + publishedPlayerProbes.get().size()
                             + " entitySamples=" + publishedEntitySamples.get().size()
@@ -2693,6 +2697,7 @@ public final class AeroServerRuntime {
         shellWindowRetainUntilTick.clear();
         mirrorOnlyPrewarmedWindowKeys.clear();
         mirrorOnlyUploadedBrickStaticSignatures.clear();
+        uploadedBrickDynamicSeedSignatures.clear();
         brickRuntimeHintWorldKeys.clear();
         brickRuntimeKnownWorldKeys.clear();
         activePlayerProbeRequests = List.of();
@@ -3269,6 +3274,7 @@ public final class AeroServerRuntime {
             desiredWindows.add(entry.getKey());
         }
         mirrorOnlyUploadedBrickStaticSignatures.keySet().retainAll(desiredWindows);
+        uploadedBrickDynamicSeedSignatures.keySet().retainAll(desiredWindows);
         MinecraftServer server = currentServer;
         Iterator<Map.Entry<WindowKey, RegionRecord>> iterator = regions.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -3279,6 +3285,7 @@ public final class AeroServerRuntime {
             shellWindowRetainUntilTick.remove(entry.getKey());
             mirrorOnlyPrewarmedWindowKeys.remove(entry.getKey());
             mirrorOnlyUploadedBrickStaticSignatures.remove(entry.getKey());
+            uploadedBrickDynamicSeedSignatures.remove(entry.getKey());
             RegionRecord region = entry.getValue();
             if (region.attached()) {
                 deactivateWindow(entry.getKey(), region, true, false);
@@ -4214,9 +4221,9 @@ public final class AeroServerRuntime {
             hint.brickY(),
             hint.brickZ()
         );
-        byte[] obstacleMask = buildBrickObstacleMask(snapshots, true);
+        byte[] obstacleMask = buildBrickObstacleMask(snapshots, false);
         if (obstacleMask == null) {
-            return false;
+            obstacleMask = new byte[BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE];
         }
         int cells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
         float[] flowState = new float[cells * RESPONSE_CHANNELS];
@@ -4810,27 +4817,16 @@ public final class AeroServerRuntime {
         if (simulationServiceId == 0L || !simulationBridge.isLoaded() || coreSnapshots == null || coreSnapshots.length != CORE_SECTION_COUNT) {
             return;
         }
+        long signature = coreStaticBrickSignature(coreSnapshots);
+        if (signature != Long.MIN_VALUE
+            && Long.valueOf(signature).equals(uploadedBrickDynamicSeedSignatures.get(key))) {
+            return;
+        }
         BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
         int brickX = Math.floorDiv(coreOrigin.getX(), BRICK_RUNTIME_SIZE);
         int brickY = Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE);
         int brickZ = Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE);
         int brickCells = BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE;
-        float[] existingFlow = new float[brickCells * RESPONSE_CHANNELS];
-        float[] existingAir = new float[brickCells];
-        float[] existingSurface = new float[brickCells];
-        if (simulationBridge.copyBrickWorldDynamicBrick(
-            simulationServiceId,
-            simulationWorldKey(key.worldKey()),
-            BRICK_RUNTIME_SIZE,
-            brickX,
-            brickY,
-            brickZ,
-            existingFlow,
-            existingAir,
-            existingSurface
-        )) {
-            return;
-        }
         byte[] obstacleMask = buildCoreBrickObstacleMask(coreSnapshots);
         if (obstacleMask == null) {
             return;
@@ -4875,6 +4871,9 @@ public final class AeroServerRuntime {
             airTemperatureState,
             surfaceTemperatureState
         );
+        if (signature != Long.MIN_VALUE) {
+            uploadedBrickDynamicSeedSignatures.put(key, signature);
+        }
     }
 
     private boolean uploadWindowCoreStaticBrickToRuntime(
@@ -6984,15 +6983,15 @@ public final class AeroServerRuntime {
                     int dstCell = ((sx * n) + sy) * n + sz;
                     int dstBase = dstCell * NativeSimulationBridge.PACKED_ATLAS_CHANNELS;
                     packed[dstBase] = quantizeSignedToShort(
-                        brickState.flowState()[srcBase],
+                        brickState.flowState()[srcBase] * NATIVE_VELOCITY_SCALE,
                         ATLAS_VELOCITY_QUANT_RANGE
                     );
                     packed[dstBase + 1] = quantizeSignedToShort(
-                        brickState.flowState()[srcBase + 1],
+                        brickState.flowState()[srcBase + 1] * NATIVE_VELOCITY_SCALE,
                         ATLAS_VELOCITY_QUANT_RANGE
                     );
                     packed[dstBase + 2] = quantizeSignedToShort(
-                        brickState.flowState()[srcBase + 2],
+                        brickState.flowState()[srcBase + 2] * NATIVE_VELOCITY_SCALE,
                         ATLAS_VELOCITY_QUANT_RANGE
                     );
                     packed[dstBase + 3] = quantizeSignedToShort(
@@ -8063,6 +8062,7 @@ public final class AeroServerRuntime {
                         lastCoordinatorState = "publishBrickAtlases";
                         float maxSpeedThisCycle = publishBrickSolveAtlases(solveWindowKeys);
                         lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
+                        lastMaxFlowSpeed = maxSpeedThisCycle;
                         lastCoordinatorSolveCompleteTick = tickCounter;
                         lastCoordinatorState = "published";
                         lastCoordinatorNoPublishReason = "";

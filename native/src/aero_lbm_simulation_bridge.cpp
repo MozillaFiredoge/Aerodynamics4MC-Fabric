@@ -697,10 +697,12 @@ void step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             }
             ensure_brick_dynamic_region_storage(runtime, brick);
             auto next_dynamic = std::make_shared<DynamicRegionData>(*brick.dynamic_region);
-            const bool bootstrap_macro_ghost =
-                needs_seed.find(entry.first) != needs_seed.end() || brick.context_key == 0;
-            if (bootstrap_macro_ghost) {
+            const bool needs_seed_fill = needs_seed.find(entry.first) != needs_seed.end();
+            const bool needs_face_bootstrap = needs_seed_fill || brick.context_key == 0;
+            if (needs_seed_fill) {
                 seed_brick_from_neighbor_means(runtime, entry.first, snapshots, *next_dynamic);
+            }
+            if (needs_face_bootstrap) {
                 for (int i = 0; i < k_brick_face_neighbor_count; ++i) {
                     BrickCoord neighbor_coord{
                         entry.first.x + k_brick_face_neighbor_offsets[i][0],
@@ -3543,6 +3545,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_sync_region_core_to_brick_world(
     }
 
     BrickData& brick = runtime.bricks[BrickCoord{brick_x, brick_y, brick_z}];
+    if (brick.context_key != 0) {
+        release_brick_context(brick);
+    }
     brick.dynamic_region = std::move(brick_dynamic);
     brick.active = true;
     brick.last_active_epoch = runtime.epoch;
@@ -3651,12 +3656,12 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_dynamic_brick(
     dynamic->surface_temperature.assign(surface_temperature, surface_temperature + cells);
 
     BrickData& brick = runtime.bricks[BrickCoord{brick_x, brick_y, brick_z}];
+    if (brick.context_key != 0) {
+        release_brick_context(brick);
+    }
     brick.dynamic_region = std::move(dynamic);
     brick.active = true;
     brick.last_active_epoch = runtime.epoch;
-    if (brick.pending_reinit && brick.context_key != 0) {
-        release_brick_context(brick);
-    }
     brick.pending_reinit = false;
     brick.forcing_dirty = false;
     if (brick.static_region) {
