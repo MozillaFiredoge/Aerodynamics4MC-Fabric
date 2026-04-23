@@ -451,6 +451,17 @@ bool brick_is_resident_for_windows(const BrickData& brick) {
         || brick.pending_reinit;
 }
 
+bool brick_has_solver_static(const FluidWorldRuntime& runtime, const BrickData& brick) {
+    return brick.static_region
+        && brick.static_region->nx == runtime.brick_size
+        && brick.static_region->ny == runtime.brick_size
+        && brick.static_region->nz == runtime.brick_size;
+}
+
+bool brick_is_solver_active(const FluidWorldRuntime& runtime, const BrickData& brick) {
+    return brick.active && brick_has_solver_static(runtime, brick);
+}
+
 int count_resident_bricks(const FluidWorldRuntime& runtime) {
     int count = 0;
     for (const auto& entry : runtime.bricks) {
@@ -533,7 +544,7 @@ BrickCoord brick_coord_for_block(int x, int y, int z, int brick_size) {
 void recompute_runtime_active_flags(FluidWorldRuntime& runtime) {
     for (auto& entry : runtime.bricks) {
         const bool hinted = runtime.active_hint_closure.find(entry.first) != runtime.active_hint_closure.end();
-        entry.second.active = hinted
+        entry.second.active = (hinted && brick_has_solver_static(runtime, entry.second))
             || entry.second.geometry_dirty
             || entry.second.forcing_dirty
             || entry.second.pending_reinit;
@@ -995,7 +1006,7 @@ bool brick_face_exposed(
         neighbor.z += positive_face ? 1 : -1;
     }
     auto it = runtime.bricks.find(neighbor);
-    return it == runtime.bricks.end() || !it->second.active;
+    return it == runtime.bricks.end() || !brick_is_solver_active(runtime, it->second);
 }
 
 bool build_brick_step_packet(
