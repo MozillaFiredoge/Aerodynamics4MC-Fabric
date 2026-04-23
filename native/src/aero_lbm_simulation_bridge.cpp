@@ -672,9 +672,18 @@ bool step_brick_actual(
     DynamicRegionData& dynamic
 );
 void apply_pending_world_deltas(ServiceState& service, long long world_key, FluidWorldRuntime& runtime);
+bool ensure_l2_runtime(ServiceState& service, int nx, int ny, int nz, int input_channels, int output_channels);
 
 bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidWorldRuntime& runtime, int step_count) {
     if (step_count <= 0) {
+        return false;
+    }
+    if (!ensure_l2_runtime(service, runtime.brick_size, runtime.brick_size, runtime.brick_size, k_packet_channels, 4)) {
+        set_simulation_last_error(
+            "brick_step_runtime_init failed for world=" + std::to_string(world_key)
+                + " brickSize=" + std::to_string(runtime.brick_size)
+                + ": " + aero_lbm_last_error()
+        );
         return false;
     }
     bool overall_success = true;
@@ -685,7 +694,7 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
         std::unordered_map<BrickCoord, bool, BrickCoordHash> needs_seed;
         for (auto& entry : runtime.bricks) {
             BrickData& brick = entry.second;
-            if (!brick.active) {
+            if (!brick_is_solver_active(runtime, brick)) {
                 continue;
             }
             const bool had_dynamic = brick.dynamic_region != nullptr;
@@ -707,7 +716,8 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
         std::unordered_map<BrickCoord, std::shared_ptr<const DynamicRegionData>, BrickCoordHash> snapshots;
         snapshots.reserve(runtime.bricks.size());
         for (const auto& entry : runtime.bricks) {
-            if (!entry.second.active || !brick_dynamic_region_valid(runtime, entry.second.dynamic_region.get())) {
+            if (!brick_is_solver_active(runtime, entry.second)
+                || !brick_dynamic_region_valid(runtime, entry.second.dynamic_region.get())) {
                 continue;
             }
             snapshots.emplace(entry.first, entry.second.dynamic_region);
@@ -715,7 +725,7 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
 
         for (auto& entry : runtime.bricks) {
             BrickData& brick = entry.second;
-            if (!brick.active || brick.context_key == 0) {
+            if (!brick_is_solver_active(runtime, brick) || brick.context_key == 0) {
                 continue;
             }
             for (int i = 0; i < k_brick_face_neighbor_count; ++i) {
@@ -732,7 +742,7 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
                     continue;
                 }
                 BrickData& neighbor = neighbor_it->second;
-                if (!neighbor.active || neighbor.context_key == 0) {
+                if (!brick_is_solver_active(runtime, neighbor) || neighbor.context_key == 0) {
                     continue;
                 }
                 exchange_brick_face_context_halo(
@@ -748,7 +758,7 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
 
         for (auto& entry : runtime.bricks) {
             BrickData& brick = entry.second;
-            if (!brick.active || !brick.dynamic_region) {
+            if (!brick_is_solver_active(runtime, brick) || !brick.dynamic_region) {
                 continue;
             }
             ensure_brick_dynamic_region_storage(runtime, brick);

@@ -6107,17 +6107,34 @@ static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jin
     auto tick_begin = Clock::now();
     StepTiming timing;
 
-    if (!g_cfg.initialized || !packet) return false;
-    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
+    clear_last_native_error();
+    if (!g_cfg.initialized) {
+        set_last_native_error("native_step_raw_dims: runtime not initialized");
+        return false;
+    }
+    if (!packet) {
+        set_last_native_error("native_step_raw_dims: missing packet");
+        return false;
+    }
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        set_last_native_error("native_step_raw_dims: invalid dimensions");
+        return false;
+    }
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
     LockedContext locked_context(context_key, true);
-    if (!locked_context.ctx) return false;
+    if (!locked_context.ctx) {
+        set_last_native_error("native_step_raw_dims: failed to allocate or acquire context");
+        return false;
+    }
     ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, nx, ny, nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
 
     const bool ok = run_solver_step(ctx, packet, nullptr, nullptr, 0, output_flow, timing);
+    if (!ok && g_last_native_error.empty()) {
+        set_last_native_error("native_step_raw_dims: run_solver_step failed");
+    }
     timing.total_ms = elapsed_ms(tick_begin, Clock::now());
     record_timing(timing);
     return ok;
@@ -6137,19 +6154,42 @@ static bool native_step_raw_dims_with_sparse_overlays_impl(
     auto tick_begin = Clock::now();
     StepTiming timing;
 
-    if (!g_cfg.initialized || !packet) return false;
-    if (nx <= 0 || ny <= 0 || nz <= 0) return false;
-    if (overlay_count < 0) return false;
-    if (overlay_count > 0 && (!overlay_cells || !overlay_values)) return false;
+    clear_last_native_error();
+    if (!g_cfg.initialized) {
+        set_last_native_error("native_step_raw_dims_sparse: runtime not initialized");
+        return false;
+    }
+    if (!packet) {
+        set_last_native_error("native_step_raw_dims_sparse: missing packet");
+        return false;
+    }
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        set_last_native_error("native_step_raw_dims_sparse: invalid dimensions");
+        return false;
+    }
+    if (overlay_count < 0) {
+        set_last_native_error("native_step_raw_dims_sparse: invalid overlay count");
+        return false;
+    }
+    if (overlay_count > 0 && (!overlay_cells || !overlay_values)) {
+        set_last_native_error("native_step_raw_dims_sparse: missing overlay data");
+        return false;
+    }
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
     LockedContext locked_context(context_key, true);
-    if (!locked_context.ctx) return false;
+    if (!locked_context.ctx) {
+        set_last_native_error("native_step_raw_dims_sparse: failed to allocate or acquire context");
+        return false;
+    }
     ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, nx, ny, nz, cells);
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
 
     const bool ok = run_solver_step(ctx, packet, overlay_cells, overlay_values, overlay_count, output_flow, timing);
+    if (!ok && g_last_native_error.empty()) {
+        set_last_native_error("native_step_raw_dims_sparse: run_solver_step failed");
+    }
     timing.total_ms = elapsed_ms(tick_begin, Clock::now());
     record_timing(timing);
     return ok;
