@@ -4353,11 +4353,6 @@ public final class AeroServerRuntime {
                 shellWindowRetainUntilTick.remove(key);
             }
         }
-        for (WindowKey key : desiredWindowKeys) {
-            if (!desiredSolveWindowKeys.contains(key)) {
-                removePublishedRegionAtlas(key);
-            }
-        }
     }
 
     private List<NestedFeedbackAxisSpan> buildHorizontalNestedFeedbackSpans(
@@ -7024,7 +7019,8 @@ public final class AeroServerRuntime {
             regionMaxSpeeds.put(key, atlas.maxSpeed());
         }
         if (atlases.isEmpty()) {
-            return 0.0f;
+            PublishedFrame current = publishedFrame.get();
+            return current == null ? 0.0f : current.maxSpeed();
         }
         float maxSpeed = computePublishedMaxSpeed(regionMaxSpeeds);
         PublishedFrame next = new PublishedFrame(
@@ -8055,8 +8051,14 @@ public final class AeroServerRuntime {
                     long postSolveStartNanos = System.nanoTime();
                     synchronized (simulationStateLock) {
                         lastCoordinatorState = "sampleProbes";
-                        publishedPlayerProbes.set(samplePlayerProbesLocked());
-                        publishedEntitySamples.set(sampleEntitySamplesLocked());
+                        Map<UUID, PlayerProbe> nextPlayerProbes = samplePlayerProbesLocked();
+                        if (!nextPlayerProbes.isEmpty() || activePlayerProbeRequests.isEmpty()) {
+                            publishedPlayerProbes.set(nextPlayerProbes);
+                        }
+                        Map<UUID, EntitySample> nextEntitySamples = sampleEntitySamplesLocked();
+                        if (!nextEntitySamples.isEmpty() || activeEntitySampleRequests.isEmpty()) {
+                            publishedEntitySamples.set(nextEntitySamples);
+                        }
                         lastCoordinatorState = "publishBrickAtlases";
                         float maxSpeedThisCycle = publishBrickSolveAtlases(solveWindowKeys);
                         lastCoordinatorAppliedMaxSpeed = maxSpeedThisCycle;
