@@ -135,7 +135,7 @@ constexpr int kSpongeLayers = 4;
 constexpr float kSpongeStrength = 0.03f;
 constexpr float kBoundaryConvectiveBeta = 0.15f;
 
-constexpr float kObstacleBounceBlend = 0.30f;
+constexpr float kObstacleBounceBlend = 0.0f;
 constexpr float kFanBeta = 0.07f;
 constexpr float kFanTargetScale = 1.0f / kRuntimeVelocityScale;
 constexpr float kFanTargetMax = 0.28f;
@@ -1124,6 +1124,26 @@ inline bool solid_or_oob(const ContextState& ctx, int x, int y, int z) {
     return ctx.obstacle[cell_index(x, y, z, ctx.nx, ctx.ny, ctx.nz)] != 0;
 }
 
+inline bool obstacle_adjacent(const ContextState& ctx, int x, int y, int z) {
+    constexpr int offsets[6][3] = {
+        { 1, 0, 0}, {-1, 0, 0},
+        { 0, 1, 0}, { 0,-1, 0},
+        { 0, 0, 1}, { 0, 0,-1}
+    };
+    for (const auto& offset : offsets) {
+        int nx = x + offset[0];
+        int ny = y + offset[1];
+        int nz = z + offset[2];
+        if (nx < 0 || ny < 0 || nz < 0 || nx >= ctx.nx || ny >= ctx.ny || nz >= ctx.nz) {
+            continue;
+        }
+        if (ctx.obstacle[cell_index(nx, ny, nz, ctx.nx, ctx.ny, ctx.nz)] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline float hash_signed_noise(std::uint64_t cell, std::uint64_t tick) {
     std::uint64_t x = cell * 0x9E3779B97F4A7C15ULL ^ tick * 0xD1B54A32D192ED03ULL;
     x ^= x >> 30;
@@ -1788,6 +1808,7 @@ inline float runtime_local_turbulent_nu(
     float uz_center
 ) {
     if (benchmark_mode_active() || !effective_enable_sgs()) return 0.0f;
+    if (obstacle_adjacent(ctx, x, y, z)) return 0.0f;
 
     const float ux_px = velocity_component_or_self(ctx, x + 1, y, z, 0, ux_center);
     const float ux_mx = velocity_component_or_self(ctx, x - 1, y, z, 0, ux_center);
@@ -2489,7 +2510,7 @@ __constant float SGS_BULK_COUPLING = 0.30f;
 __constant int SPONGE_LAYERS = 4;
 __constant float SPONGE_STRENGTH = 0.03f;
 __constant float BOUNDARY_CONVECTIVE_BETA = 0.15f;
-__constant float OBSTACLE_BOUNCE_BLEND = 0.30f;
+__constant float OBSTACLE_BOUNCE_BLEND = 0.0f;
 __constant float FAN_BETA = 0.07f;
 __constant float FAN_TARGET_SCALE = 0.033333335f;
 __constant float FAN_TARGET_MAX = 0.34f;
@@ -2876,6 +2897,36 @@ inline float velocity_component_or_self(
     return payload[base + channel];
 }
 
+inline bool obstacle_adjacent(
+    __global const float* payload,
+    int in_ch,
+    int nx,
+    int ny,
+    int nz,
+    int x,
+    int y,
+    int z
+) {
+    const int offsets[6][3] = {
+        { 1, 0, 0}, {-1, 0, 0},
+        { 0, 1, 0}, { 0,-1, 0},
+        { 0, 0, 1}, { 0, 0,-1}
+    };
+    for (int i = 0; i < 6; ++i) {
+        int sx = x + offsets[i][0];
+        int sy = y + offsets[i][1];
+        int sz = z + offsets[i][2];
+        if (sx < 0 || sy < 0 || sz < 0 || sx >= nx || sy >= ny || sz >= nz) {
+            continue;
+        }
+        int cell = (sx * ny + sy) * nz + sz;
+        if (payload[cell * in_ch + 0] > 0.5f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline float runtime_local_turbulent_nu(
     __global const float* payload,
     int in_ch,
@@ -2889,6 +2940,9 @@ inline float runtime_local_turbulent_nu(
     float uy_center,
     float uz_center
 ) {
+    if (obstacle_adjacent(payload, in_ch, nx, ny, nz, x, y, z)) {
+        return 0.0f;
+    }
     float ux_px = velocity_component_or_self(payload, in_ch, nx, ny, nz, x + 1, y, z, 5, ux_center);
     float ux_mx = velocity_component_or_self(payload, in_ch, nx, ny, nz, x - 1, y, z, 5, ux_center);
     float ux_py = velocity_component_or_self(payload, in_ch, nx, ny, nz, x, y + 1, z, 5, ux_center);
