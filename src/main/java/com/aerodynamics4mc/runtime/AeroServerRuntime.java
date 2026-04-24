@@ -5486,7 +5486,6 @@ public final class AeroServerRuntime {
         if (!copied) {
             return;
         }
-        byte[] connectedAirMask = buildExternallyConnectedAirMask(obstacleMask, GRID_SIZE, GRID_SIZE, GRID_SIZE);
         for (int x = 0; x < BRICK_RUNTIME_SIZE; x++) {
             for (int y = 0; y < BRICK_RUNTIME_SIZE; y++) {
                 for (int z = 0; z < BRICK_RUNTIME_SIZE; z++) {
@@ -5494,8 +5493,7 @@ public final class AeroServerRuntime {
                     int dstY = REGION_HALO_CELLS + y;
                     int dstZ = REGION_HALO_CELLS + z;
                     int dstCell = gridCellIndex(dstX, dstY, dstZ);
-                    if (obstacleMask[dstCell] != 0 || connectedAirMask[dstCell] == 0) {
-                        clearSeedFlowCell(flowState, dstCell);
+                    if (obstacleMask[dstCell] != 0) {
                         continue;
                     }
                     int srcCell = patchCellIndex(x, y, z, BRICK_RUNTIME_SIZE);
@@ -5578,18 +5576,15 @@ public final class AeroServerRuntime {
         )) {
             return false;
         }
-        byte[] connectedAirMask = buildExternallyConnectedAirMask(obstacleMask, sizeX, sizeY, sizeZ);
-        byte[] seedObstacleMask = buildSeedObstacleMask(obstacleMask, connectedAirMask);
         for (int cell = 0; cell < cells; cell++) {
-            if (seedObstacleMask[cell] != 0) {
-                clearSeedFlowCell(flowState, cell);
+            if (obstacleMask[cell] != 0) {
                 continue;
             }
             int base = cell * RESPONSE_CHANNELS;
             flowState[base] = windX[cell] / NATIVE_VELOCITY_SCALE;
             flowState[base + 2] = windZ[cell] / NATIVE_VELOCITY_SCALE;
         }
-        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, seedObstacleMask, flowState);
+        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, obstacleMask, flowState);
         return true;
     }
 
@@ -5615,108 +5610,17 @@ public final class AeroServerRuntime {
             ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K + THERMAL_DEEP_GROUND_OFFSET_K
             : boundarySample.deepGroundTemperatureKelvin();
         int cells = sizeX * sizeY * sizeZ;
-        byte[] connectedAirMask = buildExternallyConnectedAirMask(obstacleMask, sizeX, sizeY, sizeZ);
-        byte[] seedObstacleMask = buildSeedObstacleMask(obstacleMask, connectedAirMask);
         for (int cell = 0; cell < cells; cell++) {
             airTemperatureState[cell] = seedAirTemperature;
             surfaceTemperatureState[cell] = seedSurfaceTemperature;
-            if (seedObstacleMask[cell] != 0) {
-                clearSeedFlowCell(flowState, cell);
+            if (obstacleMask[cell] != 0) {
                 continue;
             }
             int base = cell * RESPONSE_CHANNELS;
             flowState[base] = seedVx;
             flowState[base + 2] = seedVz;
         }
-        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, seedObstacleMask, flowState);
-    }
-
-    private byte[] buildSeedObstacleMask(byte[] obstacleMask, byte[] connectedAirMask) {
-        byte[] seedObstacleMask = new byte[obstacleMask.length];
-        for (int cell = 0; cell < obstacleMask.length; cell++) {
-            seedObstacleMask[cell] = obstacleMask[cell] != 0 || connectedAirMask[cell] == 0 ? (byte) 1 : (byte) 0;
-        }
-        return seedObstacleMask;
-    }
-
-    private byte[] buildExternallyConnectedAirMask(byte[] obstacleMask, int sizeX, int sizeY, int sizeZ) {
-        int cells = sizeX * sizeY * sizeZ;
-        byte[] connectedAirMask = new byte[cells];
-        int[] queue = new int[cells];
-        int head = 0;
-        int tail = 0;
-
-        for (int x = 0; x < sizeX; x++) {
-            for (int y = 0; y < sizeY; y++) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, 0, sizeY, sizeZ);
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, sizeZ - 1, sizeY, sizeZ);
-            }
-            for (int z = 0; z < sizeZ; z++) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, 0, z, sizeY, sizeZ);
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, sizeY - 1, z, sizeY, sizeZ);
-            }
-        }
-        for (int y = 0; y < sizeY; y++) {
-            for (int z = 0; z < sizeZ; z++) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, 0, y, z, sizeY, sizeZ);
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, sizeX - 1, y, z, sizeY, sizeZ);
-            }
-        }
-
-        while (head < tail) {
-            int cell = queue[head++];
-            int yz = sizeY * sizeZ;
-            int x = cell / yz;
-            int rem = cell - x * yz;
-            int y = rem / sizeZ;
-            int z = rem - y * sizeZ;
-            if (x > 0) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x - 1, y, z, sizeY, sizeZ);
-            }
-            if (x + 1 < sizeX) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x + 1, y, z, sizeY, sizeZ);
-            }
-            if (y > 0) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y - 1, z, sizeY, sizeZ);
-            }
-            if (y + 1 < sizeY) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y + 1, z, sizeY, sizeZ);
-            }
-            if (z > 0) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, z - 1, sizeY, sizeZ);
-            }
-            if (z + 1 < sizeZ) {
-                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, z + 1, sizeY, sizeZ);
-            }
-        }
-        return connectedAirMask;
-    }
-
-    private int enqueueConnectedAirBoundaryCell(
-        byte[] obstacleMask,
-        byte[] connectedAirMask,
-        int[] queue,
-        int tail,
-        int x,
-        int y,
-        int z,
-        int sizeY,
-        int sizeZ
-    ) {
-        int cell = patchCellIndex3d(x, y, z, sizeY, sizeZ);
-        if (obstacleMask[cell] != 0 || connectedAirMask[cell] != 0) {
-            return tail;
-        }
-        connectedAirMask[cell] = 1;
-        queue[tail++] = cell;
-        return tail;
-    }
-
-    private void clearSeedFlowCell(float[] flowState, int cell) {
-        int base = cell * RESPONSE_CHANNELS;
-        for (int channel = 0; channel < RESPONSE_CHANNELS; channel++) {
-            flowState[base + channel] = 0.0f;
-        }
+        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, obstacleMask, flowState);
     }
 
     private void deriveSeedVerticalVelocity(int sizeX, int sizeY, int sizeZ, byte[] obstacleMask, float[] flowState) {

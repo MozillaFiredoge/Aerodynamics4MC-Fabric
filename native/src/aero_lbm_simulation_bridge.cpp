@@ -22,7 +22,6 @@ struct StaticRegionData {
     int ny = 0;
     int nz = 0;
     std::vector<uint8_t> obstacle;
-    std::vector<uint8_t> connected_air;
     std::vector<uint8_t> surface_kind;
     std::vector<uint16_t> open_face_mask;
     std::vector<float> emitter_power_watts;
@@ -273,11 +272,6 @@ constexpr float k_native_thermal_source_max = 0.006f;
 constexpr float k_thermal_surface_init_min_k = 220.0f;
 constexpr float k_thermal_surface_max_k = 1800.0f;
 constexpr int k_brick_face_ghost_layers = 1;
-constexpr int k_aperture_ring_radius = 2;
-constexpr int k_aperture_min_solid_ring_cells = 4;
-constexpr float k_aperture_forcing_mask = 0.22f;
-constexpr float k_aperture_min_drive_lattice = 0.006f;
-constexpr float k_aperture_target_max_lattice = 0.18f;
 constexpr std::uint64_t k_brick_inactive_retention_epochs = 16;
 constexpr int k_brick_face_neighbor_count = 6;
 constexpr int k_brick_face_neighbor_offsets[k_brick_face_neighbor_count][3] = {
@@ -635,18 +629,6 @@ void prune_inactive_bricks(FluidWorldRuntime& runtime) {
 }
 
 bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicRegionData* dynamic);
-void rebuild_static_connected_air(StaticRegionData& stat);
-bool static_cell_fluid_solved(const StaticRegionData& stat, std::size_t cell);
-void apply_brick_aperture_forcing(
-    const FluidWorldRuntime& runtime,
-    const StaticRegionData& stat,
-    const DynamicRegionData* reference,
-    int x,
-    int y,
-    int z,
-    std::size_t flow_base,
-    float* packet_cell
-);
 void ensure_brick_dynamic_region_storage(FluidWorldRuntime& runtime, BrickData& brick);
 void reset_brick_dynamic_region_state(FluidWorldRuntime& runtime, BrickData& brick);
 void apply_brick_static_constraints(FluidWorldRuntime& runtime, BrickData& brick);
@@ -894,7 +876,7 @@ void apply_brick_static_constraints(FluidWorldRuntime& runtime, BrickData& brick
     }
     const size_t cells = dynamic.air_temperature.size();
     for (size_t cell = 0; cell < cells; ++cell) {
-        const bool obstacle = !static_cell_fluid_solved(stat, cell);
+        const bool obstacle = stat.obstacle[cell] != 0;
         const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
         if (obstacle) {
             std::fill_n(
@@ -1144,8 +1126,7 @@ bool build_brick_step_packet(
                 const size_t cell = static_cast<size_t>(cell_index(x, y, z));
                 const size_t packet_base = cell * k_packet_channels;
                 const size_t flow_base = cell * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
-                float* packet_cell = packet.data() + static_cast<std::ptrdiff_t>(packet_base);
-                const bool obstacle = !static_cell_fluid_solved(stat, cell);
+                const bool obstacle = stat.obstacle[cell] != 0;
                 packet[packet_base + k_channel_obstacle] = obstacle ? 1.0f : 0.0f;
                 packet[packet_base + k_channel_fan_mask] = 0.0f;
                 packet[packet_base + k_channel_fan_vx] = 0.0f;
@@ -1171,16 +1152,6 @@ bool build_brick_step_packet(
                     packet[packet_base + k_channel_thermal_source] =
                         temperature_source_from_power_watts(stat.emitter_power_watts[cell]);
                 }
-                apply_brick_aperture_forcing(
-                    runtime,
-                    stat,
-                    boundary_reference_valid ? boundary_reference : &dynamic,
-                    x,
-                    y,
-                    z,
-                    flow_base,
-                    packet_cell
-                );
             }
         }
     }
@@ -1329,7 +1300,6 @@ void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta
             const size_t face_base = static_cast<size_t>(cell) * k_face_count;
             std::fill_n(stat.face_sky_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
             std::fill_n(stat.face_direct_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
-            rebuild_static_connected_air(stat);
             brick.static_region = std::move(updated_static);
             if (brick.dynamic_region) {
                 apply_brick_static_constraints(runtime, brick);
@@ -1530,7 +1500,7 @@ void accumulate_nested_feedback(
             for (int y = bin.min_y; y < bin.max_y; ++y) {
                 for (int z = bin.min_z; z < bin.max_z; ++z) {
                     const int cell = grid_cell_index(dynamic.ny, dynamic.nz, x, y, z);
-                    if (!static_cell_fluid_solved(*stat, static_cast<std::size_t>(cell))) {
+                    if (stat->obstacle[static_cast<std::size_t>(cell)] != 0) {
                         continue;
                     }
                     const std::size_t flow_base = static_cast<std::size_t>(cell) * AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS;
@@ -1666,7 +1636,7 @@ std::shared_ptr<const RegionPacketTemplateData> build_region_packet_template(
     packet->values.assign(static_cast<size_t>(cells) * k_packet_channels, 0.0f);
     for (int cell = 0; cell < cells; ++cell) {
         size_t packet_base = static_cast<size_t>(cell) * k_packet_channels;
-        const bool obstacle = !static_cell_fluid_solved(stat, static_cast<std::size_t>(cell));
+        const bool obstacle = stat.obstacle[static_cast<std::size_t>(cell)] != 0;
         packet->values[packet_base + k_channel_obstacle] = obstacle ? 1.0f : 0.0f;
         if (obstacle) {
             continue;
@@ -1778,179 +1748,6 @@ bool in_bounds(int nx, int ny, int nz, int x, int y, int z) {
 
 int grid_cell_index(int ny, int nz, int x, int y, int z) {
     return (x * ny + y) * nz + z;
-}
-
-bool static_cell_fluid_solved(const StaticRegionData& stat, std::size_t cell) {
-    if (cell >= stat.obstacle.size() || stat.obstacle[cell] != 0) {
-        return false;
-    }
-    return stat.connected_air.size() != stat.obstacle.size()
-        || stat.connected_air[cell] != 0;
-}
-
-void rebuild_static_connected_air(StaticRegionData& stat) {
-    int cells = 0;
-    if (!checked_cell_count(stat.nx, stat.ny, stat.nz, &cells)
-        || stat.obstacle.size() != static_cast<std::size_t>(cells)) {
-        stat.connected_air.clear();
-        return;
-    }
-    stat.connected_air.assign(static_cast<std::size_t>(cells), 0u);
-    std::vector<int> queue;
-    queue.reserve(static_cast<std::size_t>(cells));
-
-    auto enqueue = [&](int x, int y, int z) {
-        const int cell = grid_cell_index(stat.ny, stat.nz, x, y, z);
-        const std::size_t index = static_cast<std::size_t>(cell);
-        if (stat.obstacle[index] != 0 || stat.connected_air[index] != 0) {
-            return;
-        }
-        stat.connected_air[index] = 1u;
-        queue.push_back(cell);
-    };
-
-    for (int x = 0; x < stat.nx; ++x) {
-        for (int y = 0; y < stat.ny; ++y) {
-            enqueue(x, y, 0);
-            enqueue(x, y, stat.nz - 1);
-        }
-        for (int z = 0; z < stat.nz; ++z) {
-            enqueue(x, 0, z);
-            enqueue(x, stat.ny - 1, z);
-        }
-    }
-    for (int y = 0; y < stat.ny; ++y) {
-        for (int z = 0; z < stat.nz; ++z) {
-            enqueue(0, y, z);
-            enqueue(stat.nx - 1, y, z);
-        }
-    }
-
-    for (std::size_t head = 0; head < queue.size(); ++head) {
-        const int cell = queue[head];
-        const int yz = stat.ny * stat.nz;
-        const int x = cell / yz;
-        const int rem = cell - x * yz;
-        const int y = rem / stat.nz;
-        const int z = rem - y * stat.nz;
-        if (x > 0) enqueue(x - 1, y, z);
-        if (x + 1 < stat.nx) enqueue(x + 1, y, z);
-        if (y > 0) enqueue(x, y - 1, z);
-        if (y + 1 < stat.ny) enqueue(x, y + 1, z);
-        if (z > 0) enqueue(x, y, z - 1);
-        if (z + 1 < stat.nz) enqueue(x, y, z + 1);
-    }
-}
-
-bool static_solved_air_at(const StaticRegionData& stat, int x, int y, int z) {
-    if (!in_bounds(stat.nx, stat.ny, stat.nz, x, y, z)) {
-        return false;
-    }
-    return static_cell_fluid_solved(
-        stat,
-        static_cast<std::size_t>(grid_cell_index(stat.ny, stat.nz, x, y, z))
-    );
-}
-
-bool static_raw_obstacle_at(const StaticRegionData& stat, int x, int y, int z) {
-    if (!in_bounds(stat.nx, stat.ny, stat.nz, x, y, z)) {
-        return false;
-    }
-    const int cell = grid_cell_index(stat.ny, stat.nz, x, y, z);
-    return stat.obstacle[static_cast<std::size_t>(cell)] != 0;
-}
-
-int aperture_solid_ring_count(const StaticRegionData& stat, int axis, int x, int y, int z) {
-    int solid_count = 0;
-    for (int du = -k_aperture_ring_radius; du <= k_aperture_ring_radius; ++du) {
-        for (int dv = -k_aperture_ring_radius; dv <= k_aperture_ring_radius; ++dv) {
-            if (du == 0 && dv == 0) {
-                continue;
-            }
-            int sx = x;
-            int sy = y;
-            int sz = z;
-            if (axis == 0) {
-                sy += du;
-                sz += dv;
-            } else if (axis == 1) {
-                sx += du;
-                sz += dv;
-            } else {
-                sx += du;
-                sy += dv;
-            }
-            if (static_raw_obstacle_at(stat, sx, sy, sz)) {
-                solid_count++;
-            }
-        }
-    }
-    return solid_count;
-}
-
-bool static_cell_is_aperture_for_axis(const StaticRegionData& stat, int axis, int x, int y, int z) {
-    if (!static_solved_air_at(stat, x, y, z)) {
-        return false;
-    }
-    bool open_negative = false;
-    bool open_positive = false;
-    if (axis == 0) {
-        open_negative = static_solved_air_at(stat, x - 1, y, z);
-        open_positive = static_solved_air_at(stat, x + 1, y, z);
-    } else if (axis == 1) {
-        open_negative = static_solved_air_at(stat, x, y - 1, z);
-        open_positive = static_solved_air_at(stat, x, y + 1, z);
-    } else {
-        open_negative = static_solved_air_at(stat, x, y, z - 1);
-        open_positive = static_solved_air_at(stat, x, y, z + 1);
-    }
-    if (!open_negative || !open_positive) {
-        return false;
-    }
-    return aperture_solid_ring_count(stat, axis, x, y, z) >= k_aperture_min_solid_ring_cells;
-}
-
-void apply_brick_aperture_forcing(
-    const FluidWorldRuntime& runtime,
-    const StaticRegionData& stat,
-    const DynamicRegionData* reference,
-    int x,
-    int y,
-    int z,
-    std::size_t flow_base,
-    float* packet_cell
-) {
-    if (!reference || !packet_cell || reference->flow_state.size() <= flow_base + 2) {
-        return;
-    }
-    int best_axis = -1;
-    float best_drive = 0.0f;
-    for (int axis = 0; axis < 3; ++axis) {
-        if (!static_cell_is_aperture_for_axis(stat, axis, x, y, z)) {
-            continue;
-        }
-        const float drive = reference->flow_state[flow_base + static_cast<std::size_t>(axis)];
-        if (std::fabs(drive) > std::fabs(best_drive)) {
-            best_drive = drive;
-            best_axis = axis;
-        }
-    }
-    if (best_axis < 0 || std::fabs(best_drive) < k_aperture_min_drive_lattice) {
-        return;
-    }
-
-    const float target_lattice = std::clamp(
-        best_drive,
-        -k_aperture_target_max_lattice,
-        k_aperture_target_max_lattice
-    );
-    const float meters_per_second_scale = runtime.dt_seconds > 0.0f
-        ? runtime.dx_meters / runtime.dt_seconds
-        : 1.0f;
-    packet_cell[k_channel_fan_mask] = std::max(packet_cell[k_channel_fan_mask], k_aperture_forcing_mask);
-    packet_cell[k_channel_fan_vx] = best_axis == 0 ? target_lattice * meters_per_second_scale : 0.0f;
-    packet_cell[k_channel_fan_vy] = best_axis == 1 ? target_lattice * meters_per_second_scale : 0.0f;
-    packet_cell[k_channel_fan_vz] = best_axis == 2 ? target_lattice * meters_per_second_scale : 0.0f;
 }
 
 int boundary_face_index(int face, int u, int v, int resolution) {
@@ -3162,7 +2959,7 @@ bool refresh_region_thermal(
 
                 if (!material) {
                     if (emitter_power_watts > 0.0f && open_face_mask != 0) {
-                        const bool self_blocked = !static_cell_fluid_solved(stat, static_cast<std::size_t>(cell));
+                        const bool self_blocked = stat.obstacle[static_cast<size_t>(cell)] != 0;
                         const float self_weight = self_blocked ? 0.0f : 0.30f;
                         float face_weights[k_face_count] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
                         float total_weight = self_weight;
@@ -3191,13 +2988,14 @@ bool refresh_region_thermal(
                                     continue;
                                 }
                                 const int neighbor_cell = grid_cell_index(ny, nz, nx_cell, ny_cell, nz_cell);
-                                if (static_cell_fluid_solved(stat, static_cast<std::size_t>(neighbor_cell))) {
-                                    add_thermal_source(
-                                        forcing.thermal_source,
-                                        neighbor_cell,
-                                        scalar_source * (weight / total_weight)
-                                    );
+                                if (stat.obstacle[static_cast<std::size_t>(neighbor_cell)] != 0) {
+                                    continue;
                                 }
+                                add_thermal_source(
+                                    forcing.thermal_source,
+                                    neighbor_cell,
+                                    scalar_source * (weight / total_weight)
+                                );
                             }
                         }
                     } else {
@@ -3665,7 +3463,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick(
     region->emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
     region->face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
     region->face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
-    rebuild_static_connected_air(*region);
 
     BrickCoord coord{brick_x, brick_y, brick_z};
     BrickData& brick = runtime.bricks[coord];
@@ -3731,7 +3528,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_queue_brick_world_static_brick_uplo
     region->emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
     region->face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
     region->face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
-    rebuild_static_connected_air(*region);
 
     int upload_id = service->next_pending_static_brick_upload_id++;
     if (upload_id <= 0) {
@@ -4098,7 +3894,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region(
     region->emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
     region->face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
     region->face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
-    rebuild_static_connected_air(*region);
     service->static_regions[region_key] = std::move(region);
     rebuild_region_packet_template(*service, region_key);
     return 1;
@@ -4184,7 +3979,6 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_static_region_patch(
             }
         }
     }
-    rebuild_static_connected_air(region);
     service->static_regions[region_key] = std::make_shared<StaticRegionData>(std::move(region));
     rebuild_region_packet_template(*service, region_key);
     return 1;

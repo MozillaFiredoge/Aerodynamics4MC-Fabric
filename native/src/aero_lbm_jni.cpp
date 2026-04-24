@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -6698,23 +6699,29 @@ static bool native_copy_flow_temperature_subrect_raw_dims_impl(
     if (offset_x < 0 || offset_y < 0 || offset_z < 0) return false;
     if (offset_x + copy_nx > nx || offset_y + copy_ny > ny || offset_z + copy_nz > nz) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
-    const std::size_t copy_cells = static_cast<std::size_t>(copy_nx) * copy_ny * copy_nz;
+    if (cells > static_cast<std::size_t>(std::numeric_limits<jint>::max() / 4)) return false;
+
+    std::vector<float> full_flow(cells * 4, 0.0f);
+    if (!native_extract_flow_atlas_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        context_key,
+        1,
+        full_flow.data(),
+        static_cast<jint>(cells * 4)
+    )) {
+        return false;
+    }
 
     LockedContext locked_context(context_key, false);
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, nx, ny, nz, cells);
-    if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return false;
-    if (ctx.f.empty() || ctx.cells == 0 || ctx.obstacle.size() != cells || ctx.temperature.size() != cells) {
+    if (g_cfg.opencl_enabled && !sync_context_temperature_from_gpu(ctx)) return false;
+    if (ctx.cells == 0 || ctx.obstacle.size() != cells || ctx.temperature.size() != cells) {
         return false;
     }
-
-    auto write_zero = [](float* flow) {
-        flow[0] = 0.0f;
-        flow[1] = 0.0f;
-        flow[2] = 0.0f;
-        flow[3] = 0.0f;
-    };
 
     std::size_t dst_cell = 0;
     for (int x = 0; x < copy_nx; ++x) {
@@ -6728,52 +6735,11 @@ static bool native_copy_flow_temperature_subrect_raw_dims_impl(
                 out_temperature[dst_cell] = ctx.obstacle[src_cell]
                     ? 0.0f
                     : finite_or(clampf(ctx.temperature[src_cell], kThermalMin, kThermalMax), 0.0f);
-                if (ctx.obstacle[src_cell]) {
-                    write_zero(dst_flow);
-                    continue;
-                }
-
-                float rho = 0.0f;
-                float ux = 0.0f;
-                float uy = 0.0f;
-                float uz = 0.0f;
-                bool valid = true;
-                for (int q = 0; q < kQ; ++q) {
-                    const float fq = ctx.f[dist_index(src_cell, q, cells)];
-                    if (!std::isfinite(fq)) {
-                        valid = false;
-                        break;
-                    }
-                    rho += fq;
-                    ux += fq * static_cast<float>(kCx[q]);
-                    uy += fq * static_cast<float>(kCy[q]);
-                    uz += fq * static_cast<float>(kCz[q]);
-                }
-                if (!valid || !std::isfinite(rho) || !std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
-                    write_zero(dst_flow);
-                    continue;
-                }
-                rho = clampf(rho, kRhoMin, kRhoMax);
-                if (!std::isfinite(rho) || rho <= 1e-6f) {
-                    write_zero(dst_flow);
-                    continue;
-                }
-                ux /= rho;
-                uy /= rho;
-                uz /= rho;
-                if (!std::isfinite(ux) || !std::isfinite(uy) || !std::isfinite(uz)) {
-                    ux = 0.0f;
-                    uy = 0.0f;
-                    uz = 0.0f;
-                }
-                if (std::fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
-                if (std::fabs(ux) < 1e-7f) ux = 0.0f;
-                if (std::fabs(uy) < 1e-7f) uy = 0.0f;
-                if (std::fabs(uz) < 1e-7f) uz = 0.0f;
-                dst_flow[0] = ux;
-                dst_flow[1] = uy;
-                dst_flow[2] = uz;
-                dst_flow[3] = clampf(rho - 1.0f, kPressureMin, kPressureMax);
+                const float* src_flow = full_flow.data() + src_cell * 4;
+                dst_flow[0] = src_flow[0];
+                dst_flow[1] = src_flow[1];
+                dst_flow[2] = src_flow[2];
+                dst_flow[3] = src_flow[3];
             }
         }
     }
@@ -6784,14 +6750,16 @@ static bool native_get_flow_state_raw_dims_impl(jint nx, jint ny, jint nz, jlong
     if (!g_cfg.initialized || !flow_out) return false;
     if (nx <= 0 || ny <= 0 || nz <= 0) return false;
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
-    LockedContext locked_context(context_key, false);
-    if (!locked_context.ctx) return false;
-    ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, nx, ny, nz, cells);
-    if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return false;
-    if (ctx.f.empty() || ctx.cells == 0) return false;
-    write_output(ctx, flow_out, 4);
-    return true;
+    if (cells > static_cast<std::size_t>(std::numeric_limits<jint>::max() / 4)) return false;
+    return native_extract_flow_atlas_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        context_key,
+        1,
+        flow_out,
+        static_cast<jint>(cells * 4)
+    );
 }
 
 static jboolean native_get_temperature_state_impl(
@@ -7286,18 +7254,13 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_copy_flow_temperature_subrect(
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_flow_state_rect(int nx, int ny, int nz, long long context_key, float* out_flow) {
-    if (!g_cfg.initialized || !out_flow) return 0;
-    if (nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) return 0;
-    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
-
-    LockedContext locked_context(static_cast<jlong>(context_key), false);
-    if (!locked_context.ctx) return 0;
-    ContextState& ctx = *locked_context.ctx;
-    ensure_context_shape(ctx, nx, ny, nz, cells);
-    if (g_cfg.opencl_enabled && !sync_context_state_from_gpu(ctx)) return 0;
-    if (ctx.f.empty() || ctx.cells == 0) return 0;
-    write_output(ctx, out_flow, 4);
-    return 1;
+    return native_get_flow_state_raw_dims_impl(
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        out_flow
+    ) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_set_temperature_state_rect(
