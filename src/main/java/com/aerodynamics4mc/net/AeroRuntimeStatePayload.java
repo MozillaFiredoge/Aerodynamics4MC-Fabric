@@ -8,7 +8,9 @@ import net.minecraft.network.packet.CustomPayload;
 import net.minecraft.util.Identifier;
 
 public record AeroRuntimeStatePayload(
-    boolean streamingEnabled
+    boolean streamingEnabled,
+    boolean renderVelocityVectors,
+    boolean renderStreamlines
 ) implements CustomPayload {
     public static final CustomPayload.Id<AeroRuntimeStatePayload> ID =
         new CustomPayload.Id<>(Identifier.of(ModBlocks.MOD_ID, "runtime_state"));
@@ -17,12 +19,16 @@ public record AeroRuntimeStatePayload(
 
     private AeroRuntimeStatePayload(RegistryByteBuf buf) {
         this(
+            buf.readBoolean(),
+            buf.readBoolean(),
             buf.readBoolean()
         );
     }
 
     private void write(RegistryByteBuf buf) {
         buf.writeBoolean(streamingEnabled);
+        buf.writeBoolean(renderVelocityVectors);
+        buf.writeBoolean(renderStreamlines);
     }
 
     @Override

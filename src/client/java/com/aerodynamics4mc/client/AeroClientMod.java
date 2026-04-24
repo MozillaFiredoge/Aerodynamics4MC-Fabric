@@ -34,7 +34,11 @@ public final class AeroClientMod implements ClientModInitializer {
 
     private void onRuntimeState(AeroRuntimeStatePayload payload, ClientPlayNetworking.Context context) {
         context.client().execute(() -> {
-            visualizer.onRuntimeState(new AeroVisualizer.AeroFlowState(payload.streamingEnabled()));
+            visualizer.onRuntimeState(new AeroVisualizer.AeroFlowState(
+                payload.streamingEnabled(),
+                payload.renderVelocityVectors(),
+                payload.renderStreamlines()
+            ));
             irisWindBridge.onRuntimeState(payload.streamingEnabled());
         });
     }

@@ -110,7 +110,7 @@ public final class AeroServerRuntime {
 
     private static final int WINDOW_THERMAL_REFRESH_TICKS = 40;
     private static final int PARTICLE_FLOW_SYNC_INTERVAL_TICKS = 4;
-    private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 4;
+    private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 1;
     private static final float ATLAS_VELOCITY_QUANT_RANGE = 5.6f;
     private static final float ATLAS_PRESSURE_QUANT_RANGE = 0.03f;
     private static final float ANALYSIS_FLOW_VELOCITY_TOLERANCE = 0.02f;
@@ -304,6 +304,8 @@ public final class AeroServerRuntime {
     private volatile InspectionSolveSession activeInspectionSolveSession;
 
     private volatile boolean streamingEnabled = false;
+    private volatile boolean renderVelocityVectorsEnabled = true;
+    private volatile boolean renderStreamlinesEnabled = true;
     private volatile int tickCounter = 0;
     private long simulationTicks = 0L;
     private long lastObservedPublishedFrameId = 0L;
@@ -703,6 +705,8 @@ public final class AeroServerRuntime {
                     feedback(
                         ctx.getSource(),
                         "Status streaming=" + streamingEnabled
+                            + " renderVectors=" + renderVelocityVectorsEnabled
+                            + " renderStreamlines=" + renderStreamlinesEnabled
                             + " box=" + format2(DOMAIN_SIZE_METERS) + "m"
                             + " n=" + GRID_SIZE
                             + " dx=" + format4(CELL_SIZE_METERS) + "m"
@@ -772,6 +776,21 @@ public final class AeroServerRuntime {
                     broadcastState(ctx.getSource().getServer());
                     return 1;
                 }))
+            .then(CommandManager.literal("render")
+                .executes(ctx -> renderStatus(ctx.getSource()))
+                .then(CommandManager.literal("vectors")
+                    .then(CommandManager.literal("on")
+                        .executes(ctx -> setRenderVelocityVectors(ctx.getSource(), true)))
+                    .then(CommandManager.literal("off")
+                        .executes(ctx -> setRenderVelocityVectors(ctx.getSource(), false)))
+                )
+                .then(CommandManager.literal("streamlines")
+                    .then(CommandManager.literal("on")
+                        .executes(ctx -> setRenderStreamlines(ctx.getSource(), true)))
+                    .then(CommandManager.literal("off")
+                        .executes(ctx -> setRenderStreamlines(ctx.getSource(), false)))
+                )
+            )
             .then(CommandManager.literal("dumpdata")
                 .executes(ctx -> dumpRuntimeData(ctx.getSource()))
                 )
@@ -918,6 +937,29 @@ public final class AeroServerRuntime {
                 )
             )
         );
+    }
+
+    private int renderStatus(ServerCommandSource source) {
+        feedback(
+            source,
+            "Render vectors=" + renderVelocityVectorsEnabled
+                + " streamlines=" + renderStreamlinesEnabled
+        );
+        return 1;
+    }
+
+    private int setRenderVelocityVectors(ServerCommandSource source, boolean enabled) {
+        renderVelocityVectorsEnabled = enabled;
+        broadcastState(source.getServer());
+        feedback(source, "Render vectors " + (enabled ? "enabled" : "disabled"));
+        return 1;
+    }
+
+    private int setRenderStreamlines(ServerCommandSource source, boolean enabled) {
+        renderStreamlinesEnabled = enabled;
+        broadcastState(source.getServer());
+        feedback(source, "Render streamlines " + (enabled ? "enabled" : "disabled"));
+        return 1;
     }
 
     private int startL2Capture(ServerCommandSource source, int durationSeconds, int fps) {
@@ -2535,7 +2577,7 @@ public final class AeroServerRuntime {
         boolean shouldSyncFlow = tickCounter % PARTICLE_FLOW_SYNC_INTERVAL_TICKS == 0;
         if (shouldSyncFlow) {
             phaseStartNanos = System.nanoTime();
-            syncPublishedFlowToPlayers(server, frame, PARTICLE_FLOW_SAMPLE_STRIDE);
+            syncPublishedFlowToPlayers(server, frame);
             tickL2Capture(server);
             recordMainThreadPhase(MAIN_THREAD_PHASE_FLOW_SYNC, System.nanoTime() - phaseStartNanos);
         } else {
@@ -5444,6 +5486,7 @@ public final class AeroServerRuntime {
         if (!copied) {
             return;
         }
+        byte[] connectedAirMask = buildExternallyConnectedAirMask(obstacleMask, GRID_SIZE, GRID_SIZE, GRID_SIZE);
         for (int x = 0; x < BRICK_RUNTIME_SIZE; x++) {
             for (int y = 0; y < BRICK_RUNTIME_SIZE; y++) {
                 for (int z = 0; z < BRICK_RUNTIME_SIZE; z++) {
@@ -5451,7 +5494,8 @@ public final class AeroServerRuntime {
                     int dstY = REGION_HALO_CELLS + y;
                     int dstZ = REGION_HALO_CELLS + z;
                     int dstCell = gridCellIndex(dstX, dstY, dstZ);
-                    if (obstacleMask[dstCell] != 0) {
+                    if (obstacleMask[dstCell] != 0 || connectedAirMask[dstCell] == 0) {
+                        clearSeedFlowCell(flowState, dstCell);
                         continue;
                     }
                     int srcCell = patchCellIndex(x, y, z, BRICK_RUNTIME_SIZE);
@@ -5534,15 +5578,18 @@ public final class AeroServerRuntime {
         )) {
             return false;
         }
+        byte[] connectedAirMask = buildExternallyConnectedAirMask(obstacleMask, sizeX, sizeY, sizeZ);
+        byte[] seedObstacleMask = buildSeedObstacleMask(obstacleMask, connectedAirMask);
         for (int cell = 0; cell < cells; cell++) {
-            if (obstacleMask[cell] != 0) {
+            if (seedObstacleMask[cell] != 0) {
+                clearSeedFlowCell(flowState, cell);
                 continue;
             }
             int base = cell * RESPONSE_CHANNELS;
             flowState[base] = windX[cell] / NATIVE_VELOCITY_SCALE;
             flowState[base + 2] = windZ[cell] / NATIVE_VELOCITY_SCALE;
         }
-        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, obstacleMask, flowState);
+        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, seedObstacleMask, flowState);
         return true;
     }
 
@@ -5568,17 +5615,108 @@ public final class AeroServerRuntime {
             ? THERMAL_BASE_AMBIENT_AIR_TEMPERATURE_K + THERMAL_DEEP_GROUND_OFFSET_K
             : boundarySample.deepGroundTemperatureKelvin();
         int cells = sizeX * sizeY * sizeZ;
+        byte[] connectedAirMask = buildExternallyConnectedAirMask(obstacleMask, sizeX, sizeY, sizeZ);
+        byte[] seedObstacleMask = buildSeedObstacleMask(obstacleMask, connectedAirMask);
         for (int cell = 0; cell < cells; cell++) {
             airTemperatureState[cell] = seedAirTemperature;
             surfaceTemperatureState[cell] = seedSurfaceTemperature;
-            if (obstacleMask[cell] != 0) {
+            if (seedObstacleMask[cell] != 0) {
+                clearSeedFlowCell(flowState, cell);
                 continue;
             }
             int base = cell * RESPONSE_CHANNELS;
             flowState[base] = seedVx;
             flowState[base + 2] = seedVz;
         }
-        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, obstacleMask, flowState);
+        deriveSeedVerticalVelocity(sizeX, sizeY, sizeZ, seedObstacleMask, flowState);
+    }
+
+    private byte[] buildSeedObstacleMask(byte[] obstacleMask, byte[] connectedAirMask) {
+        byte[] seedObstacleMask = new byte[obstacleMask.length];
+        for (int cell = 0; cell < obstacleMask.length; cell++) {
+            seedObstacleMask[cell] = obstacleMask[cell] != 0 || connectedAirMask[cell] == 0 ? (byte) 1 : (byte) 0;
+        }
+        return seedObstacleMask;
+    }
+
+    private byte[] buildExternallyConnectedAirMask(byte[] obstacleMask, int sizeX, int sizeY, int sizeZ) {
+        int cells = sizeX * sizeY * sizeZ;
+        byte[] connectedAirMask = new byte[cells];
+        int[] queue = new int[cells];
+        int head = 0;
+        int tail = 0;
+
+        for (int x = 0; x < sizeX; x++) {
+            for (int y = 0; y < sizeY; y++) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, 0, sizeY, sizeZ);
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, sizeZ - 1, sizeY, sizeZ);
+            }
+            for (int z = 0; z < sizeZ; z++) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, 0, z, sizeY, sizeZ);
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, sizeY - 1, z, sizeY, sizeZ);
+            }
+        }
+        for (int y = 0; y < sizeY; y++) {
+            for (int z = 0; z < sizeZ; z++) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, 0, y, z, sizeY, sizeZ);
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, sizeX - 1, y, z, sizeY, sizeZ);
+            }
+        }
+
+        while (head < tail) {
+            int cell = queue[head++];
+            int yz = sizeY * sizeZ;
+            int x = cell / yz;
+            int rem = cell - x * yz;
+            int y = rem / sizeZ;
+            int z = rem - y * sizeZ;
+            if (x > 0) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x - 1, y, z, sizeY, sizeZ);
+            }
+            if (x + 1 < sizeX) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x + 1, y, z, sizeY, sizeZ);
+            }
+            if (y > 0) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y - 1, z, sizeY, sizeZ);
+            }
+            if (y + 1 < sizeY) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y + 1, z, sizeY, sizeZ);
+            }
+            if (z > 0) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, z - 1, sizeY, sizeZ);
+            }
+            if (z + 1 < sizeZ) {
+                tail = enqueueConnectedAirBoundaryCell(obstacleMask, connectedAirMask, queue, tail, x, y, z + 1, sizeY, sizeZ);
+            }
+        }
+        return connectedAirMask;
+    }
+
+    private int enqueueConnectedAirBoundaryCell(
+        byte[] obstacleMask,
+        byte[] connectedAirMask,
+        int[] queue,
+        int tail,
+        int x,
+        int y,
+        int z,
+        int sizeY,
+        int sizeZ
+    ) {
+        int cell = patchCellIndex3d(x, y, z, sizeY, sizeZ);
+        if (obstacleMask[cell] != 0 || connectedAirMask[cell] != 0) {
+            return tail;
+        }
+        connectedAirMask[cell] = 1;
+        queue[tail++] = cell;
+        return tail;
+    }
+
+    private void clearSeedFlowCell(float[] flowState, int cell) {
+        int base = cell * RESPONSE_CHANNELS;
+        for (int channel = 0; channel < RESPONSE_CHANNELS; channel++) {
+            flowState[base + channel] = 0.0f;
+        }
     }
 
     private void deriveSeedVerticalVelocity(int sizeX, int sizeY, int sizeZ, byte[] obstacleMask, float[] flowState) {
@@ -6854,10 +6992,6 @@ public final class AeroServerRuntime {
         }
     }
 
-    private int sanitizeStride(int requested) {
-        return (requested == 1 || requested == 2 || requested == 4 || requested == 8) ? requested : PARTICLE_FLOW_SAMPLE_STRIDE;
-    }
-
     private BrickRuntimeDynamicState copyBrickRuntimeDynamicState(
         RegistryKey<World> worldKey,
         int brickX,
@@ -6931,7 +7065,7 @@ public final class AeroServerRuntime {
         return (short) Math.round(normalized * 32767.0f);
     }
 
-    private BrickRuntimeAtlasSnapshot sampleBrickRuntimeCoreAtlas(WindowKey key, int sampleStride) {
+    private BrickRuntimeAtlasSnapshot sampleBrickRuntimeCoreAtlas(WindowKey key) {
         BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
         BrickRuntimeDynamicState brickState = copyBrickRuntimeDynamicState(
             key.worldKey(),
@@ -6953,30 +7087,14 @@ public final class AeroServerRuntime {
                 maxSpeed = speed;
             }
         }
-        int n = (GRID_SIZE + sampleStride - 1) / sampleStride;
+        int n = BRICK_RUNTIME_SIZE;
         short[] packed = new short[n * n * n * NativeSimulationBridge.PACKED_ATLAS_CHANNELS];
-        boolean hasCoreSamples = false;
-        for (int sx = 0; sx < n; sx++) {
-            int gx = Math.min(GRID_SIZE - 1, sx * sampleStride);
-            if (gx < REGION_HALO_CELLS || gx >= REGION_HALO_CELLS + BRICK_RUNTIME_SIZE) {
-                continue;
-            }
-            int bx = gx - REGION_HALO_CELLS;
-            for (int sy = 0; sy < n; sy++) {
-                int gy = Math.min(GRID_SIZE - 1, sy * sampleStride);
-                if (gy < REGION_HALO_CELLS || gy >= REGION_HALO_CELLS + BRICK_RUNTIME_SIZE) {
-                    continue;
-                }
-                int by = gy - REGION_HALO_CELLS;
-                for (int sz = 0; sz < n; sz++) {
-                    int gz = Math.min(GRID_SIZE - 1, sz * sampleStride);
-                    if (gz < REGION_HALO_CELLS || gz >= REGION_HALO_CELLS + BRICK_RUNTIME_SIZE) {
-                        continue;
-                    }
-                    int bz = gz - REGION_HALO_CELLS;
+        for (int bx = 0; bx < n; bx++) {
+            for (int by = 0; by < n; by++) {
+                for (int bz = 0; bz < n; bz++) {
                     int srcCell = patchCellIndex(bx, by, bz, BRICK_RUNTIME_SIZE);
                     int srcBase = srcCell * RESPONSE_CHANNELS;
-                    int dstCell = ((sx * n) + sy) * n + sz;
+                    int dstCell = ((bx * n) + by) * n + bz;
                     int dstBase = dstCell * NativeSimulationBridge.PACKED_ATLAS_CHANNELS;
                     packed[dstBase] = quantizeSignedToShort(
                         brickState.flowState()[srcBase] * NATIVE_VELOCITY_SCALE,
@@ -6994,11 +7112,10 @@ public final class AeroServerRuntime {
                         brickState.flowState()[srcBase + 3],
                         ATLAS_PRESSURE_QUANT_RANGE
                     );
-                    hasCoreSamples = true;
                 }
             }
         }
-        return hasCoreSamples ? new BrickRuntimeAtlasSnapshot(packed, maxSpeed) : null;
+        return new BrickRuntimeAtlasSnapshot(coreOrigin, packed, maxSpeed);
     }
 
     private float publishBrickSolveAtlases(Set<WindowKey> solveWindowKeys) {
@@ -7008,14 +7125,14 @@ public final class AeroServerRuntime {
             lastCoordinatorPublishedMaxSpeed = 0.0f;
             return 0.0f;
         }
-        Map<WindowKey, short[]> atlases = new HashMap<>();
+        Map<WindowKey, BrickRuntimeAtlasSnapshot> atlases = new HashMap<>();
         Map<WindowKey, Float> regionMaxSpeeds = new HashMap<>();
         for (WindowKey key : solveWindowKeys) {
-            BrickRuntimeAtlasSnapshot atlas = sampleBrickRuntimeCoreAtlas(key, PARTICLE_FLOW_SAMPLE_STRIDE);
+            BrickRuntimeAtlasSnapshot atlas = sampleBrickRuntimeCoreAtlas(key);
             if (atlas == null) {
                 continue;
             }
-            atlases.put(key, atlas.packed());
+            atlases.put(key, atlas);
             regionMaxSpeeds.put(key, atlas.maxSpeed());
         }
         if (atlases.isEmpty()) {
@@ -7061,7 +7178,11 @@ public final class AeroServerRuntime {
     }
 
     private void sendStateToPlayer(ServerPlayerEntity player, MinecraftServer server) {
-        ServerPlayNetworking.send(player, new AeroRuntimeStatePayload(streamingEnabled));
+        ServerPlayNetworking.send(player, new AeroRuntimeStatePayload(
+            streamingEnabled,
+            renderVelocityVectorsEnabled,
+            renderStreamlinesEnabled
+        ));
     }
 
     private void broadcastState(MinecraftServer server) {
@@ -7075,12 +7196,14 @@ public final class AeroServerRuntime {
         if (frame == null) {
             return;
         }
-        int stride = PARTICLE_FLOW_SAMPLE_STRIDE;
-        for (Map.Entry<WindowKey, short[]> entry : frame.regionAtlases().entrySet()) {
+        for (Map.Entry<WindowKey, BrickRuntimeAtlasSnapshot> entry : frame.regionAtlases().entrySet()) {
             WindowKey key = entry.getKey();
-            short[] packed = entry.getValue();
+            BrickRuntimeAtlasSnapshot atlas = entry.getValue();
             Identifier dimId = key.worldKey().getValue();
-            ServerPlayNetworking.send(player, new AeroFlowPayload(dimId, key.origin(), stride, packed));
+            ServerPlayNetworking.send(
+                player,
+                new AeroFlowPayload(dimId, atlas.origin(), PARTICLE_FLOW_SAMPLE_STRIDE, atlas.packed())
+            );
         }
     }
 
@@ -7154,15 +7277,15 @@ public final class AeroServerRuntime {
         if (simulationServiceId == 0L) {
             return;
         }
-        short[] packed = pollPackedFlowForNetwork(key, PARTICLE_FLOW_SAMPLE_STRIDE);
-        if (packed == null) {
+        BrickRuntimeAtlasSnapshot atlas = sampleBrickRuntimeCoreAtlas(key);
+        if (atlas == null) {
             return;
         }
         while (true) {
             PublishedFrame current = publishedFrame.get();
-            Map<WindowKey, short[]> nextAtlases = new HashMap<>(current == null ? Map.of() : current.regionAtlases());
+            Map<WindowKey, BrickRuntimeAtlasSnapshot> nextAtlases = new HashMap<>(current == null ? Map.of() : current.regionAtlases());
             Map<WindowKey, Float> nextRegionMaxSpeeds = new HashMap<>(current == null ? Map.of() : current.regionMaxSpeeds());
-            nextAtlases.put(key, packed);
+            nextAtlases.put(key, atlas);
             nextRegionMaxSpeeds.put(key, Math.max(0.0f, regionMaxSpeed));
             float nextMaxSpeed = computePublishedMaxSpeed(nextRegionMaxSpeeds);
             PublishedFrame next = new PublishedFrame(
@@ -7186,7 +7309,7 @@ public final class AeroServerRuntime {
             if (current == null || !current.regionAtlases().containsKey(key)) {
                 return;
             }
-            Map<WindowKey, short[]> nextAtlases = new HashMap<>(current.regionAtlases());
+            Map<WindowKey, BrickRuntimeAtlasSnapshot> nextAtlases = new HashMap<>(current.regionAtlases());
             Map<WindowKey, Float> nextRegionMaxSpeeds = new HashMap<>(current.regionMaxSpeeds());
             nextAtlases.remove(key);
             nextRegionMaxSpeeds.remove(key);
@@ -7218,16 +7341,20 @@ public final class AeroServerRuntime {
         return maxSpeed;
     }
 
-    private void syncPublishedFlowToPlayers(MinecraftServer server, PublishedFrame frame, int stride) {
-        int sampleStride = sanitizeStride(stride);
-        for (Map.Entry<WindowKey, short[]> entry : frame.regionAtlases().entrySet()) {
+    private void syncPublishedFlowToPlayers(MinecraftServer server, PublishedFrame frame) {
+        for (Map.Entry<WindowKey, BrickRuntimeAtlasSnapshot> entry : frame.regionAtlases().entrySet()) {
             WindowKey key = entry.getKey();
             ServerWorld world = server.getWorld(key.worldKey());
             if (world == null) {
                 continue;
             }
-            short[] packed = entry.getValue();
-            AeroFlowPayload payload = new AeroFlowPayload(world.getRegistryKey().getValue(), key.origin(), sampleStride, packed);
+            BrickRuntimeAtlasSnapshot atlas = entry.getValue();
+            AeroFlowPayload payload = new AeroFlowPayload(
+                world.getRegistryKey().getValue(),
+                atlas.origin(),
+                PARTICLE_FLOW_SAMPLE_STRIDE,
+                atlas.packed()
+            );
             for (ServerPlayerEntity player : world.getPlayers()) {
                 ServerPlayNetworking.send(player, payload);
             }
@@ -7240,13 +7367,13 @@ public final class AeroServerRuntime {
         for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
             ServerWorld world = player.getEntityWorld();
             WindowKey key = new WindowKey(world.getRegistryKey(), windowOriginFromCoreOrigin(coreOriginForPosition(player.getBlockPos())));
-            short[] basePacked = frame.regionAtlases().get(key);
-            if (basePacked == null || missingKeys.contains(key)) {
+            BrickRuntimeAtlasSnapshot atlas = frame.regionAtlases().get(key);
+            if (atlas == null || missingKeys.contains(key)) {
                 continue;
             }
             AeroFlowAnalysisPayload payload = payloadCache.get(key);
             if (payload == null && !payloadCache.containsKey(key)) {
-                payload = buildAnalysisFlowPayload(world, key, basePacked);
+                payload = buildAnalysisFlowPayload(world, key, atlas.packed());
                 if (payload == null) {
                     missingKeys.add(key);
                     continue;
@@ -7292,18 +7419,6 @@ public final class AeroServerRuntime {
             ANALYSIS_FLOW_VELOCITY_TOLERANCE,
             ANALYSIS_FLOW_PRESSURE_TOLERANCE
         );
-    }
-
-    private short[] pollPackedFlowForNetwork(WindowKey key, int stride) {
-        int sampleStride = sanitizeStride(stride);
-        int n = (GRID_SIZE + sampleStride - 1) / sampleStride;
-        short[] packed = new short[n * n * n * NativeSimulationBridge.PACKED_ATLAS_CHANNELS];
-        if (simulationServiceId != 0L
-            && simulationBridge.pollPackedFlowAtlas(simulationServiceId, simulationRegionKey(key), packed)) {
-            return packed;
-        }
-        BrickRuntimeAtlasSnapshot atlas = sampleBrickRuntimeCoreAtlas(key, sampleStride);
-        return atlas == null ? null : atlas.packed();
     }
 
     private Map<UUID, PlayerProbe> samplePlayerProbesLocked() {
@@ -7663,7 +7778,7 @@ public final class AeroServerRuntime {
     ) {
     }
 
-    private record BrickRuntimeAtlasSnapshot(short[] packed, float maxSpeed) {
+    private record BrickRuntimeAtlasSnapshot(BlockPos origin, short[] packed, float maxSpeed) {
     }
 
     private record TornadoRegionDescriptor(
@@ -7707,7 +7822,7 @@ public final class AeroServerRuntime {
     private record PublishedFrame(
         long frameId,
         float maxSpeed,
-        Map<WindowKey, short[]> regionAtlases,
+        Map<WindowKey, BrickRuntimeAtlasSnapshot> regionAtlases,
         Map<WindowKey, Float> regionMaxSpeeds
     ) {
     }
