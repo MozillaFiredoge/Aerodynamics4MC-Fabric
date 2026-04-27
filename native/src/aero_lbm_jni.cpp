@@ -4805,7 +4805,8 @@ bool opencl_step(
     const int benchmark_preset = benchmark_mode_active() ? g_benchmark_cfg.preset : 0;
     const bool use_tgv_fastpath = benchmark_preset == AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D;
     const bool use_hydro_bench_fastpath =
-        benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D
+        benchmark_preset == AERO_LBM_BENCHMARK_PRESET_NONE
+        || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D
         || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D
         || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D;
     const bool use_bfecc_thermal =
@@ -4828,31 +4829,32 @@ bool opencl_step(
     cl_mem temp_read = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
     cl_mem temp_write = (ctx.step_counter % 2 == 0) ? ctx.d_temp_next : ctx.d_temp;
     const float state_nudge = effective_state_nudge();
-
-    err = CL_SUCCESS;
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &ctx.nx);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 4, sizeof(int), &ctx.ny);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 5, sizeof(int), &ctx.nz);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 6, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 7, sizeof(float), &state_nudge);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_read);
-    if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_read)", err);
-    err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
-    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_apply_temperature_reference,temp_read)", err);
-    err = CL_SUCCESS;
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_write);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &ctx.nx);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 4, sizeof(int), &ctx.ny);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 5, sizeof(int), &ctx.nz);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 6, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 7, sizeof(float), &state_nudge);
-    if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_write)", err);
-    err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
-    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_apply_temperature_reference,temp_write)", err);
+    if (state_nudge > 0.0f || use_bfecc_thermal) {
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 4, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 5, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 6, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 7, sizeof(float), &state_nudge);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_read);
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_read)", err);
+        err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_apply_temperature_reference,temp_read)", err);
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 0, sizeof(cl_mem), &ctx.d_payload);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 1, sizeof(cl_mem), &temp_write);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 2, sizeof(int), &g_cfg.input_channels);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 3, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 4, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 5, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 6, sizeof(int), &cells_i32);
+        err |= clSetKernelArg(g_opencl.k_apply_temperature_reference, 7, sizeof(float), &state_nudge);
+        if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_apply_temperature_reference,temp_write)", err);
+        err = enqueue_kernel_1d(g_opencl.k_apply_temperature_reference, cells_i32);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_apply_temperature_reference,temp_write)", err);
+    }
     if (use_bfecc_thermal) {
         const float thermal_dt = static_cast<float>(thermal_update_stride);
 
