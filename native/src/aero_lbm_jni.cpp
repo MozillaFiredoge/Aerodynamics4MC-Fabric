@@ -4588,8 +4588,20 @@ bool opencl_step(
     const int cells_i32 = static_cast<int>(ctx.cells);
     const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
     const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
+    const std::size_t payload_values = ctx.cells * static_cast<std::size_t>(g_cfg.input_channels);
+    const bool reuse_resident_payload = payload == nullptr;
+    if (reuse_resident_payload && overlay_count > 0) {
+        g_opencl.error = "opencl_step cached payload cannot be combined with sparse overlays";
+        return false;
+    }
+    if (reuse_resident_payload && (!ctx.gpu_initialized || ctx.payload_cache.size() != payload_values)) {
+        g_opencl.error = "opencl_step cached payload requested before resident payload upload";
+        return false;
+    }
 
-    if (benchmark_mode_active() && g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
+    if (!reuse_resident_payload
+        && benchmark_mode_active()
+        && g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D) {
         if (ctx.obstacle.size() != ctx.cells) {
             ctx.obstacle.assign(ctx.cells, 0);
         }
@@ -4600,9 +4612,8 @@ bool opencl_step(
     }
 
     auto upload_begin = Clock::now();
-    {
+    if (!reuse_resident_payload) {
         constexpr std::size_t kPayloadIncrementalMaxRanges = 96;
-        const std::size_t payload_values = ctx.cells * static_cast<std::size_t>(g_cfg.input_channels);
         const std::size_t cell_bytes = static_cast<std::size_t>(g_cfg.input_channels) * sizeof(float);
         thread_local std::vector<int> overlay_lookup;
         thread_local std::vector<int> overlay_lookup_touched;
@@ -6119,6 +6130,37 @@ bool run_solver_step(
     return ok;
 }
 
+bool run_solver_cached_step(ContextState& ctx, float* out, StepTiming& timing) {
+#if defined(AERO_LBM_OPENCL)
+    if (!g_cfg.opencl_enabled || !benchmark_opencl_supported()) {
+        set_last_native_error("cached solver step requires an OpenCL-capable benchmark path");
+        return false;
+    }
+    if (!ctx.gpu_buffers_ready || !ctx.gpu_initialized) {
+        set_last_native_error("cached solver step requested before GPU context initialization");
+        return false;
+    }
+    const std::size_t payload_values = ctx.cells * static_cast<std::size_t>(g_cfg.input_channels);
+    if (ctx.payload_cache.size() != payload_values) {
+        set_last_native_error("cached solver step has no resident payload cache");
+        return false;
+    }
+    if (!opencl_step(ctx, nullptr, nullptr, nullptr, 0, out, timing)) {
+        const std::string reason = g_opencl.error.empty() ? "OpenCL cached step fail" : g_opencl.error;
+        disable_opencl_runtime(reason);
+        set_last_native_error(reason);
+        return false;
+    }
+    return true;
+#else
+    (void)ctx;
+    (void)out;
+    (void)timing;
+    set_last_native_error("cached solver step requires OpenCL support");
+    return false;
+#endif
+}
+
 }  // namespace
 
 extern "C" {
@@ -6245,6 +6287,41 @@ static bool native_step_raw_dims_with_sparse_overlays_impl(
     const bool ok = run_solver_step(ctx, packet, overlay_cells, overlay_values, overlay_count, output_flow, timing);
     if (!ok && g_last_native_error.empty()) {
         set_last_native_error("native_step_raw_dims_sparse: run_solver_step failed");
+    }
+    timing.total_ms = elapsed_ms(tick_begin, Clock::now());
+    record_timing(timing);
+    return ok;
+}
+
+static bool native_step_raw_dims_cached_impl(jint nx, jint ny, jint nz, jlong context_key, float* output_flow) {
+    auto tick_begin = Clock::now();
+    StepTiming timing;
+
+    clear_last_native_error();
+    if (!g_cfg.initialized) {
+        set_last_native_error("native_step_raw_dims_cached: runtime not initialized");
+        return false;
+    }
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+        set_last_native_error("native_step_raw_dims_cached: invalid dimensions");
+        return false;
+    }
+    const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
+
+    LockedContext locked_context(context_key, false);
+    if (!locked_context.ctx) {
+        set_last_native_error("native_step_raw_dims_cached: context not found");
+        return false;
+    }
+    ContextState& ctx = *locked_context.ctx;
+    if (ctx.nx != nx || ctx.ny != ny || ctx.nz != nz || ctx.cells != cells) {
+        set_last_native_error("native_step_raw_dims_cached: context shape mismatch");
+        return false;
+    }
+
+    const bool ok = run_solver_cached_step(ctx, output_flow, timing);
+    if (!ok && g_last_native_error.empty()) {
+        set_last_native_error("native_step_raw_dims_cached: run_solver_cached_step failed");
     }
     timing.total_ms = elapsed_ms(tick_begin, Clock::now());
     record_timing(timing);
@@ -7080,6 +7157,10 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_ch
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny, int nz, long long context_key, float* output_flow) {
     return native_step_raw_dims_impl(packet, nx, ny, nz, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached(int nx, int ny, int nz, long long context_key, float* output_flow) {
+    return native_step_raw_dims_cached_impl(nx, ny, nz, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(

@@ -129,6 +129,16 @@ aero_solver_set_flow_state(solver, prev_flow, cells * 4);
 
 Important: this releases the internal LBM context and uses `prev_flow` as the next initialization state. Do not call it before every small step if you want continuous LBM time integration. For continuous integration, create once, set the solid mask once, then repeatedly call `aero_solver_step_wind_tunnel`.
 
+## Advance Without Readback
+
+Use this when benchmarking pure solver throughput or when you only need to read the flow field every N steps:
+
+```c
+int ok = aero_solver_advance_wind_tunnel(solver, &boundary, steps);
+```
+
+This advances the same persistent LBM context but does not run the output/readback path. After one normal step uploads the static packet, unchanged wind-tunnel calls can reuse the GPU-resident payload through the cached native step path.
+
 ## Convenience One-Shot API
 
 For simple validation tools, use:
@@ -209,6 +219,7 @@ Do not interpret it as Pascals in this MVP API.
 - The API is serialized internally with a mutex. It is safe from concurrent calls, but not designed for parallel throughput yet.
 - Boundary conditions are configured through the existing benchmark-mode path. This is appropriate for wind-tunnel validation, but not a final aerodynamic analysis ABI.
 - `density` is stored in the benchmark config as a reference value, but force output is not exposed yet, so it does not currently affect returned fields.
+- `aero_solver_step_wind_tunnel` includes full-field output readback and unit conversion. Use `aero_solver_advance_wind_tunnel` for MLUPS-style solver-only benchmarking.
 
 ## Debugging
 

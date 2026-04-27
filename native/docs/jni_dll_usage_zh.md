@@ -134,6 +134,12 @@ public interface AeroSolverLibrary extends Library {
         int outValueCount
     );
 
+    int aero_solver_advance_wind_tunnel(
+        long handle,
+        AeroBoundaryDesc boundary,
+        int steps
+    );
+
     void aero_solver_destroy(long handle);
 
     Pointer aero_solver_last_error();
@@ -261,6 +267,14 @@ lib.aero_solver_set_flow_state(handle, previousFlow, cells * 4);
 - 这是初始化/重启输入，不建议每个小 step 都调用。
 - 如果想连续推进 LBM 时间，应创建一次 handle，设置一次 solid mask，然后反复调用 `aero_solver_step_wind_tunnel`。
 - 如果结构发生变化，应重新调用 `aero_solver_set_solid_mask`，内部会释放旧 LBM context，下次 step 重新初始化。
+
+如果只想推进求解器、不需要每一步读回完整速度/压力场，可以调用：
+
+```java
+int ok = lib.aero_solver_advance_wind_tunnel(handle, boundary, steps);
+```
+
+这条路径不会执行 full-field readback，适合测 MLUPS 或每 N 步才采样一次结果。第一次常规 step 会上传静态 packet；之后边界和 solid mask 不变时，native 内部会复用 GPU resident payload，避免每步重复扫描/上传输入包。
 
 ## 边界条件
 
@@ -521,12 +535,25 @@ py native\tools\benchmark_solver_dll.py `
   --warmup 8
 ```
 
+如果要对齐 FluidX3D 这类 MLUPS benchmark 的口径，先测不读回完整场的纯推进：
+
+```powershell
+py native\tools\benchmark_solver_dll.py `
+  --dll path\to\aero_lbm.dll `
+  --grid 128 `
+  --steps-per-frame 1 `
+  --frames 120 `
+  --warmup 8 `
+  --no-readback
+```
+
 输出会包含：
 
 ```text
 runtime 后端信息
 avg/min/p50/p95/max ms per frame
 LBM steps per second
+MLUPS
 NaN 检查
 采样速度
 native_timing(copy/solver/readback/total)

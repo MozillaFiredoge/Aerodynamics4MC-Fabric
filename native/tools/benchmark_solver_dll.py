@@ -4,6 +4,7 @@
 Example on Windows:
 
     py native\\tools\\benchmark_solver_dll.py --dll path\\to\\aero_lbm.dll --grid 128 --steps-per-frame 1 --frames 120
+    py native\\tools\\benchmark_solver_dll.py --dll path\\to\\aero_lbm.dll --grid 128 --no-readback
 
 The script uses ctypes only. It does not require Minecraft, Fabric, Java, or JNI.
 """
@@ -75,6 +76,16 @@ def configure_api(lib: ctypes.CDLL) -> None:
         ctypes.c_int,
     ]
     lib.aero_solver_step_wind_tunnel.restype = ctypes.c_int
+
+    try:
+        lib.aero_solver_advance_wind_tunnel.argtypes = [
+            ctypes.c_longlong,
+            ctypes.POINTER(AeroBoundaryDesc),
+            ctypes.c_int,
+        ]
+        lib.aero_solver_advance_wind_tunnel.restype = ctypes.c_int
+    except AttributeError:
+        pass
 
     lib.aero_solver_destroy.argtypes = [ctypes.c_longlong]
     lib.aero_solver_destroy.restype = None
@@ -231,6 +242,11 @@ def main() -> int:
     )
     parser.add_argument("--obstacle-radius-ratio", type=float, default=0.08, help="Obstacle radius as fraction of grid")
     parser.add_argument("--scan-output", action="store_true", help="Scan all output values for NaN and max speed each frame")
+    parser.add_argument(
+        "--no-readback",
+        action="store_true",
+        help="Measure solver advance only. A final unmeasured readback is still run for sanity checking.",
+    )
     args = parser.parse_args()
 
     nx = args.nx or args.grid
@@ -246,6 +262,7 @@ def main() -> int:
     print(f"[bench] dll={args.dll}")
     print(f"[bench] grid={nx}x{ny}x{nz} cells={cells:,} flow_values={value_count:,}")
     print(f"[bench] dx={args.dx:g}m dt={args.dt:g}s inlet_vx={args.velocity:g}m/s steps/frame={args.steps_per_frame}")
+    print(f"[bench] readback={'off' if args.no_readback else 'full-field every frame'}")
 
     lib = load_library(args.dll)
     configure_api(lib)
@@ -270,16 +287,22 @@ def main() -> int:
             ctypes.c_float(1.5e-5),
         )
         out_flow = (ctypes.c_float * value_count)()
+        advance = getattr(lib, "aero_solver_advance_wind_tunnel", None)
+        if args.no_readback and advance is None:
+            raise SystemExit("no-readback mode requires aero_solver_advance_wind_tunnel in the DLL")
 
         print(f"[bench] warmup_frames={args.warmup}")
         for _ in range(args.warmup):
-            ok = lib.aero_solver_step_wind_tunnel(
-                handle.value,
-                ctypes.byref(boundary),
-                args.steps_per_frame,
-                out_flow,
-                value_count,
-            )
+            if args.no_readback:
+                ok = advance(handle.value, ctypes.byref(boundary), args.steps_per_frame)
+            else:
+                ok = lib.aero_solver_step_wind_tunnel(
+                    handle.value,
+                    ctypes.byref(boundary),
+                    args.steps_per_frame,
+                    out_flow,
+                    value_count,
+                )
             if not ok:
                 raise SystemExit(f"warmup step failed: {native_error(lib)}")
 
@@ -291,22 +314,39 @@ def main() -> int:
         scan_values = value_count if args.scan_output else min(value_count, 4096)
         for frame in range(args.frames):
             start = perf_counter()
-            ok = lib.aero_solver_step_wind_tunnel(
-                handle.value,
-                ctypes.byref(boundary),
-                args.steps_per_frame,
-                out_flow,
-                value_count,
-            )
+            if args.no_readback:
+                ok = advance(handle.value, ctypes.byref(boundary), args.steps_per_frame)
+            else:
+                ok = lib.aero_solver_step_wind_tunnel(
+                    handle.value,
+                    ctypes.byref(boundary),
+                    args.steps_per_frame,
+                    out_flow,
+                    value_count,
+                )
             elapsed_ms = (perf_counter() - start) * 1000.0
             if not ok:
                 raise SystemExit(f"frame {frame} step failed: {native_error(lib)}")
             times_ms.append(elapsed_ms)
-            frame_max, frame_bad = validate_output(out_flow, scan_values)
-            max_speed = max(max_speed, frame_max)
-            non_finite += frame_bad
+            if not args.no_readback:
+                frame_max, frame_bad = validate_output(out_flow, scan_values)
+                max_speed = max(max_speed, frame_max)
+                non_finite += frame_bad
+
+        if args.no_readback:
+            ok = lib.aero_solver_step_wind_tunnel(
+                handle.value,
+                ctypes.byref(boundary),
+                1,
+                out_flow,
+                value_count,
+            )
+            if not ok:
+                raise SystemExit(f"final readback failed: {native_error(lib)}")
+            max_speed, non_finite = validate_output(out_flow, scan_values)
 
         avg_ms = sum(times_ms) / len(times_ms)
+        mlups = cells * args.steps_per_frame / (avg_ms * 1000.0)
         print("[bench] result")
         print(f"  avg_ms_per_frame={avg_ms:.3f}")
         print(f"  min_ms={min(times_ms):.3f}")
@@ -314,6 +354,7 @@ def main() -> int:
         print(f"  p95_ms={percentile(times_ms, 0.95):.3f}")
         print(f"  max_ms={max(times_ms):.3f}")
         print(f"  avg_lbm_steps_per_second={args.steps_per_frame * 1000.0 / avg_ms:.2f}")
+        print(f"  avg_mlups={mlups:.2f}")
         print(f"  max_speed_scanned_mps={max_speed:.6f}")
         print(f"  non_finite_values_scanned={non_finite}")
         print(f"  first_cell=({out_flow[0]:.6f}, {out_flow[1]:.6f}, {out_flow[2]:.6f}, {out_flow[3]:.6f})")

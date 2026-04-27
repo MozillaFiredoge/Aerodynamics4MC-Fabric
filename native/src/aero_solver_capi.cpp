@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -40,6 +41,7 @@ struct SolverContext {
     int cells = 0;
     bool custom_flow_state = false;
     bool packet_dirty = true;
+    bool native_payload_uploaded = false;
     AeroBoundaryDesc packet_boundary{};
     std::vector<uint8_t> solid_mask;
     std::vector<float> packet;
@@ -263,6 +265,11 @@ bool configure_benchmark_boundary(const SolverContext& ctx, const AeroBoundaryDe
     return aero_lbm_benchmark_set_config(&cfg) != 0;
 }
 
+bool native_runtime_is_opencl() {
+    const char* info = aero_lbm_runtime_info();
+    return info && std::strncmp(info, "opencl|", 7) == 0;
+}
+
 bool convert_output_to_public_units(SolverContext& ctx, float* out_flow, int out_value_count) {
     if (!out_flow || out_value_count != ctx.cells * kOutputChannels) {
         set_error("invalid output flow buffer");
@@ -289,6 +296,11 @@ bool step_solver_locked(
         set_error("steps must be positive");
         return false;
     }
+    const bool wants_output = out_flow != nullptr;
+    if (wants_output && out_value_count != ctx.cells * kOutputChannels) {
+        set_error("invalid output flow buffer");
+        return false;
+    }
     if (!configure_benchmark_boundary(ctx, boundary)) {
         if (g_last_error.empty()) {
             set_error(std::string("failed to configure boundary: ") + aero_lbm_last_error());
@@ -301,16 +313,28 @@ bool step_solver_locked(
         initialize_packet(ctx, boundary, overwrite_flow_state);
         ctx.packet_boundary = boundary;
         ctx.packet_dirty = false;
+        ctx.native_payload_uploaded = false;
     }
-    if (ctx.scratch_flow.size() != static_cast<std::size_t>(ctx.cells) * kOutputChannels) {
+    if (wants_output && ctx.scratch_flow.size() != static_cast<std::size_t>(ctx.cells) * kOutputChannels) {
         ctx.scratch_flow.assign(static_cast<std::size_t>(ctx.cells) * kOutputChannels, 0.0f);
     }
     for (int step = 0; step < steps; ++step) {
-        float* step_output = step + 1 == steps ? ctx.scratch_flow.data() : nullptr;
-        if (!aero_lbm_step_rect(ctx.packet.data(), ctx.grid.nx, ctx.grid.ny, ctx.grid.nz, ctx.context_key, step_output)) {
-            set_error(std::string("aero_lbm_step_rect failed: ") + aero_lbm_last_error());
-            return false;
+        float* step_output = wants_output && step + 1 == steps ? ctx.scratch_flow.data() : nullptr;
+        bool step_ok = false;
+        if (ctx.native_payload_uploaded && native_runtime_is_opencl()) {
+            step_ok = aero_lbm_step_rect_cached(ctx.grid.nx, ctx.grid.ny, ctx.grid.nz, ctx.context_key, step_output) != 0;
         }
+        if (!step_ok) {
+            step_ok = aero_lbm_step_rect(ctx.packet.data(), ctx.grid.nx, ctx.grid.ny, ctx.grid.nz, ctx.context_key, step_output) != 0;
+            if (!step_ok) {
+                set_error(std::string("aero_lbm_step_rect failed: ") + aero_lbm_last_error());
+                return false;
+            }
+            ctx.native_payload_uploaded = native_runtime_is_opencl();
+        }
+    }
+    if (!wants_output) {
+        return true;
     }
     std::copy(ctx.scratch_flow.begin(), ctx.scratch_flow.end(), out_flow);
     return convert_output_to_public_units(ctx, out_flow, out_value_count);
@@ -393,6 +417,7 @@ AERO_LBM_CAPI_EXPORT int aero_solver_create_with_grid(
     initialize_packet(*ctx, boundary, true);
     ctx->packet_boundary = boundary;
     ctx->packet_dirty = false;
+    ctx->native_payload_uploaded = false;
 
     const long long handle = ctx->handle;
     g_contexts.emplace(handle, std::move(ctx));
@@ -418,6 +443,7 @@ AERO_LBM_CAPI_EXPORT int aero_solver_set_solid_mask(
     ctx->solid_mask.assign(solid_mask, solid_mask + cell_count);
     ctx->custom_flow_state = false;
     ctx->packet_dirty = true;
+    ctx->native_payload_uploaded = false;
     aero_lbm_release_context(ctx->context_key);
     return AERO_SOLVER_STATUS_OK;
 }
@@ -455,6 +481,7 @@ AERO_LBM_CAPI_EXPORT int aero_solver_set_flow_state(
     }
     ctx->custom_flow_state = true;
     ctx->packet_dirty = false;
+    ctx->native_payload_uploaded = false;
     aero_lbm_release_context(ctx->context_key);
     return AERO_SOLVER_STATUS_OK;
 }
@@ -478,6 +505,27 @@ AERO_LBM_CAPI_EXPORT int aero_solver_step_wind_tunnel(
         effective_boundary = *boundary;
     }
     return step_solver_locked(*ctx, effective_boundary, steps, out_flow, out_value_count)
+        ? AERO_SOLVER_STATUS_OK
+        : AERO_SOLVER_STATUS_ERROR;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_solver_advance_wind_tunnel(
+    long long handle,
+    const AeroBoundaryDesc* boundary,
+    int steps
+) {
+    std::lock_guard<std::mutex> lock(g_solver_mutex);
+    clear_error();
+    SolverContext* ctx = lookup_context(handle);
+    if (!ctx) {
+        return AERO_SOLVER_STATUS_ERROR;
+    }
+    AeroBoundaryDesc effective_boundary{};
+    aero_solver_default_boundary(&effective_boundary);
+    if (boundary) {
+        effective_boundary = *boundary;
+    }
+    return step_solver_locked(*ctx, effective_boundary, steps, nullptr, 0)
         ? AERO_SOLVER_STATUS_OK
         : AERO_SOLVER_STATUS_ERROR;
 }

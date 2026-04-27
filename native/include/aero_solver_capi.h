@@ -92,6 +92,12 @@ AERO_LBM_CAPI_EXPORT int aero_solver_step_wind_tunnel(
     int out_value_count
 );
 
+AERO_LBM_CAPI_EXPORT int aero_solver_advance_wind_tunnel(
+    long long handle,
+    const AeroBoundaryDesc* boundary,
+    int steps
+);
+
 AERO_LBM_CAPI_EXPORT int aero_solver_run_wind_tunnel(
     const AeroStepInput* input,
     AeroStepOutput* output
