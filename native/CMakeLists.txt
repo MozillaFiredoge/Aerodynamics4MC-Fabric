@@ -110,6 +110,7 @@ add_library(aero_lbm SHARED
     src/aero_lbm_thermal_core.cpp
     src/aero_lbm_mesoscale.cpp
     src/aero_lbm_simulation_bridge.cpp
+    src/aero_solver_capi.cpp
 )
 
 add_subdirectory(third_party/zfp)

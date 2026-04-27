@@ -35,9 +35,10 @@ final class AeroVisualizer {
     private static final int REGION_STALE_TICKS = 40;
     private static final int REMOTE_VECTOR_FIELD_STRIDE = 1;
     private static final int REMOTE_STREAMLINE_SEED_STRIDE = 1;
-    private static final int REMOTE_STREAMLINE_FACE_BUCKETS = 4;
+    private static final int REMOTE_STREAMLINE_FACE_BUCKETS = 2;
+    private static final int REMOTE_STREAMLINE_SEEDS_PER_BUCKET = 5;
     private static final int REMOTE_STREAMLINE_SEEDS_PER_FACE =
-        REMOTE_STREAMLINE_FACE_BUCKETS * REMOTE_STREAMLINE_FACE_BUCKETS;
+        REMOTE_STREAMLINE_FACE_BUCKETS * REMOTE_STREAMLINE_FACE_BUCKETS * REMOTE_STREAMLINE_SEEDS_PER_BUCKET;
     private static final int REMOTE_STREAMLINE_MAX_STEPS = 192;
     private static final double REMOTE_STREAMLINE_MAX_LENGTH = 96.0;
     private static final float MIN_SPEED = 0.01f;
@@ -398,11 +399,25 @@ final class AeroVisualizer {
                 }
                 int bucket = streamlineFaceBucket(u, v, gridSize);
                 float score = inward * (0.35f + 0.65f * MathHelper.clamp(speed / MAX_INFLOW_SPEED, 0.0f, 1.0f));
-                if (score > bestScores[bucket]) {
-                    bestScores[bucket] = score;
-                    bestX[bucket] = x;
-                    bestY[bucket] = y;
-                    bestZ[bucket] = z;
+                int bucketBase = bucket * REMOTE_STREAMLINE_SEEDS_PER_BUCKET;
+                for (int slot = 0; slot < REMOTE_STREAMLINE_SEEDS_PER_BUCKET; slot++) {
+                    int seedIndex = bucketBase + slot;
+                    if (score <= bestScores[seedIndex]) {
+                        continue;
+                    }
+                    for (int shift = REMOTE_STREAMLINE_SEEDS_PER_BUCKET - 1; shift > slot; shift--) {
+                        int dst = bucketBase + shift;
+                        int src = dst - 1;
+                        bestScores[dst] = bestScores[src];
+                        bestX[dst] = bestX[src];
+                        bestY[dst] = bestY[src];
+                        bestZ[dst] = bestZ[src];
+                    }
+                    bestScores[seedIndex] = score;
+                    bestX[seedIndex] = x;
+                    bestY[seedIndex] = y;
+                    bestZ[seedIndex] = z;
+                    break;
                 }
             }
         }

@@ -44,6 +44,11 @@ Current native code includes:
 Use `/aero backend status` after switching to native to confirm runtime path (`opencl|cumulant-d3q27+sgs+bouss:<device>` or `cpu|cumulant-d3q27+sgs+bouss...`).
 The status command also prints tick timing breakdown: payload copy / solver / readback / total.
 
+## External C API
+
+For non-Minecraft validation tools, the same native library now exports a thin wind-tunnel C ABI in `include/aero_solver_capi.h`.
+See `docs/wind_tunnel_solver_api.md` for the handoff contract: static voxel mask input, wind-tunnel boundary conditions, optional previous macro flow initialization, and `vx/vy/vz/pressure_proxy` field output.
+
 ### Boussinesq coupling notes
 
 - Native payload now supports `10 -> 4` (extra `thermal_source` at channel index 9).
