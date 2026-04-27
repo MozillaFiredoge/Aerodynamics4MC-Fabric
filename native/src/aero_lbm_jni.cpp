@@ -951,6 +951,7 @@ inline int opencl_hydrodynamic_periodic_mask() {
 inline bool benchmark_opencl_supported() {
     if (!benchmark_mode_active()) return true;
     switch (g_benchmark_cfg.preset) {
+        case AERO_LBM_BENCHMARK_PRESET_NONE:
         case AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D:
         case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D:
         case AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D:
@@ -4577,7 +4578,7 @@ bool opencl_step(
         return false;
     };
     auto stage_fence = [&](const char* stage) -> bool {
-        if (!benchmark_mode_active()) return true;
+        if (!benchmark_mode_active() || g_benchmark_cfg.preset == AERO_LBM_BENCHMARK_PRESET_NONE) return true;
         const std::string label = std::string("clFinish(") + stage + ")";
         cl_int finish_err = clFinish(g_opencl.queue);
         if (finish_err != CL_SUCCESS) return fail_cl(label.c_str(), finish_err);

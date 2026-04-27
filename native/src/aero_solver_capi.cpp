@@ -39,6 +39,8 @@ struct SolverContext {
     AeroGridDesc grid{};
     int cells = 0;
     bool custom_flow_state = false;
+    bool packet_dirty = true;
+    AeroBoundaryDesc packet_boundary{};
     std::vector<uint8_t> solid_mask;
     std::vector<float> packet;
     std::vector<float> scratch_flow;
@@ -108,6 +110,14 @@ float velocity_lattice_to_mps(const AeroGridDesc& grid, float velocity_lattice) 
 
 float pressure_proxy(float pressure) {
     return finite_or(pressure, 0.0f);
+}
+
+bool same_boundary_for_packet(const AeroBoundaryDesc& a, const AeroBoundaryDesc& b) {
+    return a.mode == b.mode
+        && a.inlet_vx == b.inlet_vx
+        && a.inlet_vy == b.inlet_vy
+        && a.inlet_vz == b.inlet_vz
+        && a.outlet_pressure == b.outlet_pressure;
 }
 
 std::size_t packet_base(std::size_t cell) {
@@ -285,7 +295,13 @@ bool step_solver_locked(
         }
         return false;
     }
-    initialize_packet(ctx, boundary, !ctx.custom_flow_state);
+    const bool overwrite_flow_state = !ctx.custom_flow_state;
+    const bool boundary_changes_packet = overwrite_flow_state && !same_boundary_for_packet(ctx.packet_boundary, boundary);
+    if (ctx.packet_dirty || boundary_changes_packet) {
+        initialize_packet(ctx, boundary, overwrite_flow_state);
+        ctx.packet_boundary = boundary;
+        ctx.packet_dirty = false;
+    }
     if (ctx.scratch_flow.size() != static_cast<std::size_t>(ctx.cells) * kOutputChannels) {
         ctx.scratch_flow.assign(static_cast<std::size_t>(ctx.cells) * kOutputChannels, 0.0f);
     }
@@ -375,6 +391,8 @@ AERO_LBM_CAPI_EXPORT int aero_solver_create_with_grid(
     AeroBoundaryDesc boundary{};
     aero_solver_default_boundary(&boundary);
     initialize_packet(*ctx, boundary, true);
+    ctx->packet_boundary = boundary;
+    ctx->packet_dirty = false;
 
     const long long handle = ctx->handle;
     g_contexts.emplace(handle, std::move(ctx));
@@ -398,6 +416,8 @@ AERO_LBM_CAPI_EXPORT int aero_solver_set_solid_mask(
         return AERO_SOLVER_STATUS_ERROR;
     }
     ctx->solid_mask.assign(solid_mask, solid_mask + cell_count);
+    ctx->custom_flow_state = false;
+    ctx->packet_dirty = true;
     aero_lbm_release_context(ctx->context_key);
     return AERO_SOLVER_STATUS_OK;
 }
@@ -434,6 +454,7 @@ AERO_LBM_CAPI_EXPORT int aero_solver_set_flow_state(
         );
     }
     ctx->custom_flow_state = true;
+    ctx->packet_dirty = false;
     aero_lbm_release_context(ctx->context_key);
     return AERO_SOLVER_STATUS_OK;
 }
