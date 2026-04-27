@@ -97,6 +97,12 @@ def configure_api(lib: ctypes.CDLL) -> None:
     lib.aero_solver_runtime_info.restype = ctypes.c_char_p
 
     try:
+        lib.aero_solver_finish.argtypes = []
+        lib.aero_solver_finish.restype = ctypes.c_int
+    except AttributeError:
+        pass
+
+    try:
         lib.aero_lbm_reset_timing.argtypes = []
         lib.aero_lbm_reset_timing.restype = None
         lib.aero_lbm_timing_info.argtypes = []
@@ -247,6 +253,11 @@ def main() -> int:
         action="store_true",
         help="Measure solver advance only. A final unmeasured readback is still run for sanity checking.",
     )
+    parser.add_argument(
+        "--async-enqueue-only",
+        action="store_true",
+        help="Do not clFinish each no-readback frame. This measures enqueue overhead, not real GPU solve time.",
+    )
     args = parser.parse_args()
 
     nx = args.nx or args.grid
@@ -288,13 +299,18 @@ def main() -> int:
         )
         out_flow = (ctypes.c_float * value_count)()
         advance = getattr(lib, "aero_solver_advance_wind_tunnel", None)
+        finish = getattr(lib, "aero_solver_finish", None)
         if args.no_readback and advance is None:
             raise SystemExit("no-readback mode requires aero_solver_advance_wind_tunnel in the DLL")
+        if args.no_readback and not args.async_enqueue_only and finish is None:
+            raise SystemExit("synchronous no-readback mode requires aero_solver_finish in the DLL")
 
         print(f"[bench] warmup_frames={args.warmup}")
         for _ in range(args.warmup):
             if args.no_readback:
                 ok = advance(handle.value, ctypes.byref(boundary), args.steps_per_frame)
+                if ok and not args.async_enqueue_only:
+                    ok = finish()
             else:
                 ok = lib.aero_solver_step_wind_tunnel(
                     handle.value,
@@ -316,6 +332,8 @@ def main() -> int:
             start = perf_counter()
             if args.no_readback:
                 ok = advance(handle.value, ctypes.byref(boundary), args.steps_per_frame)
+                if ok and not args.async_enqueue_only:
+                    ok = finish()
             else:
                 ok = lib.aero_solver_step_wind_tunnel(
                     handle.value,
@@ -333,6 +351,7 @@ def main() -> int:
                 max_speed = max(max_speed, frame_max)
                 non_finite += frame_bad
 
+        measured_native_timing = native_timing_info(lib)
         if args.no_readback:
             ok = lib.aero_solver_step_wind_tunnel(
                 handle.value,
@@ -358,7 +377,9 @@ def main() -> int:
         print(f"  max_speed_scanned_mps={max_speed:.6f}")
         print(f"  non_finite_values_scanned={non_finite}")
         print(f"  first_cell=({out_flow[0]:.6f}, {out_flow[1]:.6f}, {out_flow[2]:.6f}, {out_flow[3]:.6f})")
-        print(f"  native_timing={native_timing_info(lib)}")
+        print(f"  native_timing={measured_native_timing}")
+        if args.no_readback:
+            print(f"  native_timing_after_final_readback={native_timing_info(lib)}")
     finally:
         lib.aero_solver_destroy(handle.value)
 

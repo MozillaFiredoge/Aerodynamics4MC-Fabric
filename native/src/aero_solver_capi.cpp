@@ -586,4 +586,14 @@ AERO_LBM_CAPI_EXPORT const char* aero_solver_runtime_info(void) {
     return aero_lbm_runtime_info();
 }
 
+AERO_LBM_CAPI_EXPORT int aero_solver_finish(void) {
+    std::lock_guard<std::mutex> lock(g_solver_mutex);
+    clear_error();
+    if (!aero_lbm_finish()) {
+        set_error(std::string("aero_lbm_finish failed: ") + aero_lbm_last_error());
+        return AERO_SOLVER_STATUS_ERROR;
+    }
+    return AERO_SOLVER_STATUS_OK;
+}
+
 }  // extern "C"

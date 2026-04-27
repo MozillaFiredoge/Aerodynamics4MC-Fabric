@@ -7397,6 +7397,20 @@ AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void) {
     reset_timing_stats();
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_finish(void) {
+#if defined(AERO_LBM_OPENCL)
+    clear_last_native_error();
+    if (g_cfg.opencl_enabled && g_opencl.queue) {
+        const cl_int err = clFinish(g_opencl.queue);
+        if (err != CL_SUCCESS) {
+            set_last_native_error(format_opencl_api_error("clFinish", err));
+            return 0;
+        }
+    }
+#endif
+    return 1;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_timing_snapshot(AeroLbmTimingSnapshot* out_snapshot) {
     if (!out_snapshot) return 0;
     const double inv = g_timing.ticks == 0 ? 0.0 : 1.0 / static_cast<double>(g_timing.ticks);

@@ -106,6 +106,7 @@ AERO_LBM_CAPI_EXPORT int aero_solver_run_wind_tunnel(
 AERO_LBM_CAPI_EXPORT void aero_solver_destroy(long long handle);
 AERO_LBM_CAPI_EXPORT const char* aero_solver_last_error(void);
 AERO_LBM_CAPI_EXPORT const char* aero_solver_runtime_info(void);
+AERO_LBM_CAPI_EXPORT int aero_solver_finish(void);
 
 #ifdef __cplusplus
 }
