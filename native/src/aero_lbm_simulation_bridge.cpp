@@ -910,6 +910,20 @@ struct BrickMeanState {
     bool valid = false;
 };
 
+bool dynamic_has_nonzero_flow(const DynamicRegionData& dynamic) {
+    constexpr float k_nonzero_flow_epsilon = 1.0e-8f;
+    for (std::size_t base = 0;
+        base + 2 < dynamic.flow_state.size();
+        base += AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS) {
+        if (std::fabs(dynamic.flow_state[base]) > k_nonzero_flow_epsilon
+            || std::fabs(dynamic.flow_state[base + 1]) > k_nonzero_flow_epsilon
+            || std::fabs(dynamic.flow_state[base + 2]) > k_nonzero_flow_epsilon) {
+            return true;
+        }
+    }
+    return false;
+}
+
 BrickMeanState compute_brick_mean_state(const DynamicRegionData& dynamic) {
     BrickMeanState mean;
     const size_t cells = dynamic.air_temperature.size();
@@ -946,6 +960,9 @@ void seed_brick_from_neighbor_means(
         BrickCoord neighbor_coord{coord.x + offset[0], coord.y + offset[1], coord.z + offset[2]};
         auto it = snapshots.find(neighbor_coord);
         if (it == snapshots.end() || !brick_dynamic_region_valid(runtime, it->second.get())) {
+            continue;
+        }
+        if (!dynamic_has_nonzero_flow(*it->second)) {
             continue;
         }
         BrickMeanState mean = compute_brick_mean_state(*it->second);
@@ -986,6 +1003,9 @@ bool seed_brick_from_boundary_reference(
 ) {
     const DynamicRegionData* reference = brick.boundary_reference_region.get();
     if (!brick_dynamic_region_valid(runtime, reference) || !brick_dynamic_region_valid(runtime, &dynamic)) {
+        return false;
+    }
+    if (!dynamic_has_nonzero_flow(*reference)) {
         return false;
     }
     dynamic.flow_state = reference->flow_state;

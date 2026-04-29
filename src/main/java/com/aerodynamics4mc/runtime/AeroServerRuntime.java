@@ -117,6 +117,8 @@ public final class AeroServerRuntime {
     private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 1;
     private static final float ATLAS_VELOCITY_QUANT_RANGE = 5.6f;
     private static final float ATLAS_PRESSURE_QUANT_RANGE = 0.03f;
+    private static final float ZERO_ATLAS_MAX_SPEED_EPS_MPS = 0.02f;
+    private static final float EXPECTED_COARSE_WIND_MIN_MPS = 0.05f;
     private static final int COARSE_WIND_SYNC_CELL_SIZE_BLOCKS = 32;
     private static final int COARSE_WIND_SYNC_SIZE_X = 9;
     private static final int COARSE_WIND_SYNC_SIZE_Y = 5;
@@ -249,9 +251,12 @@ public final class AeroServerRuntime {
     private static final int REGION_LATTICE_STRIDE = REGION_CORE_SIZE;
     private static final int BRICK_RUNTIME_SIZE = REGION_CORE_SIZE;
     private static final int HORIZONTAL_ATTACH_MARGIN_CELLS = Math.max(4, REGION_CORE_SIZE / 4);
+    private static final int HORIZONTAL_SOLVE_MARGIN_CELLS = Math.max(4, REGION_CORE_SIZE / 4);
     private static final int VERTICAL_SOLVE_MARGIN_CELLS = Math.max(4, REGION_CORE_SIZE / 4);
     private static final int VERTICAL_ATTACH_MARGIN_CELLS = Math.max(VERTICAL_SOLVE_MARGIN_CELLS + 4, REGION_CORE_SIZE / 3);
     private static final int SHELL_WINDOW_RETENTION_TICKS = 8;
+    private static final int SOLVE_WINDOW_RETENTION_TICKS = 12;
+    private static final int ACTIVE_BRICK_TRAIL_MAX_SEGMENTS_PER_PLAYER = 8;
     private static final int BOUNDARY_FIELD_REFRESH_TICKS = 4;
     private static final int BRICK_DYNAMIC_SYNC_INTERVAL_TICKS = 4;
     private static final int BRICK_BOUNDARY_REFERENCE_REFRESH_INTERVAL_TICKS = 4;
@@ -300,6 +305,8 @@ public final class AeroServerRuntime {
     private volatile Set<WindowKey> anchorDesiredWindowKeys = Set.of();
     private volatile Set<WindowKey> anchorSolveWindowKeys = Set.of();
     private final Map<WindowKey, Integer> shellWindowRetainUntilTick = new HashMap<>();
+    private final Map<WindowKey, Integer> solveWindowRetainUntilTick = new HashMap<>();
+    private final Map<UUID, PlayerMotionAnchorState> playerMotionAnchorStates = new HashMap<>();
     private final Set<WindowKey> mirrorOnlyPrewarmedWindowKeys = new HashSet<>();
     private final Map<WindowKey, Long> mirrorOnlyUploadedBrickStaticSignatures = new HashMap<>();
     private final Map<WindowKey, Long> uploadedBrickDynamicSeedSignatures = new HashMap<>();
@@ -2788,6 +2795,8 @@ public final class AeroServerRuntime {
         anchorDesiredWindowKeys = Set.of();
         anchorSolveWindowKeys = Set.of();
         shellWindowRetainUntilTick.clear();
+        solveWindowRetainUntilTick.clear();
+        playerMotionAnchorStates.clear();
         mirrorOnlyPrewarmedWindowKeys.clear();
         mirrorOnlyUploadedBrickStaticSignatures.clear();
         uploadedBrickDynamicSeedSignatures.clear();
@@ -3199,6 +3208,7 @@ public final class AeroServerRuntime {
         List<PlayerRegionAnchor> anchors = new ArrayList<>();
         List<PlayerProbeRequest> probeRequests = new ArrayList<>();
         Map<RegistryKey<World>, WorldEnvironmentSnapshot> snapshots = new HashMap<>();
+        Set<UUID> observedPlayers = new HashSet<>();
         for (ServerWorld world : server.getWorlds()) {
             List<ServerPlayerEntity> players = world.getPlayers();
             if (players.isEmpty()) {
@@ -3215,13 +3225,24 @@ public final class AeroServerRuntime {
                 )
             );
             for (ServerPlayerEntity player : players) {
-                BlockPos playerPos = player.getBlockPos();
-                anchors.add(new PlayerRegionAnchor(worldKey, coreOriginForPosition(playerPos), playerPos.toImmutable()));
-                probeRequests.add(new PlayerProbeRequest(player.getUuid(), worldKey, playerPos.toImmutable()));
+                UUID playerId = player.getUuid();
+                BlockPos playerPos = player.getBlockPos().toImmutable();
+                BlockPos coreOrigin = coreOriginForPosition(playerPos);
+                observedPlayers.add(playerId);
+                anchors.add(new PlayerRegionAnchor(worldKey, coreOrigin, playerPos));
+                appendPlayerMotionTrailAnchors(playerId, worldKey, playerPos, coreOrigin, anchors);
+                playerMotionAnchorStates.put(
+                    playerId,
+                    new PlayerMotionAnchorState(worldKey, coreOrigin, tickCounter)
+                );
+                probeRequests.add(new PlayerProbeRequest(playerId, worldKey, playerPos));
             }
         }
+        playerMotionAnchorStates.entrySet().removeIf(entry -> {
+            PlayerMotionAnchorState state = entry.getValue();
+            return !observedPlayers.contains(entry.getKey()) || tickCounter - state.lastSeenTick() > SOLVE_WINDOW_RETENTION_TICKS;
+        });
         Set<WindowKey> activeKeys = activeRegionKeys(anchors);
-        Map<RegistryKey<World>, int[]> brickRuntimeHintCoordsByWorld = brickRuntimeHintCoords(anchors);
         List<EntitySampleRequest> entityRequests = ENTITY_SAMPLE_COLLECTION_ENABLED
             ? collectEntitySampleRequests(server, activeKeys)
             : List.of();
@@ -3230,9 +3251,58 @@ public final class AeroServerRuntime {
             List.copyOf(anchors),
             List.copyOf(probeRequests),
             List.copyOf(entityRequests),
-            Map.copyOf(snapshots),
-            brickRuntimeHintCoordsByWorld
+            Map.copyOf(snapshots)
         );
+    }
+
+    private void appendPlayerMotionTrailAnchors(
+        UUID playerId,
+        RegistryKey<World> worldKey,
+        BlockPos playerPos,
+        BlockPos currentCoreOrigin,
+        List<PlayerRegionAnchor> anchors
+    ) {
+        PlayerMotionAnchorState previous = playerMotionAnchorStates.get(playerId);
+        if (previous == null || !previous.worldKey().equals(worldKey)) {
+            return;
+        }
+        BlockPos previousCoreOrigin = previous.coreOrigin();
+        if (previousCoreOrigin.equals(currentCoreOrigin)) {
+            return;
+        }
+        int previousBrickX = Math.floorDiv(previousCoreOrigin.getX(), REGION_LATTICE_STRIDE);
+        int previousBrickY = Math.floorDiv(previousCoreOrigin.getY(), REGION_LATTICE_STRIDE);
+        int previousBrickZ = Math.floorDiv(previousCoreOrigin.getZ(), REGION_LATTICE_STRIDE);
+        int currentBrickX = Math.floorDiv(currentCoreOrigin.getX(), REGION_LATTICE_STRIDE);
+        int currentBrickY = Math.floorDiv(currentCoreOrigin.getY(), REGION_LATTICE_STRIDE);
+        int currentBrickZ = Math.floorDiv(currentCoreOrigin.getZ(), REGION_LATTICE_STRIDE);
+        int deltaX = currentBrickX - previousBrickX;
+        int deltaY = currentBrickY - previousBrickY;
+        int deltaZ = currentBrickZ - previousBrickZ;
+        int steps = Math.max(Math.abs(deltaX), Math.max(Math.abs(deltaY), Math.abs(deltaZ)));
+        if (steps <= 0) {
+            return;
+        }
+        int firstStep = Math.max(0, steps - ACTIVE_BRICK_TRAIL_MAX_SEGMENTS_PER_PLAYER);
+        for (int step = firstStep; step < steps; step++) {
+            int brickX = previousBrickX + Math.round(deltaX * (step / (float) steps));
+            int brickY = previousBrickY + Math.round(deltaY * (step / (float) steps));
+            int brickZ = previousBrickZ + Math.round(deltaZ * (step / (float) steps));
+            BlockPos coreOrigin = new BlockPos(
+                brickX * REGION_LATTICE_STRIDE,
+                brickY * REGION_LATTICE_STRIDE,
+                brickZ * REGION_LATTICE_STRIDE
+            );
+            if (coreOrigin.equals(currentCoreOrigin)) {
+                continue;
+            }
+            BlockPos syntheticPos = coreOrigin.add(
+                REGION_CORE_SIZE / 2,
+                MathHelper.clamp(playerPos.getY() - coreOrigin.getY(), 0, REGION_CORE_SIZE - 1),
+                REGION_CORE_SIZE / 2
+            );
+            anchors.add(new PlayerRegionAnchor(worldKey, coreOrigin, syntheticPos));
+        }
     }
 
     private List<EntitySampleRequest> collectEntitySampleRequests(MinecraftServer server, Set<WindowKey> activeKeys) {
@@ -3315,7 +3385,7 @@ public final class AeroServerRuntime {
             } else {
                 refreshWindowFromMirror(key, region);
             }
-            prewarmMirrorOnlyWindowCoreStaticBrick(key);
+            uploadSolveWindowCoreStaticBrickToRuntime(key, region);
         }
         for (WindowKey key : mirrorOnlyWindowKeysToRemove) {
             RegionRecord region = regions.get(key);
@@ -3773,7 +3843,21 @@ public final class AeroServerRuntime {
             RegistryKey<World> worldKey = anchor.worldKey();
             BlockPos baseCore = anchor.coreOrigin();
             keys.add(new WindowKey(worldKey, windowOriginFromCoreOrigin(baseCore)));
+            int localX = MathHelper.clamp(anchor.blockPos().getX() - baseCore.getX(), 0, REGION_CORE_SIZE - 1);
             int localY = MathHelper.clamp(anchor.blockPos().getY() - baseCore.getY(), 0, REGION_CORE_SIZE - 1);
+            int localZ = MathHelper.clamp(anchor.blockPos().getZ() - baseCore.getZ(), 0, REGION_CORE_SIZE - 1);
+            if (localX >= REGION_CORE_SIZE - HORIZONTAL_SOLVE_MARGIN_CELLS) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(REGION_LATTICE_STRIDE, 0, 0))
+                ));
+            }
+            if (localX < HORIZONTAL_SOLVE_MARGIN_CELLS) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(-REGION_LATTICE_STRIDE, 0, 0))
+                ));
+            }
             if (localY >= REGION_CORE_SIZE - VERTICAL_SOLVE_MARGIN_CELLS) {
                 keys.add(new WindowKey(
                     worldKey,
@@ -3784,6 +3868,18 @@ public final class AeroServerRuntime {
                 keys.add(new WindowKey(
                     worldKey,
                     windowOriginFromCoreOrigin(baseCore.add(0, -REGION_LATTICE_STRIDE, 0))
+                ));
+            }
+            if (localZ >= REGION_CORE_SIZE - HORIZONTAL_SOLVE_MARGIN_CELLS) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, 0, REGION_LATTICE_STRIDE))
+                ));
+            }
+            if (localZ < HORIZONTAL_SOLVE_MARGIN_CELLS) {
+                keys.add(new WindowKey(
+                    worldKey,
+                    windowOriginFromCoreOrigin(baseCore.add(0, 0, -REGION_LATTICE_STRIDE))
                 ));
             }
         }
@@ -4364,9 +4460,9 @@ public final class AeroServerRuntime {
         );
     }
 
-    private Map<RegistryKey<World>, int[]> brickRuntimeHintCoords(List<PlayerRegionAnchor> anchors) {
+    private Map<RegistryKey<World>, int[]> brickRuntimeHintCoords(Set<WindowKey> solveKeys) {
         Map<RegistryKey<World>, LinkedHashSet<BrickRuntimeHint>> hintsByWorld = new HashMap<>();
-        for (WindowKey solveKey : solveRegionKeys(anchors)) {
+        for (WindowKey solveKey : solveKeys) {
             RegistryKey<World> worldKey = solveKey.worldKey();
             BlockPos coreOrigin = solveKey.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
             LinkedHashSet<BrickRuntimeHint> hints = hintsByWorld.computeIfAbsent(worldKey, ignored -> new LinkedHashSet<>());
@@ -4375,17 +4471,6 @@ public final class AeroServerRuntime {
                 Math.floorDiv(coreOrigin.getY(), BRICK_RUNTIME_SIZE),
                 Math.floorDiv(coreOrigin.getZ(), BRICK_RUNTIME_SIZE)
             ));
-        }
-        if (hintsByWorld.isEmpty()) {
-            for (PlayerRegionAnchor anchor : anchors) {
-                RegistryKey<World> worldKey = anchor.worldKey();
-                BlockPos baseCore = anchor.coreOrigin();
-                hintsByWorld.computeIfAbsent(worldKey, ignored -> new LinkedHashSet<>()).add(new BrickRuntimeHint(
-                    Math.floorDiv(baseCore.getX(), BRICK_RUNTIME_SIZE),
-                    Math.floorDiv(baseCore.getY(), BRICK_RUNTIME_SIZE),
-                    Math.floorDiv(baseCore.getZ(), BRICK_RUNTIME_SIZE)
-                ));
-            }
         }
         Map<RegistryKey<World>, int[]> coordsByWorld = new HashMap<>();
         for (Map.Entry<RegistryKey<World>, LinkedHashSet<BrickRuntimeHint>> entry : hintsByWorld.entrySet()) {
@@ -4433,6 +4518,13 @@ public final class AeroServerRuntime {
 
     private void refreshDesiredWindowsFromBrickRuntime() {
         Set<WindowKey> solveWindows = new HashSet<>(anchorSolveWindowKeys);
+        int solveRetainUntilTick = tickCounter + SOLVE_WINDOW_RETENTION_TICKS;
+        solveWindowRetainUntilTick.entrySet().removeIf(entry -> entry.getValue() < tickCounter);
+        for (WindowKey key : anchorSolveWindowKeys) {
+            solveWindowRetainUntilTick.put(key, solveRetainUntilTick);
+        }
+        solveWindows.addAll(solveWindowRetainUntilTick.keySet());
+
         Set<WindowKey> desiredWindows = new HashSet<>(anchorDesiredWindowKeys);
         desiredWindows.addAll(solveWindows);
         desiredSolveWindowKeys = Set.copyOf(solveWindows);
@@ -4870,6 +4962,7 @@ public final class AeroServerRuntime {
         }
         if (region.uploadedBrickStaticServiceId == simulationServiceId
             && region.uploadedBrickStaticSignature == signature) {
+            ensureWindowCoreDynamicBrickSeeded(key, coreSnapshots);
             return true;
         }
         boolean uploaded = uploadWindowCoreStaticBrickToRuntime(key, coreSnapshots);
@@ -4960,8 +5053,11 @@ public final class AeroServerRuntime {
             airTemperatureState,
             surfaceTemperatureState
         );
-        if (signature != Long.MIN_VALUE) {
+        float seedMaxSpeed = maxFlowSpeedMetersPerSecond(flowState);
+        if (signature != Long.MIN_VALUE && seedMaxSpeed >= ZERO_ATLAS_MAX_SPEED_EPS_MPS) {
             uploadedBrickDynamicSeedSignatures.put(key, signature);
+        } else if (signature != Long.MIN_VALUE) {
+            uploadedBrickDynamicSeedSignatures.remove(key);
         }
     }
 
@@ -7108,6 +7204,39 @@ public final class AeroServerRuntime {
         return (short) Math.round(normalized * 32767.0f);
     }
 
+    private float maxFlowSpeedMetersPerSecond(float[] flowState) {
+        if (flowState == null) {
+            return 0.0f;
+        }
+        float maxSpeed = 0.0f;
+        for (int base = 0; base + 2 < flowState.length; base += RESPONSE_CHANNELS) {
+            float vx = flowState[base] * NATIVE_VELOCITY_SCALE;
+            float vy = flowState[base + 1] * NATIVE_VELOCITY_SCALE;
+            float vz = flowState[base + 2] * NATIVE_VELOCITY_SCALE;
+            float speed = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
+            if (Float.isFinite(speed) && speed > maxSpeed) {
+                maxSpeed = speed;
+            }
+        }
+        return maxSpeed;
+    }
+
+    private float expectedCoarseSpeedMetersPerSecond(WindowKey key) {
+        BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
+        BlockPos center = coreOrigin.add(BRICK_RUNTIME_SIZE / 2, BRICK_RUNTIME_SIZE / 2, BRICK_RUNTIME_SIZE / 2);
+        AeroWindSample coarse = sampleCoarseWindLocked(key.worldKey(), center);
+        if (!coarse.hasFlow()) {
+            return 0.0f;
+        }
+        return (float) coarse.velocity().length();
+    }
+
+    private boolean shouldSuppressZeroBrickAtlas(WindowKey key, BrickRuntimeAtlasSnapshot atlas) {
+        return atlas != null
+            && atlas.maxSpeed() < ZERO_ATLAS_MAX_SPEED_EPS_MPS
+            && expectedCoarseSpeedMetersPerSecond(key) >= EXPECTED_COARSE_WIND_MIN_MPS;
+    }
+
     private BrickRuntimeAtlasSnapshot sampleBrickRuntimeCoreAtlas(WindowKey key) {
         BlockPos coreOrigin = key.origin().add(REGION_HALO_CELLS, REGION_HALO_CELLS, REGION_HALO_CELLS);
         BrickRuntimeDynamicState brickState = copyBrickRuntimeDynamicState(
@@ -7119,17 +7248,7 @@ public final class AeroServerRuntime {
         if (brickState == null) {
             return null;
         }
-        float maxSpeed = 0.0f;
-        for (int cell = 0; cell < BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE * BRICK_RUNTIME_SIZE; cell++) {
-            int srcBase = cell * RESPONSE_CHANNELS;
-            float vx = brickState.flowState()[srcBase] * NATIVE_VELOCITY_SCALE;
-            float vy = brickState.flowState()[srcBase + 1] * NATIVE_VELOCITY_SCALE;
-            float vz = brickState.flowState()[srcBase + 2] * NATIVE_VELOCITY_SCALE;
-            float speed = (float) Math.sqrt(vx * vx + vy * vy + vz * vz);
-            if (Float.isFinite(speed) && speed > maxSpeed) {
-                maxSpeed = speed;
-            }
-        }
+        float maxSpeed = maxFlowSpeedMetersPerSecond(brickState.flowState());
         int n = BRICK_RUNTIME_SIZE;
         short[] packed = new short[n * n * n * NativeSimulationBridge.PACKED_ATLAS_CHANNELS];
         for (int bx = 0; bx < n; bx++) {
@@ -7170,17 +7289,29 @@ public final class AeroServerRuntime {
         }
         Map<WindowKey, BrickRuntimeAtlasSnapshot> atlases = new HashMap<>();
         Map<WindowKey, Float> regionMaxSpeeds = new HashMap<>();
+        PublishedFrame previousFrame = publishedFrame.get();
         for (WindowKey key : solveWindowKeys) {
             BrickRuntimeAtlasSnapshot atlas = sampleBrickRuntimeCoreAtlas(key);
             if (atlas == null) {
+                continue;
+            }
+            if (shouldSuppressZeroBrickAtlas(key, atlas)) {
+                uploadedBrickDynamicSeedSignatures.remove(key);
+                BrickRuntimeAtlasSnapshot previousAtlas = previousFrame == null ? null : previousFrame.regionAtlases().get(key);
+                Float previousMaxSpeed = previousFrame == null ? null : previousFrame.regionMaxSpeeds().get(key);
+                if (previousAtlas == null || previousMaxSpeed == null) {
+                    continue;
+                }
+                atlas = previousAtlas;
+                atlases.put(key, atlas);
+                regionMaxSpeeds.put(key, previousMaxSpeed);
                 continue;
             }
             atlases.put(key, atlas);
             regionMaxSpeeds.put(key, atlas.maxSpeed());
         }
         if (atlases.isEmpty()) {
-            PublishedFrame current = publishedFrame.get();
-            return current == null ? 0.0f : current.maxSpeed();
+            return previousFrame == null ? 0.0f : previousFrame.maxSpeed();
         }
         float maxSpeed = computePublishedMaxSpeed(regionMaxSpeeds);
         PublishedFrame next = new PublishedFrame(
@@ -7784,6 +7915,13 @@ public final class AeroServerRuntime {
     ) {
     }
 
+    private record PlayerMotionAnchorState(
+        RegistryKey<World> worldKey,
+        BlockPos coreOrigin,
+        int lastSeenTick
+    ) {
+    }
+
     private record PlayerProbeRequest(
         UUID playerId,
         RegistryKey<World> worldKey,
@@ -7817,8 +7955,7 @@ public final class AeroServerRuntime {
         List<PlayerRegionAnchor> anchors,
         List<PlayerProbeRequest> playerProbeRequests,
         List<EntitySampleRequest> entitySampleRequests,
-        Map<RegistryKey<World>, WorldEnvironmentSnapshot> environmentSnapshots,
-        Map<RegistryKey<World>, int[]> brickRuntimeHintCoordsByWorld
+        Map<RegistryKey<World>, WorldEnvironmentSnapshot> environmentSnapshots
     ) {
     }
 
@@ -8360,7 +8497,8 @@ public final class AeroServerRuntime {
             }
             anchorDesiredWindowKeys = Set.copyOf(activeRegionKeys(batch.anchors()));
             anchorSolveWindowKeys = Set.copyOf(solveRegionKeys(batch.anchors()));
-            syncBrickRuntimeHints(batch.brickRuntimeHintCoordsByWorld());
+            refreshDesiredWindowsFromBrickRuntime();
+            syncBrickRuntimeHints(brickRuntimeHintCoords(desiredSolveWindowKeys));
             activePlayerProbeRequests = batch.playerProbeRequests();
             activeEntitySampleRequests = batch.entitySampleRequests();
             worldEnvironmentSnapshots = batch.environmentSnapshots();

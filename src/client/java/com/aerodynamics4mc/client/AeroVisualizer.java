@@ -154,14 +154,14 @@ final class AeroVisualizer {
     }
 
     AeroWindSample sampleFlow(Identifier dimensionId, Vec3d position) {
-        return sampleFlow(dimensionId, position, SamplePolicy.VISUAL_LOCAL_FIRST);
+        return sampleFlow(dimensionId, position, SamplePolicy.SERVER_AGGREGATED_PREFERRED);
     }
 
     AeroWindSample sampleFlow(Identifier dimensionId, Vec3d position, SamplePolicy policy) {
         if (!streamingEnabled) {
             return AeroWindSample.ZERO;
         }
-        SamplePolicy effectivePolicy = policy == null ? SamplePolicy.VISUAL_LOCAL_FIRST : policy;
+        SamplePolicy effectivePolicy = policy == null ? SamplePolicy.SERVER_AGGREGATED_PREFERRED : policy;
         RemoteFlowField l2Field = effectivePolicy.allowClientLocalL2()
             ? findNewestField(localWindows, dimensionId, position)
             : null;

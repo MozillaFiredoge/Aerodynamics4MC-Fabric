@@ -39,6 +39,7 @@ final class ClientL2Solver {
     private static final float NATIVE_VELOCITY_SCALE = DX_METERS / DT_SECONDS;
     private static final float ATLAS_VELOCITY_RANGE = 5.6f;
     private static final float ATLAS_PRESSURE_RANGE = 0.03f;
+    private static final boolean EXPERIMENTAL_CLIENT_L2_DEFAULT = false;
 
     private final AeroVisualizer visualizer;
     private final NativeSimulationBridge bridge = new NativeSimulationBridge();
@@ -64,6 +65,7 @@ final class ClientL2Solver {
     private BlockPos activeOrigin;
     private Identifier activeDimension;
     private boolean streamingEnabled;
+    private boolean experimentalEnabled = EXPERIMENTAL_CLIENT_L2_DEFAULT;
     private boolean activeHintUploaded;
     private boolean clientSolveDisabled;
     private int activeBrickCount;
@@ -89,13 +91,13 @@ final class ClientL2Solver {
 
     void onRuntimeState(boolean streamingEnabled) {
         this.streamingEnabled = streamingEnabled;
-        if (!streamingEnabled) {
+        if (!streamingEnabled || !experimentalEnabled) {
             resetActiveBrick();
         }
     }
 
     void onCoarseWindField(AeroCoarseWindPayload payload) {
-        if (!streamingEnabled || payload == null) {
+        if (!streamingEnabled || !experimentalEnabled || payload == null) {
             return;
         }
         long serverTick = payload.serverTick();
@@ -109,7 +111,7 @@ final class ClientL2Solver {
     }
 
     private void onClientTick(MinecraftClient client) {
-        if (!streamingEnabled || client.world == null || client.player == null) {
+        if (!experimentalEnabled || !streamingEnabled || client.world == null || client.player == null) {
             return;
         }
         if (clientSolveDisabled) {
@@ -673,6 +675,26 @@ final class ClientL2Solver {
             bridge.releaseService(serviceKey);
             serviceKey = 0L;
         }
+    }
+
+    String status() {
+        if (!experimentalEnabled) {
+            return "client L2 experimental=off";
+        }
+        return "client L2 experimental=on streaming=" + streamingEnabled
+            + " disabled=" + clientSolveDisabled
+            + " activeBricks=" + activeBrickCount
+            + " pendingServerSteps=" + pendingServerSteps;
+    }
+
+    void setExperimentalEnabled(boolean enabled) {
+        if (experimentalEnabled == enabled) {
+            return;
+        }
+        experimentalEnabled = enabled;
+        clientSolveDisabled = false;
+        resetActiveBrick();
+        LOGGER.info("Client L2 experimental {}", enabled ? "enabled" : "disabled");
     }
 
     private void disableClientSolve(MinecraftClient client, String reason) {

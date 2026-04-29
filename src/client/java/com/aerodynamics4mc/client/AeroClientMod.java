@@ -8,8 +8,11 @@ import com.aerodynamics4mc.net.AeroFlowAnalysisPayload;
 import com.aerodynamics4mc.net.AeroRuntimeStatePayload;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.text.Text;
 import net.minecraft.util.math.Vec3d;
 
 public final class AeroClientMod implements ClientModInitializer {
@@ -28,10 +31,11 @@ public final class AeroClientMod implements ClientModInitializer {
         visualizer.initialize();
         irisWindBridge.initialize();
         clientL2Solver.initialize();
+        registerClientCommands();
     }
 
     public static AeroWindSample sampleFlow(ClientWorld world, Vec3d position) {
-        return sampleFlow(world, position, SamplePolicy.VISUAL_LOCAL_FIRST);
+        return sampleFlow(world, position, SamplePolicy.SERVER_AGGREGATED_PREFERRED);
     }
 
     public static AeroWindSample sampleFlow(ClientWorld world, Vec3d position, SamplePolicy policy) {
@@ -75,5 +79,32 @@ public final class AeroClientMod implements ClientModInitializer {
 
     private void onFlowAnalysis(AeroFlowAnalysisPayload payload, ClientPlayNetworking.Context context) {
         context.client().execute(() -> visualizer.onFlowAnalysis(payload));
+    }
+
+    private void registerClientCommands() {
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> dispatcher.register(
+            ClientCommandManager.literal("aero_client_l2")
+                .executes(ctx -> clientL2Status(ctx.getSource()))
+                .then(ClientCommandManager.literal("status")
+                    .executes(ctx -> clientL2Status(ctx.getSource())))
+                .then(ClientCommandManager.literal("on")
+                    .executes(ctx -> setClientL2Experimental(ctx.getSource(), true)))
+                .then(ClientCommandManager.literal("off")
+                    .executes(ctx -> setClientL2Experimental(ctx.getSource(), false)))
+        ));
+    }
+
+    private int clientL2Status(net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource source) {
+        source.sendFeedback(Text.literal(clientL2Solver.status()));
+        return 1;
+    }
+
+    private int setClientL2Experimental(
+        net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource source,
+        boolean enabled
+    ) {
+        clientL2Solver.setExperimentalEnabled(enabled);
+        source.sendFeedback(Text.literal("Client L2 experimental " + (enabled ? "enabled" : "disabled")));
+        return 1;
     }
 }
