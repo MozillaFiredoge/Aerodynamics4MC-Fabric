@@ -26,7 +26,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final float DEFAULT_MOLECULAR_NU_M2_S = 1.5e-5f;
     private static final float DEFAULT_PRANDTL_AIR = 0.71f;
     private static final float DEFAULT_TURBULENT_PRANDTL = 0.85f;
-    private static final int NATIVE_FORCING_CHANNELS = 24;
+    private static final int NATIVE_FORCING_CHANNELS = 25;
     private static final int NATIVE_STATE_CHANNELS = 6;
     private static final int CH_TERRAIN_HEIGHT = 0;
     private static final int CH_BIOME_TEMPERATURE = 1;
@@ -52,6 +52,7 @@ final class MesoscaleGrid implements AutoCloseable {
     private static final int CH_NESTED_WIND_Z_DELTA = 21;
     private static final int CH_NESTED_AMBIENT_DELTA = 22;
     private static final int CH_NESTED_SURFACE_DELTA = 23;
+    private static final int CH_SOLID_MASK = 24;
     private static final int OUT_AMBIENT = 0;
     private static final int OUT_DEEP_GROUND = 1;
     private static final int OUT_SURFACE = 2;
@@ -168,7 +169,7 @@ final class MesoscaleGrid implements AutoCloseable {
         if (state == null) {
             return null;
         }
-        int layer = layerIndexForY(pos.getY(), state);
+        int layer = layerIndexForY(pos.getY());
         if (layer < 0 || layer >= state.layerCount()) {
             return null;
         }
@@ -275,18 +276,9 @@ final class MesoscaleGrid implements AutoCloseable {
                 if (c00 == null || c10 == null || c01 == null || c11 == null) {
                     return false;
                 }
-                float terrainBase = bilerp(
-                    c00.terrainHeightBlocks,
-                    c10.terrainHeightBlocks,
-                    c01.terrainHeightBlocks,
-                    c11.terrainHeightBlocks,
-                    tx,
-                    tz
-                );
-
                 for (int y = 0; y < sizeY; y++) {
                     double worldY = origin.getY() + y + 0.5;
-                    double layerCoord = (worldY - (terrainBase + layerHeightBlocks * 0.5)) / layerHeightBlocks;
+                    double layerCoord = (worldY - (verticalBaseY + layerHeightBlocks * 0.5)) / layerHeightBlocks;
                     int layer0 = MathHelper.floor(layerCoord);
                     int layer1 = layer0 + 1;
                     float ty = (float) (layerCoord - layer0);
@@ -434,6 +426,7 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] forcingNestedWindXDelta = new float[stateCount];
         float[] forcingNestedWindZDelta = new float[stateCount];
         float[] forcingNestedUpdraft = new float[stateCount];
+        float[] terrainSolidMask = new float[stateCount];
         float[] windX = new float[stateCount];
         float[] windY = new float[stateCount];
         float[] windZ = new float[stateCount];
@@ -504,6 +497,9 @@ final class MesoscaleGrid implements AutoCloseable {
                         : 0.0f;
                     forcingNestedUpdraft[stateIndex] = forcingBase >= 0 && forcingBase + CH_NESTED_UPDRAFT < forcingBuffer.length
                         ? forcingBuffer[forcingBase + CH_NESTED_UPDRAFT]
+                        : 0.0f;
+                    terrainSolidMask[stateIndex] = forcingBase >= 0 && forcingBase + CH_SOLID_MASK < forcingBuffer.length
+                        ? forcingBuffer[forcingBase + CH_SOLID_MASK]
                         : 0.0f;
                     windX[stateIndex] = cell.windX[layer];
                     windY[stateIndex] = cell.windY[layer];
@@ -600,6 +596,7 @@ final class MesoscaleGrid implements AutoCloseable {
             forcingNestedWindXDelta,
             forcingNestedWindZDelta,
             forcingNestedUpdraft,
+            terrainSolidMask,
             windX,
             windY,
             windZ,
@@ -955,7 +952,8 @@ final class MesoscaleGrid implements AutoCloseable {
                     - stableWeight * (ABL_NEUTRAL_HEIGHT_BLOCKS - ABL_STABLE_HEIGHT_BLOCKS);
 
                 for (int layer = 0; layer < activeLayers; layer++) {
-                    int sampleY = layerCenterBlockY(cell, layer);
+                    int sampleY = layerCenterBlockY(layer);
+                    boolean terrainSolid = sampleY <= cell.terrainHeightBlocks;
                     float layerHeightAboveGround = Math.max(0.0f, sampleY - cell.terrainHeightBlocks);
                     float layerAmbient = ambientAirTemperatureKelvin + temperatureAdjustment
                         - Math.max(0.0f, sampleY - world.getSeaLevel()) * AMBIENT_LAPSE_RATE_K_PER_BLOCK;
@@ -1024,6 +1022,7 @@ final class MesoscaleGrid implements AutoCloseable {
                     forcingBuffer[base + CH_NESTED_WIND_Z_DELTA] = preservedNestedWindZDelta;
                     forcingBuffer[base + CH_NESTED_AMBIENT_DELTA] = preservedNestedAmbientDelta;
                     forcingBuffer[base + CH_NESTED_SURFACE_DELTA] = preservedNestedSurfaceDelta;
+                    forcingBuffer[base + CH_SOLID_MASK] = terrainSolid ? 1.0f : 0.0f;
                     cell.humidity[layer] = layerHumidity;
                 }
             }
@@ -1210,6 +1209,7 @@ final class MesoscaleGrid implements AutoCloseable {
                 for (int layer = 0; layer < activeLayers; layer++) {
                     int stateBase = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_STATE_CHANNELS;
                     int forcingBase = forcingIndex(cx, layer, cz, gridWidth) * NATIVE_FORCING_CHANNELS;
+                    boolean terrainSolid = forcingBuffer[forcingBase + CH_SOLID_MASK] > 0.5f;
                     cell.ambientAirTemperatureKelvin[layer] = finiteOrDefault(
                         stateBuffer[stateBase + OUT_AMBIENT],
                         finiteOrDefault(forcingBuffer[forcingBase + CH_AMBIENT_TARGET], cell.ambientAirTemperatureKelvin[layer])
@@ -1222,18 +1222,24 @@ final class MesoscaleGrid implements AutoCloseable {
                         stateBuffer[stateBase + OUT_SURFACE],
                         finiteOrDefault(forcingBuffer[forcingBase + CH_SURFACE_TARGET], cell.surfaceTemperatureKelvin[layer])
                     );
-                    cell.windX[layer] = finiteOrDefault(
-                        stateBuffer[stateBase + OUT_WIND_X],
-                        finiteOrDefault(forcingBuffer[forcingBase + CH_BACKGROUND_WIND_X], cell.windX[layer])
-                    );
-                    cell.windY[layer] = finiteOrDefault(
-                        stateBuffer[stateBase + OUT_WIND_Y],
-                        cell.windY[layer]
-                    );
-                    cell.windZ[layer] = finiteOrDefault(
-                        stateBuffer[stateBase + OUT_WIND_Z],
-                        finiteOrDefault(forcingBuffer[forcingBase + CH_BACKGROUND_WIND_Z], cell.windZ[layer])
-                    );
+                    cell.windX[layer] = terrainSolid
+                        ? 0.0f
+                        : finiteOrDefault(
+                            stateBuffer[stateBase + OUT_WIND_X],
+                            finiteOrDefault(forcingBuffer[forcingBase + CH_BACKGROUND_WIND_X], cell.windX[layer])
+                        );
+                    cell.windY[layer] = terrainSolid
+                        ? 0.0f
+                        : finiteOrDefault(
+                            stateBuffer[stateBase + OUT_WIND_Y],
+                            cell.windY[layer]
+                        );
+                    cell.windZ[layer] = terrainSolid
+                        ? 0.0f
+                        : finiteOrDefault(
+                            stateBuffer[stateBase + OUT_WIND_Z],
+                            finiteOrDefault(forcingBuffer[forcingBase + CH_BACKGROUND_WIND_Z], cell.windZ[layer])
+                        );
                     cell.humidity[layer] = MathHelper.clamp(
                         finiteOrDefault(forcingBuffer[forcingBase + CH_HUMIDITY], cell.humidity[layer]),
                         0.0f,
@@ -1261,6 +1267,7 @@ final class MesoscaleGrid implements AutoCloseable {
                     float windTargetX = forcingBuffer[base + CH_BACKGROUND_WIND_X] + forcingBuffer[base + CH_NESTED_WIND_X_DELTA];
                     float windTargetY = forcingBuffer[base + CH_NESTED_UPDRAFT] + forcingBuffer[base + CH_TORNADO_UPDRAFT];
                     float windTargetZ = forcingBuffer[base + CH_BACKGROUND_WIND_Z] + forcingBuffer[base + CH_NESTED_WIND_Z_DELTA];
+                    boolean terrainSolid = forcingBuffer[base + CH_SOLID_MASK] > 0.5f;
                     cell.ambientAirTemperatureKelvin[layer] = relax(
                         cell.ambientAirTemperatureKelvin[layer],
                         ambientTarget,
@@ -1276,9 +1283,9 @@ final class MesoscaleGrid implements AutoCloseable {
                         surfaceTarget,
                         deltaSeconds
                     );
-                    cell.windX[layer] = relax(cell.windX[layer], windTargetX, deltaSeconds * 0.5f);
-                    cell.windY[layer] = relax(cell.windY[layer], windTargetY, deltaSeconds * 0.5f);
-                    cell.windZ[layer] = relax(cell.windZ[layer], windTargetZ, deltaSeconds * 0.5f);
+                    cell.windX[layer] = terrainSolid ? 0.0f : relax(cell.windX[layer], windTargetX, deltaSeconds * 0.5f);
+                    cell.windY[layer] = terrainSolid ? 0.0f : relax(cell.windY[layer], windTargetY, deltaSeconds * 0.5f);
+                    cell.windZ[layer] = terrainSolid ? 0.0f : relax(cell.windZ[layer], windTargetZ, deltaSeconds * 0.5f);
                     cell.humidity[layer] = relax(cell.humidity[layer], forcingBuffer[base + CH_HUMIDITY], deltaSeconds * 0.5f);
                 }
             }
@@ -1307,17 +1314,15 @@ final class MesoscaleGrid implements AutoCloseable {
         return Math.max(1, maxLayers);
     }
 
-    private int layerCenterBlockY(CellColumnState cell, int layer) {
-        float terrainBase = Float.isFinite(cell.terrainHeightBlocks) ? cell.terrainHeightBlocks : verticalBaseY;
-        return Math.round(terrainBase + layer * layerHeightBlocks + layerHeightBlocks * 0.5f);
+    private int layerCenterBlockY(int layer) {
+        return verticalBaseY + layer * layerHeightBlocks + layerHeightBlocks / 2;
     }
 
-    private int layerIndexForY(int y, CellColumnState cell) {
+    private int layerIndexForY(int y) {
         if (activeLayers <= 1) {
             return 0;
         }
-        float terrainBase = Float.isFinite(cell.terrainHeightBlocks) ? cell.terrainHeightBlocks : verticalBaseY;
-        return MathHelper.clamp(MathHelper.floor((y - terrainBase) / (float) layerHeightBlocks), 0, activeLayers - 1);
+        return MathHelper.clamp(MathHelper.floor((y - verticalBaseY) / (float) layerHeightBlocks), 0, activeLayers - 1);
     }
 
     private int forcingIndex(int cellX, int layer, int cellZ, int gridWidth) {
@@ -1805,6 +1810,7 @@ final class MesoscaleGrid implements AutoCloseable {
         float[] forcingNestedWindXDelta,
         float[] forcingNestedWindZDelta,
         float[] forcingNestedUpdraft,
+        float[] terrainSolidMask,
         float[] windX,
         float[] windY,
         float[] windZ,

@@ -136,6 +136,7 @@ constexpr int kChNestedWindXDelta = 20;
 constexpr int kChNestedWindZDelta = 21;
 constexpr int kChNestedAmbientDelta = 22;
 constexpr int kChNestedSurfaceDelta = 23;
+constexpr int kChSolidMask = 24;
 constexpr int kOutAmbient = 0;
 constexpr int kOutDeepGround = 1;
 constexpr int kOutSurface = 2;
@@ -270,6 +271,15 @@ float trt_odd_tau(float even_tau) {
     return std::clamp(0.5f + 0.25f / tau_delta, 0.55f, 2.5f);
 }
 
+bool mesoscale_solid(const float* forcing, int cell) {
+    return forcing && forcing[cell * kForcingChannels + kChSolidMask] > 0.5f;
+}
+
+float solid_wall_temperature(const float* forcing, int cell) {
+    const int base = cell * kForcingChannels;
+    return forcing[base + kChSurfaceTarget] + forcing[base + kChNestedSurfaceDelta];
+}
+
 void ensure_mesoscale_storage(MesoscaleContextState& ctx) {
     const int cells = mesoscale_cells(ctx.config);
     ctx.rho.resize(cells);
@@ -295,25 +305,26 @@ void seed_mesoscale_state(
         const int base = i * kForcingChannels;
         const float ambient_target = forcing[base + kChAmbientTarget] + forcing[base + kChNestedAmbientDelta];
         const float surface_target = forcing[base + kChSurfaceTarget] + forcing[base + kChNestedSurfaceDelta];
+        const bool solid = mesoscale_solid(forcing, i);
         const float bg_wind_x = forcing[base + kChBackgroundWindX] + forcing[base + kChNestedWindXDelta];
         const float bg_wind_z = forcing[base + kChBackgroundWindZ] + forcing[base + kChNestedWindZDelta];
         const float bg_wind_y = forcing[base + kChNestedUpdraft] + forcing[base + kChTornadoUpdraft];
         const float bg_wind_x_lattice = clamp_lattice_speed(
-            bg_wind_x / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
+            (solid ? 0.0f : bg_wind_x) / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
         );
         const float bg_wind_y_lattice = clamp_lattice_speed(
-            bg_wind_y / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
+            (solid ? 0.0f : bg_wind_y) / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
         );
         const float bg_wind_z_lattice = clamp_lattice_speed(
-            bg_wind_z / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
+            (solid ? 0.0f : bg_wind_z) / std::max(1.0e-6f, velocity_scale_m_s_per_lattice)
         );
         ctx.rho[i] = 1.0f;
-        ctx.ambient[i] = ambient_target;
+        ctx.ambient[i] = solid ? surface_target : ambient_target;
         ctx.deep_ground[i] = forcing[base + kChDeepGroundTarget];
         ctx.surface[i] = surface_target;
-        ctx.wind_x[i] = bg_wind_x;
-        ctx.wind_y[i] = bg_wind_y;
-        ctx.wind_z[i] = bg_wind_z;
+        ctx.wind_x[i] = solid ? 0.0f : bg_wind_x;
+        ctx.wind_y[i] = solid ? 0.0f : bg_wind_y;
+        ctx.wind_z[i] = solid ? 0.0f : bg_wind_z;
         for (int q = 0; q < kMesoQ; ++q) {
             ctx.f[dist_index(i, q)] = hydro_feq_3d(q, 1.0f, bg_wind_x_lattice, bg_wind_y_lattice, bg_wind_z_lattice);
             ctx.g[dist_index(i, q)] = thermal_feq_3d(q, ctx.ambient[i], bg_wind_x_lattice, bg_wind_y_lattice, bg_wind_z_lattice);
@@ -435,6 +446,17 @@ CellTargets compute_cell_targets(
     const float bg_wind_x = forcing[base + kChBackgroundWindX] + nested_wind_x_delta + convective_inflow_x + tornado_wind_x;
     const float bg_wind_z = forcing[base + kChBackgroundWindZ] + nested_wind_z_delta + convective_inflow_z + tornado_wind_z;
     const float bg_wind_y = nested_updraft + tornado_updraft;
+    if (mesoscale_solid(forcing, i)) {
+        CellTargets solid_out{};
+        solid_out.rho = 1.0f;
+        solid_out.relax_ux = 0.0f;
+        solid_out.relax_uy = 0.0f;
+        solid_out.relax_uz = 0.0f;
+        solid_out.thermal_eq = surface_target;
+        solid_out.next_surface = surface_target;
+        solid_out.next_deep = deep_target;
+        return solid_out;
+    }
     const float humidity = std::clamp(forcing[base + kChHumidity] + convective_moistening + tornado_moistening, 0.0f, 1.0f);
     const float slope_x = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 0);
     const float slope_z = terrain_gradient_component(forcing, x, y, z, nx, ny, nz, 1);
@@ -600,6 +622,15 @@ int mesoscale_cpu_step(
             for (int z = 0; z < nz; ++z) {
                 const int i = mesoscale_index(x, y, z, ny, nz);
                 const int base = i * kForcingChannels;
+                if (mesoscale_solid(forcing, i)) {
+                    const float wall_temp = solid_wall_temperature(forcing, i);
+                    for (int q = 0; q < kMesoQ; ++q) {
+                        const int d = dist_index(i, q);
+                        ctx.f_next[d] = hydro_feq_3d(q, 1.0f, 0.0f, 0.0f, 0.0f);
+                        ctx.g_next[d] = thermal_feq_3d(q, wall_temp, 0.0f, 0.0f, 0.0f);
+                    }
+                    continue;
+                }
                 const float boundary_bg_x = clamp_lattice_speed(
                     (forcing[base + kChBackgroundWindX]
                         + forcing[base + kChNestedWindXDelta]
@@ -632,18 +663,26 @@ int mesoscale_cpu_step(
                     const int d = dist_index(i, q);
                     float f_value;
                     float g_value;
+                    bool bounced_from_solid = false;
                     if (sx >= 0 && sx < nx && sy >= 0 && sy < ny && sz >= 0 && sz < nz) {
                         const int src = mesoscale_index(sx, sy, sz, ny, nz);
-                        f_value = post_f[dist_index(src, q)];
-                        g_value = post_g[dist_index(src, q)];
+                        if (mesoscale_solid(forcing, src)) {
+                            f_value = post_f[dist_index(i, kMesoOpp[q])];
+                            g_value = thermal_feq_3d(q, solid_wall_temperature(forcing, src), 0.0f, 0.0f, 0.0f);
+                            bounced_from_solid = true;
+                        } else {
+                            f_value = post_f[dist_index(src, q)];
+                            g_value = post_g[dist_index(src, q)];
+                        }
                     } else if (sy < 0) {
                         f_value = post_f[dist_index(i, kMesoOpp[q])];
-                        g_value = thermal_feq_3d(q, boundary_temp, boundary_bg_x, 0.0f, boundary_bg_z);
+                        g_value = thermal_feq_3d(q, solid_wall_temperature(forcing, i), 0.0f, 0.0f, 0.0f);
+                        bounced_from_solid = true;
                     } else {
                         f_value = hydro_feq_3d(q, 1.0f, boundary_bg_x, boundary_bg_y, boundary_bg_z);
                         g_value = thermal_feq_3d(q, boundary_temp, boundary_bg_x, boundary_bg_y, boundary_bg_z);
                     }
-                    if (edge_alpha > 0.0f) {
+                    if (edge_alpha > 0.0f && !bounced_from_solid) {
                         const float f_bg = hydro_feq_3d(q, 1.0f, boundary_bg_x, boundary_bg_y, boundary_bg_z);
                         const float g_bg = thermal_feq_3d(q, boundary_temp, boundary_bg_x, boundary_bg_y, boundary_bg_z);
                         f_value = (1.0f - edge_alpha) * f_value + edge_alpha * f_bg;
@@ -662,6 +701,14 @@ int mesoscale_cpu_step(
     ctx.surface.swap(next_surface);
 
     for (int i = 0; i < cells; ++i) {
+        if (mesoscale_solid(forcing, i)) {
+            ctx.rho[i] = 1.0f;
+            ctx.ambient[i] = solid_wall_temperature(forcing, i);
+            ctx.wind_x[i] = 0.0f;
+            ctx.wind_y[i] = 0.0f;
+            ctx.wind_z[i] = 0.0f;
+            continue;
+        }
         float rho = 0.0f;
         float ux = 0.0f;
         float uy = 0.0f;

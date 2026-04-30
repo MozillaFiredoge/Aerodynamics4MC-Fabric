@@ -2399,6 +2399,7 @@ public final class AeroServerRuntime {
         appendJsonArray(builder, "forcing_nested_wind_x_delta", snapshot.forcingNestedWindXDelta(), true);
         appendJsonArray(builder, "forcing_nested_wind_z_delta", snapshot.forcingNestedWindZDelta(), true);
         appendJsonArray(builder, "forcing_nested_updraft", snapshot.forcingNestedUpdraft(), true);
+        appendJsonArray(builder, "terrain_solid_mask", snapshot.terrainSolidMask(), true);
         appendJsonArray(builder, "wind_x", snapshot.windX(), true);
         appendJsonArray(builder, "wind_y", snapshot.windY(), true);
         appendJsonArray(builder, "wind_z", snapshot.windZ(), true);
