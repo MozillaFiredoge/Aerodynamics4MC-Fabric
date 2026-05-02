@@ -68,6 +68,8 @@ final class ClientL2Solver {
     private static final float THERMAL_EMITTER_POWER_SOUL_TORCH_W = 50.0f;
     private static final float THERMAL_EMITTER_POWER_LANTERN_W = 60.0f;
     private static final float THERMAL_EMITTER_POWER_SOUL_LANTERN_W = 40.0f;
+    private static final int FAN_FORCE_LENGTH_CELLS = 5;
+    private static final int HEAT_PLUME_HEIGHT_CELLS = 4;
     private static final byte SURFACE_KIND_FAN_X_NEG = 32;
     private static final byte SURFACE_KIND_FAN_X_POS = 33;
     private static final byte SURFACE_KIND_FAN_Y_NEG = 34;
@@ -184,7 +186,7 @@ final class ClientL2Solver {
         if (!blockPatchTouchesActiveBrick(pos)) {
             return;
         }
-        NativeSimulationBridge.WorldDelta[] deltas = buildStaticPatchDeltas(world, pos);
+        NativeSimulationBridge.WorldDelta[] deltas = buildStaticPatchDeltas(world, pos, oldState, newState);
         if (deltas.length == 0) {
             return;
         }
@@ -818,14 +820,75 @@ final class ClientL2Solver {
         return true;
     }
 
-    private NativeSimulationBridge.WorldDelta[] buildStaticPatchDeltas(ClientWorld world, BlockPos center) {
-        NativeSimulationBridge.WorldDelta[] deltas = new NativeSimulationBridge.WorldDelta[1 + Direction.values().length];
-        int count = 0;
-        deltas[count++] = buildStaticCellPatchDelta(world, center);
+    private NativeSimulationBridge.WorldDelta[] buildStaticPatchDeltas(
+        ClientWorld world,
+        BlockPos center,
+        BlockState oldState,
+        BlockState newState
+    ) {
+        java.util.LinkedHashSet<BlockPos> positions = new java.util.LinkedHashSet<>();
+        addStaticPatchPosition(positions, center);
         for (Direction direction : Direction.values()) {
-            deltas[count++] = buildStaticCellPatchDelta(world, center.offset(direction));
+            addStaticPatchPosition(positions, center.offset(direction));
         }
-        return java.util.Arrays.copyOf(deltas, count);
+        addFanOcclusionPatchPositions(positions, center);
+        addHeatOcclusionPatchPositions(positions, center);
+        addForcingSourcePatchPositions(positions, center, oldState);
+        addForcingSourcePatchPositions(positions, center, newState);
+
+        NativeSimulationBridge.WorldDelta[] deltas = new NativeSimulationBridge.WorldDelta[positions.size()];
+        int count = 0;
+        for (BlockPos pos : positions) {
+            deltas[count++] = buildStaticCellPatchDelta(world, pos);
+        }
+        return count == deltas.length ? deltas : java.util.Arrays.copyOf(deltas, count);
+    }
+
+    private void addStaticPatchPosition(java.util.LinkedHashSet<BlockPos> positions, BlockPos pos) {
+        positions.add(pos.toImmutable());
+    }
+
+    private void addFanOcclusionPatchPositions(java.util.LinkedHashSet<BlockPos> positions, BlockPos center) {
+        for (Direction direction : Direction.values()) {
+            for (int distance = 1; distance <= FAN_FORCE_LENGTH_CELLS; distance++) {
+                addStaticPatchPosition(positions, offset(center, direction, distance));
+            }
+        }
+    }
+
+    private void addHeatOcclusionPatchPositions(java.util.LinkedHashSet<BlockPos> positions, BlockPos center) {
+        for (int distance = 1; distance <= HEAT_PLUME_HEIGHT_CELLS; distance++) {
+            addStaticPatchPosition(positions, offset(center, Direction.UP, distance));
+        }
+    }
+
+    private void addForcingSourcePatchPositions(
+        java.util.LinkedHashSet<BlockPos> positions,
+        BlockPos center,
+        BlockState state
+    ) {
+        if (state == null) {
+            return;
+        }
+        if (state.isOf(ModBlocks.FAN_BLOCK)) {
+            Direction direction = state.getOrEmpty(FanBlock.FACING).orElse(Direction.NORTH);
+            for (int distance = 1; distance <= FAN_FORCE_LENGTH_CELLS; distance++) {
+                addStaticPatchPosition(positions, offset(center, direction, distance));
+            }
+        }
+        if (sampleEmitterThermalPowerWatts(state) > 0.0f) {
+            for (int distance = 0; distance <= HEAT_PLUME_HEIGHT_CELLS; distance++) {
+                addStaticPatchPosition(positions, offset(center, Direction.UP, distance));
+            }
+        }
+    }
+
+    private BlockPos offset(BlockPos pos, Direction direction, int distance) {
+        return new BlockPos(
+            pos.getX() + direction.getOffsetX() * distance,
+            pos.getY() + direction.getOffsetY() * distance,
+            pos.getZ() + direction.getOffsetZ() * distance
+        );
     }
 
     private boolean blockPatchTouchesActiveBrick(BlockPos center) {
@@ -834,6 +897,16 @@ final class ClientL2Solver {
         }
         for (Direction direction : Direction.values()) {
             if (blockInActiveBrick(center.offset(direction))) {
+                return true;
+            }
+            for (int distance = 2; distance <= FAN_FORCE_LENGTH_CELLS; distance++) {
+                if (blockInActiveBrick(offset(center, direction, distance))) {
+                    return true;
+                }
+            }
+        }
+        for (int distance = 2; distance <= HEAT_PLUME_HEIGHT_CELLS; distance++) {
+            if (blockInActiveBrick(offset(center, Direction.UP, distance))) {
                 return true;
             }
         }
@@ -970,19 +1043,37 @@ final class ClientL2Solver {
 
     private byte fanSurfaceKindForCell(ClientWorld world, BlockPos pos) {
         for (Direction direction : Direction.values()) {
-            staticNeighbor.set(
-                pos.getX() - direction.getOffsetX(),
-                pos.getY() - direction.getOffsetY(),
-                pos.getZ() - direction.getOffsetZ()
-            );
-            BlockState fanState = world.getBlockState(staticNeighbor);
-            if (!fanState.isOf(ModBlocks.FAN_BLOCK)
-                || fanState.getOrEmpty(FanBlock.FACING).orElse(Direction.NORTH) != direction) {
-                continue;
+            for (int distance = 1; distance <= FAN_FORCE_LENGTH_CELLS; distance++) {
+                int fanX = pos.getX() - direction.getOffsetX() * distance;
+                int fanY = pos.getY() - direction.getOffsetY() * distance;
+                int fanZ = pos.getZ() - direction.getOffsetZ() * distance;
+                staticNeighbor.set(fanX, fanY, fanZ);
+                BlockState fanState = world.getBlockState(staticNeighbor);
+                if (!fanState.isOf(ModBlocks.FAN_BLOCK)
+                    || fanState.getOrEmpty(FanBlock.FACING).orElse(Direction.NORTH) != direction) {
+                    continue;
+                }
+                if (!fanPathClear(world, fanX, fanY, fanZ, direction, distance)) {
+                    continue;
+                }
+                return fanSurfaceKind(direction);
             }
-            return fanSurfaceKind(direction);
         }
         return 0;
+    }
+
+    private boolean fanPathClear(ClientWorld world, int fanX, int fanY, int fanZ, Direction direction, int distance) {
+        for (int step = 1; step < distance; step++) {
+            staticNeighbor.set(
+                fanX + direction.getOffsetX() * step,
+                fanY + direction.getOffsetY() * step,
+                fanZ + direction.getOffsetZ() * step
+            );
+            if (isSolidObstacle(world, staticNeighbor, world.getBlockState(staticNeighbor))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private byte fanSurfaceKind(Direction direction) {
@@ -1001,9 +1092,28 @@ final class ClientL2Solver {
         if (directPower > 0.0f) {
             return directPower;
         }
-        staticNeighbor.set(pos.getX(), pos.getY() - 1, pos.getZ());
-        float belowPower = sampleEmitterThermalPowerWatts(world.getBlockState(staticNeighbor));
-        return belowPower > 0.0f ? belowPower * HEAT_COUPLING_TO_ADJACENT_AIR : 0.0f;
+        float coupledPower = 0.0f;
+        for (int distance = 1; distance <= HEAT_PLUME_HEIGHT_CELLS; distance++) {
+            int sourceY = pos.getY() - distance;
+            staticNeighbor.set(pos.getX(), sourceY, pos.getZ());
+            float belowPower = sampleEmitterThermalPowerWatts(world.getBlockState(staticNeighbor));
+            if (belowPower <= 0.0f || !heatPathClear(world, pos.getX(), sourceY, pos.getZ(), pos.getY())) {
+                continue;
+            }
+            float falloff = HEAT_COUPLING_TO_ADJACENT_AIR / (distance * distance);
+            coupledPower += belowPower * falloff;
+        }
+        return coupledPower;
+    }
+
+    private boolean heatPathClear(ClientWorld world, int sourceX, int sourceY, int sourceZ, int targetY) {
+        for (int y = sourceY + 1; y < targetY; y++) {
+            staticNeighbor.set(sourceX, y, sourceZ);
+            if (isSolidObstacle(world, staticNeighbor, world.getBlockState(staticNeighbor))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private float sampleEmitterThermalPowerWatts(BlockState state) {

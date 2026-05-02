@@ -130,7 +130,7 @@ struct BrickData {
     std::uint64_t last_hint_epoch = 0;
     std::uint64_t last_active_epoch = 0;
     long long context_key = 0;
-    std::shared_ptr<const StaticRegionData> static_region;
+    std::shared_ptr<StaticRegionData> static_region;
     std::shared_ptr<DynamicRegionData> dynamic_region;
     std::shared_ptr<const DynamicRegionData> boundary_reference_region;
     std::vector<float> packet_cache;
@@ -149,7 +149,7 @@ struct FluidWorldRuntime {
 struct PendingStaticBrickUpload {
     long long world_key = 0;
     BrickCoord coord;
-    std::shared_ptr<const StaticRegionData> static_region;
+    std::shared_ptr<StaticRegionData> static_region;
 };
 
 struct ServiceState {
@@ -726,6 +726,11 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             if (!brick_is_solver_active(runtime, brick)) {
                 continue;
             }
+            if (brick.context_key != 0
+                && brick.forcing_dirty
+                && brick_dynamic_region_valid(runtime, brick.dynamic_region.get())) {
+                sync_brick_dynamic_from_context(runtime, brick);
+            }
             const bool had_dynamic = brick_dynamic_region_valid(runtime, brick.dynamic_region.get());
             const bool had_nonzero_dynamic = had_dynamic && dynamic_has_nonzero_flow(*brick.dynamic_region);
             if ((brick.pending_reinit || brick.geometry_dirty || !had_nonzero_dynamic) && brick.context_key != 0) {
@@ -1259,6 +1264,10 @@ bool step_brick_actual(
     BrickData& brick,
     DynamicRegionData& dynamic
 ) {
+    std::shared_ptr<DynamicRegionData> zero_output_fallback;
+    if (brick.forcing_dirty && dynamic_has_nonzero_flow(dynamic)) {
+        zero_output_fallback = std::make_shared<DynamicRegionData>(dynamic);
+    }
     if (!build_brick_step_packet(runtime, coord, brick, dynamic, brick.packet_cache)) {
         return false;
     }
@@ -1287,6 +1296,12 @@ bool step_brick_actual(
         );
         release_brick_context(brick);
         return false;
+    }
+    if (zero_output_fallback && !dynamic_has_nonzero_flow(*brick.dynamic_region)) {
+        brick.dynamic_region = std::move(zero_output_fallback);
+        apply_brick_static_constraints(runtime, brick);
+        release_brick_context(brick);
+        return true;
     }
     apply_brick_static_constraints(runtime, brick);
     return true;
@@ -1367,8 +1382,10 @@ void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta
                 break;
             }
             const int cell = (local_x * runtime.brick_size + local_y) * runtime.brick_size + local_z;
-            auto updated_static = std::make_shared<StaticRegionData>(*brick.static_region);
-            StaticRegionData& stat = *updated_static;
+            if (!brick.static_region.unique()) {
+                brick.static_region = std::make_shared<StaticRegionData>(*brick.static_region);
+            }
+            StaticRegionData& stat = *brick.static_region;
             const size_t cell_index = static_cast<size_t>(cell);
             const uint8_t previous_obstacle = stat.obstacle[cell_index];
             const uint8_t previous_surface_kind = stat.surface_kind[cell_index];
@@ -1385,7 +1402,6 @@ void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta
             const size_t face_base = static_cast<size_t>(cell) * k_face_count;
             std::fill_n(stat.face_sky_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
             std::fill_n(stat.face_direct_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
-            brick.static_region = std::move(updated_static);
             if (brick.dynamic_region) {
                 apply_brick_static_constraints(runtime, brick);
             }
