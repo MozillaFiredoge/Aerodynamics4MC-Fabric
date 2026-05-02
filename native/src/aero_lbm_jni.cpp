@@ -1111,6 +1111,19 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     return aero_lbm::hydro_core::equilibrium_d3q27(q, rho, ux, uy, uz);
 }
 
+inline float guo_force_source(int q, float ux, float uy, float uz, float fx, float fy, float fz, float omega) {
+    const float cx = static_cast<float>(kCx[q]);
+    const float cy = static_cast<float>(kCy[q]);
+    const float cz = static_cast<float>(kCz[q]);
+    const float cu = cx * ux + cy * uy + cz * uz;
+    const float c_force = cx * fx + cy * fy + cz * fz;
+    const float u_force = ux * fx + uy * fy + uz * fz;
+    const float inv_cs2 = 1.0f / kCs2;
+    const float inv_cs4 = inv_cs2 * inv_cs2;
+    const float prefactor = std::max(0.0f, 1.0f - 0.5f * clampf(omega, 0.0f, 1.999f));
+    return prefactor * kW[q] * ((c_force - u_force) * inv_cs2 + cu * c_force * inv_cs4);
+}
+
 inline void decode_cell(std::size_t cell, int nx, int ny, int nz, int& x, int& y, int& z) {
     (void)nx;
     const int yz = ny * nz;
@@ -2224,17 +2237,9 @@ void collide(ContextState& ctx) {
             f_cumulant[q] += feq(q, rho_safe, ux, uy, uz) - feq(q, rho_corr_safe, ux_corr, uy_corr, uz_corr);
         }
 
-        // Exact Difference Method (EDM) forcing in population space.
-        const float ux_minus = ux - 0.5f * dux;
-        const float uy_minus = uy - 0.5f * duy;
-        const float uz_minus = uz - 0.5f * duz;
-        const float ux_plus = ux + 0.5f * dux;
-        const float uy_plus = uy + 0.5f * duy;
-        const float uz_plus = uz + 0.5f * duz;
-
         for (int q = 0; q < kQ; ++q) {
-            const float edm_source = feq(q, rho_safe, ux_plus, uy_plus, uz_plus) - feq(q, rho_safe, ux_minus, uy_minus, uz_minus);
-            ctx.f_post[dist_index(cell, q, ctx.cells)] = f_cumulant[q] + edm_source;
+            const float source = guo_force_source(q, ux, uy, uz, fx, fy, fz, omega_offdiag);
+            ctx.f_post[dist_index(cell, q, ctx.cells)] = f_cumulant[q] + source;
         }
 
         int cx = 0, cy = 0, cz = 0;
@@ -2573,6 +2578,19 @@ inline float feq(int q, float rho, float ux, float uy, float uz) {
     float cu = 3.0f * (CX[q] * ux + CY[q] * uy + CZ[q] * uz);
     float uu = ux * ux + uy * uy + uz * uz;
     return W[q] * rho * (1.0f + cu + 0.5f * cu * cu - 1.5f * uu);
+}
+
+inline float guo_force_source(int q, float ux, float uy, float uz, float fx, float fy, float fz, float omega) {
+    float cx = (float)CX[q];
+    float cy = (float)CY[q];
+    float cz = (float)CZ[q];
+    float cu = cx * ux + cy * uy + cz * uz;
+    float c_force = cx * fx + cy * fy + cz * fz;
+    float u_force = ux * fx + uy * fy + uz * fz;
+    float inv_cs2 = 1.0f / CS2;
+    float inv_cs4 = inv_cs2 * inv_cs2;
+    float prefactor = fmax(0.0f, 1.0f - 0.5f * clampf(omega, 0.0f, 1.999f));
+    return prefactor * W[q] * ((c_force - u_force) * inv_cs2 + cu * c_force * inv_cs4);
 }
 
 inline float obstacle_bounce_value(
@@ -3699,18 +3717,12 @@ R"CLC(
         f_post_local[q] += feq(q, rho_safe, ux, uy, uz) - feq(q, fmax(1e-6f, rho_corr), ux_corr, uy_corr, uz_corr);
     }
 
-    float ux_minus = ux - 0.5f * dux;
-    float uy_minus = uy - 0.5f * duy;
-    float uz_minus = uz - 0.5f * duz;
-    float ux_plus = ux + 0.5f * dux;
-    float uy_plus = uy + 0.5f * duy;
-    float uz_plus = uz + 0.5f * duz;
     float alpha_sponge = (benchmark_flags & BENCH_DISABLE_SPONGE) ? 0.0f : sponge_alpha(nx, ny, nz, x, y, z);
     float keep_sponge = 1.0f - alpha_sponge;
 
     for (int q = 0; q < KQ; ++q) {
-        float edm_source = feq(q, rho_safe, ux_plus, uy_plus, uz_plus) - feq(q, rho_safe, ux_minus, uy_minus, uz_minus);
-        float f_next = f_post_local[q] + edm_source;
+        float source = guo_force_source(q, ux, uy, uz, fx, fy, fz, omega_offdiag);
+        float f_next = f_post_local[q] + source;
         if (alpha_sponge > 0.0f) {
             float f_far = feq(q, 1.0f, 0.0f, 0.0f, 0.0f);
             f_next = keep_sponge * f_next + alpha_sponge * f_far;
