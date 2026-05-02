@@ -222,6 +222,8 @@ constexpr int k_window_edge_stabilization_layers = 8;
 constexpr float k_window_edge_stabilization_min_keep = 0.15f;
 constexpr int k_nested_boundary_layers = 3;
 constexpr float k_nested_boundary_min_keep = 0.25f;
+// Keep this aligned with aero_lbm_jni.cpp runtime state nudge layers.
+constexpr int k_brick_boundary_reference_layers = 8;
 constexpr float k_sponge_relaxation_max = 0.95f;
 constexpr float k_runtime_temperature_scale_kelvin = 20.0f;
 constexpr int k_tornado_descriptor_floats = 17;
@@ -1190,6 +1192,10 @@ bool build_brick_step_packet(
     const bool exposed_y_pos = boundary_reference_valid && brick_face_exposed(runtime, coord, 1, true);
     const bool exposed_z_neg = boundary_reference_valid && brick_face_exposed(runtime, coord, 2, false);
     const bool exposed_z_pos = boundary_reference_valid && brick_face_exposed(runtime, coord, 2, true);
+    const int reference_layers = std::max(
+        1,
+        std::min(k_brick_boundary_reference_layers, runtime.brick_size)
+    );
     auto cell_index = [runtime](int x, int y, int z) {
         return (x * runtime.brick_size + y) * runtime.brick_size + z;
     };
@@ -1218,12 +1224,12 @@ bool build_brick_step_packet(
                     packet[packet_base + k_channel_fan_vz] = fan_vz;
                 }
                 const bool use_boundary_reference = boundary_reference_valid
-                    && ((exposed_x_neg && x == 0)
-                        || (exposed_x_pos && x == runtime.brick_size - 1)
-                        || (exposed_y_neg && y == 0)
-                        || (exposed_y_pos && y == runtime.brick_size - 1)
-                        || (exposed_z_neg && z == 0)
-                        || (exposed_z_pos && z == runtime.brick_size - 1));
+                    && ((exposed_x_neg && x < reference_layers)
+                        || (exposed_x_pos && x >= runtime.brick_size - reference_layers)
+                        || (exposed_y_neg && y < reference_layers)
+                        || (exposed_y_pos && y >= runtime.brick_size - reference_layers)
+                        || (exposed_z_neg && z < reference_layers)
+                        || (exposed_z_pos && z >= runtime.brick_size - reference_layers));
                 const DynamicRegionData& source = use_boundary_reference ? *boundary_reference : dynamic;
                 packet[packet_base + k_channel_state_vx] = source.flow_state[flow_base];
                 packet[packet_base + k_channel_state_vy] = source.flow_state[flow_base + 1];
