@@ -4814,13 +4814,17 @@ bool opencl_step(
     const int benchmark_flags = opencl_benchmark_flags();
     const int hydro_periodic_mask = opencl_hydrodynamic_periodic_mask();
     const int thermal_periodic_mask = opencl_thermal_periodic_mask();
-    const int benchmark_preset = benchmark_mode_active() ? g_benchmark_cfg.preset : 0;
-    const bool use_tgv_fastpath = benchmark_preset == AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D;
+    const bool benchmark_active = benchmark_mode_active();
+    const int benchmark_preset = benchmark_active ? g_benchmark_cfg.preset : 0;
+    const bool use_tgv_fastpath =
+        benchmark_active
+        && benchmark_preset == AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D;
     const bool use_hydro_bench_fastpath =
-        benchmark_preset == AERO_LBM_BENCHMARK_PRESET_NONE
-        || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D
-        || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D
-        || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D;
+        benchmark_active
+        && (benchmark_preset == AERO_LBM_BENCHMARK_PRESET_NONE
+            || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_2D
+            || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_LID_DRIVEN_CAVITY_3D
+            || benchmark_preset == AERO_LBM_BENCHMARK_PRESET_CYLINDER_CROSSFLOW_2D);
     const bool use_bfecc_thermal =
         !use_tgv_fastpath
         && !use_hydro_bench_fastpath
