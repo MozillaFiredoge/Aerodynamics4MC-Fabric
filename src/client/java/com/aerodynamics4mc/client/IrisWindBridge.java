@@ -7,6 +7,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.aerodynamics4mc.ModBlocks;
+import com.aerodynamics4mc.api.AeroClientWindApi;
+import com.aerodynamics4mc.api.SamplePolicy;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -206,7 +208,11 @@ final class IrisWindBridge {
             double worldY = originY + (y + 0.5) * CELL_SIZE_BLOCKS;
             double worldZ = originZ + (z + 0.5) * CELL_SIZE_BLOCKS;
             Vec3d sampledWind = streamingEnabled
-                ? AeroClientMod.sampleFlow(client.world, new Vec3d(worldX, worldY, worldZ)).velocityWithGust()
+                ? AeroClientWindApi.sample(
+                    client.world,
+                    new Vec3d(worldX, worldY, worldZ),
+                    SamplePolicy.CLIENT_LOCAL_PREFERRED
+                ).effectiveVelocity()
                 : Vec3d.ZERO;
             targetWindField[windBase] = (float) sampledWind.x;
             targetWindField[windBase + 1] = (float) sampledWind.y;

@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
 import com.aerodynamics4mc.api.AeroWindSamplingRules;
 import com.aerodynamics4mc.api.AeroWindSample;
@@ -18,9 +19,11 @@ import com.aerodynamics4mc.runtime.NativeSimulationBridge;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.minecraft.block.Blocks;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
@@ -54,6 +57,23 @@ final class ClientL2Solver {
     private static final float ZERO_DYNAMIC_MAX_SPEED_EPS_MPS = 0.02f;
     private static final float COARSE_RESEED_MIN_SPEED_MPS = 0.05f;
     private static final float FAST_RESUME_HORIZONTAL_SPEED_MPS = 6.0f;
+    private static final float HEAT_COUPLING_TO_ADJACENT_AIR = 0.85f;
+    private static final float THERMAL_EMITTER_POWER_LAVA_W = 3200.0f;
+    private static final float THERMAL_EMITTER_POWER_MAGMA_W = 1200.0f;
+    private static final float THERMAL_EMITTER_POWER_CAMPFIRE_W = 1800.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_CAMPFIRE_W = 1200.0f;
+    private static final float THERMAL_EMITTER_POWER_FIRE_W = 2200.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_FIRE_W = 1500.0f;
+    private static final float THERMAL_EMITTER_POWER_TORCH_W = 80.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_TORCH_W = 50.0f;
+    private static final float THERMAL_EMITTER_POWER_LANTERN_W = 60.0f;
+    private static final float THERMAL_EMITTER_POWER_SOUL_LANTERN_W = 40.0f;
+    private static final byte SURFACE_KIND_FAN_X_NEG = 32;
+    private static final byte SURFACE_KIND_FAN_X_POS = 33;
+    private static final byte SURFACE_KIND_FAN_Y_NEG = 34;
+    private static final byte SURFACE_KIND_FAN_Y_POS = 35;
+    private static final byte SURFACE_KIND_FAN_Z_NEG = 36;
+    private static final byte SURFACE_KIND_FAN_Z_POS = 37;
     private static final int WORKER_QUEUE_CAPACITY = 128;
     private static final boolean CLIENT_L2_DEFAULT_ENABLED = false;
 
@@ -599,7 +619,7 @@ final class ClientL2Solver {
         java.util.Arrays.fill(surfaceTemperature, 0.0f);
         StaticBrickSnapshot cached = staticBrickCache.get(new StaticBrickCacheKey(dimensionId, brickX, brickY, brickZ));
         if (cached != null) {
-            cached.copyInto(obstacle, surfaceKind, openFaceMask);
+            cached.copyInto(obstacle, surfaceKind, openFaceMask, emitterPower);
             stagedStaticCursor = CELL_COUNT;
             stagedStaticFromCache = true;
         }
@@ -627,7 +647,7 @@ final class ClientL2Solver {
         }
         staticBrickCache.put(
             new StaticBrickCacheKey(stagedDimension, stagedBrickX, stagedBrickY, stagedBrickZ),
-            StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask)
+            StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask, emitterPower)
         );
         stagedStaticFromCache = true;
     }
@@ -786,15 +806,14 @@ final class ClientL2Solver {
         StaticBrickCacheKey key = activeDimension == null ? null : new StaticBrickCacheKey(activeDimension, brickX, brickY, brickZ);
         StaticBrickSnapshot cached = key == null ? null : staticBrickCache.get(key);
         if (cached != null) {
-            cached.copyInto(obstacle, surfaceKind, openFaceMask);
-            java.util.Arrays.fill(emitterPower, 0.0f);
+            cached.copyInto(obstacle, surfaceKind, openFaceMask, emitterPower);
             java.util.Arrays.fill(faceSkyExposure, (byte) 0);
             java.util.Arrays.fill(faceDirectExposure, (byte) 0);
             return true;
         }
         populateStaticBrickArrays(world, origin);
         if (key != null) {
-            staticBrickCache.put(key, StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask));
+            staticBrickCache.put(key, StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask, emitterPower));
         }
         return true;
     }
@@ -834,22 +853,9 @@ final class ClientL2Solver {
     }
 
     private NativeSimulationBridge.WorldDelta buildStaticCellPatchDelta(ClientWorld world, BlockPos pos) {
-        BlockState state = world.getBlockState(pos);
-        boolean solid = isSolidObstacle(world, pos, state);
-        short mask = 0;
-        if (!solid) {
-            for (Direction direction : Direction.values()) {
-                staticNeighbor.set(
-                    pos.getX() + direction.getOffsetX(),
-                    pos.getY() + direction.getOffsetY(),
-                    pos.getZ() + direction.getOffsetZ()
-                );
-                if (!isSolidObstacle(world, staticNeighbor, world.getBlockState(staticNeighbor))) {
-                    mask = (short) (mask | (1 << direction.ordinal()));
-                }
-            }
-        }
-        int packedState = solid ? 1 : 0;
+        StaticCellSample sample = sampleStaticCell(world, pos);
+        int packedState = (sample.solid() ? 1 : 0)
+            | ((Byte.toUnsignedInt(sample.surfaceKind()) & 0xFF) << 8);
         return new NativeSimulationBridge.WorldDelta(
             NativeSimulationBridge.WORLD_DELTA_BRICK_STATIC_CELL_PATCH,
             pos.getX(),
@@ -857,9 +863,9 @@ final class ClientL2Solver {
             pos.getZ(),
             (int) worldKey,
             packedState,
-            Short.toUnsignedInt(mask),
+            Short.toUnsignedInt(sample.openFaceMask()),
             0,
-            0.0f,
+            sample.emitterPowerWatts(),
             0.0f,
             0.0f,
             0.0f
@@ -934,25 +940,105 @@ final class ClientL2Solver {
     private void populateStaticCell(ClientWorld world, BlockPos origin, int x, int y, int z) {
         staticCursor.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
         int cell = cellIndex(x, y, z);
-        BlockState state = world.getBlockState(staticCursor);
-        boolean solid = isSolidObstacle(world, staticCursor, state);
-        obstacle[cell] = solid ? (byte) 1 : (byte) 0;
-        if (solid) {
-            openFaceMask[cell] = 0;
-            return;
-        }
+        StaticCellSample sample = sampleStaticCell(world, staticCursor);
+        obstacle[cell] = sample.solid() ? (byte) 1 : (byte) 0;
+        surfaceKind[cell] = sample.surfaceKind();
+        openFaceMask[cell] = sample.openFaceMask();
+        emitterPower[cell] = sample.emitterPowerWatts();
+    }
+
+    private StaticCellSample sampleStaticCell(ClientWorld world, BlockPos pos) {
+        BlockState state = world.getBlockState(pos);
+        boolean solid = isSolidObstacle(world, pos, state);
         short mask = 0;
-        for (Direction direction : Direction.values()) {
-            staticNeighbor.set(
-                staticCursor.getX() + direction.getOffsetX(),
-                staticCursor.getY() + direction.getOffsetY(),
-                staticCursor.getZ() + direction.getOffsetZ()
-            );
-            if (!isSolidObstacle(world, staticNeighbor, world.getBlockState(staticNeighbor))) {
-                mask = (short) (mask | (1 << direction.ordinal()));
+        if (!solid) {
+            for (Direction direction : Direction.values()) {
+                staticNeighbor.set(
+                    pos.getX() + direction.getOffsetX(),
+                    pos.getY() + direction.getOffsetY(),
+                    pos.getZ() + direction.getOffsetZ()
+                );
+                if (!isSolidObstacle(world, staticNeighbor, world.getBlockState(staticNeighbor))) {
+                    mask = (short) (mask | (1 << direction.ordinal()));
+                }
             }
         }
-        openFaceMask[cell] = mask;
+        byte kind = solid ? (byte) 0 : fanSurfaceKindForCell(world, pos);
+        float emitter = solid ? 0.0f : emitterPowerForCell(world, pos, state);
+        return new StaticCellSample(solid, kind, mask, emitter);
+    }
+
+    private byte fanSurfaceKindForCell(ClientWorld world, BlockPos pos) {
+        for (Direction direction : Direction.values()) {
+            staticNeighbor.set(
+                pos.getX() - direction.getOffsetX(),
+                pos.getY() - direction.getOffsetY(),
+                pos.getZ() - direction.getOffsetZ()
+            );
+            BlockState fanState = world.getBlockState(staticNeighbor);
+            if (!fanState.isOf(ModBlocks.FAN_BLOCK)
+                || fanState.getOrEmpty(FanBlock.FACING).orElse(Direction.NORTH) != direction) {
+                continue;
+            }
+            return fanSurfaceKind(direction);
+        }
+        return 0;
+    }
+
+    private byte fanSurfaceKind(Direction direction) {
+        return switch (direction) {
+            case WEST -> SURFACE_KIND_FAN_X_NEG;
+            case EAST -> SURFACE_KIND_FAN_X_POS;
+            case DOWN -> SURFACE_KIND_FAN_Y_NEG;
+            case UP -> SURFACE_KIND_FAN_Y_POS;
+            case NORTH -> SURFACE_KIND_FAN_Z_NEG;
+            case SOUTH -> SURFACE_KIND_FAN_Z_POS;
+        };
+    }
+
+    private float emitterPowerForCell(ClientWorld world, BlockPos pos, BlockState state) {
+        float directPower = sampleEmitterThermalPowerWatts(state);
+        if (directPower > 0.0f) {
+            return directPower;
+        }
+        staticNeighbor.set(pos.getX(), pos.getY() - 1, pos.getZ());
+        float belowPower = sampleEmitterThermalPowerWatts(world.getBlockState(staticNeighbor));
+        return belowPower > 0.0f ? belowPower * HEAT_COUPLING_TO_ADJACENT_AIR : 0.0f;
+    }
+
+    private float sampleEmitterThermalPowerWatts(BlockState state) {
+        float powerWatts = 0.0f;
+        if (state.isOf(Blocks.LAVA) || state.isOf(Blocks.LAVA_CAULDRON)) {
+            powerWatts += THERMAL_EMITTER_POWER_LAVA_W;
+        }
+        if (state.isOf(Blocks.MAGMA_BLOCK)) {
+            powerWatts += THERMAL_EMITTER_POWER_MAGMA_W;
+        }
+        if (state.isOf(Blocks.CAMPFIRE)) {
+            powerWatts += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_EMITTER_POWER_CAMPFIRE_W : 0.0f;
+        }
+        if (state.isOf(Blocks.SOUL_CAMPFIRE)) {
+            powerWatts += state.getOrEmpty(Properties.LIT).orElse(false) ? THERMAL_EMITTER_POWER_SOUL_CAMPFIRE_W : 0.0f;
+        }
+        if (state.isOf(Blocks.FIRE)) {
+            powerWatts += THERMAL_EMITTER_POWER_FIRE_W;
+        }
+        if (state.isOf(Blocks.SOUL_FIRE)) {
+            powerWatts += THERMAL_EMITTER_POWER_SOUL_FIRE_W;
+        }
+        if (state.isOf(Blocks.TORCH) || state.isOf(Blocks.WALL_TORCH)) {
+            powerWatts += THERMAL_EMITTER_POWER_TORCH_W;
+        }
+        if (state.isOf(Blocks.SOUL_TORCH) || state.isOf(Blocks.SOUL_WALL_TORCH)) {
+            powerWatts += THERMAL_EMITTER_POWER_SOUL_TORCH_W;
+        }
+        if (state.isOf(Blocks.LANTERN)) {
+            powerWatts += THERMAL_EMITTER_POWER_LANTERN_W;
+        }
+        if (state.isOf(Blocks.SOUL_LANTERN)) {
+            powerWatts += THERMAL_EMITTER_POWER_SOUL_LANTERN_W;
+        }
+        return Math.max(powerWatts, 0.0f);
     }
 
     private CoarseSeedStats fillFlowStateFromCoarse(Identifier dimensionId, BlockPos origin) {
@@ -1047,19 +1133,34 @@ final class ClientL2Solver {
     private record StaticBrickCacheKey(Identifier dimensionId, int brickX, int brickY, int brickZ) {
     }
 
-    private record StaticBrickSnapshot(byte[] obstacle, byte[] surfaceKind, short[] openFaceMask) {
-        static StaticBrickSnapshot copyFrom(byte[] obstacle, byte[] surfaceKind, short[] openFaceMask) {
+    private record StaticCellSample(boolean solid, byte surfaceKind, short openFaceMask, float emitterPowerWatts) {
+    }
+
+    private record StaticBrickSnapshot(byte[] obstacle, byte[] surfaceKind, short[] openFaceMask, float[] emitterPower) {
+        static StaticBrickSnapshot copyFrom(
+            byte[] obstacle,
+            byte[] surfaceKind,
+            short[] openFaceMask,
+            float[] emitterPower
+        ) {
             return new StaticBrickSnapshot(
                 java.util.Arrays.copyOf(obstacle, obstacle.length),
                 java.util.Arrays.copyOf(surfaceKind, surfaceKind.length),
-                java.util.Arrays.copyOf(openFaceMask, openFaceMask.length)
+                java.util.Arrays.copyOf(openFaceMask, openFaceMask.length),
+                java.util.Arrays.copyOf(emitterPower, emitterPower.length)
             );
         }
 
-        void copyInto(byte[] outObstacle, byte[] outSurfaceKind, short[] outOpenFaceMask) {
+        void copyInto(
+            byte[] outObstacle,
+            byte[] outSurfaceKind,
+            short[] outOpenFaceMask,
+            float[] outEmitterPower
+        ) {
             System.arraycopy(obstacle, 0, outObstacle, 0, Math.min(obstacle.length, outObstacle.length));
             System.arraycopy(surfaceKind, 0, outSurfaceKind, 0, Math.min(surfaceKind.length, outSurfaceKind.length));
             System.arraycopy(openFaceMask, 0, outOpenFaceMask, 0, Math.min(openFaceMask.length, outOpenFaceMask.length));
+            System.arraycopy(emitterPower, 0, outEmitterPower, 0, Math.min(emitterPower.length, outEmitterPower.length));
         }
     }
 

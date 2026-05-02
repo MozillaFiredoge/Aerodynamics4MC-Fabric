@@ -2,5 +2,20 @@
   "block.aerodynamics4mc.fan": "风扇",
   "item.aerodynamics4mc.fan": "风扇",
   "block.aerodynamics4mc.duct": "整流罩",
-  "item.aerodynamics4mc.duct": "整流罩"
+  "item.aerodynamics4mc.duct": "整流罩",
+  "item.aerodynamics4mc.wind_meter": "风速计",
+  "item.aerodynamics4mc.wind_meter.tooltip": "右键采样当前位置可信的 L1/L0 风场。",
+  "message.aerodynamics4mc.wind_meter.no_flow": "当前位置没有可用的风场采样。",
+  "message.aerodynamics4mc.wind_meter.summary": "风速 %s m/s，吹向 %s (vx=%s, vy=%s, vz=%s)",
+  "message.aerodynamics4mc.wind_meter.source": "来源：%s / %s，置信度=%s，压力=%s",
+  "message.aerodynamics4mc.wind_meter.atmosphere": "阵风=%s m/s，湍流=%s，风切变=%s/block",
+  "message.aerodynamics4mc.wind_meter.direction.calm": "静风",
+  "message.aerodynamics4mc.wind_meter.direction.north": "北",
+  "message.aerodynamics4mc.wind_meter.direction.north_east": "东北",
+  "message.aerodynamics4mc.wind_meter.direction.east": "东",
+  "message.aerodynamics4mc.wind_meter.direction.south_east": "东南",
+  "message.aerodynamics4mc.wind_meter.direction.south": "南",
+  "message.aerodynamics4mc.wind_meter.direction.south_west": "西南",
+  "message.aerodynamics4mc.wind_meter.direction.west": "西",
+  "message.aerodynamics4mc.wind_meter.direction.north_west": "西北"
 }

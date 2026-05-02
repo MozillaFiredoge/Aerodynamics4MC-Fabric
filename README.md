@@ -130,6 +130,7 @@ The current gameplay-facing components are intentionally thin. Most systems shou
 |-----------|------|
 | Fan block | Adds local forcing for ducts, ventilation tests, and visual flow feedback |
 | Duct block | Helps shape local airflow paths |
+| Wind Meter item | Right-click instrument that samples server-trusted L1/L0 wind at the player |
 | Terrain and blocks | Feed world-delta/static masks into the wind system |
 | Particles and Iris bridge | Should sample wind through the public API path |
 | External vehicle/machine mods | Should sample server-trusted L0/L1 unless they explicitly need local visual L2 |

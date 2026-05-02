@@ -2,5 +2,20 @@
   "block.aerodynamics4mc.fan": "Fan",
   "item.aerodynamics4mc.fan": "Fan",
   "block.aerodynamics4mc.duct": "Duct",
-  "item.aerodynamics4mc.duct": "Duct"
+  "item.aerodynamics4mc.duct": "Duct",
+  "item.aerodynamics4mc.wind_meter": "Wind Meter",
+  "item.aerodynamics4mc.wind_meter.tooltip": "Right-click to sample trusted L1/L0 wind here.",
+  "message.aerodynamics4mc.wind_meter.no_flow": "No wind sample is available here.",
+  "message.aerodynamics4mc.wind_meter.summary": "Wind %s m/s toward %s (vx=%s, vy=%s, vz=%s)",
+  "message.aerodynamics4mc.wind_meter.source": "Source: %s / %s, confidence=%s, pressure=%s",
+  "message.aerodynamics4mc.wind_meter.atmosphere": "Gust=%s m/s, turbulence=%s, shear=%s/block",
+  "message.aerodynamics4mc.wind_meter.direction.calm": "calm",
+  "message.aerodynamics4mc.wind_meter.direction.north": "north",
+  "message.aerodynamics4mc.wind_meter.direction.north_east": "north-east",
+  "message.aerodynamics4mc.wind_meter.direction.east": "east",
+  "message.aerodynamics4mc.wind_meter.direction.south_east": "south-east",
+  "message.aerodynamics4mc.wind_meter.direction.south": "south",
+  "message.aerodynamics4mc.wind_meter.direction.south_west": "south-west",
+  "message.aerodynamics4mc.wind_meter.direction.west": "west",
+  "message.aerodynamics4mc.wind_meter.direction.north_west": "north-west"
 }

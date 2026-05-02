@@ -17,10 +17,12 @@ public final class ModBlocks {
     public static final String MOD_ID = "aerodynamics4mc";
     public static final Identifier FAN_ID = Identifier.of(MOD_ID, "fan");
     public static final Identifier DUCT_ID = Identifier.of(MOD_ID, "duct");
+    public static final Identifier WIND_METER_ID = Identifier.of(MOD_ID, "wind_meter");
     public static Block FAN_BLOCK;
     public static Item FAN_ITEM;
     public static Block DUCT_BLOCK;
     public static Item DUCT_ITEM;
+    public static Item WIND_METER_ITEM;
     public static BlockEntityType<FanBlockEntity> FAN_BLOCK_ENTITY;
 
     private ModBlocks() {
@@ -45,6 +47,12 @@ public final class ModBlocks {
             new BlockItem(DUCT_BLOCK, new Item.Settings().registryKey(RegistryKey.of(RegistryKeys.ITEM, DUCT_ID)))
         );
         ItemGroupEvents.modifyEntriesEvent(ItemGroups.FUNCTIONAL).register(entries -> entries.add(DUCT_ITEM));
+        WIND_METER_ITEM = Registry.register(
+            Registries.ITEM,
+            WIND_METER_ID,
+            new WindMeterItem(new Item.Settings().registryKey(RegistryKey.of(RegistryKeys.ITEM, WIND_METER_ID)).maxCount(1))
+        );
+        ItemGroupEvents.modifyEntriesEvent(ItemGroups.TOOLS).register(entries -> entries.add(WIND_METER_ITEM));
         FAN_BLOCK_ENTITY = Registry.register(
             Registries.BLOCK_ENTITY_TYPE,
             FAN_ID,

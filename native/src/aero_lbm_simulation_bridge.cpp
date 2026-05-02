@@ -290,7 +290,29 @@ constexpr uint8_t k_surface_kind_vegetation = 3;
 constexpr uint8_t k_surface_kind_snow_ice = 4;
 constexpr uint8_t k_surface_kind_water = 5;
 constexpr uint8_t k_surface_kind_molten = 6;
+constexpr uint8_t k_surface_kind_client_fan_x_neg = 32;
+constexpr uint8_t k_surface_kind_client_fan_x_pos = 33;
+constexpr uint8_t k_surface_kind_client_fan_y_neg = 34;
+constexpr uint8_t k_surface_kind_client_fan_y_pos = 35;
+constexpr uint8_t k_surface_kind_client_fan_z_neg = 36;
+constexpr uint8_t k_surface_kind_client_fan_z_pos = 37;
+constexpr float k_client_fan_speed_mps = 4.0f;
 constexpr float k_thermal_stefan_boltzmann = 5.6703744e-8f;
+
+bool decode_client_fan_surface_kind(uint8_t kind, float& vx, float& vy, float& vz) {
+    vx = 0.0f;
+    vy = 0.0f;
+    vz = 0.0f;
+    switch (kind) {
+        case k_surface_kind_client_fan_x_neg: vx = -k_client_fan_speed_mps; return true;
+        case k_surface_kind_client_fan_x_pos: vx = k_client_fan_speed_mps; return true;
+        case k_surface_kind_client_fan_y_neg: vy = -k_client_fan_speed_mps; return true;
+        case k_surface_kind_client_fan_y_pos: vy = k_client_fan_speed_mps; return true;
+        case k_surface_kind_client_fan_z_neg: vz = -k_client_fan_speed_mps; return true;
+        case k_surface_kind_client_fan_z_pos: vz = k_client_fan_speed_mps; return true;
+        default: return false;
+    }
+}
 
 struct SparsePacketOverlayBuilder {
     std::vector<int> lookup;
@@ -1180,6 +1202,15 @@ bool build_brick_step_packet(
                 if (obstacle) {
                     continue;
                 }
+                float fan_vx = 0.0f;
+                float fan_vy = 0.0f;
+                float fan_vz = 0.0f;
+                if (decode_client_fan_surface_kind(stat.surface_kind[cell], fan_vx, fan_vy, fan_vz)) {
+                    packet[packet_base + k_channel_fan_mask] = 1.0f;
+                    packet[packet_base + k_channel_fan_vx] = fan_vx;
+                    packet[packet_base + k_channel_fan_vy] = fan_vy;
+                    packet[packet_base + k_channel_fan_vz] = fan_vz;
+                }
                 const bool use_boundary_reference = boundary_reference_valid
                     && ((exposed_x_neg && x == 0)
                         || (exposed_x_pos && x == runtime.brick_size - 1)
@@ -1338,10 +1369,19 @@ void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta
             const int cell = (local_x * runtime.brick_size + local_y) * runtime.brick_size + local_z;
             auto updated_static = std::make_shared<StaticRegionData>(*brick.static_region);
             StaticRegionData& stat = *updated_static;
-            stat.obstacle[static_cast<size_t>(cell)] = (delta.data1 & 0x1) != 0 ? 1u : 0u;
-            stat.surface_kind[static_cast<size_t>(cell)] = static_cast<uint8_t>((delta.data1 >> 8) & 0xFF);
-            stat.open_face_mask[static_cast<size_t>(cell)] = static_cast<uint16_t>(delta.data2 & 0xFF);
-            stat.emitter_power_watts[static_cast<size_t>(cell)] = std::isfinite(delta.value0) ? delta.value0 : 0.0f;
+            const size_t cell_index = static_cast<size_t>(cell);
+            const uint8_t previous_obstacle = stat.obstacle[cell_index];
+            const uint8_t previous_surface_kind = stat.surface_kind[cell_index];
+            const uint16_t previous_open_face_mask = stat.open_face_mask[cell_index];
+            const float previous_emitter_power = stat.emitter_power_watts[cell_index];
+            const uint8_t next_obstacle = (delta.data1 & 0x1) != 0 ? 1u : 0u;
+            const uint8_t next_surface_kind = static_cast<uint8_t>((delta.data1 >> 8) & 0xFF);
+            const uint16_t next_open_face_mask = static_cast<uint16_t>(delta.data2 & 0xFF);
+            const float next_emitter_power = std::isfinite(delta.value0) ? delta.value0 : 0.0f;
+            stat.obstacle[cell_index] = next_obstacle;
+            stat.surface_kind[cell_index] = next_surface_kind;
+            stat.open_face_mask[cell_index] = next_open_face_mask;
+            stat.emitter_power_watts[cell_index] = next_emitter_power;
             const size_t face_base = static_cast<size_t>(cell) * k_face_count;
             std::fill_n(stat.face_sky_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
             std::fill_n(stat.face_direct_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
@@ -1349,7 +1389,11 @@ void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta
             if (brick.dynamic_region) {
                 apply_brick_static_constraints(runtime, brick);
             }
-            brick.geometry_dirty = true;
+            brick.forcing_dirty = brick.forcing_dirty
+                || previous_obstacle != next_obstacle
+                || previous_surface_kind != next_surface_kind
+                || previous_open_face_mask != next_open_face_mask
+                || previous_emitter_power != next_emitter_power;
             brick.active = true;
             brick.last_active_epoch = runtime.epoch;
             break;

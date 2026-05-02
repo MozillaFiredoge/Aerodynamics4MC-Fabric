@@ -1,5 +1,8 @@
 package com.aerodynamics4mc.client;
 
+import com.aerodynamics4mc.api.AeroClientWindApi;
+import com.aerodynamics4mc.api.SamplePolicy;
+
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -47,7 +50,7 @@ public final class ParticleWindController {
     }
 
     private static Vec3d sampleWind(ClientWorld world, double x, double y, double z) {
-        return AeroClientMod.sampleFlow(world, new Vec3d(x, y, z)).velocityWithGust();
+        return AeroClientWindApi.sample(world, new Vec3d(x, y, z), SamplePolicy.CLIENT_LOCAL_PREFERRED).effectiveVelocity();
     }
 
     private static Vec3d applyHorizontalResponse(Vec3d velocity, Vec3d wind, double response, double maxHorizontalSpeed) {
