@@ -39,15 +39,15 @@ final class ClientL2Solver {
     private static final int PACKED_CHANNELS = NativeSimulationBridge.PACKED_ATLAS_CHANNELS;
     private static final int FACE_COUNT = Direction.values().length;
     private static final int STATIC_REFRESH_TICKS = -1;
-    private static final int LOCAL_PUBLISH_INTERVAL_TICKS = 4;
-    private static final int SOLVE_INTERVAL_TICKS = 2;
+    private static final int LOCAL_PUBLISH_INTERVAL_TICKS = 1;
+    private static final int SOLVE_INTERVAL_TICKS = 1;
     private static final int BOUNDARY_REFERENCE_REFRESH_MIN_TICKS = 40;
     private static final int FAST_SUSPEND_COOLDOWN_TICKS = 10;
     private static final int STATIC_BUILD_CELLS_PER_TICK = 1024;
     private static final int COARSE_SEED_CELLS_PER_TICK = 4096;
     private static final int STATIC_CACHE_MAX_BRICKS = 32;
     private static final int COUPLING_BAND_CELLS = 8;
-    private static final int MAX_CLIENT_ACTIVE_BRICKS = 1;
+    private static final int MAX_CLIENT_ACTIVE_BRICKS = 2;
     private static final int MAX_STEPS_PER_CLIENT_TICK = 1;
     private static final float DT_SECONDS = 0.05f;
     private static final float DX_METERS = 1.0f;
@@ -78,7 +78,7 @@ final class ClientL2Solver {
     private static final byte SURFACE_KIND_FAN_Z_NEG = 36;
     private static final byte SURFACE_KIND_FAN_Z_POS = 37;
     private static final int WORKER_QUEUE_CAPACITY = 128;
-    private static final boolean CLIENT_L2_DEFAULT_ENABLED = false;
+    private static final boolean CLIENT_L2_DEFAULT_ENABLED = true;
 
     private final AeroVisualizer visualizer;
     private final ClientL2Worker worker = new ClientL2Worker();
@@ -269,7 +269,8 @@ final class ClientL2Solver {
             activeHintUploaded = true;
         }
 
-        if (!prepareActiveBricks(client, world, dimensionId)) {
+        prepareActiveBricks(client, world, dimensionId);
+        if (!hasReadyActiveBrick()) {
             return;
         }
         if (refreshActiveBrickStatic(client, world)) {
@@ -313,9 +314,8 @@ final class ClientL2Solver {
             int brickY = activeBrickY[index];
             int brickZ = activeBrickZ[index];
             targets[count++] = new PublishTarget(dimensionId, brickOrigin(brickX, brickY, brickZ), brickX, brickY, brickZ);
-            publishCursor = (index + 1) % activeBrickCount;
-            break;
         }
+        publishCursor = activeBrickCount <= 0 ? 0 : (publishCursor + 1) % activeBrickCount;
         return java.util.Arrays.copyOf(targets, count);
     }
 
@@ -544,6 +544,15 @@ final class ClientL2Solver {
             return false;
         }
         return true;
+    }
+
+    private boolean hasReadyActiveBrick() {
+        for (int index = 0; index < activeBrickCount; index++) {
+            if (activeBrickReady[index]) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private BrickPreparationResult uploadAndSeedActiveBrick(

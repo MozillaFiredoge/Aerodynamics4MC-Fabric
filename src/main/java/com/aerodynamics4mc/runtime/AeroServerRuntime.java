@@ -120,7 +120,8 @@ public final class AeroServerRuntime {
     private static final int FLOW_ATLAS_PLAYER_INTERVAL_INCREMENT_TICKS = TICKS_PER_SECOND / 4;
     private static final int FLOW_ATLAS_MAX_RESEND_INTERVAL_TICKS = TICKS_PER_SECOND * 6;
     private static final int FLOW_ATLAS_MAX_PAYLOADS_PER_SYNC = 2;
-    private static final boolean SERVER_L2_ATLAS_STREAMING_ENABLED = true;
+    private static final boolean SERVER_AUTHORITATIVE_L2_ENABLED = false;
+    private static final boolean SERVER_L2_ATLAS_STREAMING_ENABLED = SERVER_AUTHORITATIVE_L2_ENABLED;
     private static final int PARTICLE_FLOW_SAMPLE_STRIDE = 1;
     private static final float ATLAS_VELOCITY_QUANT_RANGE = 5.6f;
     private static final float ATLAS_PRESSURE_QUANT_RANGE = 0.03f;
@@ -925,6 +926,7 @@ public final class AeroServerRuntime {
                             + " publishedRegions=" + (currentFrame == null ? 0 : currentFrame.regionAtlases().size())
                             + " probes=" + publishedPlayerProbes.get().size()
                             + " entitySamples=" + publishedEntitySamples.get().size()
+                            + " serverAuthL2=" + SERVER_AUTHORITATIVE_L2_ENABLED
                             + " clientLocalL2=" + clientLocalL2Players.size()
                             + " l0Cells=" + backgroundMetCellCount()
                             + " l1Cells=" + mesoscaleMetCellCount()
@@ -3563,7 +3565,7 @@ public final class AeroServerRuntime {
                 BlockPos playerPos = player.getBlockPos().toImmutable();
                 BlockPos coreOrigin = coreOriginForPosition(playerPos);
                 observedPlayers.add(playerId);
-                if (usesClientLocalL2(player)) {
+                if (!SERVER_AUTHORITATIVE_L2_ENABLED || usesClientLocalL2(player)) {
                     playerMotionAnchorStates.remove(playerId);
                     continue;
                 }

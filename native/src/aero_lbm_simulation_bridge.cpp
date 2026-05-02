@@ -264,6 +264,7 @@ constexpr int k_nested_feedback_value_bottom_mass_flux = 7;
 constexpr int k_nested_feedback_value_top_area = 8;
 constexpr int k_nested_feedback_value_top_mass_flux = 9;
 constexpr float k_tornado_lattice_speed_cap = 0.24f;
+constexpr float k_runtime_seconds_per_step = 0.05f;
 constexpr float k_cell_face_area_square_meters = 1.0f;
 constexpr float k_cell_volume_cubic_meters = 1.0f;
 constexpr float k_air_density_kg_per_cubic_meter = 1.225f;
@@ -1836,6 +1837,7 @@ float dequantize_unit_float(uint8_t value) {
 
 float temperature_source_from_power_watts(float thermal_power_watts) {
     const float scalar = thermal_power_watts
+        * k_runtime_seconds_per_step
         / (k_air_density_kg_per_cubic_meter * k_air_specific_heat_j_per_kg_k
             * k_cell_volume_cubic_meters * k_runtime_temperature_scale_kelvin);
     return std::clamp(scalar, -k_native_thermal_source_max, k_native_thermal_source_max);
@@ -1843,6 +1845,7 @@ float temperature_source_from_power_watts(float thermal_power_watts) {
 
 float temperature_source_from_surface_flux(float heat_flux_watts_per_square_meter) {
     const float scalar = heat_flux_watts_per_square_meter * k_cell_face_area_square_meters
+        * k_runtime_seconds_per_step
         / (k_air_density_kg_per_cubic_meter * k_air_specific_heat_j_per_kg_k
             * k_cell_volume_cubic_meters * k_runtime_temperature_scale_kelvin);
     return std::clamp(scalar, -k_native_thermal_source_max, k_native_thermal_source_max);
