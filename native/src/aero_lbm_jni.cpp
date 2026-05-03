@@ -6473,6 +6473,7 @@ static bool native_sample_temperature_point_raw_dims_impl(
     if (!locked_context.ctx) return false;
     ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, nx, ny, nz, cells);
+#if defined(AERO_LBM_OPENCL)
     if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
         cl_mem current_temp = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
         const std::size_t offset = cell * sizeof(float);
@@ -6485,6 +6486,7 @@ static bool native_sample_temperature_point_raw_dims_impl(
         *out_temperature = sampled;
         return true;
     }
+#endif
     if (ctx.temperature.size() != cells) return false;
     *out_temperature = ctx.temperature[cell];
     return true;
