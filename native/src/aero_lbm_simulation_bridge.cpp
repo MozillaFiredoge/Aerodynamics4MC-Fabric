@@ -153,9 +153,18 @@ struct FluidWorldRuntime {
     std::uint64_t compact_cached_steps = 0;
     std::uint64_t compact_cached_failures = 0;
     std::uint64_t compact_initial_steps = 0;
+    std::uint64_t compact_initial_failures = 0;
+    std::uint64_t compact_reject_empty_steps = 0;
+    std::uint64_t compact_reject_fan_steps = 0;
+    std::uint64_t compact_thermal_ignored_steps = 0;
     std::uint64_t d3q27_steps = 0;
     std::uint64_t packet_build_steps = 0;
     std::uint64_t dynamic_upload_resets = 0;
+    std::uint64_t compact_last_fluid_cells = 0;
+    std::uint64_t compact_last_obstacle_cells = 0;
+    std::uint64_t compact_last_fan_cells = 0;
+    std::uint64_t compact_last_thermal_cells = 0;
+    std::uint64_t compact_last_nonfinite_cells = 0;
     std::unordered_map<BrickCoord, BrickData, BrickCoordHash> bricks;
     std::unordered_set<BrickCoord, BrickCoordHash> active_hint_closure;
     std::vector<AeroLbmWorldDelta> pending_world_deltas;
@@ -286,6 +295,11 @@ struct CompactBrickPacketSummary {
     float vx = 0.0f;
     float vy = 0.0f;
     float vz = 0.0f;
+    int fluid_cells = 0;
+    int obstacle_cells = 0;
+    int fan_cells = 0;
+    int thermal_cells = 0;
+    int nonfinite_cells = 0;
 };
 
 CompactBrickPacketSummary summarize_compact_brick_packet(const std::vector<float>& packet) {
@@ -296,35 +310,38 @@ CompactBrickPacketSummary summarize_compact_brick_packet(const std::vector<float
     double vx_sum = 0.0;
     double vy_sum = 0.0;
     double vz_sum = 0.0;
-    int fluid_cells = 0;
     const size_t cells = packet.size() / k_packet_channels;
     for (size_t cell = 0; cell < cells; ++cell) {
         const size_t base = cell * k_packet_channels;
         if (packet[base + k_channel_obstacle] > 0.5f) {
+            summary.obstacle_cells++;
             continue;
         }
-        if (packet[base + k_channel_fan_mask] > 0.5f
-            || std::fabs(packet[base + k_channel_thermal_source]) > 1.0e-8f) {
-            return summary;
+        if (packet[base + k_channel_fan_mask] > 0.5f) {
+            summary.fan_cells++;
+        }
+        if (std::fabs(packet[base + k_channel_thermal_source]) > 1.0e-8f) {
+            summary.thermal_cells++;
         }
         const float vx = packet[base + k_channel_state_vx];
         const float vy = packet[base + k_channel_state_vy];
         const float vz = packet[base + k_channel_state_vz];
         if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz)) {
+            summary.nonfinite_cells++;
             continue;
         }
         vx_sum += vx;
         vy_sum += vy;
         vz_sum += vz;
-        fluid_cells++;
+        summary.fluid_cells++;
     }
-    if (fluid_cells <= 0) {
+    if (summary.fluid_cells <= 0 || summary.fan_cells > 0) {
         return summary;
     }
     summary.supported = true;
-    summary.vx = static_cast<float>(vx_sum / fluid_cells);
-    summary.vy = static_cast<float>(vy_sum / fluid_cells);
-    summary.vz = static_cast<float>(vz_sum / fluid_cells);
+    summary.vx = static_cast<float>(vx_sum / summary.fluid_cells);
+    summary.vy = static_cast<float>(vy_sum / summary.fluid_cells);
+    summary.vz = static_cast<float>(vz_sum / summary.fluid_cells);
     return summary;
 }
 
@@ -1497,6 +1514,11 @@ bool step_brick_actual(
     bool compact_step_ok = false;
     if (brick_world_compact_enabled()) {
         const CompactBrickPacketSummary compact_summary = summarize_compact_brick_packet(brick.packet_cache);
+        runtime.compact_last_fluid_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.fluid_cells));
+        runtime.compact_last_obstacle_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.obstacle_cells));
+        runtime.compact_last_fan_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.fan_cells));
+        runtime.compact_last_thermal_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.thermal_cells));
+        runtime.compact_last_nonfinite_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.nonfinite_cells));
         if (compact_summary.supported
             && configure_simulation_compact_boundary(compact_summary.vx, compact_summary.vy, compact_summary.vz, size, size, size)) {
             if (had_context && brick.compact_context_active) {
@@ -1505,15 +1527,30 @@ bool step_brick_actual(
             if (!step_ok) {
                 step_ok = aero_lbm_step_rect(brick.packet_cache.data(), size, size, size, brick.context_key, nullptr) != 0;
             }
-            if (step_ok) {
+            if (step_ok && aero_lbm_context_compact_initialized(brick.context_key)) {
                 compact_step_ok = true;
                 runtime.compact_initial_steps++;
+                if (compact_summary.thermal_cells > 0) {
+                    runtime.compact_thermal_ignored_steps++;
+                }
                 brick.compact_context_active = true;
                 brick.compact_vx = compact_summary.vx;
                 brick.compact_vy = compact_summary.vy;
                 brick.compact_vz = compact_summary.vz;
                 brick.dynamic_region_stale = true;
+            } else if (step_ok) {
+                runtime.compact_initial_failures++;
+                runtime.d3q27_steps++;
+                brick.compact_context_active = false;
             }
+        } else if (!compact_summary.supported) {
+            if (compact_summary.fan_cells > 0) {
+                runtime.compact_reject_fan_steps++;
+            } else {
+                runtime.compact_reject_empty_steps++;
+            }
+        } else {
+            runtime.compact_initial_failures++;
         }
         aero_lbm_benchmark_reset_config();
     }
@@ -5741,9 +5778,18 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     std::uint64_t compact_cached_steps = 0;
     std::uint64_t compact_cached_failures = 0;
     std::uint64_t compact_initial_steps = 0;
+    std::uint64_t compact_initial_failures = 0;
+    std::uint64_t compact_reject_empty_steps = 0;
+    std::uint64_t compact_reject_fan_steps = 0;
+    std::uint64_t compact_thermal_ignored_steps = 0;
     std::uint64_t d3q27_steps = 0;
     std::uint64_t packet_build_steps = 0;
     std::uint64_t dynamic_upload_resets = 0;
+    std::uint64_t compact_last_fluid_cells = 0;
+    std::uint64_t compact_last_obstacle_cells = 0;
+    std::uint64_t compact_last_fan_cells = 0;
+    std::uint64_t compact_last_thermal_cells = 0;
+    std::uint64_t compact_last_nonfinite_cells = 0;
     std::uint64_t max_brick_epoch = 0;
     if (g_service) {
         for (const auto& region : g_service->regions) {
@@ -5770,13 +5816,25 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
             compact_cached_steps += entry.second.compact_cached_steps;
             compact_cached_failures += entry.second.compact_cached_failures;
             compact_initial_steps += entry.second.compact_initial_steps;
+            compact_initial_failures += entry.second.compact_initial_failures;
+            compact_reject_empty_steps += entry.second.compact_reject_empty_steps;
+            compact_reject_fan_steps += entry.second.compact_reject_fan_steps;
+            compact_thermal_ignored_steps += entry.second.compact_thermal_ignored_steps;
             d3q27_steps += entry.second.d3q27_steps;
             packet_build_steps += entry.second.packet_build_steps;
             dynamic_upload_resets += entry.second.dynamic_upload_resets;
+            compact_last_fluid_cells = std::max(compact_last_fluid_cells, entry.second.compact_last_fluid_cells);
+            compact_last_obstacle_cells = std::max(compact_last_obstacle_cells, entry.second.compact_last_obstacle_cells);
+            compact_last_fan_cells = std::max(compact_last_fan_cells, entry.second.compact_last_fan_cells);
+            compact_last_thermal_cells = std::max(compact_last_thermal_cells, entry.second.compact_last_thermal_cells);
+            compact_last_nonfinite_cells = std::max(compact_last_nonfinite_cells, entry.second.compact_last_nonfinite_cells);
             max_brick_epoch = std::max(max_brick_epoch, entry.second.epoch);
         }
     }
+    std::string solver_runtime = aero_lbm_runtime_info();
+    std::replace(solver_runtime.begin(), solver_runtime.end(), '|', '/');
     text = "simulation_bridge|services=" + std::to_string(g_service ? 1 : 0)
+        + "|solver_runtime=" + solver_runtime
         + "|compact_experimental=" + std::string(simulation_compact_enabled() ? "on" : "off")
         + "|brick_world_compact=" + std::string(brick_world_compact_enabled() ? "on" : "off")
         + "|active_regions=" + std::to_string(active_region_count)
@@ -5798,9 +5856,18 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         + "|compact_cached_steps=" + std::to_string(compact_cached_steps)
         + "|compact_cached_failures=" + std::to_string(compact_cached_failures)
         + "|compact_initial_steps=" + std::to_string(compact_initial_steps)
+        + "|compact_initial_failures=" + std::to_string(compact_initial_failures)
+        + "|compact_reject_empty_steps=" + std::to_string(compact_reject_empty_steps)
+        + "|compact_reject_fan_steps=" + std::to_string(compact_reject_fan_steps)
+        + "|compact_thermal_ignored_steps=" + std::to_string(compact_thermal_ignored_steps)
         + "|d3q27_steps=" + std::to_string(d3q27_steps)
         + "|packet_build_steps=" + std::to_string(packet_build_steps)
         + "|dynamic_upload_resets=" + std::to_string(dynamic_upload_resets)
+        + "|compact_last_fluid_cells=" + std::to_string(compact_last_fluid_cells)
+        + "|compact_last_obstacle_cells=" + std::to_string(compact_last_obstacle_cells)
+        + "|compact_last_fan_cells=" + std::to_string(compact_last_fan_cells)
+        + "|compact_last_thermal_cells=" + std::to_string(compact_last_thermal_cells)
+        + "|compact_last_nonfinite_cells=" + std::to_string(compact_last_nonfinite_cells)
         + "|brick_epoch_max=" + std::to_string(max_brick_epoch);
     return text.c_str();
 }

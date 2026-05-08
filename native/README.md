@@ -42,7 +42,7 @@ Current native code includes:
   - writes full-field `aero_solver_step_wind_tunnel` output directly in public velocity units, avoiding a solver-side scratch copy and CPU conversion pass
   - expected `128^3` resident device memory is about 34 MiB without readback and about 66 MiB with full-field output
   - experimental game-side stored-region opt-in: set `AERO_LBM_SIMULATION_COMPACT=1` to route simple `step_region_stored` calls without sparse overlays or nested/tornado boundary overrides through the compact path
-  - experimental game-side brick path: `BrickWorldRuntime` enables the same compact path by default for bricks whose packet has no fan or thermal forcing, then falls back to D3Q27 when unsupported; set `AERO_LBM_BRICK_WORLD_COMPACT=0` or `AERO_LBM_SIMULATION_COMPACT=0` to disable it
+  - experimental game-side brick path: `BrickWorldRuntime` enables the same compact path by default for bricks without fan forcing; thermal sources are ignored by the compact velocity-only path instead of forcing the whole brick back to D3Q27; set `AERO_LBM_BRICK_WORLD_COMPACT=0` or `AERO_LBM_SIMULATION_COMPACT=0` to disable it
   - client-local L2 brick size can be raised for profiling with `AERO_LBM_CLIENT_L2_BRICK_SIZE=128`; the default remains `32`
   - client-local L2 publishes packed flow atlases through native code; `128^3` defaults to `AERO_LBM_CLIENT_L2_PUBLISH_SAMPLE_STRIDE=4` to avoid full-field Java readback every frame
 - CPU reference `D3Q27` path (automatic fallback):

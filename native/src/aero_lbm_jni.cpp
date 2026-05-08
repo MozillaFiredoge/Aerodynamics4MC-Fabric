@@ -8010,6 +8010,16 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_has_context(long long context_key) {
     return native_has_context_impl(static_cast<jlong>(context_key)) ? 1 : 0;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_context_compact_initialized(long long context_key) {
+    LockedContext locked_context(static_cast<jlong>(context_key), false);
+    return locked_context.ctx
+        && g_cfg.opencl_enabled
+        && locked_context.ctx->compact_buffers_ready
+        && locked_context.ctx->compact_initialized
+        ? 1
+        : 0;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
     int grid_size,
     long long first_context_key,

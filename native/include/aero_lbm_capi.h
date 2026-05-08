@@ -176,6 +176,7 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_shift_context(int grid_size, long long context_key, int dx, int dy, int dz);
 AERO_LBM_CAPI_EXPORT int aero_lbm_has_context(long long context_key);
+AERO_LBM_CAPI_EXPORT int aero_lbm_context_compact_initialized(long long context_key);
 AERO_LBM_CAPI_EXPORT int aero_lbm_exchange_halo(
     int grid_size,
     long long first_context_key,
