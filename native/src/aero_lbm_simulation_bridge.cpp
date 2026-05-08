@@ -515,6 +515,16 @@ bool brick_has_solver_static(const FluidWorldRuntime& runtime, const BrickData& 
 bool brick_is_solver_active(const FluidWorldRuntime& runtime, const BrickData& brick);
 bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicRegionData* dynamic);
 
+bool brick_compact_cached_ready(const FluidWorldRuntime& runtime, const BrickData& brick) {
+    return simulation_compact_enabled()
+        && brick.compact_context_active
+        && brick.context_key != 0
+        && !brick.forcing_dirty
+        && !brick.geometry_dirty
+        && !brick.pending_reinit
+        && brick_dynamic_region_valid(runtime, brick.dynamic_region.get());
+}
+
 int count_active_hint_bricks(const FluidWorldRuntime& runtime) {
     int count = 0;
     for (const auto& entry : runtime.bricks) {
@@ -827,18 +837,20 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
             if (!brick_is_solver_active(runtime, brick)) {
                 continue;
             }
+            const bool compact_fast = brick_compact_cached_ready(runtime, brick);
             if (brick.context_key != 0
                 && brick.forcing_dirty
                 && brick_dynamic_region_valid(runtime, brick.dynamic_region.get())) {
                 sync_brick_dynamic_from_context(runtime, brick);
             }
             const bool had_dynamic = brick_dynamic_region_valid(runtime, brick.dynamic_region.get());
-            const bool had_nonzero_dynamic = had_dynamic && dynamic_has_nonzero_flow(*brick.dynamic_region);
+            const bool had_nonzero_dynamic = compact_fast
+                || (had_dynamic && dynamic_has_nonzero_flow(*brick.dynamic_region));
             if ((brick.pending_reinit || brick.geometry_dirty || !had_nonzero_dynamic) && brick.context_key != 0) {
                 release_brick_context(brick);
             }
             ensure_brick_dynamic_region_storage(runtime, brick);
-            if (brick.static_region && brick.dynamic_region) {
+            if (!compact_fast && brick.static_region && brick.dynamic_region) {
                 apply_brick_static_constraints(runtime, brick);
             }
             if (!had_nonzero_dynamic) {
@@ -892,6 +904,14 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
         for (auto& entry : runtime.bricks) {
             BrickData& brick = entry.second;
             if (!brick_is_solver_active(runtime, brick) || !brick.dynamic_region) {
+                continue;
+            }
+            const bool compact_fast = brick_compact_cached_ready(runtime, brick)
+                && needs_seed.find(entry.first) == needs_seed.end();
+            if (compact_fast) {
+                if (!step_brick_actual(service, runtime, entry.first, brick, *brick.dynamic_region)) {
+                    overall_success = false;
+                }
                 continue;
             }
             ensure_brick_dynamic_region_storage(runtime, brick);
