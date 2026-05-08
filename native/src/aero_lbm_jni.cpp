@@ -2420,7 +2420,7 @@ void compute_benchmark_force_from_distributions(ContextState& ctx, const float* 
     ctx.last_force[2] = static_cast<float>(fz * inv_depth);
 }
 
-void write_output(const ContextState& ctx, float* out, int out_channels) {
+void write_output(const ContextState& ctx, float* out, int out_channels, float output_velocity_scale) {
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         const std::size_t out_base = cell * out_channels;
         if (ctx.obstacle[cell]) {
@@ -2458,9 +2458,9 @@ void write_output(const ContextState& ctx, float* out, int out_channels) {
         if (std::fabs(uy) < 1e-7f) uy = 0.0f;
         if (std::fabs(uz) < 1e-7f) uz = 0.0f;
 
-        out[out_base + 0] = ux;
-        out[out_base + 1] = uy;
-        out[out_base + 2] = uz;
+        out[out_base + 0] = ux * output_velocity_scale;
+        out[out_base + 1] = uy * output_velocity_scale;
+        out[out_base + 2] = uz * output_velocity_scale;
         out[out_base + 3] = clampf(rho - 1.0f, kPressureMin, kPressureMax);
         for (int c = 4; c < out_channels; ++c) out[out_base + c] = 0.0f;
 next_cell:
@@ -4436,6 +4436,7 @@ kernel void compact_output_macro(
     __global const uchar* solid,
     int out_ch,
     int cells,
+    float output_velocity_scale,
     __global float* out
 ) {
     int cell = (int)get_global_id(0);
@@ -4446,9 +4447,9 @@ kernel void compact_output_macro(
         return;
     }
     float4 value = compact_load4(state, cell);
-    out[out_base + 0] = value.x;
-    out[out_base + 1] = value.y;
-    out[out_base + 2] = value.z;
+    out[out_base + 0] = value.x * output_velocity_scale;
+    out[out_base + 1] = value.y * output_velocity_scale;
+    out[out_base + 2] = value.z * output_velocity_scale;
     out[out_base + 3] = clampf(value.w, P_MIN, P_MAX);
     for (int c = 4; c < out_ch; ++c) out[out_base + c] = 0.0f;
 }
@@ -4457,7 +4458,7 @@ kernel void compact_output_macro(
 R"CLC(
 kernel void output_macro(
     __global const float* f, __global const float* payload,
-    int in_ch, int out_ch, int cells, __global float* out
+    int in_ch, int out_ch, int cells, float output_velocity_scale, __global float* out
 ) {
     int cell = (int)get_global_id(0);
     if (cell >= cells) return;
@@ -4485,9 +4486,9 @@ kernel void output_macro(
     if (fabs(vz) < 1e-7f) vz = 0.0f;
     if (fabs(rho - 1.0f) < 1e-6f) rho = 1.0f;
 
-    out[out_base + 0] = vx;
-    out[out_base + 1] = vy;
-    out[out_base + 2] = vz;
+    out[out_base + 0] = vx * output_velocity_scale;
+    out[out_base + 1] = vy * output_velocity_scale;
+    out[out_base + 2] = vz * output_velocity_scale;
     out[out_base + 3] = rho - 1.0f;
     for (int c = 4; c < out_ch; ++c) out[out_base + c] = 0.0f;
 }
@@ -5008,7 +5009,13 @@ bool upload_compact_initial_state(ContextState& ctx, const float* payload) {
     return true;
 }
 
-bool opencl_compact_step(ContextState& ctx, const float* payload, float* out, StepTiming& timing) {
+bool opencl_compact_step(
+    ContextState& ctx,
+    const float* payload,
+    float* out,
+    StepTiming& timing,
+    float output_velocity_scale
+) {
     auto fail_cl = [&](const char* api, cl_int err) -> bool {
         g_opencl.error = format_opencl_api_error(api, err);
         return false;
@@ -5052,7 +5059,8 @@ bool opencl_compact_step(ContextState& ctx, const float* payload, float* out, St
         err |= clSetKernelArg(g_opencl.k_compact_output, 1, sizeof(cl_mem), &ctx.d_compact_solid);
         err |= clSetKernelArg(g_opencl.k_compact_output, 2, sizeof(int), &g_cfg.output_channels);
         err |= clSetKernelArg(g_opencl.k_compact_output, 3, sizeof(int), &cells_i32);
-        err |= clSetKernelArg(g_opencl.k_compact_output, 4, sizeof(cl_mem), &ctx.d_compact_output);
+        err |= clSetKernelArg(g_opencl.k_compact_output, 4, sizeof(float), &output_velocity_scale);
+        err |= clSetKernelArg(g_opencl.k_compact_output, 5, sizeof(cl_mem), &ctx.d_compact_output);
         if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_compact_output)", err);
         err = enqueue_kernel_1d(g_opencl.k_compact_output, cells_i32);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_compact_output)", err);
@@ -5081,12 +5089,13 @@ bool opencl_step(
     const float* overlay_values,
     int overlay_count,
     float* out,
-    StepTiming& timing
+    StepTiming& timing,
+    float output_velocity_scale
 ) {
     if (compact_realtime_path_enabled(overlay_count)) {
         (void)overlay_cells;
         (void)overlay_values;
-        return opencl_compact_step(ctx, payload, out, timing);
+        return opencl_compact_step(ctx, payload, out, timing, output_velocity_scale);
     }
 
     if (!ensure_context_gpu_buffers(ctx)) return false;
@@ -5554,12 +5563,14 @@ bool opencl_step(
     if (!stage_fence("after_stream_collide")) return false;
 
     if (out) {
+        err = CL_SUCCESS;
         err |= clSetKernelArg(g_opencl.k_output, 0, sizeof(cl_mem), &write_buf);
         err |= clSetKernelArg(g_opencl.k_output, 1, sizeof(cl_mem), &ctx.d_payload);
         err |= clSetKernelArg(g_opencl.k_output, 2, sizeof(int), &g_cfg.input_channels);
         err |= clSetKernelArg(g_opencl.k_output, 3, sizeof(int), &g_cfg.output_channels);
         err |= clSetKernelArg(g_opencl.k_output, 4, sizeof(int), &cells_i32);
-        err |= clSetKernelArg(g_opencl.k_output, 5, sizeof(cl_mem), &ctx.d_output);
+        err |= clSetKernelArg(g_opencl.k_output, 5, sizeof(float), &output_velocity_scale);
+        err |= clSetKernelArg(g_opencl.k_output, 6, sizeof(cl_mem), &ctx.d_output);
         if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_output)", err);
         err = enqueue_kernel_1d(g_opencl.k_output, cells_i32);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_output)", err);
@@ -6027,7 +6038,7 @@ OpenClRuntime g_opencl;
 void release_context_gpu_buffers(ContextState&) {}
 void release_opencl_runtime() {}
 bool initialize_opencl_runtime() { g_opencl.error = "Disabled"; return false; }
-bool opencl_step(ContextState&, const float*, const int*, const float*, int, float*, StepTiming&) { return false; }
+bool opencl_step(ContextState&, const float*, const int*, const float*, int, float*, StepTiming&, float) { return false; }
 bool sync_context_temperature_from_gpu(ContextState&) { return true; }
 bool sync_context_temperature_to_gpu(ContextState&) { return true; }
 bool sync_context_state_from_gpu(ContextState&) { return true; }
@@ -6608,7 +6619,8 @@ void run_cpu_step(
     const int* overlay_cells,
     const float* overlay_values,
     int overlay_count,
-    float* out
+    float* out,
+    float output_velocity_scale
 ) {
     if (ctx.f.empty() || ctx.f_post.empty() || ctx.cells == 0) allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     ingest_payload(ctx, packet, g_cfg.input_channels);
@@ -6625,7 +6637,7 @@ void run_cpu_step(
     compute_benchmark_force(ctx);
     stream_and_bounce(ctx);
     if (out) {
-        write_output(ctx, out, g_cfg.output_channels);
+        write_output(ctx, out, g_cfg.output_channels, output_velocity_scale);
     }
     ctx.step_counter += 1;
 }
@@ -6637,27 +6649,28 @@ bool run_solver_step(
     const float* overlay_values,
     int overlay_count,
     float* out,
-    StepTiming& timing
+    StepTiming& timing,
+    float output_velocity_scale = 1.0f
 ) {
     bool ok = false;
     if (g_cfg.opencl_enabled && benchmark_opencl_supported()) {
-        if (!(ok = opencl_step(ctx, packet, overlay_cells, overlay_values, overlay_count, out, timing))) {
+        if (!(ok = opencl_step(ctx, packet, overlay_cells, overlay_values, overlay_count, out, timing, output_velocity_scale))) {
             disable_opencl_runtime(g_opencl.error.empty() ? "OpenCL fail" : g_opencl.error);
         }
     }
     if (!ok) {
         auto solver_begin = Clock::now();
-        run_cpu_step(ctx, packet, overlay_cells, overlay_values, overlay_count, out);
+        run_cpu_step(ctx, packet, overlay_cells, overlay_values, overlay_count, out, output_velocity_scale);
         timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
         ok = true;
     }
     return ok;
 }
 
-bool run_solver_cached_step(ContextState& ctx, float* out, StepTiming& timing) {
+bool run_solver_cached_step(ContextState& ctx, float* out, StepTiming& timing, float output_velocity_scale = 1.0f) {
 #if defined(AERO_LBM_OPENCL)
     if (g_cfg.opencl_enabled && compact_realtime_path_enabled(0) && ctx.compact_initialized) {
-        if (!opencl_compact_step(ctx, nullptr, out, timing)) {
+        if (!opencl_compact_step(ctx, nullptr, out, timing, output_velocity_scale)) {
             const std::string reason = g_opencl.error.empty() ? "OpenCL compact cached step fail" : g_opencl.error;
             disable_opencl_runtime(reason);
             set_last_native_error(reason);
@@ -6678,7 +6691,7 @@ bool run_solver_cached_step(ContextState& ctx, float* out, StepTiming& timing) {
         set_last_native_error("cached solver step has no resident payload cache");
         return false;
     }
-    if (!opencl_step(ctx, nullptr, nullptr, nullptr, 0, out, timing)) {
+    if (!opencl_step(ctx, nullptr, nullptr, nullptr, 0, out, timing, output_velocity_scale)) {
         const std::string reason = g_opencl.error.empty() ? "OpenCL cached step fail" : g_opencl.error;
         disable_opencl_runtime(reason);
         set_last_native_error(reason);
@@ -6689,6 +6702,7 @@ bool run_solver_cached_step(ContextState& ctx, float* out, StepTiming& timing) {
     (void)ctx;
     (void)out;
     (void)timing;
+    (void)output_velocity_scale;
     set_last_native_error("cached solver step requires OpenCL support");
     return false;
 #endif
@@ -6738,7 +6752,15 @@ static jboolean native_init_impl(jint grid_size, jint input_channels, jint outpu
     return native_init_dims_impl(grid_size, grid_size, grid_size, input_channels, output_channels);
 }
 
-static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jint nz, jlong context_key, float* output_flow) {
+static bool native_step_raw_dims_impl(
+    const float* packet,
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    float* output_flow,
+    float output_velocity_scale = 1.0f
+) {
     auto tick_begin = Clock::now();
     StepTiming timing;
 
@@ -6754,6 +6776,9 @@ static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jin
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         set_last_native_error("native_step_raw_dims: invalid dimensions");
         return false;
+    }
+    if (!std::isfinite(output_velocity_scale)) {
+        output_velocity_scale = 1.0f;
     }
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
@@ -6773,7 +6798,7 @@ static bool native_step_raw_dims_impl(const float* packet, jint nx, jint ny, jin
         allocate_cpu_context(ctx, ctx.nx, ctx.ny, ctx.nz);
     }
 
-    const bool ok = run_solver_step(ctx, packet, nullptr, nullptr, 0, output_flow, timing);
+    const bool ok = run_solver_step(ctx, packet, nullptr, nullptr, 0, output_flow, timing, output_velocity_scale);
     if (!ok && g_last_native_error.empty()) {
         set_last_native_error("native_step_raw_dims: run_solver_step failed");
     }
@@ -6844,7 +6869,14 @@ static bool native_step_raw_dims_with_sparse_overlays_impl(
     return ok;
 }
 
-static bool native_step_raw_dims_cached_impl(jint nx, jint ny, jint nz, jlong context_key, float* output_flow) {
+static bool native_step_raw_dims_cached_impl(
+    jint nx,
+    jint ny,
+    jint nz,
+    jlong context_key,
+    float* output_flow,
+    float output_velocity_scale = 1.0f
+) {
     auto tick_begin = Clock::now();
     StepTiming timing;
 
@@ -6856,6 +6888,9 @@ static bool native_step_raw_dims_cached_impl(jint nx, jint ny, jint nz, jlong co
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         set_last_native_error("native_step_raw_dims_cached: invalid dimensions");
         return false;
+    }
+    if (!std::isfinite(output_velocity_scale)) {
+        output_velocity_scale = 1.0f;
     }
     const std::size_t cells = static_cast<std::size_t>(nx) * ny * nz;
 
@@ -6870,7 +6905,7 @@ static bool native_step_raw_dims_cached_impl(jint nx, jint ny, jint nz, jlong co
         return false;
     }
 
-    const bool ok = run_solver_cached_step(ctx, output_flow, timing);
+    const bool ok = run_solver_cached_step(ctx, output_flow, timing, output_velocity_scale);
     if (!ok && g_last_native_error.empty()) {
         set_last_native_error("native_step_raw_dims_cached: run_solver_cached_step failed");
     }
@@ -7712,8 +7747,46 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny,
     return native_step_raw_dims_impl(packet, nx, ny, nz, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_scaled(
+    const float* packet,
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    float output_velocity_scale,
+    float* output_flow
+) {
+    return native_step_raw_dims_impl(
+        packet,
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        output_flow,
+        output_velocity_scale
+    ) ? 1 : 0;
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached(int nx, int ny, int nz, long long context_key, float* output_flow) {
     return native_step_raw_dims_cached_impl(nx, ny, nz, static_cast<jlong>(context_key), output_flow) ? 1 : 0;
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached_scaled(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    float output_velocity_scale,
+    float* output_flow
+) {
+    return native_step_raw_dims_cached_impl(
+        nx,
+        ny,
+        nz,
+        static_cast<jlong>(context_key),
+        output_flow,
+        output_velocity_scale
+    ) ? 1 : 0;
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(

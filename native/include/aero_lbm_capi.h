@@ -160,7 +160,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_init(int grid_size, int input_channels, int ou
 AERO_LBM_CAPI_EXPORT int aero_lbm_step(const float* packet, int grid_size, long long context_key, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_init_rect(int nx, int ny, int nz, int input_channels, int output_channels);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny, int nz, long long context_key, float* output_flow);
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_scaled(const float* packet, int nx, int ny, int nz, long long context_key, float output_velocity_scale, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached(int nx, int ny, int nz, long long context_key, float* output_flow);
+AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached_scaled(int nx, int ny, int nz, long long context_key, float output_velocity_scale, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(
     const float* packet,
     int nx,

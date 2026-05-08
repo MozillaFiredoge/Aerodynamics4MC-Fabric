@@ -39,6 +39,7 @@ Current native code includes:
   - stores `vx/vy/vz/pressure` as packed fp16 macro state with fp32 math in the kernel
   - keeps only two half4 state buffers plus a byte solid mask resident on the device
   - avoids the full D3Q27 distribution buffers and full payload buffer for `aero_solver_advance_wind_tunnel`
+  - writes full-field `aero_solver_step_wind_tunnel` output directly in public velocity units, avoiding a solver-side scratch copy and CPU conversion pass
   - expected `128^3` resident device memory is about 34 MiB without readback and about 66 MiB with full-field output
 - CPU reference `D3Q27` path (automatic fallback):
   - per-window context state (`contextKey`)

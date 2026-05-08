@@ -45,7 +45,6 @@ struct SolverContext {
     AeroBoundaryDesc packet_boundary{};
     std::vector<uint8_t> solid_mask;
     std::vector<float> packet;
-    std::vector<float> scratch_flow;
 };
 
 std::mutex g_solver_mutex;
@@ -104,10 +103,6 @@ float lattice_velocity_scale(const AeroGridDesc& grid) {
 
 float velocity_mps_to_lattice(const AeroGridDesc& grid, float velocity_mps) {
     return finite_or(velocity_mps, 0.0f) / lattice_velocity_scale(grid);
-}
-
-float velocity_lattice_to_mps(const AeroGridDesc& grid, float velocity_lattice) {
-    return finite_or(velocity_lattice, 0.0f) * lattice_velocity_scale(grid);
 }
 
 float pressure_proxy(float pressure) {
@@ -270,21 +265,6 @@ bool native_runtime_is_opencl() {
     return info && std::strncmp(info, "opencl|", 7) == 0;
 }
 
-bool convert_output_to_public_units(SolverContext& ctx, float* out_flow, int out_value_count) {
-    if (!out_flow || out_value_count != ctx.cells * kOutputChannels) {
-        set_error("invalid output flow buffer");
-        return false;
-    }
-    for (int cell = 0; cell < ctx.cells; ++cell) {
-        const std::size_t base = static_cast<std::size_t>(cell) * kOutputChannels;
-        out_flow[base + 0] = velocity_lattice_to_mps(ctx.grid, out_flow[base + 0]);
-        out_flow[base + 1] = velocity_lattice_to_mps(ctx.grid, out_flow[base + 1]);
-        out_flow[base + 2] = velocity_lattice_to_mps(ctx.grid, out_flow[base + 2]);
-        out_flow[base + 3] = pressure_proxy(out_flow[base + 3]);
-    }
-    return true;
-}
-
 bool step_solver_locked(
     SolverContext& ctx,
     const AeroBoundaryDesc& boundary,
@@ -315,17 +295,30 @@ bool step_solver_locked(
         ctx.packet_dirty = false;
         ctx.native_payload_uploaded = false;
     }
-    if (wants_output && ctx.scratch_flow.size() != static_cast<std::size_t>(ctx.cells) * kOutputChannels) {
-        ctx.scratch_flow.assign(static_cast<std::size_t>(ctx.cells) * kOutputChannels, 0.0f);
-    }
+    const float output_velocity_scale = lattice_velocity_scale(ctx.grid);
     for (int step = 0; step < steps; ++step) {
-        float* step_output = wants_output && step + 1 == steps ? ctx.scratch_flow.data() : nullptr;
+        float* step_output = wants_output && step + 1 == steps ? out_flow : nullptr;
         bool step_ok = false;
         if (ctx.native_payload_uploaded && native_runtime_is_opencl()) {
-            step_ok = aero_lbm_step_rect_cached(ctx.grid.nx, ctx.grid.ny, ctx.grid.nz, ctx.context_key, step_output) != 0;
+            step_ok = aero_lbm_step_rect_cached_scaled(
+                ctx.grid.nx,
+                ctx.grid.ny,
+                ctx.grid.nz,
+                ctx.context_key,
+                output_velocity_scale,
+                step_output
+            ) != 0;
         }
         if (!step_ok) {
-            step_ok = aero_lbm_step_rect(ctx.packet.data(), ctx.grid.nx, ctx.grid.ny, ctx.grid.nz, ctx.context_key, step_output) != 0;
+            step_ok = aero_lbm_step_rect_scaled(
+                ctx.packet.data(),
+                ctx.grid.nx,
+                ctx.grid.ny,
+                ctx.grid.nz,
+                ctx.context_key,
+                output_velocity_scale,
+                step_output
+            ) != 0;
             if (!step_ok) {
                 set_error(std::string("aero_lbm_step_rect failed: ") + aero_lbm_last_error());
                 return false;
@@ -333,11 +326,7 @@ bool step_solver_locked(
             ctx.native_payload_uploaded = native_runtime_is_opencl();
         }
     }
-    if (!wants_output) {
-        return true;
-    }
-    std::copy(ctx.scratch_flow.begin(), ctx.scratch_flow.end(), out_flow);
-    return convert_output_to_public_units(ctx, out_flow, out_value_count);
+    return true;
 }
 
 }  // namespace
@@ -411,7 +400,6 @@ AERO_LBM_CAPI_EXPORT int aero_solver_create_with_grid(
     ctx->cells = cells;
     ctx->solid_mask.assign(static_cast<std::size_t>(cells), 0u);
     ctx->packet.assign(static_cast<std::size_t>(cells) * kInputChannels, 0.0f);
-    ctx->scratch_flow.assign(static_cast<std::size_t>(cells) * kOutputChannels, 0.0f);
     AeroBoundaryDesc boundary{};
     aero_solver_default_boundary(&boundary);
     initialize_packet(*ctx, boundary, true);
