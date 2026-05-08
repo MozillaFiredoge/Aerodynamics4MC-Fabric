@@ -41,6 +41,7 @@ Current native code includes:
   - avoids the full D3Q27 distribution buffers and full payload buffer for `aero_solver_advance_wind_tunnel`
   - writes full-field `aero_solver_step_wind_tunnel` output directly in public velocity units, avoiding a solver-side scratch copy and CPU conversion pass
   - expected `128^3` resident device memory is about 34 MiB without readback and about 66 MiB with full-field output
+  - experimental game-side stored-region opt-in: set `AERO_LBM_SIMULATION_COMPACT=1` to route simple `step_region_stored` calls without sparse overlays or nested/tornado boundary overrides through the compact path
 - CPU reference `D3Q27` path (automatic fallback):
   - per-window context state (`contextKey`)
   - cumulant + SGS + thermal scalar + Boussinesq force

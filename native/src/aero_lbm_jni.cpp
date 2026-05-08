@@ -569,6 +569,7 @@ struct ContextState {
     cl_mem d_compact_state_next = nullptr;
     cl_mem d_compact_solid = nullptr;
     cl_mem d_compact_output = nullptr;
+    std::size_t compact_output_bytes = 0;
 #endif
 
     std::vector<uint8_t> compact_solid_cache;
@@ -1149,6 +1150,35 @@ std::uint16_t float_to_half_bits(float value) {
         ++half;
     }
     return static_cast<std::uint16_t>(half);
+}
+
+float half_bits_to_float(std::uint16_t value) {
+    const std::uint32_t sign = (static_cast<std::uint32_t>(value & 0x8000u)) << 16;
+    int exponent = static_cast<int>((value >> 10) & 0x1fu);
+    std::uint32_t mantissa = static_cast<std::uint32_t>(value & 0x03ffu);
+    std::uint32_t bits = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            int normalized_exponent = -14;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                --normalized_exponent;
+            }
+            mantissa &= 0x03ffu;
+            bits = sign
+                | (static_cast<std::uint32_t>(normalized_exponent + 127) << 23)
+                | (mantissa << 13);
+        }
+    } else if (exponent == 31) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        bits = sign | (static_cast<std::uint32_t>(exponent + 112) << 23) | (mantissa << 13);
+    }
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
 }
 
 inline float feq(int q, float rho, float ux, float uy, float uz) {
@@ -2489,6 +2519,7 @@ struct OpenClRuntime {
     cl_kernel k_stream_collide_hydro_forced = nullptr;
     cl_kernel k_compact_macro_step = nullptr;
     cl_kernel k_compact_output = nullptr;
+    cl_kernel k_compact_output_strided = nullptr;
     cl_kernel k_output = nullptr;
     cl_kernel k_output_strided = nullptr;
 };
@@ -4454,6 +4485,46 @@ kernel void compact_output_macro(
     for (int c = 4; c < out_ch; ++c) out[out_base + c] = 0.0f;
 }
 
+kernel void compact_output_macro_strided(
+    __global const ushort4* state,
+    __global const uchar* solid,
+    int nx,
+    int ny,
+    int nz,
+    int stride,
+    int sx,
+    int sy,
+    int sz,
+    __global float* out
+) {
+    int atlas_cell = (int)get_global_id(0);
+    int atlas_cells = sx * sy * sz;
+    if (atlas_cell >= atlas_cells) return;
+
+    int ayz = sy * sz;
+    int ax = atlas_cell / ayz;
+    int rem = atlas_cell - ax * ayz;
+    int ay = rem / sz;
+    int az = rem - ay * sz;
+    int gx = min(nx - 1, ax * stride);
+    int gy = min(ny - 1, ay * stride);
+    int gz = min(nz - 1, az * stride);
+    int cell = (gx * ny + gy) * nz + gz;
+    int out_base = atlas_cell * 4;
+    if (solid[cell] != 0) {
+        out[out_base + 0] = 0.0f;
+        out[out_base + 1] = 0.0f;
+        out[out_base + 2] = 0.0f;
+        out[out_base + 3] = 0.0f;
+        return;
+    }
+    float4 value = compact_load4(state, cell);
+    out[out_base + 0] = value.x;
+    out[out_base + 1] = value.y;
+    out[out_base + 2] = value.z;
+    out[out_base + 3] = clampf(value.w, P_MIN, P_MAX);
+}
+
 )CLC"
 R"CLC(
 kernel void output_macro(
@@ -4620,6 +4691,7 @@ std::string format_opencl_api_error(const char* api, cl_int err) {
 
 void release_opencl_runtime() {
     if (g_opencl.k_output_strided) clReleaseKernel(g_opencl.k_output_strided);
+    if (g_opencl.k_compact_output_strided) clReleaseKernel(g_opencl.k_compact_output_strided);
     if (g_opencl.k_compact_output) clReleaseKernel(g_opencl.k_compact_output);
     if (g_opencl.k_compact_macro_step) clReleaseKernel(g_opencl.k_compact_macro_step);
     if (g_opencl.k_apply_temperature_reference) clReleaseKernel(g_opencl.k_apply_temperature_reference);
@@ -4656,6 +4728,7 @@ void release_context_gpu_buffers(ContextState& ctx) {
     ctx.compact_buffers_ready = false;
     ctx.compact_initialized = false;
     ctx.compact_output_ready = false;
+    ctx.compact_output_bytes = 0;
     ctx.gpu_buffers_ready = ctx.gpu_initialized = false;
 }
 
@@ -4720,12 +4793,13 @@ bool initialize_opencl_runtime() {
     cl_kernel k_stream_collide_hydro_forced = clCreateKernel(program, "stream_collide_hydro_forced_step", &err);
     cl_kernel k_compact_macro_step = clCreateKernel(program, "compact_macro_step", &err);
     cl_kernel k_compact_output = clCreateKernel(program, "compact_output_macro", &err);
+    cl_kernel k_compact_output_strided = clCreateKernel(program, "compact_output_macro_strided", &err);
     cl_kernel k_output = clCreateKernel(program, "output_macro", &err);
     cl_kernel k_output_strided = clCreateKernel(program, "output_macro_strided", &err);
 
     if (!k_init || !k_apply_temperature_reference || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize
         || !k_stream_collide_tgv || !k_stream_collide_hydro_bench || !k_stream_collide_hydro_forced
-        || !k_compact_macro_step || !k_compact_output || !k_output
+        || !k_compact_macro_step || !k_compact_output || !k_compact_output_strided || !k_output
         || !k_output_strided) {
         if (k_init) clReleaseKernel(k_init);
         if (k_apply_temperature_reference) clReleaseKernel(k_apply_temperature_reference);
@@ -4737,6 +4811,7 @@ bool initialize_opencl_runtime() {
         if (k_stream_collide_hydro_forced) clReleaseKernel(k_stream_collide_hydro_forced);
         if (k_compact_macro_step) clReleaseKernel(k_compact_macro_step);
         if (k_compact_output) clReleaseKernel(k_compact_output);
+        if (k_compact_output_strided) clReleaseKernel(k_compact_output_strided);
         if (k_output) clReleaseKernel(k_output);
         if (k_output_strided) clReleaseKernel(k_output_strided);
         clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
@@ -4754,6 +4829,7 @@ bool initialize_opencl_runtime() {
     g_opencl.k_stream_collide_hydro_forced = k_stream_collide_hydro_forced;
     g_opencl.k_compact_macro_step = k_compact_macro_step;
     g_opencl.k_compact_output = k_compact_output;
+    g_opencl.k_compact_output_strided = k_compact_output_strided;
     g_opencl.k_output = k_output;
     g_opencl.k_output_strided = k_output_strided;
     g_opencl.platform = selected_platform; g_opencl.device = selected_device;
@@ -4880,6 +4956,29 @@ float compact_viscosity_alpha() {
     return clampf(0.08f + 8.0f * effective_base_nu_shear(), 0.05f, 0.22f);
 }
 
+bool ensure_compact_output_buffer(ContextState& ctx, std::size_t output_bytes) {
+    if (!g_opencl.available || output_bytes == 0) return false;
+    if (ctx.d_compact_output && ctx.compact_output_bytes >= output_bytes) {
+        ctx.compact_output_ready = true;
+        return true;
+    }
+    if (ctx.d_compact_output) {
+        clReleaseMemObject(ctx.d_compact_output);
+        ctx.d_compact_output = nullptr;
+        ctx.compact_output_bytes = 0;
+        ctx.compact_output_ready = false;
+    }
+    cl_int err = CL_SUCCESS;
+    ctx.d_compact_output = clCreateBuffer(g_opencl.context, CL_MEM_WRITE_ONLY, output_bytes, nullptr, &err);
+    if (err != CL_SUCCESS || !ctx.d_compact_output) {
+        g_opencl.error = format_opencl_api_error("clCreateBuffer(d_compact_output)", err);
+        return false;
+    }
+    ctx.compact_output_bytes = output_bytes;
+    ctx.compact_output_ready = true;
+    return true;
+}
+
 bool ensure_compact_gpu_buffers(ContextState& ctx, bool wants_output) {
     if (!g_opencl.available || ctx.cells == 0) return false;
 
@@ -4906,13 +5005,12 @@ bool ensure_compact_gpu_buffers(ContextState& ctx, bool wants_output) {
         ctx.compact_initialized = false;
     }
 
-    if (wants_output && !ctx.compact_output_ready) {
+    if (wants_output) {
         const std::size_t output_bytes = ctx.cells * g_cfg.output_channels * sizeof(float);
-        if (!create_buffer(ctx.d_compact_output, CL_MEM_WRITE_ONLY, output_bytes, "clCreateBuffer(d_compact_output)")) {
+        if (!ensure_compact_output_buffer(ctx, output_bytes)) {
             release_context_gpu_buffers(ctx);
             return false;
         }
-        ctx.compact_output_ready = true;
     }
     return true;
 }
@@ -5603,6 +5701,13 @@ bool opencl_step(
 }
 
 bool sync_context_temperature_from_gpu(ContextState& ctx) {
+    if (ctx.compact_buffers_ready || ctx.compact_initialized) {
+        ensure_context_temperature_storage(ctx);
+        std::fill(ctx.temperature.begin(), ctx.temperature.end(), 0.0f);
+        std::fill(ctx.temperature_next.begin(), ctx.temperature_next.end(), 0.0f);
+        std::fill(ctx.temperature_scratch.begin(), ctx.temperature_scratch.end(), 0.0f);
+        return true;
+    }
     if (!ctx.gpu_buffers_ready || !ctx.gpu_initialized) {
         return true;
     }
@@ -7041,6 +7146,11 @@ static bool native_sample_temperature_point_raw_dims_impl(
     ContextState& ctx = *locked_context.ctx;
     ensure_context_shape(ctx, nx, ny, nz, cells);
 #if defined(AERO_LBM_OPENCL)
+    if (g_cfg.opencl_enabled && ctx.compact_buffers_ready && ctx.compact_initialized) {
+        *out_temperature = 0.0f;
+        return true;
+    }
+
     if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
         cl_mem current_temp = (ctx.step_counter % 2 == 0) ? ctx.d_temp : ctx.d_temp_next;
         const std::size_t offset = cell * sizeof(float);
@@ -7089,6 +7199,51 @@ static bool native_sample_flow_point_raw_dims_impl(
     };
 
 #if defined(AERO_LBM_OPENCL)
+    if (g_cfg.opencl_enabled && ctx.compact_buffers_ready && ctx.compact_initialized) {
+        std::uint8_t solid = 0;
+        cl_int err = clEnqueueReadBuffer(
+            g_opencl.queue,
+            ctx.d_compact_solid,
+            CL_TRUE,
+            cell * sizeof(std::uint8_t),
+            sizeof(std::uint8_t),
+            &solid,
+            0,
+            nullptr,
+            nullptr
+        );
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(sample_flow_point:compact_solid)", err);
+            return false;
+        }
+        if (solid != 0) {
+            write_zero();
+            return true;
+        }
+        std::uint16_t packed[4] = {};
+        cl_mem current_state = (ctx.step_counter % 2 == 0) ? ctx.d_compact_state : ctx.d_compact_state_next;
+        err = clEnqueueReadBuffer(
+            g_opencl.queue,
+            current_state,
+            CL_TRUE,
+            cell * 4u * sizeof(std::uint16_t),
+            sizeof(packed),
+            packed,
+            0,
+            nullptr,
+            nullptr
+        );
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(sample_flow_point:compact_state)", err);
+            return false;
+        }
+        out_flow[0] = half_bits_to_float(packed[0]);
+        out_flow[1] = half_bits_to_float(packed[1]);
+        out_flow[2] = half_bits_to_float(packed[2]);
+        out_flow[3] = clampf(half_bits_to_float(packed[3]), kPressureMin, kPressureMax);
+        return true;
+    }
+
     if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
         float obstacle = 0.0f;
         const std::size_t obstacle_offset =
@@ -7239,6 +7394,40 @@ static bool native_extract_flow_atlas_raw_dims_impl(
     ensure_context_shape(ctx, nx, ny, nz, cells);
 
 #if defined(AERO_LBM_OPENCL)
+    if (g_cfg.opencl_enabled && ctx.compact_buffers_ready && ctx.compact_initialized) {
+        const std::size_t bytes = static_cast<std::size_t>(value_count) * sizeof(float);
+        if (!ensure_compact_output_buffer(ctx, bytes)) {
+            return false;
+        }
+        cl_mem current_state = (ctx.step_counter % 2 == 0) ? ctx.d_compact_state : ctx.d_compact_state_next;
+        cl_int err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 0, sizeof(cl_mem), &current_state);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 1, sizeof(cl_mem), &ctx.d_compact_solid);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 2, sizeof(int), &ctx.nx);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 3, sizeof(int), &ctx.ny);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 4, sizeof(int), &ctx.nz);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 5, sizeof(int), &stride);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 6, sizeof(int), &sx);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 7, sizeof(int), &sy);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 8, sizeof(int), &sz);
+        err |= clSetKernelArg(g_opencl.k_compact_output_strided, 9, sizeof(cl_mem), &ctx.d_compact_output);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clSetKernelArg(k_compact_output_strided)", err);
+            return false;
+        }
+        err = enqueue_kernel_1d(g_opencl.k_compact_output_strided, atlas_cells);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueNDRangeKernel(k_compact_output_strided)", err);
+            return false;
+        }
+        err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_compact_output, CL_TRUE, 0, bytes, out_flow_atlas, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueReadBuffer(d_compact_output_atlas)", err);
+            return false;
+        }
+        return true;
+    }
+
     if (g_cfg.opencl_enabled && ctx.gpu_buffers_ready && ctx.gpu_initialized) {
         cl_mem current_flow = (ctx.step_counter % 2 == 0) ? ctx.d_f : ctx.d_f_post;
         cl_int err = CL_SUCCESS;

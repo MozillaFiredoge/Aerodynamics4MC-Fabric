@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -265,6 +267,48 @@ constexpr int k_nested_feedback_value_bottom_area = 6;
 constexpr int k_nested_feedback_value_bottom_mass_flux = 7;
 constexpr int k_nested_feedback_value_top_area = 8;
 constexpr int k_nested_feedback_value_top_mass_flux = 9;
+
+bool env_flag_enabled(const char* name, bool default_value = false) {
+    const char* value = std::getenv(name);
+    if (!value) return default_value;
+    return std::strcmp(value, "0") != 0
+        && std::strcmp(value, "false") != 0
+        && std::strcmp(value, "FALSE") != 0
+        && std::strcmp(value, "off") != 0
+        && std::strcmp(value, "OFF") != 0;
+}
+
+bool simulation_compact_enabled() {
+    return env_flag_enabled("AERO_LBM_SIMULATION_COMPACT", false);
+}
+
+AeroLbmBoundaryFaceConfig simulation_compact_face(int hydro_kind, int thermal_kind) {
+    AeroLbmBoundaryFaceConfig face{};
+    face.hydrodynamic_kind = hydro_kind;
+    face.thermal_kind = thermal_kind;
+    return face;
+}
+
+bool configure_simulation_compact_boundary(float vx, float vy, float vz, int nx, int ny, int nz) {
+    AeroLbmBenchmarkConfig cfg{};
+    aero_lbm_benchmark_default_config(&cfg);
+    cfg.enabled = 1;
+    cfg.preset = AERO_LBM_BENCHMARK_PRESET_NONE;
+    cfg.reference_length = static_cast<float>(std::max({1, nx, ny, nz}));
+    cfg.initial_velocity[0] = vx;
+    cfg.initial_velocity[1] = vy;
+    cfg.initial_velocity[2] = vz;
+    cfg.x_min = simulation_compact_face(AERO_LBM_HYDRO_BOUNDARY_VELOCITY_DIRICHLET, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+    cfg.x_min.velocity[0] = vx;
+    cfg.x_min.velocity[1] = vy;
+    cfg.x_min.velocity[2] = vz;
+    cfg.x_max = simulation_compact_face(AERO_LBM_HYDRO_BOUNDARY_CONVECTIVE_OUTFLOW, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+    cfg.y_min = simulation_compact_face(AERO_LBM_HYDRO_BOUNDARY_SYMMETRY, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+    cfg.y_max = simulation_compact_face(AERO_LBM_HYDRO_BOUNDARY_SYMMETRY, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+    cfg.z_min = simulation_compact_face(AERO_LBM_HYDRO_BOUNDARY_SYMMETRY, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+    cfg.z_max = simulation_compact_face(AERO_LBM_HYDRO_BOUNDARY_SYMMETRY, AERO_LBM_THERMAL_BOUNDARY_DISABLED);
+    return aero_lbm_benchmark_set_config(&cfg) != 0;
+}
 constexpr float k_tornado_lattice_speed_cap = 0.24f;
 constexpr float k_runtime_seconds_per_step = 0.05f;
 constexpr float k_cell_face_area_square_meters = 1.0f;
@@ -4664,19 +4708,44 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_step_region_stored(
     }
     // Hot path keeps the live L2 state inside the native context. Full flow-state
     // caches are refreshed only on explicit sync/export paths.
-    const bool step_ok = overlay_builder.cells.empty()
-        ? aero_lbm_step_rect(packet_data, nx, ny, nz, region_key, nullptr) != 0
-        : aero_lbm_step_rect_with_sparse_overlays(
-            packet_data,
-            nx,
-            ny,
-            nz,
-            region_key,
-            overlay_builder.cells.data(),
-            overlay_builder.values.data(),
-            static_cast<int>(overlay_builder.cells.size()),
-            nullptr
-        ) != 0;
+    const auto run_d3q27_step = [&]() -> bool {
+        return overlay_builder.cells.empty()
+            ? aero_lbm_step_rect(packet_data, nx, ny, nz, region_key, nullptr) != 0
+            : aero_lbm_step_rect_with_sparse_overlays(
+                packet_data,
+                nx,
+                ny,
+                nz,
+                region_key,
+                overlay_builder.cells.data(),
+                overlay_builder.values.data(),
+                static_cast<int>(overlay_builder.cells.size()),
+                nullptr
+            ) != 0;
+    };
+    const bool compact_candidate =
+        simulation_compact_enabled()
+        && overlay_builder.cells.empty()
+        && !has_boundary_override
+        && !has_global_edge_stabilization
+        && !has_tornado_override;
+    bool step_ok = false;
+    if (compact_candidate
+        && configure_simulation_compact_boundary(boundary_wind_x, boundary_wind_y, boundary_wind_z, nx, ny, nz)) {
+        if (context_ready && !needs_dynamic_seed) {
+            step_ok = aero_lbm_step_rect_cached(nx, ny, nz, region_key, nullptr) != 0;
+        }
+        if (!step_ok) {
+            step_ok = aero_lbm_step_rect(packet_data, nx, ny, nz, region_key, nullptr) != 0;
+        }
+        aero_lbm_benchmark_reset_config();
+        if (!step_ok) {
+            step_ok = run_d3q27_step();
+        }
+    } else {
+        aero_lbm_benchmark_reset_config();
+        step_ok = run_d3q27_step();
+    }
     if (!step_ok) {
         set_simulation_last_error(std::string("simulation_step_region_stored failed: ") + aero_lbm_last_error());
         return 0;
@@ -5361,6 +5430,7 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         }
     }
     text = "simulation_bridge|services=" + std::to_string(g_service ? 1 : 0)
+        + "|compact_experimental=" + std::string(simulation_compact_enabled() ? "on" : "off")
         + "|active_regions=" + std::to_string(active_region_count)
         + "|static_regions=" + std::to_string(static_region_count)
         + "|dynamic_regions=" + std::to_string(dynamic_region_count)
