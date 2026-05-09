@@ -5833,6 +5833,9 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     }
     std::string solver_runtime = aero_lbm_runtime_info();
     std::replace(solver_runtime.begin(), solver_runtime.end(), '|', '/');
+    std::string native_timing = aero_lbm_timing_info();
+    std::replace(native_timing.begin(), native_timing.end(), '|', '/');
+    std::replace(native_timing.begin(), native_timing.end(), ' ', '_');
     text = "simulation_bridge|services=" + std::to_string(g_service ? 1 : 0)
         + "|solver_runtime=" + solver_runtime
         + "|compact_experimental=" + std::string(simulation_compact_enabled() ? "on" : "off")
@@ -5868,6 +5871,7 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         + "|compact_last_fan_cells=" + std::to_string(compact_last_fan_cells)
         + "|compact_last_thermal_cells=" + std::to_string(compact_last_thermal_cells)
         + "|compact_last_nonfinite_cells=" + std::to_string(compact_last_nonfinite_cells)
+        + "|native_timing=" + native_timing
         + "|brick_epoch_max=" + std::to_string(max_brick_epoch);
     return text.c_str();
 }

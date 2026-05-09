@@ -47,4 +47,5 @@ replay_*.log
 
 media/
 *.py
+!native/tools/check_d3q27_fp16.py
 banner_*

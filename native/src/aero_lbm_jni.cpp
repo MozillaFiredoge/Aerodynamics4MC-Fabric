@@ -596,6 +596,15 @@ struct StepTiming {
     double solver_ms = 0.0;
     double readback_ms = 0.0;
     double total_ms = 0.0;
+    double gpu_step_ms = 0.0;
+    double gpu_output_ms = 0.0;
+    double gpu_upload_ms = 0.0;
+    double gpu_readback_ms = 0.0;
+    std::uint64_t upload_bytes = 0;
+    std::uint64_t readback_bytes = 0;
+    std::uint64_t full_packet_steps = 0;
+    std::uint64_t cached_steps = 0;
+    std::string path;
 };
 
 struct TimingStats {
@@ -604,6 +613,14 @@ struct TimingStats {
     double solver_ms_sum = 0.0;
     double readback_ms_sum = 0.0;
     double total_ms_sum = 0.0;
+    double gpu_step_ms_sum = 0.0;
+    double gpu_output_ms_sum = 0.0;
+    double gpu_upload_ms_sum = 0.0;
+    double gpu_readback_ms_sum = 0.0;
+    std::uint64_t upload_bytes_sum = 0;
+    std::uint64_t readback_bytes_sum = 0;
+    std::uint64_t full_packet_steps = 0;
+    std::uint64_t cached_steps = 0;
     StepTiming last;
 };
 
@@ -1085,6 +1102,14 @@ void record_timing(const StepTiming& timing) {
     g_timing.solver_ms_sum += timing.solver_ms;
     g_timing.readback_ms_sum += timing.readback_ms;
     g_timing.total_ms_sum += timing.total_ms;
+    g_timing.gpu_step_ms_sum += timing.gpu_step_ms;
+    g_timing.gpu_output_ms_sum += timing.gpu_output_ms;
+    g_timing.gpu_upload_ms_sum += timing.gpu_upload_ms;
+    g_timing.gpu_readback_ms_sum += timing.gpu_readback_ms;
+    g_timing.upload_bytes_sum += timing.upload_bytes;
+    g_timing.readback_bytes_sum += timing.readback_bytes;
+    g_timing.full_packet_steps += timing.full_packet_steps;
+    g_timing.cached_steps += timing.cached_steps;
     g_timing.last = timing;
 }
 
@@ -1094,14 +1119,29 @@ std::string timing_info_string() {
     std::ostringstream oss;
     oss.setf(std::ios::fixed);
     oss << std::setprecision(3) << "ticks=" << g_timing.ticks
+        << " path=" << (g_timing.last.path.empty() ? "unknown" : g_timing.last.path)
         << " last_ms(copy=" << g_timing.last.payload_copy_ms
         << ",solver=" << g_timing.last.solver_ms
         << ",readback=" << g_timing.last.readback_ms
-        << ",total=" << g_timing.last.total_ms << ")"
+        << ",total=" << g_timing.last.total_ms
+        << ",gpu_step=" << g_timing.last.gpu_step_ms
+        << ",gpu_output=" << g_timing.last.gpu_output_ms
+        << ",gpu_upload=" << g_timing.last.gpu_upload_ms
+        << ",gpu_readback=" << g_timing.last.gpu_readback_ms << ")"
         << " avg_ms(copy=" << g_timing.payload_copy_ms_sum * inv
         << ",solver=" << g_timing.solver_ms_sum * inv
         << ",readback=" << g_timing.readback_ms_sum * inv
-        << ",total=" << g_timing.total_ms_sum * inv << ")";
+        << ",total=" << g_timing.total_ms_sum * inv
+        << ",gpu_step=" << g_timing.gpu_step_ms_sum * inv
+        << ",gpu_output=" << g_timing.gpu_output_ms_sum * inv
+        << ",gpu_upload=" << g_timing.gpu_upload_ms_sum * inv
+        << ",gpu_readback=" << g_timing.gpu_readback_ms_sum * inv << ")"
+        << " bytes(last_upload=" << g_timing.last.upload_bytes
+        << ",last_readback=" << g_timing.last.readback_bytes
+        << ",avg_upload=" << static_cast<double>(g_timing.upload_bytes_sum) * inv
+        << ",avg_readback=" << static_cast<double>(g_timing.readback_bytes_sum) * inv << ")"
+        << " steps(full_packet=" << g_timing.full_packet_steps
+        << ",cached=" << g_timing.cached_steps << ")";
     return oss.str();
 }
 
@@ -5047,7 +5087,7 @@ bool initialize_opencl_runtime() {
     cl_context context = clCreateContext(nullptr, 1, &selected_device, nullptr, nullptr, &err);
     if (err != CL_SUCCESS) return false;
 
-    cl_command_queue queue = clCreateCommandQueue(context, selected_device, 0, &err);
+    cl_command_queue queue = clCreateCommandQueue(context, selected_device, CL_QUEUE_PROFILING_ENABLE, &err);
     if (err != CL_SUCCESS) { clReleaseContext(context); return false; }
 
     const char* src = kOpenClSource;
@@ -5197,9 +5237,27 @@ bool ensure_context_gpu_buffers(ContextState& ctx) {
     return true;
 }
 
-cl_int enqueue_kernel_1d(cl_kernel kernel, int cells) {
+double profiled_event_ms(cl_event event) {
+    if (!event) return 0.0;
+    const cl_int wait_err = clWaitForEvents(1, &event);
+    if (wait_err != CL_SUCCESS) {
+        clReleaseEvent(event);
+        return 0.0;
+    }
+    cl_ulong start = 0;
+    cl_ulong end = 0;
+    const cl_int start_err = clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, nullptr);
+    const cl_int end_err = clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr);
+    clReleaseEvent(event);
+    if (start_err != CL_SUCCESS || end_err != CL_SUCCESS || end < start) {
+        return 0.0;
+    }
+    return static_cast<double>(end - start) * 1.0e-6;
+}
+
+cl_int enqueue_kernel_1d(cl_kernel kernel, int cells, cl_event* event = nullptr) {
     const size_t global_size = static_cast<size_t>(cells);
-    return clEnqueueNDRangeKernel(g_opencl.queue, kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    return clEnqueueNDRangeKernel(g_opencl.queue, kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, event);
 }
 
 bool compact_realtime_env_enabled() {
@@ -5323,7 +5381,7 @@ bool ensure_d3q27_f16_buffers(ContextState& ctx, bool wants_output, std::size_t 
     return !wants_output || ensure_d3q27_f16_output_buffer(ctx, output_bytes);
 }
 
-bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload) {
+bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload, StepTiming* timing = nullptr) {
     if (!payload) {
         if (ctx.d3q27_f16_initialized) return true;
         g_opencl.error = "d3q27 fp16 cached step requested before initialization";
@@ -5367,6 +5425,7 @@ bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload) {
     }
     const std::size_t solid_bytes = ctx.cells * sizeof(std::uint8_t);
     const std::size_t dist_bytes = ctx.d3q27_f16_staging.size() * sizeof(std::uint16_t);
+    cl_event solid_event = nullptr;
     cl_int err = clEnqueueWriteBuffer(
         g_opencl.queue,
         ctx.d_d3q27_f16_solid,
@@ -5376,12 +5435,19 @@ bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload) {
         ctx.d3q27_f16_solid_staging.data(),
         0,
         nullptr,
-        nullptr
+        &solid_event
     );
     if (err != CL_SUCCESS) {
         g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_d3q27_f16_solid)", err);
         return false;
     }
+    if (timing) {
+        timing->gpu_upload_ms += profiled_event_ms(solid_event);
+        timing->upload_bytes += static_cast<std::uint64_t>(solid_bytes);
+    } else if (solid_event) {
+        clReleaseEvent(solid_event);
+    }
+    cl_event dist_event = nullptr;
     err = clEnqueueWriteBuffer(
         g_opencl.queue,
         ctx.d_d3q27_f16,
@@ -5391,11 +5457,17 @@ bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload) {
         ctx.d3q27_f16_staging.data(),
         0,
         nullptr,
-        nullptr
+        &dist_event
     );
     if (err != CL_SUCCESS) {
         g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_d3q27_f16)", err);
         return false;
+    }
+    if (timing) {
+        timing->gpu_upload_ms += profiled_event_ms(dist_event);
+        timing->upload_bytes += static_cast<std::uint64_t>(dist_bytes);
+    } else if (dist_event) {
+        clReleaseEvent(dist_event);
     }
     ctx.d3q27_f16_initialized = true;
     ctx.d3q27_f16_parity = 0;
@@ -5564,6 +5636,12 @@ bool opencl_d3q27_f16_inplace_step(
         g_opencl.error = format_opencl_api_error(api, err);
         return false;
     };
+    timing.path = "d3q27-fp16-inplace-srt";
+    if (payload) {
+        timing.full_packet_steps += 1;
+    } else {
+        timing.cached_steps += 1;
+    }
 
     const bool wants_output = out != nullptr;
     const std::size_t output_bytes = wants_output
@@ -5573,7 +5651,7 @@ bool opencl_d3q27_f16_inplace_step(
 
     auto upload_begin = Clock::now();
     if (payload || !ctx.d3q27_f16_initialized) {
-        if (!upload_d3q27_f16_initial_state(ctx, payload)) {
+        if (!upload_d3q27_f16_initial_state(ctx, payload, &timing)) {
             return false;
         }
     }
@@ -5597,8 +5675,10 @@ bool opencl_d3q27_f16_inplace_step(
     err |= clSetKernelArg(kernel, 6, sizeof(float), &omega);
     err |= clSetKernelArg(kernel, 7, sizeof(OpenClFaceData), inlet.data());
     if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_d3q27_f16_step)", err);
-    err = enqueue_kernel_1d(kernel, cells_i32);
+    cl_event step_event = nullptr;
+    err = enqueue_kernel_1d(kernel, cells_i32, &step_event);
     if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_d3q27_f16_step)", err);
+    timing.gpu_step_ms += profiled_event_ms(step_event);
     ctx.d3q27_f16_parity = 1 - ctx.d3q27_f16_parity;
     timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
 
@@ -5626,11 +5706,16 @@ bool opencl_d3q27_f16_inplace_step(
         err |= clSetKernelArg(g_opencl.k_d3q27_f16_output_strided, 12, sizeof(OpenClFaceData), output_inlet.data());
         err |= clSetKernelArg(g_opencl.k_d3q27_f16_output_strided, 13, sizeof(cl_mem), &ctx.d_d3q27_f16_output);
         if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_d3q27_f16_output_strided)", err);
-        err = enqueue_kernel_1d(g_opencl.k_d3q27_f16_output_strided, cells_i32);
+        cl_event output_event = nullptr;
+        err = enqueue_kernel_1d(g_opencl.k_d3q27_f16_output_strided, cells_i32, &output_event);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_d3q27_f16_output_strided)", err);
+        timing.gpu_output_ms += profiled_event_ms(output_event);
         auto readback_begin = Clock::now();
-        err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_d3q27_f16_output, CL_TRUE, 0, output_bytes, out, 0, nullptr, nullptr);
+        cl_event readback_event = nullptr;
+        err = clEnqueueReadBuffer(g_opencl.queue, ctx.d_d3q27_f16_output, CL_TRUE, 0, output_bytes, out, 0, nullptr, &readback_event);
         if (err != CL_SUCCESS) return fail_cl("clEnqueueReadBuffer(d_d3q27_f16_output)", err);
+        timing.gpu_readback_ms += profiled_event_ms(readback_event);
+        timing.readback_bytes += static_cast<std::uint64_t>(output_bytes);
         timing.readback_ms += elapsed_ms(readback_begin, Clock::now());
     }
 
