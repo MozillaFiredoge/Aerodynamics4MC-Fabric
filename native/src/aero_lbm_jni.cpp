@@ -4434,14 +4434,21 @@ kernel void compact_macro_step(
     }
     u = mix(u, wind, clampf(inlet_blend, 0.0f, 1.0f));
 
-    float solid_contact = 0.0f;
-    solid_contact += (x + 1 < nx && solid[((x + 1) * ny + y) * nz + z] != 0) ? 1.0f : 0.0f;
-    solid_contact += (x - 1 >= 0 && solid[((x - 1) * ny + y) * nz + z] != 0) ? 1.0f : 0.0f;
-    solid_contact += (y + 1 < ny && solid[(x * ny + y + 1) * nz + z] != 0) ? 1.0f : 0.0f;
-    solid_contact += (y - 1 >= 0 && solid[(x * ny + y - 1) * nz + z] != 0) ? 1.0f : 0.0f;
-    solid_contact += (z + 1 < nz && solid[(x * ny + y) * nz + z + 1] != 0) ? 1.0f : 0.0f;
-    solid_contact += (z - 1 >= 0 && solid[(x * ny + y) * nz + z - 1] != 0) ? 1.0f : 0.0f;
-    u *= 1.0f - clampf(0.12f * solid_contact, 0.0f, 0.72f);
+    float solid_xp = (x + 1 < nx && solid[((x + 1) * ny + y) * nz + z] != 0) ? 1.0f : 0.0f;
+    float solid_xm = (x - 1 >= 0 && solid[((x - 1) * ny + y) * nz + z] != 0) ? 1.0f : 0.0f;
+    float solid_yp = (y + 1 < ny && solid[(x * ny + y + 1) * nz + z] != 0) ? 1.0f : 0.0f;
+    float solid_ym = (y - 1 >= 0 && solid[(x * ny + y - 1) * nz + z] != 0) ? 1.0f : 0.0f;
+    float solid_zp = (z + 1 < nz && solid[(x * ny + y) * nz + z + 1] != 0) ? 1.0f : 0.0f;
+    float solid_zm = (z - 1 >= 0 && solid[(x * ny + y) * nz + z - 1] != 0) ? 1.0f : 0.0f;
+    float solid_contact = solid_xp + solid_xm + solid_yp + solid_ym + solid_zp + solid_zm;
+    float3 solid_normal = (float3)(solid_xp - solid_xm, solid_yp - solid_ym, solid_zp - solid_zm);
+    float solid_normal_len2 = dot(solid_normal, solid_normal);
+    if (solid_normal_len2 > 0.0f) {
+        float3 n = solid_normal * rsqrt(solid_normal_len2);
+        float into_solid = fmax(dot(u, n), 0.0f);
+        u -= n * into_solid * clampf(0.68f + 0.04f * solid_contact, 0.0f, 0.92f);
+    }
+    u *= 1.0f - clampf(0.045f * solid_contact, 0.0f, 0.32f);
 
     float max_speed = fmax(0.04f, fmin(0.34641016f, fmax(speed * 1.8f, 0.18f)));
     float speed2 = dot(u, u);
@@ -4450,7 +4457,21 @@ kernel void compact_macro_step(
     }
 
     float div = (xp.x - xm.x) + (yp.y - ym.y) + (zp.z - zm.z);
-    float pressure = center.w + 0.10f * (avg.w - center.w) - 0.035f * div + 0.003f * solid_contact;
+    float3 gradp = (float3)(xp.w - xm.w, yp.w - ym.w, zp.w - zm.w) * 0.5f;
+    u -= 0.22f * gradp;
+    speed2 = dot(u, u);
+    if (speed2 > max_speed * max_speed && speed2 > 0.0f) {
+        u *= max_speed * rsqrt(speed2);
+    }
+
+    float obstacle_pressure = solid_normal_len2 > 0.0f
+        ? fmax(dot(wind, solid_normal * rsqrt(solid_normal_len2)), 0.0f)
+        : 0.0f;
+    float pressure = center.w
+        + 0.18f * (avg.w - center.w)
+        - 0.040f * div
+        + 0.0065f * obstacle_pressure
+        + 0.0015f * solid_contact;
     if (x <= 0) {
         pressure = inlet_value.w;
     } else if (x >= nx - 2) {

@@ -76,6 +76,13 @@ final class ClientL2Solver {
         1,
         CELL_COUNT
     );
+    private static final int BOUNDARY_REFERENCE_CELLS_PER_TICK = configuredInt(
+        "a4mc.clientL2.boundaryReferenceCellsPerTick",
+        "AERO_LBM_CLIENT_L2_BOUNDARY_REFERENCE_CELLS_PER_TICK",
+        BRICK_SIZE >= 128 ? 16384 : 4096,
+        1,
+        CELL_COUNT
+    );
     private static final int STATIC_CACHE_MAX_BRICKS = configuredInt(
         "a4mc.clientL2.staticCacheMaxBricks",
         "AERO_LBM_CLIENT_L2_STATIC_CACHE_MAX_BRICKS",
@@ -179,6 +186,14 @@ final class ClientL2Solver {
     private boolean stagedStaticFromCache;
     private BlockPos stagedOrigin;
     private Identifier stagedDimension;
+    private int boundaryRefreshActiveIndex = -1;
+    private int boundaryRefreshBrickX;
+    private int boundaryRefreshBrickY;
+    private int boundaryRefreshBrickZ;
+    private int boundaryRefreshCursor;
+    private float boundaryRefreshMaxCoarseSpeed;
+    private BlockPos boundaryRefreshOrigin;
+    private Identifier boundaryRefreshDimension;
     private int ticksSinceStaticRefresh = STATIC_REFRESH_TICKS;
     private long lastServerTick = Long.MIN_VALUE;
     private long lastProcessedClientGameTime = Long.MIN_VALUE;
@@ -349,6 +364,7 @@ final class ClientL2Solver {
             activeHintUploaded = false;
             buildActiveBrickSet(brickX, brickY, brickZ, localX, localY, localZ);
             cancelStagedPreparation();
+            cancelBoundaryReferenceRefresh();
             lastPublishedClientGameTime = Long.MIN_VALUE;
             lastSolveClientGameTime = Long.MIN_VALUE;
             lastBoundaryRefreshClientGameTime = Long.MIN_VALUE;
@@ -872,30 +888,48 @@ final class ClientL2Solver {
         Identifier dimensionId,
         long clientGameTime
     ) {
-        if (!hasBoundaryRefreshPending()) {
+        if (!hasBoundaryRefreshPending() && boundaryRefreshActiveIndex < 0) {
             return false;
         }
-        if (lastBoundaryRefreshClientGameTime != Long.MIN_VALUE
+        if (stagedActiveIndex >= 0) {
+            return false;
+        }
+        if (boundaryRefreshActiveIndex < 0
+            && lastBoundaryRefreshClientGameTime != Long.MIN_VALUE
             && clientGameTime - lastBoundaryRefreshClientGameTime < BOUNDARY_REFERENCE_REFRESH_MIN_TICKS) {
             return false;
         }
         for (int attempts = 0; attempts < activeBrickCount; attempts++) {
-            int index = (refreshCursor + attempts) % activeBrickCount;
+            int index = boundaryRefreshActiveIndex >= 0
+                ? boundaryRefreshActiveIndex
+                : (refreshCursor + attempts) % activeBrickCount;
             if (!activeBrickBoundaryRefreshPending[index]) {
+                if (boundaryRefreshActiveIndex >= 0) {
+                    cancelBoundaryReferenceRefresh();
+                }
                 continue;
             }
             if (!activeBrickReady[index]) {
                 activeBrickBoundaryRefreshPending[index] = false;
+                if (boundaryRefreshActiveIndex >= 0) {
+                    cancelBoundaryReferenceRefresh();
+                }
                 continue;
             }
             int brickX = activeBrickX[index];
             int brickY = activeBrickY[index];
             int brickZ = activeBrickZ[index];
             BlockPos origin = brickOrigin(brickX, brickY, brickZ);
-            CoarseSeedStats seedStats = fillFlowStateFromCoarse(dimensionId, origin);
-            if (seedStats == null) {
+            if (!boundaryReferenceRefreshMatches(index, dimensionId, brickX, brickY, brickZ)) {
+                beginBoundaryReferenceRefresh(index, dimensionId, origin, brickX, brickY, brickZ);
+            }
+            BoundaryReferenceBuildResult result = buildBoundaryReferenceCells(dimensionId);
+            if (result == BoundaryReferenceBuildResult.WAITING_FOR_COARSE) {
                 maybeLog(client, "client L2 boundary refresh waiting for coarse field");
-                return true;
+                return false;
+            }
+            if (result == BoundaryReferenceBuildResult.IN_PROGRESS) {
+                return false;
             }
             worker.submitBoundaryReference(new BoundaryReferenceCommand(
                 worldKey,
@@ -905,14 +939,105 @@ final class ClientL2Solver {
                 java.util.Arrays.copyOf(flowState, flowState.length),
                 java.util.Arrays.copyOf(airTemperature, airTemperature.length),
                 java.util.Arrays.copyOf(surfaceTemperature, surfaceTemperature.length),
-                seedStats.maxCoarseSpeedMetersPerSecond()
+                boundaryRefreshMaxCoarseSpeed
             ));
             activeBrickBoundaryRefreshPending[index] = false;
             refreshCursor = (index + 1) % activeBrickCount;
             lastBoundaryRefreshClientGameTime = clientGameTime;
-            return true;
+            cancelBoundaryReferenceRefresh();
+            return false;
         }
         return false;
+    }
+
+    private boolean boundaryReferenceRefreshMatches(
+        int activeIndex,
+        Identifier dimensionId,
+        int brickX,
+        int brickY,
+        int brickZ
+    ) {
+        return boundaryRefreshActiveIndex == activeIndex
+            && boundaryRefreshDimension != null
+            && boundaryRefreshDimension.equals(dimensionId)
+            && boundaryRefreshBrickX == brickX
+            && boundaryRefreshBrickY == brickY
+            && boundaryRefreshBrickZ == brickZ;
+    }
+
+    private void beginBoundaryReferenceRefresh(
+        int activeIndex,
+        Identifier dimensionId,
+        BlockPos origin,
+        int brickX,
+        int brickY,
+        int brickZ
+    ) {
+        boundaryRefreshActiveIndex = activeIndex;
+        boundaryRefreshDimension = dimensionId;
+        boundaryRefreshOrigin = origin;
+        boundaryRefreshBrickX = brickX;
+        boundaryRefreshBrickY = brickY;
+        boundaryRefreshBrickZ = brickZ;
+        boundaryRefreshCursor = 0;
+        boundaryRefreshMaxCoarseSpeed = 0.0f;
+        java.util.Arrays.fill(airTemperature, 0.0f);
+        java.util.Arrays.fill(surfaceTemperature, 0.0f);
+    }
+
+    private BoundaryReferenceBuildResult buildBoundaryReferenceCells(Identifier dimensionId) {
+        if (boundaryRefreshOrigin == null) {
+            return BoundaryReferenceBuildResult.WAITING_FOR_COARSE;
+        }
+        int built = 0;
+        while (boundaryRefreshCursor < CELL_COUNT && built < BOUNDARY_REFERENCE_CELLS_PER_TICK) {
+            int cell = boundaryRefreshCursor;
+            int x = cell / (BRICK_SIZE * BRICK_SIZE);
+            int rem = cell - x * BRICK_SIZE * BRICK_SIZE;
+            int y = rem / BRICK_SIZE;
+            int z = rem - y * BRICK_SIZE;
+            int base = cell * FLOW_CHANNELS;
+            if (obstacle[cell] == 0) {
+                Vec3d pos = new Vec3d(
+                    boundaryRefreshOrigin.getX() + x + 0.5,
+                    boundaryRefreshOrigin.getY() + y + 0.5,
+                    boundaryRefreshOrigin.getZ() + z + 0.5
+                );
+                AeroWindSample coarse = visualizer.sampleServerCoarseFlow(dimensionId, pos);
+                if (!coarse.hasFlow()) {
+                    return BoundaryReferenceBuildResult.WAITING_FOR_COARSE;
+                }
+                flowState[base] = coarse.velocityX() / NATIVE_VELOCITY_SCALE;
+                flowState[base + 1] = coarse.velocityY() / NATIVE_VELOCITY_SCALE;
+                flowState[base + 2] = coarse.velocityZ() / NATIVE_VELOCITY_SCALE;
+                flowState[base + 3] = coarse.pressure();
+                float speed = (float) coarse.velocity().length();
+                if (Float.isFinite(speed) && speed > boundaryRefreshMaxCoarseSpeed) {
+                    boundaryRefreshMaxCoarseSpeed = speed;
+                }
+            } else {
+                flowState[base] = 0.0f;
+                flowState[base + 1] = 0.0f;
+                flowState[base + 2] = 0.0f;
+                flowState[base + 3] = 0.0f;
+            }
+            boundaryRefreshCursor++;
+            built++;
+        }
+        return boundaryRefreshCursor >= CELL_COUNT
+            ? BoundaryReferenceBuildResult.COMPLETED
+            : BoundaryReferenceBuildResult.IN_PROGRESS;
+    }
+
+    private void cancelBoundaryReferenceRefresh() {
+        boundaryRefreshActiveIndex = -1;
+        boundaryRefreshDimension = null;
+        boundaryRefreshOrigin = null;
+        boundaryRefreshBrickX = 0;
+        boundaryRefreshBrickY = 0;
+        boundaryRefreshBrickZ = 0;
+        boundaryRefreshCursor = 0;
+        boundaryRefreshMaxCoarseSpeed = 0.0f;
     }
 
     private boolean hasBoundaryRefreshPending() {
@@ -1457,6 +1582,12 @@ final class ClientL2Solver {
         FAILED
     }
 
+    private enum BoundaryReferenceBuildResult {
+        IN_PROGRESS,
+        COMPLETED,
+        WAITING_FOR_COARSE
+    }
+
     private interface WorkerCommand {
     }
 
@@ -1916,6 +2047,7 @@ final class ClientL2Solver {
         java.util.Arrays.fill(activeBrickRefreshPending, false);
         java.util.Arrays.fill(activeBrickBoundaryRefreshPending, false);
         cancelStagedPreparation();
+        cancelBoundaryReferenceRefresh();
         lastServerTick = Long.MIN_VALUE;
         lastProcessedClientGameTime = Long.MIN_VALUE;
         lastSolveClientGameTime = Long.MIN_VALUE;
@@ -1953,7 +2085,9 @@ final class ClientL2Solver {
             + " maxActive=" + MAX_CLIENT_ACTIVE_BRICKS
             + " prepBudget=" + STATIC_BUILD_CELLS_PER_TICK
             + " seedBudget=" + COARSE_SEED_CELLS_PER_TICK
+            + " boundaryBudget=" + BOUNDARY_REFERENCE_CELLS_PER_TICK
             + " prep=" + stagedPreparationStatus()
+            + " boundaryPrep=" + boundaryReferenceRefreshStatus()
             + " fastSuspendUntil=" + fastSuspendUntilGameTime
             + " lastServerTick=" + lastServerTick;
     }
@@ -1984,6 +2118,15 @@ final class ClientL2Solver {
             + ":seed=" + stagedSeedCursor + "/" + CELL_COUNT
             + ":staticUploaded=" + stagedStaticUploaded
             + ":dynamicUploaded=" + stagedDynamicUploaded;
+    }
+
+    private String boundaryReferenceRefreshStatus() {
+        if (boundaryRefreshActiveIndex < 0) {
+            return "idle";
+        }
+        return boundaryRefreshBrickX + "," + boundaryRefreshBrickY + "," + boundaryRefreshBrickZ
+            + ":cells=" + boundaryRefreshCursor + "/" + CELL_COUNT
+            + ":maxCoarse=" + String.format("%.3f", boundaryRefreshMaxCoarseSpeed);
     }
 
     void setExperimentalEnabled(boolean enabled) {
