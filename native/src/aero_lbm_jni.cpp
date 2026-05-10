@@ -21,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(AERO_LBM_OPENCL) && !defined(CL_TARGET_OPENCL_VERSION)
@@ -576,6 +577,9 @@ struct ContextState {
     int d3q27_f16_parity = 0;
     cl_mem d_d3q27_f16 = nullptr;
     cl_mem d_d3q27_f16_solid = nullptr;
+    cl_mem d_d3q27_f16_cell_class = nullptr;
+    cl_mem d_d3q27_f16_fan_dir = nullptr;
+    cl_mem d_d3q27_f16_active_cells = nullptr;
     cl_mem d_d3q27_f16_output = nullptr;
     std::size_t d3q27_f16_output_bytes = 0;
 #endif
@@ -583,7 +587,14 @@ struct ContextState {
     std::vector<uint8_t> compact_solid_cache;
     std::vector<std::uint16_t> compact_state_staging;
     std::vector<uint8_t> d3q27_f16_solid_staging;
+    std::vector<uint8_t> d3q27_f16_cell_class_staging;
+    std::vector<uint8_t> d3q27_f16_fan_dir_staging;
+    std::vector<std::int32_t> d3q27_f16_active_cells_staging;
     std::vector<std::uint16_t> d3q27_f16_staging;
+    std::uint64_t d3q27_f16_active_cells = 0;
+    std::uint64_t d3q27_f16_bulk_cells = 0;
+    std::uint64_t d3q27_f16_boundary_cells = 0;
+    std::uint64_t d3q27_f16_solid_cells = 0;
 };
 
 Config g_cfg;
@@ -604,6 +615,11 @@ struct StepTiming {
     std::uint64_t readback_bytes = 0;
     std::uint64_t full_packet_steps = 0;
     std::uint64_t cached_steps = 0;
+    std::uint64_t active_cells = 0;
+    std::uint64_t dispatch_cells = 0;
+    std::uint64_t bulk_cells = 0;
+    std::uint64_t boundary_cells = 0;
+    std::uint64_t solid_cells = 0;
     std::string path;
 };
 
@@ -1141,7 +1157,12 @@ std::string timing_info_string() {
         << ",avg_upload=" << static_cast<double>(g_timing.upload_bytes_sum) * inv
         << ",avg_readback=" << static_cast<double>(g_timing.readback_bytes_sum) * inv << ")"
         << " steps(full_packet=" << g_timing.full_packet_steps
-        << ",cached=" << g_timing.cached_steps << ")";
+        << ",cached=" << g_timing.cached_steps << ")"
+        << " cells(active=" << g_timing.last.active_cells
+        << ",dispatch=" << g_timing.last.dispatch_cells
+        << ",bulk=" << g_timing.last.bulk_cells
+        << ",boundary=" << g_timing.last.boundary_cells
+        << ",solid=" << g_timing.last.solid_cells << ")";
     return oss.str();
 }
 
@@ -2569,6 +2590,8 @@ struct OpenClRuntime {
     cl_kernel k_stream_collide_hydro_forced = nullptr;
     cl_kernel k_d3q27_f16_step_even = nullptr;
     cl_kernel k_d3q27_f16_step_odd = nullptr;
+    cl_kernel k_d3q27_f16_patch_static = nullptr;
+    cl_kernel k_d3q27_f16_reset_patched = nullptr;
     cl_kernel k_d3q27_f16_output_strided = nullptr;
     cl_kernel k_compact_macro_step = nullptr;
     cl_kernel k_compact_output = nullptr;
@@ -2579,9 +2602,12 @@ struct OpenClRuntime {
 
 OpenClRuntime g_opencl;
 
-const char* kOpenClSource =
+const char* kOpenClSourceParts[] = {
 R"CLC(
 #define KQ 27
+#define D3Q27_CELL_SOLID 0
+#define D3Q27_CELL_BOUNDARY 1
+#define D3Q27_CELL_BULK 2
 #define MI(a, b, c) (((a) * 3 + (b)) * 3 + (c))
 
 __constant int CX[KQ] = {
@@ -2923,7 +2949,7 @@ inline float benchmark_boundary_value(
     }
 }
 
-)CLC"
+)CLC",
 R"CLC(
 inline float temperature_or_self(
     __global const float* temp,
@@ -3314,7 +3340,7 @@ kernel void apply_temperature_reference(
     temperature[cell] = clampf(mix(temperature[cell], ref_temperature, local_state_nudge), THERMAL_MIN, THERMAL_MAX);
 }
 
-)CLC"
+)CLC",
 R"CLC(
 kernel void thermal_bfecc_forward(
     __global const float* payload,
@@ -3685,7 +3711,7 @@ kernel void stream_collide_hydro_forced_step(
         uz *= scale;
     }
 
-)CLC"
+)CLC",
 R"CLC(
     float raw[27];
     float central_pre[27];
@@ -3861,7 +3887,7 @@ R"CLC(
     }
 }
 
- )CLC"
+ )CLC",
 R"CLC(
 kernel void stream_collide_tgv_step(
     __global const float* f_read,
@@ -4065,7 +4091,7 @@ kernel void stream_collide_tgv_step(
     }
 }
 
-)CLC"
+)CLC",
 R"CLC(
 kernel void stream_collide_hydro_benchmark_step(
     __global const float* f_read,
@@ -4341,7 +4367,7 @@ kernel void stream_collide_hydro_benchmark_step(
     }
 }
 
-)CLC"
+)CLC",
 R"CLC(
 inline float half_bits_to_float(ushort h) {
     uint sign = ((uint)h & 0x8000u) << 16;
@@ -4414,7 +4440,40 @@ inline void d3q27_f16_store(__global ushort* f, int q, int cells, int cell, floa
     f[q * cells + cell] = float_to_half_bits_opencl(value);
 }
 
-inline void d3q27_f16_collide_srt(float fi[KQ], float omega, float4 inlet_value, int inlet_blend) {
+inline float3 d3q27_fan_unit_vector(uchar fan_dir) {
+    switch (fan_dir) {
+        case 1: return (float3)(-1.0f, 0.0f, 0.0f);
+        case 2: return (float3)(1.0f, 0.0f, 0.0f);
+        case 3: return (float3)(0.0f, -1.0f, 0.0f);
+        case 4: return (float3)(0.0f, 1.0f, 0.0f);
+        case 5: return (float3)(0.0f, 0.0f, -1.0f);
+        case 6: return (float3)(0.0f, 0.0f, 1.0f);
+        default: return (float3)(0.0f, 0.0f, 0.0f);
+    }
+}
+
+inline void d3q27_f16_apply_fan_force(uchar fan_dir, float* ux, float* uy, float* uz) {
+    if (fan_dir == 0) return;
+    float3 n = d3q27_fan_unit_vector(fan_dir);
+    float target_speed = clampf(4.0f * FAN_TARGET_SCALE, 0.0f, FAN_TARGET_MAX);
+    float u_para = (*ux) * n.x + (*uy) * n.y + (*uz) * n.z;
+    float u_perp_x = (*ux) - u_para * n.x;
+    float u_perp_y = (*uy) - u_para * n.y;
+    float u_perp_z = (*uz) - u_para * n.z;
+    float axial_push = fmax(0.0f, target_speed - u_para);
+    float speed_pre = sqrt((*ux) * (*ux) + (*uy) * (*uy) + (*uz) * (*uz));
+    float speed_damp = 1.0f;
+    if (speed_pre > FAN_SPEED_SOFT_CAP) {
+        float r = (speed_pre - FAN_SPEED_SOFT_CAP) / fmax(1.0e-4f, FAN_SPEED_DAMP_WIDTH);
+        speed_damp = 1.0f / (1.0f + r * r);
+    }
+    float beta = FAN_BETA * speed_damp;
+    *ux += 0.5f * beta * (axial_push * n.x - FAN_PERP_DAMP * u_perp_x);
+    *uy += 0.5f * beta * (axial_push * n.y - FAN_PERP_DAMP * u_perp_y);
+    *uz += 0.5f * beta * (axial_push * n.z - FAN_PERP_DAMP * u_perp_z);
+}
+
+inline void d3q27_f16_collide_srt(float fi[KQ], float omega, float4 inlet_value, int inlet_blend, uchar fan_dir) {
     float rho = 0.0f;
     float ux = 0.0f;
     float uy = 0.0f;
@@ -4437,6 +4496,8 @@ inline void d3q27_f16_collide_srt(float fi[KQ], float omega, float4 inlet_value,
         uy = inlet_value.y;
         uz = inlet_value.z;
         rho = clampf(1.0f + inlet_value.w, RHO_MIN, RHO_MAX);
+    } else {
+        d3q27_f16_apply_fan_force(fan_dir, &ux, &uy, &uz);
     }
     float speed2 = ux * ux + uy * uy + uz * uz;
     if (!isfinite(speed2) || speed2 > MAX_SPEED * MAX_SPEED) {
@@ -4458,6 +4519,11 @@ inline void d3q27_f16_collide_srt(float fi[KQ], float omega, float4 inlet_value,
 kernel void d3q27_f16_step_even(
     __global ushort* f,
     __global const uchar* solid,
+    __global const uchar* cell_class,
+    __global const uchar* fan_dir,
+    __global const int* active_cells,
+    int active_count,
+    int active_mode,
     int nx,
     int ny,
     int nz,
@@ -4465,12 +4531,12 @@ kernel void d3q27_f16_step_even(
     float omega,
     float4 inlet_value
 ) {
-    int cell = (int)get_global_id(0);
-    if (cell >= cells) return;
-    if (solid[cell] != 0) {
-        for (int q = 0; q < KQ; ++q) {
-            d3q27_f16_store(f, q, cells, cell, 0.0f);
-        }
+    int work_index = (int)get_global_id(0);
+    int work_count = active_mode != 0 ? active_count : cells;
+    if (work_index >= work_count) return;
+    int cell = active_mode != 0 ? active_cells[work_index] : work_index;
+    if (cell < 0 || cell >= cells) return;
+    if (cell_class[cell] == D3Q27_CELL_SOLID || solid[cell] != 0) {
         return;
     }
 
@@ -4480,7 +4546,7 @@ kernel void d3q27_f16_step_even(
     for (int q = 0; q < KQ; ++q) {
         fi[q] = d3q27_f16_load(f, q, cells, cell);
     }
-    d3q27_f16_collide_srt(fi, omega, inlet_value, x <= 0 ? 1 : 0);
+    d3q27_f16_collide_srt(fi, omega, inlet_value, x <= 0 ? 1 : 0, fan_dir[cell]);
     for (int q = 0; q < KQ; ++q) {
         d3q27_f16_store(f, OPP[q], cells, cell, fi[q]);
     }
@@ -4489,6 +4555,11 @@ kernel void d3q27_f16_step_even(
 kernel void d3q27_f16_step_odd(
     __global ushort* f,
     __global const uchar* solid,
+    __global const uchar* cell_class,
+    __global const uchar* fan_dir,
+    __global const int* active_cells,
+    int active_count,
+    int active_mode,
     int nx,
     int ny,
     int nz,
@@ -4496,18 +4567,36 @@ kernel void d3q27_f16_step_odd(
     float omega,
     float4 inlet_value
 ) {
-    int cell = (int)get_global_id(0);
-    if (cell >= cells) return;
+    int work_index = (int)get_global_id(0);
+    int work_count = active_mode != 0 ? active_count : cells;
+    if (work_index >= work_count) return;
+    int cell = active_mode != 0 ? active_cells[work_index] : work_index;
+    if (cell < 0 || cell >= cells) return;
+
+    uchar cls = cell_class[cell];
+    if (cls == D3Q27_CELL_SOLID || solid[cell] != 0) {
+        return;
+    }
 
     int yz = ny * nz;
+    if (cls == D3Q27_CELL_BULK) {
+        float fi[KQ];
+        for (int q = 0; q < KQ; ++q) {
+            int delta = CX[q] * yz + CY[q] * nz + CZ[q];
+            fi[q] = d3q27_f16_load(f, OPP[q], cells, cell - delta);
+        }
+        d3q27_f16_collide_srt(fi, omega, inlet_value, 0, fan_dir[cell]);
+        for (int q = 0; q < KQ; ++q) {
+            int delta = CX[q] * yz + CY[q] * nz + CZ[q];
+            d3q27_f16_store(f, q, cells, cell + delta, fi[q]);
+        }
+        return;
+    }
+
     int x = cell / yz;
     int rem = cell - x * yz;
     int y = rem / nz;
     int z = rem - y * nz;
-
-    if (solid[cell] != 0) {
-        return;
-    }
 
     float fi[KQ];
     for (int q = 0; q < KQ; ++q) {
@@ -4526,7 +4615,7 @@ kernel void d3q27_f16_step_odd(
         }
     }
 
-    d3q27_f16_collide_srt(fi, omega, inlet_value, x <= 0 ? 1 : 0);
+    d3q27_f16_collide_srt(fi, omega, inlet_value, x <= 0 ? 1 : 0, fan_dir[cell]);
 
     float boundary_rho = clampf(1.0f + inlet_value.w, RHO_MIN, RHO_MAX);
     for (int q = 0; q < KQ; ++q) {
@@ -4543,6 +4632,61 @@ kernel void d3q27_f16_step_odd(
             d3q27_f16_store(f, OPP[q], cells, cell, fi[q]);
         } else {
             d3q27_f16_store(f, q, cells, dst, fi[q]);
+        }
+    }
+}
+
+kernel void d3q27_f16_reset_patched_cells(
+    __global ushort* f,
+    __global const uchar* solid,
+    __global const int* patch_cells,
+    int patch_count,
+    int cells
+) {
+    int index = (int)get_global_id(0);
+    if (index >= patch_count) return;
+    int cell = patch_cells[index];
+    if (cell < 0 || cell >= cells) return;
+    if (solid[cell] != 0) {
+        for (int q = 0; q < KQ; ++q) {
+            d3q27_f16_store(f, q, cells, cell, 0.0f);
+        }
+    } else {
+        for (int q = 0; q < KQ; ++q) {
+            d3q27_f16_store(f, q, cells, cell, feq(q, 1.0f, 0.0f, 0.0f, 0.0f));
+        }
+    }
+}
+
+kernel void d3q27_f16_patch_static_fields(
+    __global uchar* solid,
+    __global uchar* cell_class,
+    __global uchar* fan_dir,
+    __global const int* patch_cells,
+    __global const uchar* patch_solid,
+    __global const uchar* patch_fan_dir,
+    int patch_count,
+    __global const int* class_cells,
+    __global const uchar* class_values,
+    int class_count,
+    int cells
+) {
+    int index = (int)get_global_id(0);
+    if (index < patch_count) {
+        int cell = patch_cells[index];
+        if (cell >= 0 && cell < cells) {
+            uchar next_solid = patch_solid[index] != 0 ? (uchar)1 : (uchar)0;
+            uchar next_fan = patch_fan_dir[index];
+            solid[cell] = next_solid;
+            fan_dir[cell] = next_solid != 0
+                ? (uchar)0
+                : (next_fan > (uchar)6 ? (uchar)6 : next_fan);
+        }
+    }
+    if (index < class_count) {
+        int cell = class_cells[index];
+        if (cell >= 0 && cell < cells) {
+            cell_class[cell] = class_values[index];
         }
     }
 }
@@ -4643,6 +4787,8 @@ kernel void d3q27_f16_output_macro_strided(
     for (int c = 4; c < out_ch; ++c) out[out_base + c] = 0.0f;
 }
 
+)CLC",
+R"CLC(
 inline float4 compact_neighbor_or_boundary(
     __global const ushort4* state,
     __global const uchar* solid,
@@ -4836,7 +4982,7 @@ kernel void compact_output_macro_strided(
     out[out_base + 3] = clampf(value.w, P_MIN, P_MAX);
 }
 
-)CLC"
+)CLC",
 R"CLC(
 kernel void output_macro(
     __global const float* f, __global const float* payload,
@@ -4940,7 +5086,17 @@ kernel void output_macro_strided(
     out[out_base + 2] = vz;
     out[out_base + 3] = rho - 1.0f;
 }
-)CLC";
+)CLC",
+nullptr
+};
+
+cl_uint opencl_source_part_count() {
+    cl_uint count = 0;
+    while (kOpenClSourceParts[count] != nullptr) {
+        ++count;
+    }
+    return count;
+}
 
 // const char* cl_error_to_string(cl_int err) {
 //     switch (err) {
@@ -5006,6 +5162,8 @@ void release_opencl_runtime() {
     if (g_opencl.k_compact_output) clReleaseKernel(g_opencl.k_compact_output);
     if (g_opencl.k_compact_macro_step) clReleaseKernel(g_opencl.k_compact_macro_step);
     if (g_opencl.k_d3q27_f16_output_strided) clReleaseKernel(g_opencl.k_d3q27_f16_output_strided);
+    if (g_opencl.k_d3q27_f16_reset_patched) clReleaseKernel(g_opencl.k_d3q27_f16_reset_patched);
+    if (g_opencl.k_d3q27_f16_patch_static) clReleaseKernel(g_opencl.k_d3q27_f16_patch_static);
     if (g_opencl.k_d3q27_f16_step_odd) clReleaseKernel(g_opencl.k_d3q27_f16_step_odd);
     if (g_opencl.k_d3q27_f16_step_even) clReleaseKernel(g_opencl.k_d3q27_f16_step_even);
     if (g_opencl.k_apply_temperature_reference) clReleaseKernel(g_opencl.k_apply_temperature_reference);
@@ -5023,14 +5181,33 @@ void release_opencl_runtime() {
     g_opencl = OpenClRuntime{};
 }
 
-void release_context_gpu_buffers(ContextState& ctx) {
+void release_context_d3q27_f16_buffers(ContextState& ctx) {
     if (ctx.d_d3q27_f16_output) clReleaseMemObject(ctx.d_d3q27_f16_output);
+    if (ctx.d_d3q27_f16_active_cells) clReleaseMemObject(ctx.d_d3q27_f16_active_cells);
+    if (ctx.d_d3q27_f16_fan_dir) clReleaseMemObject(ctx.d_d3q27_f16_fan_dir);
+    if (ctx.d_d3q27_f16_cell_class) clReleaseMemObject(ctx.d_d3q27_f16_cell_class);
     if (ctx.d_d3q27_f16_solid) clReleaseMemObject(ctx.d_d3q27_f16_solid);
     if (ctx.d_d3q27_f16) clReleaseMemObject(ctx.d_d3q27_f16);
+    ctx.d_d3q27_f16_output = ctx.d_d3q27_f16_active_cells = ctx.d_d3q27_f16_fan_dir = ctx.d_d3q27_f16_cell_class = ctx.d_d3q27_f16_solid = ctx.d_d3q27_f16 = nullptr;
+    ctx.d3q27_f16_buffers_ready = false;
+    ctx.d3q27_f16_initialized = false;
+    ctx.d3q27_f16_parity = 0;
+    ctx.d3q27_f16_output_bytes = 0;
+}
+
+void release_context_compact_gpu_buffers(ContextState& ctx) {
     if (ctx.d_compact_output) clReleaseMemObject(ctx.d_compact_output);
     if (ctx.d_compact_solid) clReleaseMemObject(ctx.d_compact_solid);
     if (ctx.d_compact_state_next) clReleaseMemObject(ctx.d_compact_state_next);
     if (ctx.d_compact_state) clReleaseMemObject(ctx.d_compact_state);
+    ctx.d_compact_output = ctx.d_compact_solid = ctx.d_compact_state_next = ctx.d_compact_state = nullptr;
+    ctx.compact_buffers_ready = false;
+    ctx.compact_initialized = false;
+    ctx.compact_output_ready = false;
+    ctx.compact_output_bytes = 0;
+}
+
+void release_context_classic_gpu_buffers(ContextState& ctx) {
     if (ctx.d_thermal_f_post) clReleaseMemObject(ctx.d_thermal_f_post);
     if (ctx.d_thermal_f) clReleaseMemObject(ctx.d_thermal_f);
     if (ctx.d_temp_scratch) clReleaseMemObject(ctx.d_temp_scratch);
@@ -5040,18 +5217,144 @@ void release_context_gpu_buffers(ContextState& ctx) {
     if (ctx.d_f_post) clReleaseMemObject(ctx.d_f_post);
     if (ctx.d_f) clReleaseMemObject(ctx.d_f);
     if (ctx.d_payload) clReleaseMemObject(ctx.d_payload);
-    ctx.d_d3q27_f16_output = ctx.d_d3q27_f16_solid = ctx.d_d3q27_f16 = nullptr;
-    ctx.d_compact_output = ctx.d_compact_solid = ctx.d_compact_state_next = ctx.d_compact_state = nullptr;
     ctx.d_thermal_f_post = ctx.d_thermal_f = ctx.d_temp_scratch = ctx.d_temp_next = ctx.d_temp = ctx.d_output = ctx.d_f_post = ctx.d_f = ctx.d_payload = nullptr;
-    ctx.compact_buffers_ready = false;
-    ctx.compact_initialized = false;
-    ctx.compact_output_ready = false;
-    ctx.compact_output_bytes = 0;
-    ctx.d3q27_f16_buffers_ready = false;
-    ctx.d3q27_f16_initialized = false;
-    ctx.d3q27_f16_parity = 0;
-    ctx.d3q27_f16_output_bytes = 0;
-    ctx.gpu_buffers_ready = ctx.gpu_initialized = false;
+    ctx.gpu_buffers_ready = false;
+    ctx.gpu_initialized = false;
+}
+
+void release_context_gpu_buffers(ContextState& ctx) {
+    release_context_d3q27_f16_buffers(ctx);
+    release_context_compact_gpu_buffers(ctx);
+    release_context_classic_gpu_buffers(ctx);
+}
+
+struct GpuMemoryStats {
+    std::uint64_t contexts = 0;
+    std::uint64_t cells = 0;
+    std::uint64_t total = 0;
+    std::uint64_t d3q27_dist = 0;
+    std::uint64_t d3q27_solid = 0;
+    std::uint64_t d3q27_class = 0;
+    std::uint64_t d3q27_fan = 0;
+    std::uint64_t d3q27_active = 0;
+    std::uint64_t d3q27_output = 0;
+    std::uint64_t compact_state = 0;
+    std::uint64_t compact_solid = 0;
+    std::uint64_t compact_output = 0;
+    std::uint64_t classic_payload = 0;
+    std::uint64_t classic_dist = 0;
+    std::uint64_t classic_output = 0;
+    std::uint64_t classic_temperature = 0;
+    std::uint64_t classic_thermal_dist = 0;
+};
+
+inline void add_gpu_bytes(std::uint64_t bytes, std::uint64_t& bucket, GpuMemoryStats& stats) {
+    bucket += bytes;
+    stats.total += bytes;
+}
+
+GpuMemoryStats collect_gpu_memory_stats() {
+    GpuMemoryStats stats;
+    std::lock_guard<SpinMutex> lock(g_contexts_mutex);
+    for (const auto& entry : g_contexts) {
+        const ContextState& ctx = entry.second;
+        if (ctx.cells == 0) {
+            continue;
+        }
+        stats.contexts++;
+        stats.cells += static_cast<std::uint64_t>(ctx.cells);
+
+        if (ctx.d_d3q27_f16) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * kQ * sizeof(std::uint16_t), stats.d3q27_dist, stats);
+        }
+        if (ctx.d_d3q27_f16_solid) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(std::uint8_t), stats.d3q27_solid, stats);
+        }
+        if (ctx.d_d3q27_f16_cell_class) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(std::uint8_t), stats.d3q27_class, stats);
+        }
+        if (ctx.d_d3q27_f16_fan_dir) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(std::uint8_t), stats.d3q27_fan, stats);
+        }
+        if (ctx.d_d3q27_f16_active_cells) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(std::int32_t), stats.d3q27_active, stats);
+        }
+        if (ctx.d_d3q27_f16_output) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.d3q27_f16_output_bytes), stats.d3q27_output, stats);
+        }
+
+        if (ctx.d_compact_state) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * 4u * sizeof(std::uint16_t), stats.compact_state, stats);
+        }
+        if (ctx.d_compact_state_next) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * 4u * sizeof(std::uint16_t), stats.compact_state, stats);
+        }
+        if (ctx.d_compact_solid) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(std::uint8_t), stats.compact_solid, stats);
+        }
+        if (ctx.d_compact_output) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.compact_output_bytes), stats.compact_output, stats);
+        }
+
+        if (ctx.d_payload) {
+            add_gpu_bytes(
+                static_cast<std::uint64_t>(ctx.cells) * static_cast<std::uint64_t>(g_cfg.input_channels) * sizeof(float),
+                stats.classic_payload,
+                stats
+            );
+        }
+        if (ctx.d_f) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * kQ * sizeof(float), stats.classic_dist, stats);
+        }
+        if (ctx.d_f_post) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * kQ * sizeof(float), stats.classic_dist, stats);
+        }
+        if (ctx.d_output) {
+            add_gpu_bytes(
+                static_cast<std::uint64_t>(ctx.cells) * static_cast<std::uint64_t>(g_cfg.output_channels) * sizeof(float),
+                stats.classic_output,
+                stats
+            );
+        }
+        if (ctx.d_temp) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(float), stats.classic_temperature, stats);
+        }
+        if (ctx.d_temp_next) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(float), stats.classic_temperature, stats);
+        }
+        if (ctx.d_temp_scratch) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(float), stats.classic_temperature, stats);
+        }
+        if (ctx.d_thermal_f) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * kThermalQ * sizeof(float), stats.classic_thermal_dist, stats);
+        }
+        if (ctx.d_thermal_f_post) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * kThermalQ * sizeof(float), stats.classic_thermal_dist, stats);
+        }
+    }
+    return stats;
+}
+
+std::string memory_info_string() {
+    const GpuMemoryStats stats = collect_gpu_memory_stats();
+    return "gpu_bytes(total=" + std::to_string(stats.total)
+        + ",d3q27_dist=" + std::to_string(stats.d3q27_dist)
+        + ",d3q27_solid=" + std::to_string(stats.d3q27_solid)
+        + ",d3q27_class=" + std::to_string(stats.d3q27_class)
+        + ",d3q27_fan=" + std::to_string(stats.d3q27_fan)
+        + ",d3q27_active=" + std::to_string(stats.d3q27_active)
+        + ",d3q27_output=" + std::to_string(stats.d3q27_output)
+        + ",compact_state=" + std::to_string(stats.compact_state)
+        + ",compact_solid=" + std::to_string(stats.compact_solid)
+        + ",compact_output=" + std::to_string(stats.compact_output)
+        + ",classic_payload=" + std::to_string(stats.classic_payload)
+        + ",classic_dist=" + std::to_string(stats.classic_dist)
+        + ",classic_output=" + std::to_string(stats.classic_output)
+        + ",classic_temperature=" + std::to_string(stats.classic_temperature)
+        + ",classic_thermal_dist=" + std::to_string(stats.classic_thermal_dist)
+        + ",contexts=" + std::to_string(stats.contexts)
+        + ",cells=" + std::to_string(stats.cells)
+        + ")";
 }
 
 bool initialize_opencl_runtime() {
@@ -5090,9 +5393,14 @@ bool initialize_opencl_runtime() {
     cl_command_queue queue = clCreateCommandQueue(context, selected_device, CL_QUEUE_PROFILING_ENABLE, &err);
     if (err != CL_SUCCESS) { clReleaseContext(context); return false; }
 
-    const char* src = kOpenClSource;
-    const size_t src_len = std::strlen(kOpenClSource);
-    cl_program program = clCreateProgramWithSource(context, 1, &src, &src_len, &err);
+    const cl_uint source_part_count = opencl_source_part_count();
+    cl_program program = clCreateProgramWithSource(
+        context,
+        source_part_count,
+        kOpenClSourceParts,
+        nullptr,
+        &err
+    );
     if (err != CL_SUCCESS) { clReleaseCommandQueue(queue); clReleaseContext(context); return false; }
 
     err = clBuildProgram(program, 1, &selected_device, "-cl-fast-relaxed-math", nullptr, nullptr);
@@ -5115,6 +5423,8 @@ bool initialize_opencl_runtime() {
     cl_kernel k_stream_collide_hydro_forced = clCreateKernel(program, "stream_collide_hydro_forced_step", &err);
     cl_kernel k_d3q27_f16_step_even = clCreateKernel(program, "d3q27_f16_step_even", &err);
     cl_kernel k_d3q27_f16_step_odd = clCreateKernel(program, "d3q27_f16_step_odd", &err);
+    cl_kernel k_d3q27_f16_patch_static = clCreateKernel(program, "d3q27_f16_patch_static_fields", &err);
+    cl_kernel k_d3q27_f16_reset_patched = clCreateKernel(program, "d3q27_f16_reset_patched_cells", &err);
     cl_kernel k_d3q27_f16_output_strided = clCreateKernel(program, "d3q27_f16_output_macro_strided", &err);
     cl_kernel k_compact_macro_step = clCreateKernel(program, "compact_macro_step", &err);
     cl_kernel k_compact_output = clCreateKernel(program, "compact_output_macro", &err);
@@ -5124,7 +5434,7 @@ bool initialize_opencl_runtime() {
 
     if (!k_init || !k_apply_temperature_reference || !k_thermal_bfecc_forward || !k_thermal_bfecc_correct || !k_thermal_bfecc_finalize
         || !k_stream_collide_tgv || !k_stream_collide_hydro_bench || !k_stream_collide_hydro_forced
-        || !k_d3q27_f16_step_even || !k_d3q27_f16_step_odd || !k_d3q27_f16_output_strided
+        || !k_d3q27_f16_step_even || !k_d3q27_f16_step_odd || !k_d3q27_f16_patch_static || !k_d3q27_f16_reset_patched || !k_d3q27_f16_output_strided
         || !k_compact_macro_step || !k_compact_output || !k_compact_output_strided || !k_output
         || !k_output_strided) {
         if (k_init) clReleaseKernel(k_init);
@@ -5137,6 +5447,8 @@ bool initialize_opencl_runtime() {
         if (k_stream_collide_hydro_forced) clReleaseKernel(k_stream_collide_hydro_forced);
         if (k_d3q27_f16_step_even) clReleaseKernel(k_d3q27_f16_step_even);
         if (k_d3q27_f16_step_odd) clReleaseKernel(k_d3q27_f16_step_odd);
+        if (k_d3q27_f16_patch_static) clReleaseKernel(k_d3q27_f16_patch_static);
+        if (k_d3q27_f16_reset_patched) clReleaseKernel(k_d3q27_f16_reset_patched);
         if (k_d3q27_f16_output_strided) clReleaseKernel(k_d3q27_f16_output_strided);
         if (k_compact_macro_step) clReleaseKernel(k_compact_macro_step);
         if (k_compact_output) clReleaseKernel(k_compact_output);
@@ -5158,6 +5470,8 @@ bool initialize_opencl_runtime() {
     g_opencl.k_stream_collide_hydro_forced = k_stream_collide_hydro_forced;
     g_opencl.k_d3q27_f16_step_even = k_d3q27_f16_step_even;
     g_opencl.k_d3q27_f16_step_odd = k_d3q27_f16_step_odd;
+    g_opencl.k_d3q27_f16_patch_static = k_d3q27_f16_patch_static;
+    g_opencl.k_d3q27_f16_reset_patched = k_d3q27_f16_reset_patched;
     g_opencl.k_d3q27_f16_output_strided = k_d3q27_f16_output_strided;
     g_opencl.k_compact_macro_step = k_compact_macro_step;
     g_opencl.k_compact_output = k_compact_output;
@@ -5171,6 +5485,8 @@ bool initialize_opencl_runtime() {
 
 bool ensure_context_gpu_buffers(ContextState& ctx) {
     if (!g_opencl.available || ctx.cells == 0) return false;
+    release_context_d3q27_f16_buffers(ctx);
+    release_context_compact_gpu_buffers(ctx);
     if (ctx.gpu_buffers_ready) return true;
 
     const std::size_t payload_bytes = ctx.cells * g_cfg.input_channels * sizeof(float);
@@ -5316,6 +5632,16 @@ bool d3q27_f16_inplace_env_enabled() {
         && std::strcmp(value, "OFF") != 0;
 }
 
+bool d3q27_f16_active_dispatch_env_enabled() {
+    const char* value = std::getenv("AERO_LBM_D3Q27_FP16_ACTIVE_DISPATCH");
+    return value
+        && (std::strcmp(value, "1") == 0
+            || std::strcmp(value, "true") == 0
+            || std::strcmp(value, "TRUE") == 0
+            || std::strcmp(value, "on") == 0
+            || std::strcmp(value, "ON") == 0);
+}
+
 bool d3q27_f16_inplace_path_enabled(int overlay_count) {
     return d3q27_f16_inplace_env_enabled()
         && benchmark_mode_active()
@@ -5358,9 +5684,13 @@ bool ensure_d3q27_f16_output_buffer(ContextState& ctx, std::size_t output_bytes)
 
 bool ensure_d3q27_f16_buffers(ContextState& ctx, bool wants_output, std::size_t output_bytes) {
     if (!g_opencl.available || ctx.cells == 0) return false;
+    release_context_classic_gpu_buffers(ctx);
+    release_context_compact_gpu_buffers(ctx);
     if (!ctx.d3q27_f16_buffers_ready) {
         const std::size_t dist_bytes = ctx.cells * kQ * sizeof(std::uint16_t);
         const std::size_t solid_bytes = ctx.cells * sizeof(std::uint8_t);
+        const std::size_t class_bytes = ctx.cells * sizeof(std::uint8_t);
+        const std::size_t fan_bytes = ctx.cells * sizeof(std::uint8_t);
         cl_int err = CL_SUCCESS;
         ctx.d_d3q27_f16 = clCreateBuffer(g_opencl.context, CL_MEM_READ_WRITE, dist_bytes, nullptr, &err);
         if (err != CL_SUCCESS || !ctx.d_d3q27_f16) {
@@ -5374,11 +5704,58 @@ bool ensure_d3q27_f16_buffers(ContextState& ctx, bool wants_output, std::size_t 
             release_context_gpu_buffers(ctx);
             return false;
         }
+        ctx.d_d3q27_f16_cell_class = clCreateBuffer(g_opencl.context, CL_MEM_READ_ONLY, class_bytes, nullptr, &err);
+        if (err != CL_SUCCESS || !ctx.d_d3q27_f16_cell_class) {
+            g_opencl.error = format_opencl_api_error("clCreateBuffer(d_d3q27_f16_cell_class)", err);
+            release_context_gpu_buffers(ctx);
+            return false;
+        }
+        ctx.d_d3q27_f16_fan_dir = clCreateBuffer(g_opencl.context, CL_MEM_READ_ONLY, fan_bytes, nullptr, &err);
+        if (err != CL_SUCCESS || !ctx.d_d3q27_f16_fan_dir) {
+            g_opencl.error = format_opencl_api_error("clCreateBuffer(d_d3q27_f16_fan_dir)", err);
+            release_context_gpu_buffers(ctx);
+            return false;
+        }
+        if (d3q27_f16_active_dispatch_env_enabled()) {
+            const std::size_t active_bytes = ctx.cells * sizeof(std::int32_t);
+            ctx.d_d3q27_f16_active_cells = clCreateBuffer(g_opencl.context, CL_MEM_READ_ONLY, active_bytes, nullptr, &err);
+            if (err != CL_SUCCESS || !ctx.d_d3q27_f16_active_cells) {
+                g_opencl.error = format_opencl_api_error("clCreateBuffer(d_d3q27_f16_active_cells)", err);
+                release_context_gpu_buffers(ctx);
+                return false;
+            }
+        }
         ctx.d3q27_f16_buffers_ready = true;
         ctx.d3q27_f16_initialized = false;
         ctx.d3q27_f16_parity = 0;
     }
     return !wants_output || ensure_d3q27_f16_output_buffer(ctx, output_bytes);
+}
+
+constexpr std::uint8_t kD3Q27F16CellSolid = 0u;
+constexpr std::uint8_t kD3Q27F16CellBoundary = 1u;
+constexpr std::uint8_t kD3Q27F16CellBulk = 2u;
+
+std::uint8_t d3q27_f16_fan_dir_code(float mask, float vx, float vy, float vz) {
+    if (!(mask > 0.5f)) {
+        return 0u;
+    }
+    vx = finite_or(vx, 0.0f);
+    vy = finite_or(vy, 0.0f);
+    vz = finite_or(vz, 0.0f);
+    const float ax = std::fabs(vx);
+    const float ay = std::fabs(vy);
+    const float az = std::fabs(vz);
+    if (ax <= 1.0e-8f && ay <= 1.0e-8f && az <= 1.0e-8f) {
+        return 0u;
+    }
+    if (ax >= ay && ax >= az) {
+        return vx < 0.0f ? 1u : 2u;
+    }
+    if (ay >= ax && ay >= az) {
+        return vy < 0.0f ? 3u : 4u;
+    }
+    return vz < 0.0f ? 5u : 6u;
 }
 
 bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload, StepTiming* timing = nullptr) {
@@ -5392,11 +5769,24 @@ bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload, Ste
         return false;
     }
     ctx.d3q27_f16_solid_staging.assign(ctx.cells, 0u);
+    ctx.d3q27_f16_cell_class_staging.assign(ctx.cells, kD3Q27F16CellSolid);
+    ctx.d3q27_f16_fan_dir_staging.assign(ctx.cells, 0u);
+    const bool build_active_list = d3q27_f16_active_dispatch_env_enabled();
+    ctx.d3q27_f16_active_cells_staging.clear();
+    if (build_active_list) {
+        ctx.d3q27_f16_active_cells_staging.reserve(ctx.cells);
+    }
     ctx.d3q27_f16_staging.assign(ctx.cells * kQ, 0u);
     for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
         const std::size_t base = cell * static_cast<std::size_t>(g_cfg.input_channels);
         const bool solid = payload[base + kChannelObstacle] > 0.5f;
         ctx.d3q27_f16_solid_staging[cell] = solid ? 1u : 0u;
+        ctx.d3q27_f16_fan_dir_staging[cell] = solid ? 0u : d3q27_f16_fan_dir_code(
+            g_cfg.input_channels > kChannelFanMask ? payload[base + kChannelFanMask] : 0.0f,
+            g_cfg.input_channels > kChannelFanVx ? payload[base + kChannelFanVx] : 0.0f,
+            g_cfg.input_channels > kChannelFanVy ? payload[base + kChannelFanVy] : 0.0f,
+            g_cfg.input_channels > kChannelFanVz ? payload[base + kChannelFanVz] : 0.0f
+        );
         float rho = 1.0f;
         float ux = 0.0f;
         float uy = 0.0f;
@@ -5423,7 +5813,58 @@ bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload, Ste
                 solid ? 0u : float_to_half_bits(feq(q, rho, ux, uy, uz));
         }
     }
+
+    ctx.d3q27_f16_active_cells = 0;
+    ctx.d3q27_f16_bulk_cells = 0;
+    ctx.d3q27_f16_boundary_cells = 0;
+    ctx.d3q27_f16_solid_cells = 0;
+    const int nx = ctx.nx;
+    const int ny = ctx.ny;
+    const int nz = ctx.nz;
+    const int yz = ny * nz;
+    for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+        if (ctx.d3q27_f16_solid_staging[cell] != 0) {
+            ctx.d3q27_f16_cell_class_staging[cell] = kD3Q27F16CellSolid;
+            ctx.d3q27_f16_solid_cells += 1;
+            continue;
+        }
+        ctx.d3q27_f16_active_cells += 1;
+        if (build_active_list) {
+            ctx.d3q27_f16_active_cells_staging.push_back(static_cast<std::int32_t>(cell));
+        }
+        const int cell_i32 = static_cast<int>(cell);
+        const int x = cell_i32 / yz;
+        const int rem = cell_i32 - x * yz;
+        const int y = rem / nz;
+        const int z = rem - y * nz;
+        bool bulk = x > 0 && x < nx - 1 && y > 0 && y < ny - 1 && z > 0 && z < nz - 1;
+        if (bulk) {
+            for (int q = 1; q < kQ; ++q) {
+                const int nxq = x + kCx[q];
+                const int nyq = y + kCy[q];
+                const int nzq = z + kCz[q];
+                const std::size_t neighbor = cell_index(nxq, nyq, nzq, nx, ny, nz);
+                if (ctx.d3q27_f16_solid_staging[neighbor] != 0) {
+                    bulk = false;
+                    break;
+                }
+            }
+        }
+        if (bulk) {
+            ctx.d3q27_f16_cell_class_staging[cell] = kD3Q27F16CellBulk;
+            ctx.d3q27_f16_bulk_cells += 1;
+        } else {
+            ctx.d3q27_f16_cell_class_staging[cell] = kD3Q27F16CellBoundary;
+            ctx.d3q27_f16_boundary_cells += 1;
+        }
+    }
+
     const std::size_t solid_bytes = ctx.cells * sizeof(std::uint8_t);
+    const std::size_t class_bytes = ctx.d3q27_f16_cell_class_staging.size() * sizeof(std::uint8_t);
+    const std::size_t fan_bytes = ctx.d3q27_f16_fan_dir_staging.size() * sizeof(std::uint8_t);
+    const std::size_t active_bytes = build_active_list
+        ? ctx.d3q27_f16_active_cells_staging.size() * sizeof(std::int32_t)
+        : 0u;
     const std::size_t dist_bytes = ctx.d3q27_f16_staging.size() * sizeof(std::uint16_t);
     cl_event solid_event = nullptr;
     cl_int err = clEnqueueWriteBuffer(
@@ -5446,6 +5887,78 @@ bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload, Ste
         timing->upload_bytes += static_cast<std::uint64_t>(solid_bytes);
     } else if (solid_event) {
         clReleaseEvent(solid_event);
+    }
+    cl_event class_event = nullptr;
+    err = clEnqueueWriteBuffer(
+        g_opencl.queue,
+        ctx.d_d3q27_f16_cell_class,
+        CL_TRUE,
+        0,
+        class_bytes,
+        ctx.d3q27_f16_cell_class_staging.data(),
+        0,
+        nullptr,
+        &class_event
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_d3q27_f16_cell_class)", err);
+        return false;
+    }
+    if (timing) {
+        timing->gpu_upload_ms += profiled_event_ms(class_event);
+        timing->upload_bytes += static_cast<std::uint64_t>(class_bytes);
+    } else if (class_event) {
+        clReleaseEvent(class_event);
+    }
+    cl_event fan_event = nullptr;
+    err = clEnqueueWriteBuffer(
+        g_opencl.queue,
+        ctx.d_d3q27_f16_fan_dir,
+        CL_TRUE,
+        0,
+        fan_bytes,
+        ctx.d3q27_f16_fan_dir_staging.data(),
+        0,
+        nullptr,
+        &fan_event
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_d3q27_f16_fan_dir)", err);
+        return false;
+    }
+    if (timing) {
+        timing->gpu_upload_ms += profiled_event_ms(fan_event);
+        timing->upload_bytes += static_cast<std::uint64_t>(fan_bytes);
+    } else if (fan_event) {
+        clReleaseEvent(fan_event);
+    }
+    if (active_bytes > 0) {
+        if (!ctx.d_d3q27_f16_active_cells) {
+            g_opencl.error = "d3q27 fp16 active dispatch requested without active cell buffer";
+            return false;
+        }
+        cl_event active_event = nullptr;
+        err = clEnqueueWriteBuffer(
+            g_opencl.queue,
+            ctx.d_d3q27_f16_active_cells,
+            CL_TRUE,
+            0,
+            active_bytes,
+            ctx.d3q27_f16_active_cells_staging.data(),
+            0,
+            nullptr,
+            &active_event
+        );
+        if (err != CL_SUCCESS) {
+            g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_d3q27_f16_active_cells)", err);
+            return false;
+        }
+        if (timing) {
+            timing->gpu_upload_ms += profiled_event_ms(active_event);
+            timing->upload_bytes += static_cast<std::uint64_t>(active_bytes);
+        } else if (active_event) {
+            clReleaseEvent(active_event);
+        }
     }
     cl_event dist_event = nullptr;
     err = clEnqueueWriteBuffer(
@@ -5474,6 +5987,320 @@ bool upload_d3q27_f16_initial_state(ContextState& ctx, const float* payload, Ste
     return true;
 }
 
+std::uint8_t classify_d3q27_f16_staging_cell(const ContextState& ctx, std::size_t cell) {
+    if (ctx.d3q27_f16_solid_staging[cell] != 0) {
+        return kD3Q27F16CellSolid;
+    }
+    const int nx = ctx.nx;
+    const int ny = ctx.ny;
+    const int nz = ctx.nz;
+    const int yz = ny * nz;
+    const int cell_i32 = static_cast<int>(cell);
+    const int x = cell_i32 / yz;
+    const int rem = cell_i32 - x * yz;
+    const int y = rem / nz;
+    const int z = rem - y * nz;
+    bool bulk = x > 0 && x < nx - 1 && y > 0 && y < ny - 1 && z > 0 && z < nz - 1;
+    if (bulk) {
+        for (int q = 1; q < kQ; ++q) {
+            const int nxq = x + kCx[q];
+            const int nyq = y + kCy[q];
+            const int nzq = z + kCz[q];
+            const std::size_t neighbor = cell_index(nxq, nyq, nzq, nx, ny, nz);
+            if (ctx.d3q27_f16_solid_staging[neighbor] != 0) {
+                bulk = false;
+                break;
+            }
+        }
+    }
+    return bulk ? kD3Q27F16CellBulk : kD3Q27F16CellBoundary;
+}
+
+void remove_d3q27_f16_class_count(ContextState& ctx, std::uint8_t cls) {
+    if (cls == kD3Q27F16CellSolid) {
+        if (ctx.d3q27_f16_solid_cells > 0) ctx.d3q27_f16_solid_cells--;
+    } else if (cls == kD3Q27F16CellBulk) {
+        if (ctx.d3q27_f16_bulk_cells > 0) ctx.d3q27_f16_bulk_cells--;
+        if (ctx.d3q27_f16_active_cells > 0) ctx.d3q27_f16_active_cells--;
+    } else if (cls == kD3Q27F16CellBoundary) {
+        if (ctx.d3q27_f16_boundary_cells > 0) ctx.d3q27_f16_boundary_cells--;
+        if (ctx.d3q27_f16_active_cells > 0) ctx.d3q27_f16_active_cells--;
+    }
+}
+
+void add_d3q27_f16_class_count(ContextState& ctx, std::uint8_t cls) {
+    if (cls == kD3Q27F16CellSolid) {
+        ctx.d3q27_f16_solid_cells++;
+    } else if (cls == kD3Q27F16CellBulk) {
+        ctx.d3q27_f16_bulk_cells++;
+        ctx.d3q27_f16_active_cells++;
+    } else if (cls == kD3Q27F16CellBoundary) {
+        ctx.d3q27_f16_boundary_cells++;
+        ctx.d3q27_f16_active_cells++;
+    }
+}
+
+bool patch_d3q27_f16_static_cells(
+    ContextState& ctx,
+    int patch_count,
+    const int* patch_cells,
+    const std::uint8_t* solid_values,
+    const std::uint8_t* fan_dir_values
+) {
+    if (!g_opencl.available
+        || !ctx.d3q27_f16_buffers_ready
+        || !ctx.d3q27_f16_initialized
+        || !patch_cells
+        || !solid_values
+        || !fan_dir_values
+        || patch_count <= 0
+        || ctx.d_d3q27_f16_active_cells) {
+        return false;
+    }
+    if (ctx.d3q27_f16_solid_staging.size() != ctx.cells
+        || ctx.d3q27_f16_cell_class_staging.size() != ctx.cells
+        || ctx.d3q27_f16_fan_dir_staging.size() != ctx.cells) {
+        return false;
+    }
+
+    std::vector<int> reset_cells;
+    reset_cells.reserve(static_cast<std::size_t>(patch_count));
+    std::vector<std::int32_t> gpu_patch_cells;
+    gpu_patch_cells.reserve(static_cast<std::size_t>(patch_count));
+    std::vector<std::uint8_t> gpu_patch_solid;
+    gpu_patch_solid.reserve(static_cast<std::size_t>(patch_count));
+    std::vector<std::uint8_t> gpu_patch_fan_dir;
+    gpu_patch_fan_dir.reserve(static_cast<std::size_t>(patch_count));
+    std::unordered_map<int, std::size_t> patch_cell_offsets;
+    patch_cell_offsets.reserve(static_cast<std::size_t>(patch_count));
+    std::unordered_set<int> affected;
+    affected.reserve(static_cast<std::size_t>(patch_count) * 27u);
+    const int nx = ctx.nx;
+    const int ny = ctx.ny;
+    const int nz = ctx.nz;
+    const int yz = ny * nz;
+    for (int i = 0; i < patch_count; ++i) {
+        const int cell = patch_cells[i];
+        if (cell < 0 || static_cast<std::size_t>(cell) >= ctx.cells) {
+            continue;
+        }
+        const std::uint8_t next_solid = solid_values[i] != 0 ? 1u : 0u;
+        const std::uint8_t next_fan = next_solid
+            ? 0u
+            : std::min<std::uint8_t>(fan_dir_values[i], static_cast<std::uint8_t>(6u));
+        const bool solid_changed = ctx.d3q27_f16_solid_staging[static_cast<std::size_t>(cell)] != next_solid;
+        ctx.d3q27_f16_solid_staging[static_cast<std::size_t>(cell)] = next_solid;
+        ctx.d3q27_f16_fan_dir_staging[static_cast<std::size_t>(cell)] = next_fan;
+        auto inserted = patch_cell_offsets.emplace(cell, gpu_patch_cells.size());
+        if (inserted.second) {
+            gpu_patch_cells.push_back(static_cast<std::int32_t>(cell));
+            gpu_patch_solid.push_back(next_solid);
+            gpu_patch_fan_dir.push_back(next_fan);
+        } else {
+            const std::size_t gpu_patch_index = inserted.first->second;
+            gpu_patch_solid[gpu_patch_index] = next_solid;
+            gpu_patch_fan_dir[gpu_patch_index] = next_fan;
+        }
+        if (solid_changed) {
+            reset_cells.push_back(cell);
+        }
+
+        const int x = cell / yz;
+        const int rem = cell - x * yz;
+        const int y = rem / nz;
+        const int z = rem - y * nz;
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int ax = x + dx;
+            if (ax < 0 || ax >= nx) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int ay = y + dy;
+                if (ay < 0 || ay >= ny) continue;
+                for (int dz = -1; dz <= 1; ++dz) {
+                    const int az = z + dz;
+                    if (az < 0 || az >= nz) continue;
+                    affected.insert(static_cast<int>(cell_index(ax, ay, az, nx, ny, nz)));
+                }
+            }
+        }
+    }
+    if (gpu_patch_cells.empty()) {
+        return true;
+    }
+
+    std::vector<std::int32_t> gpu_class_cells;
+    gpu_class_cells.reserve(affected.size());
+    std::vector<std::uint8_t> gpu_class_values;
+    gpu_class_values.reserve(affected.size());
+    for (int cell : affected) {
+        const std::size_t idx = static_cast<std::size_t>(cell);
+        const std::uint8_t old_cls = ctx.d3q27_f16_cell_class_staging[idx];
+        const std::uint8_t new_cls = classify_d3q27_f16_staging_cell(ctx, idx);
+        if (old_cls != new_cls) {
+            remove_d3q27_f16_class_count(ctx, old_cls);
+            ctx.d3q27_f16_cell_class_staging[idx] = new_cls;
+            add_d3q27_f16_class_count(ctx, new_cls);
+            gpu_class_cells.push_back(static_cast<std::int32_t>(cell));
+            gpu_class_values.push_back(new_cls);
+        }
+    }
+
+    auto create_patch_buffer = [](const char* label, std::size_t bytes, const void* data) -> cl_mem {
+        cl_int create_err = CL_SUCCESS;
+        cl_mem buffer = clCreateBuffer(
+            g_opencl.context,
+            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            bytes,
+            const_cast<void*>(data),
+            &create_err
+        );
+        if (create_err != CL_SUCCESS || !buffer) {
+            g_opencl.error = format_opencl_api_error(label, create_err);
+            return nullptr;
+        }
+        return buffer;
+    };
+
+    cl_mem d_patch_cells = create_patch_buffer(
+        "clCreateBuffer(d3q27_patch_static_cells)",
+        gpu_patch_cells.size() * sizeof(std::int32_t),
+        gpu_patch_cells.data()
+    );
+    if (!d_patch_cells) return false;
+    cl_mem d_patch_solid = create_patch_buffer(
+        "clCreateBuffer(d3q27_patch_static_solid)",
+        gpu_patch_solid.size() * sizeof(std::uint8_t),
+        gpu_patch_solid.data()
+    );
+    if (!d_patch_solid) {
+        clReleaseMemObject(d_patch_cells);
+        return false;
+    }
+    cl_mem d_patch_fan_dir = create_patch_buffer(
+        "clCreateBuffer(d3q27_patch_static_fan)",
+        gpu_patch_fan_dir.size() * sizeof(std::uint8_t),
+        gpu_patch_fan_dir.data()
+    );
+    if (!d_patch_fan_dir) {
+        clReleaseMemObject(d_patch_solid);
+        clReleaseMemObject(d_patch_cells);
+        return false;
+    }
+    cl_mem d_class_cells = d_patch_cells;
+    cl_mem d_class_values = d_patch_solid;
+    if (!gpu_class_cells.empty()) {
+        d_class_cells = create_patch_buffer(
+            "clCreateBuffer(d3q27_patch_static_class_cells)",
+            gpu_class_cells.size() * sizeof(std::int32_t),
+            gpu_class_cells.data()
+        );
+        if (!d_class_cells) {
+            clReleaseMemObject(d_patch_fan_dir);
+            clReleaseMemObject(d_patch_solid);
+            clReleaseMemObject(d_patch_cells);
+            return false;
+        }
+        d_class_values = create_patch_buffer(
+            "clCreateBuffer(d3q27_patch_static_class_values)",
+            gpu_class_values.size() * sizeof(std::uint8_t),
+            gpu_class_values.data()
+        );
+        if (!d_class_values) {
+            clReleaseMemObject(d_class_cells);
+            clReleaseMemObject(d_patch_fan_dir);
+            clReleaseMemObject(d_patch_solid);
+            clReleaseMemObject(d_patch_cells);
+            return false;
+        }
+    }
+
+    const int gpu_patch_count = static_cast<int>(gpu_patch_cells.size());
+    const int gpu_class_count = static_cast<int>(gpu_class_cells.size());
+    const int cells_i32 = static_cast<int>(ctx.cells);
+    cl_int err = CL_SUCCESS;
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 0, sizeof(cl_mem), &ctx.d_d3q27_f16_solid);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 1, sizeof(cl_mem), &ctx.d_d3q27_f16_cell_class);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 2, sizeof(cl_mem), &ctx.d_d3q27_f16_fan_dir);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 3, sizeof(cl_mem), &d_patch_cells);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 4, sizeof(cl_mem), &d_patch_solid);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 5, sizeof(cl_mem), &d_patch_fan_dir);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 6, sizeof(int), &gpu_patch_count);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 7, sizeof(cl_mem), &d_class_cells);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 8, sizeof(cl_mem), &d_class_values);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 9, sizeof(int), &gpu_class_count);
+    err |= clSetKernelArg(g_opencl.k_d3q27_f16_patch_static, 10, sizeof(int), &cells_i32);
+    if (err == CL_SUCCESS) {
+        const size_t global_size = std::max(gpu_patch_cells.size(), gpu_class_cells.size());
+        err = clEnqueueNDRangeKernel(
+            g_opencl.queue,
+            g_opencl.k_d3q27_f16_patch_static,
+            1,
+            nullptr,
+            &global_size,
+            nullptr,
+            0,
+            nullptr,
+            nullptr
+        );
+    }
+    if (d_class_values != d_patch_solid) clReleaseMemObject(d_class_values);
+    if (d_class_cells != d_patch_cells) clReleaseMemObject(d_class_cells);
+    if (err != CL_SUCCESS) {
+        clReleaseMemObject(d_patch_fan_dir);
+        clReleaseMemObject(d_patch_solid);
+        clReleaseMemObject(d_patch_cells);
+        g_opencl.error = format_opencl_api_error("clEnqueueNDRangeKernel(d3q27_f16_patch_static_fields)", err);
+        return false;
+    }
+
+    if (!reset_cells.empty()) {
+        const std::size_t patch_bytes = reset_cells.size() * sizeof(std::int32_t);
+        cl_mem d_reset_cells = create_patch_buffer(
+            "clCreateBuffer(d3q27_reset_patch_cells)",
+            patch_bytes,
+            reset_cells.data()
+        );
+        if (!d_reset_cells) {
+            clReleaseMemObject(d_patch_fan_dir);
+            clReleaseMemObject(d_patch_solid);
+            clReleaseMemObject(d_patch_cells);
+            return false;
+        }
+        const int reset_count = static_cast<int>(reset_cells.size());
+        err = CL_SUCCESS;
+        err |= clSetKernelArg(g_opencl.k_d3q27_f16_reset_patched, 0, sizeof(cl_mem), &ctx.d_d3q27_f16);
+        err |= clSetKernelArg(g_opencl.k_d3q27_f16_reset_patched, 1, sizeof(cl_mem), &ctx.d_d3q27_f16_solid);
+        err |= clSetKernelArg(g_opencl.k_d3q27_f16_reset_patched, 2, sizeof(cl_mem), &d_reset_cells);
+        err |= clSetKernelArg(g_opencl.k_d3q27_f16_reset_patched, 3, sizeof(int), &reset_count);
+        err |= clSetKernelArg(g_opencl.k_d3q27_f16_reset_patched, 4, sizeof(int), &cells_i32);
+        if (err == CL_SUCCESS) {
+            const size_t global_size = reset_cells.size();
+            err = clEnqueueNDRangeKernel(
+                g_opencl.queue,
+                g_opencl.k_d3q27_f16_reset_patched,
+                1,
+                nullptr,
+                &global_size,
+                nullptr,
+                0,
+                nullptr,
+                nullptr
+            );
+        }
+        clReleaseMemObject(d_reset_cells);
+        if (err != CL_SUCCESS) {
+            clReleaseMemObject(d_patch_fan_dir);
+            clReleaseMemObject(d_patch_solid);
+            clReleaseMemObject(d_patch_cells);
+            g_opencl.error = format_opencl_api_error("clEnqueueNDRangeKernel(d3q27_f16_reset_patched)", err);
+            return false;
+        }
+    }
+    clReleaseMemObject(d_patch_fan_dir);
+    clReleaseMemObject(d_patch_solid);
+    clReleaseMemObject(d_patch_cells);
+    return true;
+}
+
 bool ensure_compact_output_buffer(ContextState& ctx, std::size_t output_bytes) {
     if (!g_opencl.available || output_bytes == 0) return false;
     if (ctx.d_compact_output && ctx.compact_output_bytes >= output_bytes) {
@@ -5499,6 +6326,8 @@ bool ensure_compact_output_buffer(ContextState& ctx, std::size_t output_bytes) {
 
 bool ensure_compact_gpu_buffers(ContextState& ctx, bool wants_output) {
     if (!g_opencl.available || ctx.cells == 0) return false;
+    release_context_d3q27_f16_buffers(ctx);
+    release_context_classic_gpu_buffers(ctx);
 
     auto create_buffer = [&](cl_mem& target, cl_mem_flags flags, std::size_t bytes, const char* label) -> bool {
         cl_int err = CL_SUCCESS;
@@ -5655,9 +6484,27 @@ bool opencl_d3q27_f16_inplace_step(
             return false;
         }
     }
+    timing.bulk_cells = ctx.d3q27_f16_bulk_cells;
+    timing.boundary_cells = ctx.d3q27_f16_boundary_cells;
+    timing.solid_cells = ctx.d3q27_f16_solid_cells;
+    timing.active_cells = ctx.d3q27_f16_active_cells;
     timing.payload_copy_ms += elapsed_ms(upload_begin, Clock::now());
 
     const int cells_i32 = static_cast<int>(ctx.cells);
+    const int active_cells_i32 = static_cast<int>(std::min<std::uint64_t>(
+        ctx.d3q27_f16_active_cells,
+        static_cast<std::uint64_t>(std::numeric_limits<int>::max())
+    ));
+    const bool active_dispatch_enabled =
+        d3q27_f16_active_dispatch_env_enabled()
+        && ctx.d_d3q27_f16_active_cells != nullptr;
+    const bool use_active_dispatch =
+        active_dispatch_enabled
+        && ctx.d3q27_f16_active_cells > 0
+        && ctx.d3q27_f16_active_cells < ctx.cells;
+    const int active_mode = use_active_dispatch ? 1 : 0;
+    const int dispatch_cells_i32 = use_active_dispatch ? active_cells_i32 : cells_i32;
+    timing.dispatch_cells = static_cast<std::uint64_t>(std::max(dispatch_cells_i32, 0));
     const float omega = d3q27_f16_srt_omega();
     const OpenClFaceData inlet = compact_inlet_value();
     cl_kernel kernel = (ctx.d3q27_f16_parity == 0)
@@ -5666,19 +6513,29 @@ bool opencl_d3q27_f16_inplace_step(
 
     auto solver_begin = Clock::now();
     cl_int err = CL_SUCCESS;
+    cl_mem active_cells_buffer = ctx.d_d3q27_f16_active_cells
+        ? ctx.d_d3q27_f16_active_cells
+        : ctx.d_d3q27_f16_solid;
     err |= clSetKernelArg(kernel, 0, sizeof(cl_mem), &ctx.d_d3q27_f16);
     err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &ctx.d_d3q27_f16_solid);
-    err |= clSetKernelArg(kernel, 2, sizeof(int), &ctx.nx);
-    err |= clSetKernelArg(kernel, 3, sizeof(int), &ctx.ny);
-    err |= clSetKernelArg(kernel, 4, sizeof(int), &ctx.nz);
-    err |= clSetKernelArg(kernel, 5, sizeof(int), &cells_i32);
-    err |= clSetKernelArg(kernel, 6, sizeof(float), &omega);
-    err |= clSetKernelArg(kernel, 7, sizeof(OpenClFaceData), inlet.data());
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &ctx.d_d3q27_f16_cell_class);
+    err |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &ctx.d_d3q27_f16_fan_dir);
+    err |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &active_cells_buffer);
+    err |= clSetKernelArg(kernel, 5, sizeof(int), &active_cells_i32);
+    err |= clSetKernelArg(kernel, 6, sizeof(int), &active_mode);
+    err |= clSetKernelArg(kernel, 7, sizeof(int), &ctx.nx);
+    err |= clSetKernelArg(kernel, 8, sizeof(int), &ctx.ny);
+    err |= clSetKernelArg(kernel, 9, sizeof(int), &ctx.nz);
+    err |= clSetKernelArg(kernel, 10, sizeof(int), &cells_i32);
+    err |= clSetKernelArg(kernel, 11, sizeof(float), &omega);
+    err |= clSetKernelArg(kernel, 12, sizeof(OpenClFaceData), inlet.data());
     if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_d3q27_f16_step)", err);
-    cl_event step_event = nullptr;
-    err = enqueue_kernel_1d(kernel, cells_i32, &step_event);
-    if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_d3q27_f16_step)", err);
-    timing.gpu_step_ms += profiled_event_ms(step_event);
+    if (dispatch_cells_i32 > 0) {
+        cl_event step_event = nullptr;
+        err = enqueue_kernel_1d(kernel, dispatch_cells_i32, &step_event);
+        if (err != CL_SUCCESS) return fail_cl("clEnqueueNDRangeKernel(k_d3q27_f16_step)", err);
+        timing.gpu_step_ms += profiled_event_ms(step_event);
+    }
     ctx.d3q27_f16_parity = 1 - ctx.d3q27_f16_parity;
     timing.solver_ms += elapsed_ms(solver_begin, Clock::now());
 
@@ -6775,6 +7632,7 @@ bool sync_context_state_from_gpu(ContextState&) { return true; }
 bool sync_context_state_to_gpu(ContextState&) { return true; }
 bool exchange_context_halo_gpu_layers(ContextState&, ContextState&, int, int, int, int) { return true; }
 bool exchange_context_halo_gpu(ContextState&, ContextState&, int, int, int) { return true; }
+std::string memory_info_string() { return "gpu_bytes(total=0,contexts=0,cells=0)"; }
 #endif
 
 void clear_context(ContextState& ctx) { release_context_gpu_buffers(ctx); ctx = ContextState{}; }
@@ -8768,6 +9626,63 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached_scaled(
     ) ? 1 : 0;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_patch_d3q27_f16_static_cells_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int patch_count,
+    const int* cell_indices,
+    const std::uint8_t* solid_values,
+    const std::uint8_t* fan_dir_values
+) {
+#if defined(AERO_LBM_OPENCL)
+    clear_last_native_error();
+    if (!g_cfg.initialized || !g_cfg.opencl_enabled) {
+        set_last_native_error("patch_d3q27_f16_static_cells: runtime is not initialized for OpenCL");
+        return 0;
+    }
+    if (patch_count <= 0) {
+        return 1;
+    }
+    if (!cell_indices || !solid_values || !fan_dir_values) {
+        set_last_native_error("patch_d3q27_f16_static_cells: missing patch arrays");
+        return 0;
+    }
+    if (nx <= 0 || ny <= 0 || nz <= 0 || nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) {
+        set_last_native_error("patch_d3q27_f16_static_cells: invalid dimensions");
+        return 0;
+    }
+    const std::size_t cells = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+    LockedContext locked_context(static_cast<jlong>(context_key), false);
+    if (!locked_context.ctx) {
+        set_last_native_error("patch_d3q27_f16_static_cells: context not found");
+        return 0;
+    }
+    ContextState& ctx = *locked_context.ctx;
+    if (ctx.nx != nx || ctx.ny != ny || ctx.nz != nz || ctx.cells != cells) {
+        set_last_native_error("patch_d3q27_f16_static_cells: context shape mismatch");
+        return 0;
+    }
+    if (!patch_d3q27_f16_static_cells(ctx, patch_count, cell_indices, solid_values, fan_dir_values)) {
+        set_last_native_error(g_opencl.error.empty() ? "patch_d3q27_f16_static_cells failed" : g_opencl.error);
+        return 0;
+    }
+    return 1;
+#else
+    (void)nx;
+    (void)ny;
+    (void)nz;
+    (void)context_key;
+    (void)patch_count;
+    (void)cell_indices;
+    (void)solid_values;
+    (void)fan_dir_values;
+    set_last_native_error("patch_d3q27_f16_static_cells: OpenCL disabled");
+    return 0;
+#endif
+}
+
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(
     const float* packet,
     int nx,
@@ -9018,6 +9933,12 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_timing_info(void) {
     static std::string timing_text;
     timing_text = timing_info_string();
     return timing_text.c_str();
+}
+
+AERO_LBM_CAPI_EXPORT const char* aero_lbm_memory_info(void) {
+    static std::string memory_text;
+    memory_text = memory_info_string();
+    return memory_text.c_str();
 }
 
 AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void) {

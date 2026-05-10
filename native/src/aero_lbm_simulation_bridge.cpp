@@ -27,6 +27,8 @@ struct StaticRegionData {
     std::vector<uint8_t> surface_kind;
     std::vector<uint16_t> open_face_mask;
     std::vector<float> emitter_power_watts;
+    std::vector<uint8_t> source_fan_dir;
+    std::vector<float> source_emitter_power_watts;
     std::vector<uint8_t> face_sky_exposure;
     std::vector<uint8_t> face_direct_exposure;
 };
@@ -141,6 +143,7 @@ struct BrickData {
     std::shared_ptr<DynamicRegionData> dynamic_region;
     std::shared_ptr<const DynamicRegionData> boundary_reference_region;
     std::vector<float> packet_cache;
+    std::vector<int> pending_static_patch_cells;
 };
 
 struct FluidWorldRuntime {
@@ -158,6 +161,11 @@ struct FluidWorldRuntime {
     std::uint64_t compact_reject_fan_steps = 0;
     std::uint64_t compact_thermal_ignored_steps = 0;
     std::uint64_t d3q27_steps = 0;
+    std::uint64_t d3q27_patch_attempts = 0;
+    std::uint64_t d3q27_patch_steps = 0;
+    std::uint64_t d3q27_patch_failures = 0;
+    std::uint64_t d3q27_patch_cells = 0;
+    std::uint64_t d3q27_patch_upload_bytes_est = 0;
     std::uint64_t packet_build_steps = 0;
     std::uint64_t dynamic_upload_resets = 0;
     std::uint64_t compact_last_fluid_cells = 0;
@@ -335,13 +343,15 @@ CompactBrickPacketSummary summarize_compact_brick_packet(const std::vector<float
         vz_sum += vz;
         summary.fluid_cells++;
     }
+    if (summary.fluid_cells > 0) {
+        summary.vx = static_cast<float>(vx_sum / summary.fluid_cells);
+        summary.vy = static_cast<float>(vy_sum / summary.fluid_cells);
+        summary.vz = static_cast<float>(vz_sum / summary.fluid_cells);
+    }
     if (summary.fluid_cells <= 0 || summary.fan_cells > 0) {
         return summary;
     }
     summary.supported = true;
-    summary.vx = static_cast<float>(vx_sum / summary.fluid_cells);
-    summary.vy = static_cast<float>(vy_sum / summary.fluid_cells);
-    summary.vz = static_cast<float>(vz_sum / summary.fluid_cells);
     return summary;
 }
 
@@ -417,6 +427,21 @@ constexpr int k_brick_face_neighbor_axes[k_brick_face_neighbor_count] = {0, 0, 1
 constexpr bool k_brick_face_neighbor_positive_faces[k_brick_face_neighbor_count] = {
     false, true, false, true, false, true
 };
+constexpr int k_java_face_offsets[k_face_count][3] = {
+    {0, -1, 0}, {0, 1, 0},
+    {0, 0, -1}, {0, 0, 1},
+    {-1, 0, 0}, {1, 0, 0}
+};
+constexpr int k_fan_dir_offsets[7][3] = {
+    {0, 0, 0},
+    {-1, 0, 0}, {1, 0, 0},
+    {0, -1, 0}, {0, 1, 0},
+    {0, 0, -1}, {0, 0, 1}
+};
+constexpr int k_client_fan_force_length_cells = 5;
+constexpr int k_client_fan_force_radius_cells = 1;
+constexpr int k_client_heat_plume_height_cells = 4;
+constexpr float k_client_heat_coupling_to_adjacent_air = 0.85f;
 constexpr uint8_t k_surface_kind_none = 0;
 constexpr uint8_t k_surface_kind_rock = 1;
 constexpr uint8_t k_surface_kind_soil = 2;
@@ -445,6 +470,30 @@ bool decode_client_fan_surface_kind(uint8_t kind, float& vx, float& vy, float& v
         case k_surface_kind_client_fan_z_neg: vz = -k_client_fan_speed_mps; return true;
         case k_surface_kind_client_fan_z_pos: vz = k_client_fan_speed_mps; return true;
         default: return false;
+    }
+}
+
+uint8_t d3q27_fan_dir_code_from_surface_kind(uint8_t kind) {
+    switch (kind) {
+        case k_surface_kind_client_fan_x_neg: return 1u;
+        case k_surface_kind_client_fan_x_pos: return 2u;
+        case k_surface_kind_client_fan_y_neg: return 3u;
+        case k_surface_kind_client_fan_y_pos: return 4u;
+        case k_surface_kind_client_fan_z_neg: return 5u;
+        case k_surface_kind_client_fan_z_pos: return 6u;
+        default: return 0u;
+    }
+}
+
+uint8_t client_fan_surface_kind_from_dir_code(uint8_t dir) {
+    switch (dir) {
+        case 1u: return k_surface_kind_client_fan_x_neg;
+        case 2u: return k_surface_kind_client_fan_x_pos;
+        case 3u: return k_surface_kind_client_fan_y_neg;
+        case 4u: return k_surface_kind_client_fan_y_pos;
+        case 5u: return k_surface_kind_client_fan_z_neg;
+        case 6u: return k_surface_kind_client_fan_z_pos;
+        default: return k_surface_kind_none;
     }
 }
 
@@ -682,6 +731,7 @@ int count_pending_reinit_bricks(const FluidWorldRuntime& runtime) {
 
 constexpr int k_world_delta_brick_static_cell_patch = 8;
 constexpr int k_world_delta_brick_static_brick_upload = 9;
+constexpr int k_world_delta_brick_static_source_patch = 10;
 
 bool brick_is_resident_for_windows(const BrickData& brick) {
     return brick.active_hint
@@ -807,6 +857,7 @@ void release_brick_context(BrickData& brick) {
     }
     brick.compact_context_active = false;
     brick.dynamic_region_stale = false;
+    brick.pending_static_patch_cells.clear();
 }
 
 void prune_inactive_bricks(FluidWorldRuntime& runtime) {
@@ -1037,6 +1088,7 @@ bool step_brick_world_runtime(ServiceState& service, long long world_key, FluidW
                 brick.compact_vy = constrained_brick.compact_vy;
                 brick.compact_vz = constrained_brick.compact_vz;
                 brick.packet_cache = std::move(constrained_brick.packet_cache);
+                brick.pending_static_patch_cells = std::move(constrained_brick.pending_static_patch_cells);
                 brick.dynamic_region = std::move(constrained_brick.dynamic_region);
             }
             if (brick.pending_reinit) {
@@ -1462,14 +1514,78 @@ bool sync_brick_dynamic_from_context(const FluidWorldRuntime& runtime, BrickData
     return true;
 }
 
+bool apply_pending_static_patches_to_d3q27(FluidWorldRuntime& runtime, BrickData& brick) {
+    if (brick.pending_static_patch_cells.empty()
+        || brick.context_key == 0
+        || !brick.static_region
+        || brick.static_region->nx != runtime.brick_size
+        || brick.static_region->ny != runtime.brick_size
+        || brick.static_region->nz != runtime.brick_size) {
+        return false;
+    }
+    runtime.d3q27_patch_attempts++;
+    const StaticRegionData& stat = *brick.static_region;
+    std::vector<int> cells;
+    cells.reserve(brick.pending_static_patch_cells.size());
+    std::vector<uint8_t> solid_values;
+    solid_values.reserve(brick.pending_static_patch_cells.size());
+    std::vector<uint8_t> fan_dir_values;
+    fan_dir_values.reserve(brick.pending_static_patch_cells.size());
+    std::unordered_set<int> seen;
+    seen.reserve(brick.pending_static_patch_cells.size());
+    const int total_cells = runtime.brick_size * runtime.brick_size * runtime.brick_size;
+    for (int cell : brick.pending_static_patch_cells) {
+        if (cell < 0 || cell >= total_cells || !seen.insert(cell).second) {
+            continue;
+        }
+        const size_t idx = static_cast<size_t>(cell);
+        const uint8_t solid = stat.obstacle[idx] != 0 ? 1u : 0u;
+        cells.push_back(cell);
+        solid_values.push_back(solid);
+        fan_dir_values.push_back(solid ? 0u : d3q27_fan_dir_code_from_surface_kind(stat.surface_kind[idx]));
+    }
+    if (cells.empty()) {
+        brick.pending_static_patch_cells.clear();
+        brick.forcing_dirty = false;
+        return true;
+    }
+    const int ok = aero_lbm_patch_d3q27_f16_static_cells_rect(
+        runtime.brick_size,
+        runtime.brick_size,
+        runtime.brick_size,
+        brick.context_key,
+        static_cast<int>(cells.size()),
+        cells.data(),
+        solid_values.data(),
+        fan_dir_values.data()
+    );
+    if (!ok) {
+        runtime.d3q27_patch_failures++;
+        return false;
+    }
+    runtime.d3q27_patch_steps++;
+    runtime.d3q27_patch_cells += static_cast<std::uint64_t>(cells.size());
+    runtime.d3q27_patch_upload_bytes_est += static_cast<std::uint64_t>(cells.size())
+        * (sizeof(int) + 2u + 27u * (sizeof(int) + 1u) + sizeof(int));
+    brick.pending_static_patch_cells.clear();
+    brick.forcing_dirty = false;
+    brick.geometry_dirty = false;
+    brick.pending_reinit = false;
+    brick.dynamic_region_stale = true;
+    return true;
+}
+
 bool step_brick_compact_cached(FluidWorldRuntime& runtime, BrickData& brick, int size) {
     runtime.compact_cached_attempts++;
     if (!brick_world_compact_enabled()
         || !brick.compact_context_active
         || brick.context_key == 0
-        || brick.forcing_dirty
         || brick.geometry_dirty
         || brick.pending_reinit) {
+        runtime.compact_cached_failures++;
+        return false;
+    }
+    if (brick.forcing_dirty && !apply_pending_static_patches_to_d3q27(runtime, brick)) {
         runtime.compact_cached_failures++;
         return false;
     }
@@ -1495,12 +1611,12 @@ bool step_brick_actual(
     DynamicRegionData& dynamic
 ) {
     std::shared_ptr<DynamicRegionData> zero_output_fallback;
+    const int size = runtime.brick_size;
+    if (step_brick_compact_cached(runtime, brick, size)) {
+        return true;
+    }
     if (brick.forcing_dirty && dynamic_has_nonzero_flow(dynamic)) {
         zero_output_fallback = std::make_shared<DynamicRegionData>(dynamic);
-    }
-    const int size = runtime.brick_size;
-    if (!zero_output_fallback && step_brick_compact_cached(runtime, brick, size)) {
-        return true;
     }
     runtime.packet_build_steps++;
     if (!build_brick_step_packet(runtime, coord, brick, dynamic, brick.packet_cache)) {
@@ -1512,8 +1628,11 @@ bool step_brick_actual(
     }
     bool step_ok = false;
     bool compact_step_ok = false;
+    CompactBrickPacketSummary compact_summary{};
+    bool have_compact_summary = false;
     if (brick_world_compact_enabled()) {
-        const CompactBrickPacketSummary compact_summary = summarize_compact_brick_packet(brick.packet_cache);
+        compact_summary = summarize_compact_brick_packet(brick.packet_cache);
+        have_compact_summary = true;
         runtime.compact_last_fluid_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.fluid_cells));
         runtime.compact_last_obstacle_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.obstacle_cells));
         runtime.compact_last_fan_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.fan_cells));
@@ -1557,7 +1676,20 @@ bool step_brick_actual(
     if (!step_ok) {
         brick.compact_context_active = false;
         runtime.d3q27_steps++;
+        const bool fallback_boundary_configured = have_compact_summary
+            && configure_simulation_compact_boundary(compact_summary.vx, compact_summary.vy, compact_summary.vz, size, size, size);
         step_ok = aero_lbm_step_rect(brick.packet_cache.data(), size, size, size, brick.context_key, nullptr) != 0;
+        aero_lbm_benchmark_reset_config();
+        if (step_ok
+            && fallback_boundary_configured
+            && aero_lbm_context_realtime_cached_initialized(brick.context_key)) {
+            compact_step_ok = true;
+            brick.compact_context_active = true;
+            brick.compact_vx = compact_summary.vx;
+            brick.compact_vy = compact_summary.vy;
+            brick.compact_vz = compact_summary.vz;
+            brick.dynamic_region_stale = true;
+        }
     }
     if (!step_ok) {
         set_simulation_last_error(
@@ -1571,6 +1703,7 @@ bool step_brick_actual(
         return false;
     }
     if (compact_step_ok) {
+        brick.pending_static_patch_cells.clear();
         return true;
     }
     if (!sync_brick_dynamic_from_context(runtime, brick)) {
@@ -1591,6 +1724,7 @@ bool step_brick_actual(
         return true;
     }
     apply_brick_static_constraints(runtime, brick);
+    brick.pending_static_patch_cells.clear();
     return true;
 }
 
@@ -1638,9 +1772,595 @@ void clear_unbacked_placeholder_bricks(FluidWorldRuntime& runtime) {
         brick.forcing_dirty = false;
         brick.pending_reinit = false;
         brick.active = false;
+        brick.pending_static_patch_cells.clear();
         brick.dynamic_region.reset();
         brick.boundary_reference_region.reset();
         brick.packet_cache.clear();
+    }
+}
+
+int local_cell_index(int brick_size, int x, int y, int z) {
+    return (x * brick_size + y) * brick_size + z;
+}
+
+bool world_cell_to_local(const BrickCoord& coord, int brick_size, int wx, int wy, int wz, int& lx, int& ly, int& lz) {
+    lx = wx - coord.x * brick_size;
+    ly = wy - coord.y * brick_size;
+    lz = wz - coord.z * brick_size;
+    return lx >= 0 && ly >= 0 && lz >= 0
+        && lx < brick_size && ly < brick_size && lz < brick_size;
+}
+
+void ensure_static_region_source_buffers(StaticRegionData& stat) {
+    const size_t cells = static_cast<size_t>(std::max(0, stat.nx))
+        * static_cast<size_t>(std::max(0, stat.ny))
+        * static_cast<size_t>(std::max(0, stat.nz));
+    if (stat.source_fan_dir.size() != cells) {
+        stat.source_fan_dir.assign(cells, 0u);
+    }
+    if (stat.source_emitter_power_watts.size() != cells) {
+        stat.source_emitter_power_watts.assign(cells, 0.0f);
+    }
+}
+
+void add_local_affected_cell(
+    const BrickCoord& coord,
+    int brick_size,
+    std::unordered_set<int>& affected,
+    int wx,
+    int wy,
+    int wz
+) {
+    int lx = 0;
+    int ly = 0;
+    int lz = 0;
+    if (world_cell_to_local(coord, brick_size, wx, wy, wz, lx, ly, lz)) {
+        affected.insert(local_cell_index(brick_size, lx, ly, lz));
+    }
+}
+
+void add_fan_disk_affected_cells(
+    const BrickCoord& coord,
+    int brick_size,
+    std::unordered_set<int>& affected,
+    int center_x,
+    int center_y,
+    int center_z,
+    int dir
+) {
+    const int axis = (dir <= 2) ? 0 : (dir <= 4 ? 1 : 2);
+    for (int a = -k_client_fan_force_radius_cells; a <= k_client_fan_force_radius_cells; ++a) {
+        for (int b = -k_client_fan_force_radius_cells; b <= k_client_fan_force_radius_cells; ++b) {
+            int wx = center_x;
+            int wy = center_y;
+            int wz = center_z;
+            if (axis == 0) {
+                wy += a;
+                wz += b;
+            } else if (axis == 1) {
+                wx += a;
+                wz += b;
+            } else {
+                wx += a;
+                wy += b;
+            }
+            add_local_affected_cell(coord, brick_size, affected, wx, wy, wz);
+        }
+    }
+}
+
+void add_fan_footprint_affected_cells(
+    const BrickCoord& coord,
+    int brick_size,
+    std::unordered_set<int>& affected,
+    int source_x,
+    int source_y,
+    int source_z,
+    int dir
+) {
+    if (dir <= 0 || dir > 6) {
+        return;
+    }
+    const int dx = k_fan_dir_offsets[dir][0];
+    const int dy = k_fan_dir_offsets[dir][1];
+    const int dz = k_fan_dir_offsets[dir][2];
+    for (int distance = 1; distance <= k_client_fan_force_length_cells; ++distance) {
+        add_fan_disk_affected_cells(
+            coord,
+            brick_size,
+            affected,
+            source_x + dx * distance,
+            source_y + dy * distance,
+            source_z + dz * distance,
+            dir
+        );
+    }
+}
+
+void add_source_delta_affected_cells(
+    const BrickCoord& coord,
+    int brick_size,
+    std::unordered_set<int>& affected,
+    const AeroLbmWorldDelta& delta,
+    uint8_t old_fan_dir,
+    uint8_t new_fan_dir,
+    bool obstacle_changed,
+    bool heat_changed
+) {
+    add_local_affected_cell(coord, brick_size, affected, delta.x, delta.y, delta.z);
+    for (const auto& offset : k_java_face_offsets) {
+        add_local_affected_cell(
+            coord,
+            brick_size,
+            affected,
+            delta.x + offset[0],
+            delta.y + offset[1],
+            delta.z + offset[2]
+        );
+    }
+    if (old_fan_dir != 0) {
+        add_fan_footprint_affected_cells(coord, brick_size, affected, delta.x, delta.y, delta.z, old_fan_dir);
+    }
+    if (new_fan_dir != 0) {
+        add_fan_footprint_affected_cells(coord, brick_size, affected, delta.x, delta.y, delta.z, new_fan_dir);
+    }
+    if (obstacle_changed) {
+        for (int dir = 1; dir <= 6; ++dir) {
+            const int dx = k_fan_dir_offsets[dir][0];
+            const int dy = k_fan_dir_offsets[dir][1];
+            const int dz = k_fan_dir_offsets[dir][2];
+            for (int distance = 1; distance <= k_client_fan_force_length_cells; ++distance) {
+                add_fan_disk_affected_cells(
+                    coord,
+                    brick_size,
+                    affected,
+                    delta.x + dx * distance,
+                    delta.y + dy * distance,
+                    delta.z + dz * distance,
+                    dir
+                );
+            }
+        }
+        for (int distance = 1; distance <= k_client_heat_plume_height_cells; ++distance) {
+            add_local_affected_cell(coord, brick_size, affected, delta.x, delta.y + distance, delta.z);
+        }
+    }
+    if (heat_changed) {
+        for (int distance = 0; distance <= k_client_heat_plume_height_cells; ++distance) {
+            add_local_affected_cell(coord, brick_size, affected, delta.x, delta.y + distance, delta.z);
+        }
+    }
+}
+
+uint8_t source_fan_dir_at_world(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    uint8_t new_fan_dir,
+    int wx,
+    int wy,
+    int wz
+) {
+    if (wx == delta.x && wy == delta.y && wz == delta.z) {
+        return new_fan_dir;
+    }
+    int lx = 0;
+    int ly = 0;
+    int lz = 0;
+    if (!world_cell_to_local(coord, brick_size, wx, wy, wz, lx, ly, lz)) {
+        return 0u;
+    }
+    const size_t cell = static_cast<size_t>(local_cell_index(brick_size, lx, ly, lz));
+    return cell < stat.source_fan_dir.size() ? stat.source_fan_dir[cell] : 0u;
+}
+
+float source_emitter_power_at_world(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    float new_emitter_power,
+    int wx,
+    int wy,
+    int wz
+) {
+    if (wx == delta.x && wy == delta.y && wz == delta.z) {
+        return new_emitter_power;
+    }
+    int lx = 0;
+    int ly = 0;
+    int lz = 0;
+    if (!world_cell_to_local(coord, brick_size, wx, wy, wz, lx, ly, lz)) {
+        return 0.0f;
+    }
+    const size_t cell = static_cast<size_t>(local_cell_index(brick_size, lx, ly, lz));
+    return cell < stat.source_emitter_power_watts.size() ? stat.source_emitter_power_watts[cell] : 0.0f;
+}
+
+bool solid_at_world(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    bool new_solid,
+    int wx,
+    int wy,
+    int wz
+) {
+    if (wx == delta.x && wy == delta.y && wz == delta.z) {
+        return new_solid;
+    }
+    int lx = 0;
+    int ly = 0;
+    int lz = 0;
+    if (!world_cell_to_local(coord, brick_size, wx, wy, wz, lx, ly, lz)) {
+        return true;
+    }
+    const size_t cell = static_cast<size_t>(local_cell_index(brick_size, lx, ly, lz));
+    return cell >= stat.obstacle.size() || stat.obstacle[cell] != 0;
+}
+
+bool fan_path_clear_for_world_cell(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    bool new_solid,
+    int fan_x,
+    int fan_y,
+    int fan_z,
+    int dir,
+    int distance,
+    int a,
+    int b
+) {
+    const int axis = (dir <= 2) ? 0 : (dir <= 4 ? 1 : 2);
+    int lane_x = fan_x;
+    int lane_y = fan_y;
+    int lane_z = fan_z;
+    if (axis == 0) {
+        lane_y += a;
+        lane_z += b;
+    } else if (axis == 1) {
+        lane_x += a;
+        lane_z += b;
+    } else {
+        lane_x += a;
+        lane_y += b;
+    }
+    const int dx = k_fan_dir_offsets[dir][0];
+    const int dy = k_fan_dir_offsets[dir][1];
+    const int dz = k_fan_dir_offsets[dir][2];
+    for (int step = 1; step < distance; ++step) {
+        if (solid_at_world(
+                stat,
+                coord,
+                brick_size,
+                delta,
+                new_solid,
+                lane_x + dx * step,
+                lane_y + dy * step,
+                lane_z + dz * step)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint8_t compute_source_surface_kind_for_cell(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    bool new_solid,
+    uint8_t new_fan_dir,
+    int lx,
+    int ly,
+    int lz
+) {
+    const int wx = coord.x * brick_size + lx;
+    const int wy = coord.y * brick_size + ly;
+    const int wz = coord.z * brick_size + lz;
+    if (solid_at_world(stat, coord, brick_size, delta, new_solid, wx, wy, wz)) {
+        return k_surface_kind_none;
+    }
+    for (int dir = 1; dir <= 6; ++dir) {
+        const int dx = k_fan_dir_offsets[dir][0];
+        const int dy = k_fan_dir_offsets[dir][1];
+        const int dz = k_fan_dir_offsets[dir][2];
+        const int axis = (dir <= 2) ? 0 : (dir <= 4 ? 1 : 2);
+        for (int distance = 1; distance <= k_client_fan_force_length_cells; ++distance) {
+            const int axial_x = wx - dx * distance;
+            const int axial_y = wy - dy * distance;
+            const int axial_z = wz - dz * distance;
+            for (int a = -k_client_fan_force_radius_cells; a <= k_client_fan_force_radius_cells; ++a) {
+                for (int b = -k_client_fan_force_radius_cells; b <= k_client_fan_force_radius_cells; ++b) {
+                    int fan_x = axial_x;
+                    int fan_y = axial_y;
+                    int fan_z = axial_z;
+                    if (axis == 0) {
+                        fan_y -= a;
+                        fan_z -= b;
+                    } else if (axis == 1) {
+                        fan_x -= a;
+                        fan_z -= b;
+                    } else {
+                        fan_x -= a;
+                        fan_y -= b;
+                    }
+                    if (source_fan_dir_at_world(stat, coord, brick_size, delta, new_fan_dir, fan_x, fan_y, fan_z) != dir) {
+                        continue;
+                    }
+                    if (!fan_path_clear_for_world_cell(
+                            stat,
+                            coord,
+                            brick_size,
+                            delta,
+                            new_solid,
+                            fan_x,
+                            fan_y,
+                            fan_z,
+                            dir,
+                            distance,
+                            a,
+                            b)) {
+                        continue;
+                    }
+                    return client_fan_surface_kind_from_dir_code(static_cast<uint8_t>(dir));
+                }
+            }
+        }
+    }
+    return k_surface_kind_none;
+}
+
+uint16_t compute_source_open_face_mask_for_cell(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    bool new_solid,
+    int lx,
+    int ly,
+    int lz
+) {
+    const int wx = coord.x * brick_size + lx;
+    const int wy = coord.y * brick_size + ly;
+    const int wz = coord.z * brick_size + lz;
+    if (solid_at_world(stat, coord, brick_size, delta, new_solid, wx, wy, wz)) {
+        return 0u;
+    }
+    uint16_t mask = 0u;
+    for (int face = 0; face < k_face_count; ++face) {
+        if (!solid_at_world(
+                stat,
+                coord,
+                brick_size,
+                delta,
+                new_solid,
+                wx + k_java_face_offsets[face][0],
+                wy + k_java_face_offsets[face][1],
+                wz + k_java_face_offsets[face][2])) {
+            mask = static_cast<uint16_t>(mask | (1u << face));
+        }
+    }
+    return mask;
+}
+
+bool heat_path_clear_for_world_cell(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    bool new_solid,
+    int x,
+    int source_y,
+    int z,
+    int target_y
+) {
+    for (int y = source_y + 1; y < target_y; ++y) {
+        if (solid_at_world(stat, coord, brick_size, delta, new_solid, x, y, z)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+float compute_source_emitter_power_for_cell(
+    const StaticRegionData& stat,
+    const BrickCoord& coord,
+    int brick_size,
+    const AeroLbmWorldDelta& delta,
+    bool new_solid,
+    float new_emitter_power,
+    int lx,
+    int ly,
+    int lz
+) {
+    const int wx = coord.x * brick_size + lx;
+    const int wy = coord.y * brick_size + ly;
+    const int wz = coord.z * brick_size + lz;
+    if (solid_at_world(stat, coord, brick_size, delta, new_solid, wx, wy, wz)) {
+        return 0.0f;
+    }
+    const float direct = source_emitter_power_at_world(
+        stat,
+        coord,
+        brick_size,
+        delta,
+        new_emitter_power,
+        wx,
+        wy,
+        wz
+    );
+    if (direct > 0.0f) {
+        return direct;
+    }
+    float coupled = 0.0f;
+    for (int distance = 1; distance <= k_client_heat_plume_height_cells; ++distance) {
+        const int source_y = wy - distance;
+        const float below_power = source_emitter_power_at_world(
+            stat,
+            coord,
+            brick_size,
+            delta,
+            new_emitter_power,
+            wx,
+            source_y,
+            wz
+        );
+        if (below_power <= 0.0f
+            || !heat_path_clear_for_world_cell(stat, coord, brick_size, delta, new_solid, wx, source_y, wz, wy)) {
+            continue;
+        }
+        coupled += below_power * k_client_heat_coupling_to_adjacent_air / static_cast<float>(distance * distance);
+    }
+    return coupled;
+}
+
+void apply_source_delta_to_brick(FluidWorldRuntime& runtime, const BrickCoord& coord, BrickData& brick, const AeroLbmWorldDelta& delta) {
+    if (!brick.static_region
+        || brick.static_region->nx != runtime.brick_size
+        || brick.static_region->ny != runtime.brick_size
+        || brick.static_region->nz != runtime.brick_size) {
+        return;
+    }
+    const bool old_solid = (delta.data1 & 0x1) != 0;
+    const bool new_solid = (delta.data1 & 0x2) != 0;
+    const uint8_t old_fan_dir = static_cast<uint8_t>((delta.data1 >> 8) & 0xFF);
+    const uint8_t new_fan_dir = static_cast<uint8_t>((delta.data1 >> 16) & 0xFF);
+    const float old_emitter_power = std::isfinite(delta.value0) ? delta.value0 : 0.0f;
+    const float new_emitter_power = std::isfinite(delta.value1) ? delta.value1 : 0.0f;
+    const bool obstacle_changed = old_solid != new_solid;
+    const bool heat_changed = old_emitter_power != new_emitter_power;
+
+    std::unordered_set<int> affected;
+    affected.reserve(128);
+    add_source_delta_affected_cells(
+        coord,
+        runtime.brick_size,
+        affected,
+        delta,
+        old_fan_dir,
+        new_fan_dir,
+        obstacle_changed,
+        heat_changed
+    );
+
+    int source_lx = 0;
+    int source_ly = 0;
+    int source_lz = 0;
+    const bool source_in_brick = world_cell_to_local(
+        coord,
+        runtime.brick_size,
+        delta.x,
+        delta.y,
+        delta.z,
+        source_lx,
+        source_ly,
+        source_lz
+    );
+    if (affected.empty() && !source_in_brick) {
+        return;
+    }
+    if (!brick.static_region.unique()) {
+        brick.static_region = std::make_shared<StaticRegionData>(*brick.static_region);
+    }
+    StaticRegionData& stat = *brick.static_region;
+    ensure_static_region_source_buffers(stat);
+
+    if (source_in_brick) {
+        const size_t source_cell = static_cast<size_t>(local_cell_index(runtime.brick_size, source_lx, source_ly, source_lz));
+        if (source_cell < stat.obstacle.size()) {
+            stat.obstacle[source_cell] = new_solid ? 1u : 0u;
+            stat.source_fan_dir[source_cell] = std::min<uint8_t>(new_fan_dir, 6u);
+            stat.source_emitter_power_watts[source_cell] = new_emitter_power;
+            affected.insert(static_cast<int>(source_cell));
+        }
+    }
+
+    bool changed = false;
+    for (int cell : affected) {
+        if (cell < 0 || static_cast<size_t>(cell) >= stat.obstacle.size()) {
+            continue;
+        }
+        const int lx = cell / (runtime.brick_size * runtime.brick_size);
+        const int rem = cell - lx * runtime.brick_size * runtime.brick_size;
+        const int ly = rem / runtime.brick_size;
+        const int lz = rem - ly * runtime.brick_size;
+        const size_t idx = static_cast<size_t>(cell);
+        const uint8_t next_obstacle = solid_at_world(
+            stat,
+            coord,
+            runtime.brick_size,
+            delta,
+            new_solid,
+            coord.x * runtime.brick_size + lx,
+            coord.y * runtime.brick_size + ly,
+            coord.z * runtime.brick_size + lz
+        ) ? 1u : 0u;
+        const uint8_t next_surface_kind = compute_source_surface_kind_for_cell(
+            stat,
+            coord,
+            runtime.brick_size,
+            delta,
+            new_solid,
+            new_fan_dir,
+            lx,
+            ly,
+            lz
+        );
+        const uint16_t next_open_face_mask = compute_source_open_face_mask_for_cell(
+            stat,
+            coord,
+            runtime.brick_size,
+            delta,
+            new_solid,
+            lx,
+            ly,
+            lz
+        );
+        const float next_emitter_power = compute_source_emitter_power_for_cell(
+            stat,
+            coord,
+            runtime.brick_size,
+            delta,
+            new_solid,
+            new_emitter_power,
+            lx,
+            ly,
+            lz
+        );
+        const bool cell_changed = stat.obstacle[idx] != next_obstacle
+            || stat.surface_kind[idx] != next_surface_kind
+            || stat.open_face_mask[idx] != next_open_face_mask
+            || stat.emitter_power_watts[idx] != next_emitter_power;
+        stat.obstacle[idx] = next_obstacle;
+        stat.surface_kind[idx] = next_surface_kind;
+        stat.open_face_mask[idx] = next_open_face_mask;
+        stat.emitter_power_watts[idx] = next_emitter_power;
+        const size_t face_base = idx * k_face_count;
+        if (face_base + k_face_count <= stat.face_sky_exposure.size()) {
+            std::fill_n(stat.face_sky_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
+        }
+        if (face_base + k_face_count <= stat.face_direct_exposure.size()) {
+            std::fill_n(stat.face_direct_exposure.begin() + static_cast<std::ptrdiff_t>(face_base), k_face_count, 0u);
+        }
+        if (cell_changed) {
+            brick.pending_static_patch_cells.push_back(cell);
+            changed = true;
+        }
+    }
+    if (changed) {
+        if (brick.dynamic_region) {
+            apply_brick_static_constraints(runtime, brick);
+        }
+        brick.forcing_dirty = true;
+        brick.geometry_dirty = false;
+        brick.pending_reinit = false;
+        brick.active = true;
+        brick.last_active_epoch = runtime.epoch;
     }
 }
 
@@ -1651,7 +2371,11 @@ void install_static_brick_region(
 ) {
     const bool has_live_dynamic = brick.context_key != 0
         || brick_dynamic_region_valid(runtime, brick.dynamic_region.get());
+    if (static_region) {
+        ensure_static_region_source_buffers(*static_region);
+    }
     brick.static_region = std::move(static_region);
+    brick.pending_static_patch_cells.clear();
     if (has_live_dynamic) {
         brick.forcing_dirty = true;
         brick.geometry_dirty = false;
@@ -1670,6 +2394,11 @@ void install_static_brick_region(
 void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta& delta) {
     const BrickCoord coord = brick_coord_for_block(delta.x, delta.y, delta.z, runtime.brick_size);
     switch (delta.type) {
+        case k_world_delta_brick_static_source_patch:
+            for (auto& entry : runtime.bricks) {
+                apply_source_delta_to_brick(runtime, entry.first, entry.second, delta);
+            }
+            break;
         case k_world_delta_brick_static_cell_patch: {
             auto brick_it = runtime.bricks.find(coord);
             if (brick_it == runtime.bricks.end()) {
@@ -1720,6 +2449,12 @@ void apply_brick_world_delta(FluidWorldRuntime& runtime, const AeroLbmWorldDelta
                 || previous_surface_kind != next_surface_kind
                 || previous_open_face_mask != next_open_face_mask
                 || previous_emitter_power != next_emitter_power;
+            if (previous_obstacle != next_obstacle
+                || previous_surface_kind != next_surface_kind
+                || previous_open_face_mask != next_open_face_mask
+                || previous_emitter_power != next_emitter_power) {
+                brick.pending_static_patch_cells.push_back(cell);
+            }
             brick.active = true;
             brick.last_active_epoch = runtime.epoch;
             break;
@@ -3878,6 +4613,40 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick(
     const uint8_t* face_sky_exposure,
     const uint8_t* face_direct_exposure
 ) {
+    return aero_lbm_simulation_upload_brick_world_static_brick_with_sources(
+        service_key,
+        world_key,
+        brick_size,
+        brick_x,
+        brick_y,
+        brick_z,
+        obstacle,
+        surface_kind,
+        open_face_mask,
+        emitter_power_watts,
+        nullptr,
+        nullptr,
+        face_sky_exposure,
+        face_direct_exposure
+    );
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick_with_sources(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    int brick_x,
+    int brick_y,
+    int brick_z,
+    const uint8_t* obstacle,
+    const uint8_t* surface_kind,
+    const uint16_t* open_face_mask,
+    const float* emitter_power_watts,
+    const uint8_t* source_fan_dir,
+    const float* source_emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
+) {
     int cells = 0;
     if (!checked_cell_count(brick_size, brick_size, brick_size, &cells)) {
         std::lock_guard<SpinMutex> lock(g_simulation_mutex);
@@ -3916,6 +4685,16 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick(
     region->surface_kind.assign(surface_kind, surface_kind + cells);
     region->open_face_mask.assign(open_face_mask, open_face_mask + cells);
     region->emitter_power_watts.assign(emitter_power_watts, emitter_power_watts + cells);
+    if (source_fan_dir) {
+        region->source_fan_dir.assign(source_fan_dir, source_fan_dir + cells);
+    } else {
+        region->source_fan_dir.assign(static_cast<size_t>(cells), 0u);
+    }
+    if (source_emitter_power_watts) {
+        region->source_emitter_power_watts.assign(source_emitter_power_watts, source_emitter_power_watts + cells);
+    } else {
+        region->source_emitter_power_watts.assign(static_cast<size_t>(cells), 0.0f);
+    }
     region->face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
     region->face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
 
@@ -5783,6 +6562,11 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     std::uint64_t compact_reject_fan_steps = 0;
     std::uint64_t compact_thermal_ignored_steps = 0;
     std::uint64_t d3q27_steps = 0;
+    std::uint64_t d3q27_patch_attempts = 0;
+    std::uint64_t d3q27_patch_steps = 0;
+    std::uint64_t d3q27_patch_failures = 0;
+    std::uint64_t d3q27_patch_cells = 0;
+    std::uint64_t d3q27_patch_upload_bytes_est = 0;
     std::uint64_t packet_build_steps = 0;
     std::uint64_t dynamic_upload_resets = 0;
     std::uint64_t compact_last_fluid_cells = 0;
@@ -5821,6 +6605,11 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
             compact_reject_fan_steps += entry.second.compact_reject_fan_steps;
             compact_thermal_ignored_steps += entry.second.compact_thermal_ignored_steps;
             d3q27_steps += entry.second.d3q27_steps;
+            d3q27_patch_attempts += entry.second.d3q27_patch_attempts;
+            d3q27_patch_steps += entry.second.d3q27_patch_steps;
+            d3q27_patch_failures += entry.second.d3q27_patch_failures;
+            d3q27_patch_cells += entry.second.d3q27_patch_cells;
+            d3q27_patch_upload_bytes_est += entry.second.d3q27_patch_upload_bytes_est;
             packet_build_steps += entry.second.packet_build_steps;
             dynamic_upload_resets += entry.second.dynamic_upload_resets;
             compact_last_fluid_cells = std::max(compact_last_fluid_cells, entry.second.compact_last_fluid_cells);
@@ -5833,6 +6622,9 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     }
     std::string solver_runtime = aero_lbm_runtime_info();
     std::replace(solver_runtime.begin(), solver_runtime.end(), '|', '/');
+    std::string native_memory = aero_lbm_memory_info();
+    std::replace(native_memory.begin(), native_memory.end(), '|', '/');
+    std::replace(native_memory.begin(), native_memory.end(), ' ', '_');
     std::string native_timing = aero_lbm_timing_info();
     std::replace(native_timing.begin(), native_timing.end(), '|', '/');
     std::replace(native_timing.begin(), native_timing.end(), ' ', '_');
@@ -5864,6 +6656,11 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         + "|compact_reject_fan_steps=" + std::to_string(compact_reject_fan_steps)
         + "|compact_thermal_ignored_steps=" + std::to_string(compact_thermal_ignored_steps)
         + "|d3q27_steps=" + std::to_string(d3q27_steps)
+        + "|d3q27_patch_attempts=" + std::to_string(d3q27_patch_attempts)
+        + "|d3q27_patch_steps=" + std::to_string(d3q27_patch_steps)
+        + "|d3q27_patch_failures=" + std::to_string(d3q27_patch_failures)
+        + "|d3q27_patch_cells=" + std::to_string(d3q27_patch_cells)
+        + "|d3q27_patch_upload_bytes_est=" + std::to_string(d3q27_patch_upload_bytes_est)
         + "|packet_build_steps=" + std::to_string(packet_build_steps)
         + "|dynamic_upload_resets=" + std::to_string(dynamic_upload_resets)
         + "|compact_last_fluid_cells=" + std::to_string(compact_last_fluid_cells)
@@ -5871,6 +6668,7 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         + "|compact_last_fan_cells=" + std::to_string(compact_last_fan_cells)
         + "|compact_last_thermal_cells=" + std::to_string(compact_last_thermal_cells)
         + "|compact_last_nonfinite_cells=" + std::to_string(compact_last_nonfinite_cells)
+        + "|native_memory=" + native_memory
         + "|native_timing=" + native_timing
         + "|brick_epoch_max=" + std::to_string(max_brick_epoch);
     return text.c_str();
@@ -6254,6 +7052,96 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
     env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
     env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
     env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeUploadBrickWorldStaticBrickWithSources(
+    JNIEnv* env,
+    jclass,
+    jlong service_key,
+    jlong world_key,
+    jint brick_size,
+    jint brick_x,
+    jint brick_y,
+    jint brick_z,
+    jbyteArray obstacle,
+    jbyteArray surface_kind,
+    jshortArray open_face_mask,
+    jfloatArray emitter_power_watts,
+    jbyteArray source_fan_dir,
+    jfloatArray source_emitter_power_watts,
+    jbyteArray face_sky_exposure,
+    jbyteArray face_direct_exposure
+) {
+    if (!obstacle || !surface_kind || !open_face_mask || !emitter_power_watts
+        || !source_fan_dir || !source_emitter_power_watts
+        || !face_sky_exposure || !face_direct_exposure) {
+        return JNI_FALSE;
+    }
+    const int cells = brick_size * brick_size * brick_size;
+    if (cells <= 0
+        || env->GetArrayLength(obstacle) != static_cast<jsize>(cells)
+        || env->GetArrayLength(surface_kind) != static_cast<jsize>(cells)
+        || env->GetArrayLength(open_face_mask) != static_cast<jsize>(cells)
+        || env->GetArrayLength(emitter_power_watts) != static_cast<jsize>(cells)
+        || env->GetArrayLength(source_fan_dir) != static_cast<jsize>(cells)
+        || env->GetArrayLength(source_emitter_power_watts) != static_cast<jsize>(cells)
+        || env->GetArrayLength(face_sky_exposure) != static_cast<jsize>(cells * k_face_count)
+        || env->GetArrayLength(face_direct_exposure) != static_cast<jsize>(cells * k_face_count)) {
+        return JNI_FALSE;
+    }
+    jboolean obstacle_copy = JNI_FALSE;
+    jboolean surface_copy = JNI_FALSE;
+    jboolean open_copy = JNI_FALSE;
+    jboolean emitter_copy = JNI_FALSE;
+    jboolean source_fan_copy = JNI_FALSE;
+    jboolean source_emitter_copy = JNI_FALSE;
+    jboolean sky_copy = JNI_FALSE;
+    jboolean direct_copy = JNI_FALSE;
+    jbyte* obstacle_ptr = env->GetByteArrayElements(obstacle, &obstacle_copy);
+    jbyte* surface_ptr = env->GetByteArrayElements(surface_kind, &surface_copy);
+    jshort* open_ptr = env->GetShortArrayElements(open_face_mask, &open_copy);
+    jfloat* emitter_ptr = env->GetFloatArrayElements(emitter_power_watts, &emitter_copy);
+    jbyte* source_fan_ptr = env->GetByteArrayElements(source_fan_dir, &source_fan_copy);
+    jfloat* source_emitter_ptr = env->GetFloatArrayElements(source_emitter_power_watts, &source_emitter_copy);
+    jbyte* sky_ptr = env->GetByteArrayElements(face_sky_exposure, &sky_copy);
+    jbyte* direct_ptr = env->GetByteArrayElements(face_direct_exposure, &direct_copy);
+    if (!obstacle_ptr || !surface_ptr || !open_ptr || !emitter_ptr
+        || !source_fan_ptr || !source_emitter_ptr || !sky_ptr || !direct_ptr) {
+        if (obstacle_ptr) env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
+        if (surface_ptr) env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
+        if (open_ptr) env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
+        if (emitter_ptr) env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+        if (source_fan_ptr) env->ReleaseByteArrayElements(source_fan_dir, source_fan_ptr, JNI_ABORT);
+        if (source_emitter_ptr) env->ReleaseFloatArrayElements(source_emitter_power_watts, source_emitter_ptr, JNI_ABORT);
+        if (sky_ptr) env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
+        if (direct_ptr) env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
+        return JNI_FALSE;
+    }
+    const int ok = aero_lbm_simulation_upload_brick_world_static_brick_with_sources(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key),
+        brick_size,
+        brick_x,
+        brick_y,
+        brick_z,
+        reinterpret_cast<const uint8_t*>(obstacle_ptr),
+        reinterpret_cast<const uint8_t*>(surface_ptr),
+        reinterpret_cast<const uint16_t*>(open_ptr),
+        emitter_ptr,
+        reinterpret_cast<const uint8_t*>(source_fan_ptr),
+        source_emitter_ptr,
+        reinterpret_cast<const uint8_t*>(sky_ptr),
+        reinterpret_cast<const uint8_t*>(direct_ptr)
+    );
+    env->ReleaseByteArrayElements(obstacle, obstacle_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(surface_kind, surface_ptr, JNI_ABORT);
+    env->ReleaseShortArrayElements(open_face_mask, open_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(emitter_power_watts, emitter_ptr, JNI_ABORT);
+    env->ReleaseByteArrayElements(source_fan_dir, source_fan_ptr, JNI_ABORT);
+    env->ReleaseFloatArrayElements(source_emitter_power_watts, source_emitter_ptr, JNI_ABORT);
     env->ReleaseByteArrayElements(face_sky_exposure, sky_ptr, JNI_ABORT);
     env->ReleaseByteArrayElements(face_direct_exposure, direct_ptr, JNI_ABORT);
     return ok ? JNI_TRUE : JNI_FALSE;

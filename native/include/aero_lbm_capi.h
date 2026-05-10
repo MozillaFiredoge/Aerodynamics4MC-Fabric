@@ -163,6 +163,16 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect(const float* packet, int nx, int ny,
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_scaled(const float* packet, int nx, int ny, int nz, long long context_key, float output_velocity_scale, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached(int nx, int ny, int nz, long long context_key, float* output_flow);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_cached_scaled(int nx, int ny, int nz, long long context_key, float output_velocity_scale, float* output_flow);
+AERO_LBM_CAPI_EXPORT int aero_lbm_patch_d3q27_f16_static_cells_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    int patch_count,
+    const int* cell_indices,
+    const uint8_t* solid_values,
+    const uint8_t* fan_dir_values
+);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(
     const float* packet,
     int nx,
@@ -249,6 +259,7 @@ AERO_LBM_CAPI_EXPORT void aero_lbm_shutdown(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_runtime_info(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_last_error(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_timing_info(void);
+AERO_LBM_CAPI_EXPORT const char* aero_lbm_memory_info(void);
 AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void);
 AERO_LBM_CAPI_EXPORT int aero_lbm_finish(void);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_timing_snapshot(AeroLbmTimingSnapshot* out_snapshot);
@@ -346,6 +357,22 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick(
     const uint8_t* surface_kind,
     const uint16_t* open_face_mask,
     const float* emitter_power_watts,
+    const uint8_t* face_sky_exposure,
+    const uint8_t* face_direct_exposure
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick_with_sources(
+    long long service_key,
+    long long world_key,
+    int brick_size,
+    int brick_x,
+    int brick_y,
+    int brick_z,
+    const uint8_t* obstacle,
+    const uint8_t* surface_kind,
+    const uint16_t* open_face_mask,
+    const float* emitter_power_watts,
+    const uint8_t* source_fan_dir,
+    const float* source_emitter_power_watts,
     const uint8_t* face_sky_exposure,
     const uint8_t* face_direct_exposure
 );

@@ -22,6 +22,7 @@ public final class NativeSimulationBridge {
     public static final int WORLD_DELTA_WORLD_UNLOADED = 6;
     public static final int WORLD_DELTA_FOCUS_CHANGED = 7;
     public static final int WORLD_DELTA_BRICK_STATIC_CELL_PATCH = 8;
+    public static final int WORLD_DELTA_BRICK_STATIC_SOURCE_PATCH = 10;
     private static final int WORLD_DELTA_INTS_PER_ENTRY = 8;
     private static final int WORLD_DELTA_FLOATS_PER_ENTRY = 4;
 
@@ -249,6 +250,63 @@ public final class NativeSimulationBridge {
             surfaceKind,
             openFaceMask,
             emitterPowerWatts,
+            faceSkyExposure,
+            faceDirectExposure
+        );
+    }
+
+    public boolean uploadBrickWorldStaticBrickWithSources(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int brickX,
+        int brickY,
+        int brickZ,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts,
+        byte[] sourceFanDirection,
+        float[] sourceEmitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    ) {
+        if (!LOADED || serviceKey == 0L || worldKey == 0L || brickSize <= 0) {
+            return false;
+        }
+        int cells = checkedCellCount(brickSize, brickSize, brickSize);
+        if (cells <= 0
+            || obstacle == null
+            || surfaceKind == null
+            || openFaceMask == null
+            || emitterPowerWatts == null
+            || sourceFanDirection == null
+            || sourceEmitterPowerWatts == null
+            || faceSkyExposure == null
+            || faceDirectExposure == null
+            || obstacle.length != cells
+            || surfaceKind.length != cells
+            || openFaceMask.length != cells
+            || emitterPowerWatts.length != cells
+            || sourceFanDirection.length != cells
+            || sourceEmitterPowerWatts.length != cells
+            || faceSkyExposure.length != cells * FACE_COUNT
+            || faceDirectExposure.length != cells * FACE_COUNT) {
+            return false;
+        }
+        return nativeUploadBrickWorldStaticBrickWithSources(
+            serviceKey,
+            worldKey,
+            brickSize,
+            brickX,
+            brickY,
+            brickZ,
+            obstacle,
+            surfaceKind,
+            openFaceMask,
+            emitterPowerWatts,
+            sourceFanDirection,
+            sourceEmitterPowerWatts,
             faceSkyExposure,
             faceDirectExposure
         );
@@ -1234,6 +1292,23 @@ public final class NativeSimulationBridge {
         byte[] surfaceKind,
         short[] openFaceMask,
         float[] emitterPowerWatts,
+        byte[] faceSkyExposure,
+        byte[] faceDirectExposure
+    );
+
+    private static native boolean nativeUploadBrickWorldStaticBrickWithSources(
+        long serviceKey,
+        long worldKey,
+        int brickSize,
+        int brickX,
+        int brickY,
+        int brickZ,
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPowerWatts,
+        byte[] sourceFanDirection,
+        float[] sourceEmitterPowerWatts,
         byte[] faceSkyExposure,
         byte[] faceDirectExposure
     );

@@ -15,6 +15,8 @@ The following are already present in code:
 - `TornadoVortex`
 - `L0/L1` dump pipeline
 - client `AeroVisualizer` wind-trail/streamline overlay
+- client-local `128^3` D3Q27 FP16 in-place SRT solver path
+- source-delta fan forcing and sparse static patch upload for client-local `L2`
 
 The main missing areas are usability, observability, and the foliage/shaderpack integration that was lost from the working tree.
 
@@ -98,6 +100,22 @@ These are still largely not done.
 ## P3.5: On-Demand Local L2
 
 This is now the main local-air direction.
+
+Solver-core status:
+
+- complete enough for the current game-facing target
+- tested path: `d3q27-fp16-inplace-srt`
+- target shape: one client-local `128^3` brick
+- steady-state objective: stay inside a `20 ms` gameplay budget including fan forcing and ordinary block edits
+- memory objective: stay below `200 MB` for one active brick
+- do not spend the next phase on cumulant/SGS unless SRT produces a visible gameplay defect
+
+Open architecture work:
+
+- remove synchronous static/dynamic rebuild stalls; a rebuild currently can scan millions of cells and freeze the client for seconds
+- define the final boundary model: one-brick L1 boundary shell first, true halo exchange only when multiple active L2 bricks are introduced
+- preserve physical continuity when the local patch moves or wakes from cache
+- make atlas/probe publication independent from rebuild work, so visualization never disappears during geometry bursts
 
 Target:
 

@@ -83,6 +83,55 @@ final class ClientL2Solver {
         1,
         CELL_COUNT
     );
+    private static final int STRESS_PATCHES_PER_TICK = configuredInt(
+        "a4mc.clientL2.stressPatchesPerTick",
+        "AERO_LBM_CLIENT_L2_STRESS_PATCHES_PER_TICK",
+        BRICK_SIZE >= 128 ? 512 : 64,
+        1,
+        CELL_COUNT
+    );
+    private static final int STRESS_INTERVAL_TICKS = configuredInt(
+        "a4mc.clientL2.stressIntervalTicks",
+        "AERO_LBM_CLIENT_L2_STRESS_INTERVAL_TICKS",
+        1,
+        1,
+        200
+    );
+    private static final int STATIC_PATCH_DEBOUNCE_TICKS = configuredInt(
+        "a4mc.clientL2.staticPatchDebounceTicks",
+        "AERO_LBM_CLIENT_L2_STATIC_PATCH_DEBOUNCE_TICKS",
+        0,
+        0,
+        20
+    );
+    private static final int BOUNDARY_REFRESH_AFTER_STATIC_PATCH_COOLDOWN_TICKS = configuredInt(
+        "a4mc.clientL2.boundaryRefreshAfterStaticPatchCooldownTicks",
+        "AERO_LBM_CLIENT_L2_BOUNDARY_REFRESH_AFTER_STATIC_PATCH_COOLDOWN_TICKS",
+        20,
+        0,
+        200
+    );
+    private static final int STATIC_PATCH_MAX_DEBOUNCE_TICKS = configuredInt(
+        "a4mc.clientL2.staticPatchMaxDebounceTicks",
+        "AERO_LBM_CLIENT_L2_STATIC_PATCH_MAX_DEBOUNCE_TICKS",
+        8,
+        1,
+        80
+    );
+    private static final int STATIC_PATCH_BULK_CHANGE_THRESHOLD = configuredInt(
+        "a4mc.clientL2.staticPatchBulkChangeThreshold",
+        "AERO_LBM_CLIENT_L2_STATIC_PATCH_BULK_CHANGE_THRESHOLD",
+        8,
+        1,
+        CELL_COUNT
+    );
+    private static final int STATIC_PATCH_BULK_CELL_THRESHOLD = configuredInt(
+        "a4mc.clientL2.staticPatchBulkCellThreshold",
+        "AERO_LBM_CLIENT_L2_STATIC_PATCH_BULK_CELL_THRESHOLD",
+        256,
+        1,
+        CELL_COUNT
+    );
     private static final int STATIC_CACHE_MAX_BRICKS = configuredInt(
         "a4mc.clientL2.staticCacheMaxBricks",
         "AERO_LBM_CLIENT_L2_STATIC_CACHE_MAX_BRICKS",
@@ -134,7 +183,43 @@ final class ClientL2Solver {
     private static final byte SURFACE_KIND_FAN_Z_NEG = 36;
     private static final byte SURFACE_KIND_FAN_Z_POS = 37;
     private static final int WORKER_QUEUE_CAPACITY = 128;
+    private static final int STRESS_QUEUE_BACKLOG_LIMIT = configuredInt(
+        "a4mc.clientL2.stressQueueBacklogLimit",
+        "AERO_LBM_CLIENT_L2_STRESS_QUEUE_BACKLOG_LIMIT",
+        16,
+        0,
+        WORKER_QUEUE_CAPACITY
+    );
+    private static final int ALL_OPEN_FACE_MASK = (1 << FACE_COUNT) - 1;
     private static final boolean CLIENT_L2_DEFAULT_ENABLED = true;
+
+    private enum StressMode {
+        OFF,
+        FAN,
+        THERMAL,
+        DIRTY,
+        MIXED;
+
+        static StressMode parse(String value) {
+            if (value == null || value.isBlank()) {
+                return OFF;
+            }
+            return switch (value.trim().toLowerCase(java.util.Locale.ROOT)) {
+                case "fan", "fans" -> FAN;
+                case "thermal", "heat" -> THERMAL;
+                case "dirty", "obstacle", "geometry" -> DIRTY;
+                case "mixed", "all" -> MIXED;
+                case "off", "disable", "disabled" -> OFF;
+                default -> throw new IllegalArgumentException("Unknown Client L2 stress mode: " + value);
+            };
+        }
+    }
+
+    private enum StaticPatchFlushResult {
+        NONE,
+        DELAYED,
+        SUBMITTED
+    }
 
     private final AeroVisualizer visualizer;
     private final ClientL2Worker worker = new ClientL2Worker();
@@ -142,6 +227,8 @@ final class ClientL2Solver {
     private final byte[] surfaceKind = new byte[CELL_COUNT];
     private final short[] openFaceMask = new short[CELL_COUNT];
     private final float[] emitterPower = new float[CELL_COUNT];
+    private final byte[] sourceFanDirection = new byte[CELL_COUNT];
+    private final float[] sourceEmitterPower = new float[CELL_COUNT];
     private final byte[] faceSkyExposure = new byte[CELL_COUNT * FACE_COUNT];
     private final byte[] faceDirectExposure = new byte[CELL_COUNT * FACE_COUNT];
     private final float[] flowState = new float[CELL_COUNT * FLOW_CHANNELS];
@@ -163,6 +250,12 @@ final class ClientL2Solver {
     private final boolean[] activeBrickRefreshPending = new boolean[MAX_CLIENT_ACTIVE_BRICKS];
     private final boolean[] activeBrickBoundaryRefreshPending = new boolean[MAX_CLIENT_ACTIVE_BRICKS];
     private int[] activeHintCoords = new int[NativeSimulationBridge.BRICK_HINT_COORDS_PER_BRICK];
+    private final java.util.LinkedHashMap<BlockPos, PendingSourcePatch> pendingSourcePatches = new java.util.LinkedHashMap<>();
+    private Identifier pendingStaticPatchDimension;
+    private long pendingStaticPatchWorldKey;
+    private long pendingStaticPatchFirstChangeGameTime = Long.MIN_VALUE;
+    private long pendingStaticPatchLastChangeGameTime = Long.MIN_VALUE;
+    private int pendingStaticPatchSourceChanges;
 
     private long worldKey;
     private BlockPos activeOrigin;
@@ -200,11 +293,21 @@ final class ClientL2Solver {
     private long lastSolveClientGameTime = Long.MIN_VALUE;
     private long lastPublishedClientGameTime = Long.MIN_VALUE;
     private long lastBoundaryRefreshClientGameTime = Long.MIN_VALUE;
+    private long lastStaticPatchSubmitClientGameTime = Long.MIN_VALUE;
     private long fastSuspendUntilGameTime = Long.MIN_VALUE;
     private long lastDiagnosticGameTime = Long.MIN_VALUE;
     private int lastStaticPatchCount;
     private int lastFanPatchCellCount;
     private int lastHeatPatchCellCount;
+    private StressMode stressMode = StressMode.OFF;
+    private long stressStartedGameTime = Long.MIN_VALUE;
+    private long lastStressSubmitGameTime = Long.MIN_VALUE;
+    private long stressSubmittedTicks;
+    private long stressSubmittedPatches;
+    private long stressSubmittedFanCells;
+    private long stressSubmittedHeatCells;
+    private long stressSubmittedDirtyCells;
+    private boolean stressStaticSubmittedForActiveSet;
 
     ClientL2Solver(AeroVisualizer visualizer) {
         this.visualizer = visualizer;
@@ -296,26 +399,7 @@ final class ClientL2Solver {
         if (!blockPatchTouchesActiveBrick(pos)) {
             return;
         }
-        NativeSimulationBridge.WorldDelta[] deltas = buildStaticPatchDeltas(world, pos, oldState, newState);
-        if (deltas.length == 0) {
-            return;
-        }
-        int fanPatchCells = 0;
-        int heatPatchCells = 0;
-        for (NativeSimulationBridge.WorldDelta delta : deltas) {
-            int surfaceKind = (delta.data1() >> 8) & 0xFF;
-            if (isFanSurfaceKind(surfaceKind)) {
-                fanPatchCells++;
-            }
-            if (delta.value0() > 0.0f) {
-                heatPatchCells++;
-            }
-            refreshLocalStaticCellIfActive(world, new BlockPos(delta.x(), delta.y(), delta.z()));
-        }
-        lastStaticPatchCount = deltas.length;
-        lastFanPatchCellCount = fanPatchCells;
-        lastHeatPatchCellCount = heatPatchCells;
-        worker.submitWorldDeltas(worldKey, deltas);
+        queueStaticPatchPositions(dimensionId, worldKey, world.getTime(), pos, oldState, newState);
     }
 
     private void onClientTick(MinecraftClient client) {
@@ -363,11 +447,14 @@ final class ClientL2Solver {
             worldKey = worldKey(dimensionId);
             activeHintUploaded = false;
             buildActiveBrickSet(brickX, brickY, brickZ, localX, localY, localZ);
+            clearPendingStaticPatches();
             cancelStagedPreparation();
             cancelBoundaryReferenceRefresh();
             lastPublishedClientGameTime = Long.MIN_VALUE;
             lastSolveClientGameTime = Long.MIN_VALUE;
             lastBoundaryRefreshClientGameTime = Long.MIN_VALUE;
+            lastStaticPatchSubmitClientGameTime = Long.MIN_VALUE;
+            stressStaticSubmittedForActiveSet = false;
             visualizer.clearLocalFlowFields();
             ticksSinceStaticRefresh = 0;
         }
@@ -384,10 +471,17 @@ final class ClientL2Solver {
         if (refreshActiveBrickStatic(client, world)) {
             return;
         }
-        if (refreshActiveBrickBoundaryReference(client, dimensionId, clientGameTime)) {
+        StaticPatchFlushResult staticPatchFlush = flushPendingStaticPatches(world, dimensionId, clientGameTime);
+        if (staticPatchFlush == StaticPatchFlushResult.DELAYED) {
             return;
         }
-        if (lastSolveClientGameTime != Long.MIN_VALUE
+        boolean submittedStaticPatch = staticPatchFlush == StaticPatchFlushResult.SUBMITTED;
+        if (!submittedStaticPatch && refreshActiveBrickBoundaryReference(client, dimensionId, clientGameTime)) {
+            return;
+        }
+        maybeSubmitStressDeltas(dimensionId, clientGameTime);
+        if (!submittedStaticPatch
+            && lastSolveClientGameTime != Long.MIN_VALUE
             && clientGameTime - lastSolveClientGameTime < SOLVE_INTERVAL_TICKS) {
             return;
         }
@@ -430,6 +524,153 @@ final class ClientL2Solver {
         }
         publishCursor = activeBrickCount <= 0 ? 0 : (publishCursor + 1) % activeBrickCount;
         return java.util.Arrays.copyOf(targets, count);
+    }
+
+    private void maybeSubmitStressDeltas(Identifier dimensionId, long clientGameTime) {
+        if (stressMode == StressMode.OFF || worldKey == 0L || activeBrickCount <= 0) {
+            return;
+        }
+        if (activeDimension == null || !activeDimension.equals(dimensionId)) {
+            return;
+        }
+        if (lastStressSubmitGameTime != Long.MIN_VALUE
+            && clientGameTime - lastStressSubmitGameTime < STRESS_INTERVAL_TICKS) {
+            return;
+        }
+        if (stressStaticSubmittedForActiveSet && stressModeIsStatic(stressMode)) {
+            return;
+        }
+        if (worker.queueSize() > STRESS_QUEUE_BACKLOG_LIMIT) {
+            return;
+        }
+        int activeIndex = firstReadyActiveBrickIndex();
+        if (activeIndex < 0) {
+            return;
+        }
+        BlockPos origin = brickOrigin(
+            activeBrickX[activeIndex],
+            activeBrickY[activeIndex],
+            activeBrickZ[activeIndex]
+        );
+        NativeSimulationBridge.WorldDelta[] deltas = new NativeSimulationBridge.WorldDelta[STRESS_PATCHES_PER_TICK];
+        int count = 0;
+        int fanCells = 0;
+        int heatCells = 0;
+        int dirtyCells = 0;
+        for (int i = 0; i < STRESS_PATCHES_PER_TICK; i++) {
+            StressMode cellMode = stressCellMode(i);
+            int seed = stressSeed(activeIndex, clientGameTime, i);
+            int x = stressLocalCoord(seed);
+            int y = stressLocalCoord(seed >>> 7);
+            int z = stressLocalCoord(seed >>> 17);
+            boolean solid = false;
+            byte syntheticSurfaceKind = 0;
+            float syntheticEmitterPower = 0.0f;
+            int syntheticOpenFaceMask = ALL_OPEN_FACE_MASK;
+
+            if (cellMode == StressMode.FAN) {
+                syntheticSurfaceKind = fanSurfaceKind(stressFanDirection(i, clientGameTime));
+                fanCells++;
+            } else if (cellMode == StressMode.THERMAL) {
+                syntheticEmitterPower = THERMAL_EMITTER_POWER_FIRE_W;
+                heatCells++;
+            } else if (cellMode == StressMode.DIRTY) {
+                solid = (stressMix(seed ^ (int) (clientGameTime / 8L)) & 1) == 0;
+                syntheticOpenFaceMask = solid ? 0 : ALL_OPEN_FACE_MASK;
+                dirtyCells++;
+            }
+
+            int packedState = (solid ? 1 : 0)
+                | ((Byte.toUnsignedInt(syntheticSurfaceKind) & 0xFF) << 8);
+            deltas[count++] = new NativeSimulationBridge.WorldDelta(
+                NativeSimulationBridge.WORLD_DELTA_BRICK_STATIC_CELL_PATCH,
+                origin.getX() + x,
+                origin.getY() + y,
+                origin.getZ() + z,
+                (int) worldKey,
+                packedState,
+                syntheticOpenFaceMask,
+                0,
+                syntheticEmitterPower,
+                0.0f,
+                0.0f,
+                0.0f
+            );
+        }
+        if (count == 0) {
+            return;
+        }
+        NativeSimulationBridge.WorldDelta[] submitted = count == deltas.length
+            ? deltas
+            : java.util.Arrays.copyOf(deltas, count);
+        if (stressStartedGameTime == Long.MIN_VALUE) {
+            stressStartedGameTime = clientGameTime;
+        }
+        lastStressSubmitGameTime = clientGameTime;
+        stressSubmittedTicks++;
+        stressSubmittedPatches += submitted.length;
+        stressSubmittedFanCells += fanCells;
+        stressSubmittedHeatCells += heatCells;
+        stressSubmittedDirtyCells += dirtyCells;
+        lastStaticPatchCount = submitted.length;
+        lastFanPatchCellCount = fanCells;
+        lastHeatPatchCellCount = heatCells;
+        if (stressModeIsStatic(stressMode)) {
+            stressStaticSubmittedForActiveSet = true;
+        }
+        worker.submitWorldDeltas(worldKey, submitted);
+    }
+
+    private boolean stressModeIsStatic(StressMode mode) {
+        return mode == StressMode.FAN || mode == StressMode.THERMAL;
+    }
+
+    private StressMode stressCellMode(int index) {
+        if (stressMode != StressMode.MIXED) {
+            return stressMode;
+        }
+        return switch (index & 3) {
+            case 0 -> StressMode.FAN;
+            case 1 -> StressMode.THERMAL;
+            default -> StressMode.DIRTY;
+        };
+    }
+
+    private int firstReadyActiveBrickIndex() {
+        for (int index = 0; index < activeBrickCount; index++) {
+            if (activeBrickReady[index]) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    private int stressSeed(int activeIndex, long clientGameTime, int index) {
+        int seed = (int) clientGameTime;
+        seed ^= index * 0x9E3779B9;
+        seed ^= activeBrickX[activeIndex] * 0x85EBCA6B;
+        seed ^= activeBrickY[activeIndex] * 0xC2B2AE35;
+        seed ^= activeBrickZ[activeIndex] * 0x27D4EB2D;
+        return stressMix(seed);
+    }
+
+    private int stressLocalCoord(int seed) {
+        int innerSpan = Math.max(1, BRICK_SIZE - 4);
+        return 2 + Math.floorMod(stressMix(seed), innerSpan);
+    }
+
+    private Direction stressFanDirection(int index, long clientGameTime) {
+        Direction[] directions = Direction.values();
+        return directions[Math.floorMod(index + (int) clientGameTime, directions.length)];
+    }
+
+    private static int stressMix(int value) {
+        value ^= value >>> 16;
+        value *= 0x7FEB352D;
+        value ^= value >>> 15;
+        value *= 0x846CA68B;
+        value ^= value >>> 16;
+        return value;
     }
 
     private boolean shouldSuspendForFastMovement(float horizontalSpeedMetersPerSecond, long clientGameTime) {
@@ -699,6 +940,8 @@ final class ClientL2Solver {
                 java.util.Arrays.copyOf(surfaceKind, surfaceKind.length),
                 java.util.Arrays.copyOf(openFaceMask, openFaceMask.length),
                 java.util.Arrays.copyOf(emitterPower, emitterPower.length),
+                java.util.Arrays.copyOf(sourceFanDirection, sourceFanDirection.length),
+                java.util.Arrays.copyOf(sourceEmitterPower, sourceEmitterPower.length),
                 java.util.Arrays.copyOf(faceSkyExposure, faceSkyExposure.length),
                 java.util.Arrays.copyOf(faceDirectExposure, faceDirectExposure.length),
                 java.util.Arrays.copyOf(flowState, flowState.length),
@@ -750,6 +993,8 @@ final class ClientL2Solver {
         java.util.Arrays.fill(surfaceKind, (byte) 0);
         java.util.Arrays.fill(openFaceMask, (short) 0);
         java.util.Arrays.fill(emitterPower, 0.0f);
+        java.util.Arrays.fill(sourceFanDirection, (byte) 0);
+        java.util.Arrays.fill(sourceEmitterPower, 0.0f);
         java.util.Arrays.fill(faceSkyExposure, (byte) 0);
         java.util.Arrays.fill(faceDirectExposure, (byte) 0);
         java.util.Arrays.fill(flowState, 0.0f);
@@ -757,7 +1002,7 @@ final class ClientL2Solver {
         java.util.Arrays.fill(surfaceTemperature, 0.0f);
         StaticBrickSnapshot cached = staticBrickCache.get(new StaticBrickCacheKey(dimensionId, brickX, brickY, brickZ));
         if (cached != null) {
-            cached.copyInto(obstacle, surfaceKind, openFaceMask, emitterPower);
+            cached.copyInto(obstacle, surfaceKind, openFaceMask, emitterPower, sourceFanDirection, sourceEmitterPower);
             stagedStaticCursor = CELL_COUNT;
             stagedStaticFromCache = true;
         }
@@ -785,7 +1030,7 @@ final class ClientL2Solver {
         }
         staticBrickCache.put(
             new StaticBrickCacheKey(stagedDimension, stagedBrickX, stagedBrickY, stagedBrickZ),
-            StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask, emitterPower)
+            StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask, emitterPower, sourceFanDirection, sourceEmitterPower)
         );
         stagedStaticFromCache = true;
     }
@@ -889,6 +1134,10 @@ final class ClientL2Solver {
         long clientGameTime
     ) {
         if (!hasBoundaryRefreshPending() && boundaryRefreshActiveIndex < 0) {
+            return false;
+        }
+        if (lastStaticPatchSubmitClientGameTime != Long.MIN_VALUE
+            && clientGameTime - lastStaticPatchSubmitClientGameTime < BOUNDARY_REFRESH_AFTER_STATIC_PATCH_COOLDOWN_TICKS) {
             return false;
         }
         if (stagedActiveIndex >= 0) {
@@ -1053,25 +1302,130 @@ final class ClientL2Solver {
         StaticBrickCacheKey key = activeDimension == null ? null : new StaticBrickCacheKey(activeDimension, brickX, brickY, brickZ);
         StaticBrickSnapshot cached = key == null ? null : staticBrickCache.get(key);
         if (cached != null) {
-            cached.copyInto(obstacle, surfaceKind, openFaceMask, emitterPower);
+            cached.copyInto(obstacle, surfaceKind, openFaceMask, emitterPower, sourceFanDirection, sourceEmitterPower);
             java.util.Arrays.fill(faceSkyExposure, (byte) 0);
             java.util.Arrays.fill(faceDirectExposure, (byte) 0);
             return true;
         }
         populateStaticBrickArrays(world, origin);
         if (key != null) {
-            staticBrickCache.put(key, StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask, emitterPower));
+            staticBrickCache.put(key, StaticBrickSnapshot.copyFrom(obstacle, surfaceKind, openFaceMask, emitterPower, sourceFanDirection, sourceEmitterPower));
         }
         return true;
     }
 
-    private NativeSimulationBridge.WorldDelta[] buildStaticPatchDeltas(
-        ClientWorld world,
+    private void queueStaticPatchPositions(
+        Identifier dimensionId,
+        long patchWorldKey,
+        long clientGameTime,
         BlockPos center,
         BlockState oldState,
         BlockState newState
     ) {
-        java.util.LinkedHashSet<BlockPos> positions = new java.util.LinkedHashSet<>();
+        if (pendingStaticPatchWorldKey != patchWorldKey
+            || pendingStaticPatchDimension == null
+            || !pendingStaticPatchDimension.equals(dimensionId)) {
+            pendingSourcePatches.clear();
+            pendingStaticPatchDimension = dimensionId;
+            pendingStaticPatchWorldKey = patchWorldKey;
+            pendingStaticPatchFirstChangeGameTime = Long.MIN_VALUE;
+            pendingStaticPatchLastChangeGameTime = Long.MIN_VALUE;
+            pendingStaticPatchSourceChanges = 0;
+        }
+        if (pendingStaticPatchFirstChangeGameTime == Long.MIN_VALUE) {
+            pendingStaticPatchFirstChangeGameTime = clientGameTime;
+        }
+        pendingStaticPatchLastChangeGameTime = clientGameTime;
+        pendingStaticPatchSourceChanges++;
+        BlockPos key = center.toImmutable();
+        PendingSourcePatch existing = pendingSourcePatches.get(key);
+        pendingSourcePatches.put(
+            key,
+            new PendingSourcePatch(key, existing == null ? oldState : existing.oldState(), newState)
+        );
+        lastStaticPatchCount = pendingSourcePatches.size();
+        lastFanPatchCellCount = 0;
+        lastHeatPatchCellCount = 0;
+    }
+
+    private StaticPatchFlushResult flushPendingStaticPatches(ClientWorld world, Identifier dimensionId, long clientGameTime) {
+        if (pendingSourcePatches.isEmpty()) {
+            return StaticPatchFlushResult.NONE;
+        }
+        if (activeDimension == null
+            || !activeDimension.equals(dimensionId)
+            || pendingStaticPatchDimension == null
+            || !pendingStaticPatchDimension.equals(dimensionId)
+            || pendingStaticPatchWorldKey != worldKey
+            || worldKey == 0L) {
+            clearPendingStaticPatches();
+            return StaticPatchFlushResult.NONE;
+        }
+        if (activeBrickCount <= 0 || !hasReadyActiveBrick()) {
+            return StaticPatchFlushResult.NONE;
+        }
+        if (shouldDelayPendingStaticPatches(clientGameTime)) {
+            return StaticPatchFlushResult.DELAYED;
+        }
+        NativeSimulationBridge.WorldDelta[] deltas = new NativeSimulationBridge.WorldDelta[pendingSourcePatches.size()];
+        int count = 0;
+        int fanSourcePatches = 0;
+        int heatSourcePatches = 0;
+        for (PendingSourcePatch patch : pendingSourcePatches.values()) {
+            NativeSimulationBridge.WorldDelta delta = buildStaticSourcePatchDelta(world, patch);
+            deltas[count++] = delta;
+            int oldFanDirection = (delta.data1() >> 8) & 0xFF;
+            int newFanDirection = (delta.data1() >> 16) & 0xFF;
+            if (oldFanDirection != 0 || newFanDirection != 0) {
+                fanSourcePatches++;
+            }
+            if (delta.value0() > 0.0f || delta.value1() > 0.0f) {
+                heatSourcePatches++;
+            }
+            refreshLocalStaticCellIfActive(world, patch.pos());
+        }
+        clearPendingStaticPatches();
+        if (count == 0) {
+            return StaticPatchFlushResult.NONE;
+        }
+        NativeSimulationBridge.WorldDelta[] submitted = count == deltas.length
+            ? deltas
+            : java.util.Arrays.copyOf(deltas, count);
+        lastStaticPatchCount = submitted.length;
+        lastFanPatchCellCount = fanSourcePatches;
+        lastHeatPatchCellCount = heatSourcePatches;
+        lastStaticPatchSubmitClientGameTime = clientGameTime;
+        cancelBoundaryReferenceRefresh();
+        worker.submitWorldDeltas(worldKey, submitted);
+        return StaticPatchFlushResult.SUBMITTED;
+    }
+
+    private boolean shouldDelayPendingStaticPatches(long clientGameTime) {
+        if (STATIC_PATCH_DEBOUNCE_TICKS <= 0) {
+            return false;
+        }
+        boolean bulkPatch = pendingStaticPatchSourceChanges >= STATIC_PATCH_BULK_CHANGE_THRESHOLD
+            || pendingSourcePatches.size() >= STATIC_PATCH_BULK_CELL_THRESHOLD;
+        if (!bulkPatch
+            || pendingStaticPatchFirstChangeGameTime == Long.MIN_VALUE
+            || pendingStaticPatchLastChangeGameTime == Long.MIN_VALUE) {
+            return false;
+        }
+        long sinceFirstChange = clientGameTime - pendingStaticPatchFirstChangeGameTime;
+        long sinceLastChange = clientGameTime - pendingStaticPatchLastChangeGameTime;
+        if (sinceFirstChange < 0L || sinceLastChange < 0L) {
+            return false;
+        }
+        return sinceLastChange < STATIC_PATCH_DEBOUNCE_TICKS
+            && sinceFirstChange < STATIC_PATCH_MAX_DEBOUNCE_TICKS;
+    }
+
+    private void addStaticPatchPositionsForChange(
+        java.util.LinkedHashSet<BlockPos> positions,
+        BlockPos center,
+        BlockState oldState,
+        BlockState newState
+    ) {
         addStaticPatchPosition(positions, center);
         for (Direction direction : Direction.values()) {
             addStaticPatchPosition(positions, center.offset(direction));
@@ -1080,13 +1434,6 @@ final class ClientL2Solver {
         addHeatOcclusionPatchPositions(positions, center);
         addForcingSourcePatchPositions(positions, center, oldState);
         addForcingSourcePatchPositions(positions, center, newState);
-
-        NativeSimulationBridge.WorldDelta[] deltas = new NativeSimulationBridge.WorldDelta[positions.size()];
-        int count = 0;
-        for (BlockPos pos : positions) {
-            deltas[count++] = buildStaticCellPatchDelta(world, pos);
-        }
-        return count == deltas.length ? deltas : java.util.Arrays.copyOf(deltas, count);
     }
 
     private void addStaticPatchPosition(java.util.LinkedHashSet<BlockPos> positions, BlockPos pos) {
@@ -1225,6 +1572,34 @@ final class ClientL2Solver {
         );
     }
 
+    private NativeSimulationBridge.WorldDelta buildStaticSourcePatchDelta(ClientWorld world, PendingSourcePatch patch) {
+        BlockPos pos = patch.pos();
+        boolean oldSolid = sourceSolidForState(world, pos, patch.oldState());
+        boolean newSolid = sourceSolidForState(world, pos, patch.newState());
+        int oldFanDirection = sourceFanDirectionCodeForState(patch.oldState());
+        int newFanDirection = sourceFanDirectionCodeForState(patch.newState());
+        float oldEmitterPower = sourceEmitterPowerForState(patch.oldState());
+        float newEmitterPower = sourceEmitterPowerForState(patch.newState());
+        int packedState = (oldSolid ? 1 : 0)
+            | (newSolid ? 2 : 0)
+            | ((oldFanDirection & 0xFF) << 8)
+            | ((newFanDirection & 0xFF) << 16);
+        return new NativeSimulationBridge.WorldDelta(
+            NativeSimulationBridge.WORLD_DELTA_BRICK_STATIC_SOURCE_PATCH,
+            pos.getX(),
+            pos.getY(),
+            pos.getZ(),
+            (int) worldKey,
+            packedState,
+            0,
+            0,
+            oldEmitterPower,
+            newEmitterPower,
+            0.0f,
+            0.0f
+        );
+    }
+
     private void refreshLocalStaticCellIfActive(ClientWorld world, BlockPos pos) {
         for (int index = 0; index < activeBrickCount; index++) {
             int brickX = Math.floorDiv(pos.getX(), BRICK_SIZE);
@@ -1251,14 +1626,7 @@ final class ClientL2Solver {
         BlockState newState
     ) {
         java.util.LinkedHashSet<BlockPos> positions = new java.util.LinkedHashSet<>();
-        addStaticPatchPosition(positions, center);
-        for (Direction direction : Direction.values()) {
-            addStaticPatchPosition(positions, center.offset(direction));
-        }
-        addFanOcclusionPatchPositions(positions, center);
-        addHeatOcclusionPatchPositions(positions, center);
-        addForcingSourcePatchPositions(positions, center, oldState);
-        addForcingSourcePatchPositions(positions, center, newState);
+        addStaticPatchPositionsForChange(positions, center, oldState, newState);
         for (BlockPos pos : positions) {
             invalidateStaticCacheForBlock(dimensionId, pos);
         }
@@ -1286,11 +1654,22 @@ final class ClientL2Solver {
         }
     }
 
+    private void markAllActiveBricksStaticRefreshPending() {
+        for (int index = 0; index < activeBrickCount; index++) {
+            activeBrickRefreshPending[index] = true;
+            activeBrickBoundaryRefreshPending[index] = true;
+        }
+        staticBrickCache.clear();
+        ticksSinceStaticRefresh = 0;
+    }
+
     private void populateStaticBrickArrays(ClientWorld world, BlockPos origin) {
         java.util.Arrays.fill(obstacle, (byte) 0);
         java.util.Arrays.fill(surfaceKind, (byte) 0);
         java.util.Arrays.fill(openFaceMask, (short) 0);
         java.util.Arrays.fill(emitterPower, 0.0f);
+        java.util.Arrays.fill(sourceFanDirection, (byte) 0);
+        java.util.Arrays.fill(sourceEmitterPower, 0.0f);
         java.util.Arrays.fill(faceSkyExposure, (byte) 0);
         java.util.Arrays.fill(faceDirectExposure, (byte) 0);
 
@@ -1311,6 +1690,8 @@ final class ClientL2Solver {
         surfaceKind[cell] = sample.surfaceKind();
         openFaceMask[cell] = sample.openFaceMask();
         emitterPower[cell] = sample.emitterPowerWatts();
+        sourceFanDirection[cell] = sample.sourceFanDirection();
+        sourceEmitterPower[cell] = sample.sourceEmitterPowerWatts();
     }
 
     private StaticCellSample sampleStaticCell(ClientWorld world, BlockPos pos) {
@@ -1331,7 +1712,14 @@ final class ClientL2Solver {
         }
         byte kind = solid ? (byte) 0 : fanSurfaceKindForCell(world, pos);
         float emitter = solid ? 0.0f : emitterPowerForCell(world, pos, state);
-        return new StaticCellSample(solid, kind, mask, emitter);
+        return new StaticCellSample(
+            solid,
+            kind,
+            mask,
+            emitter,
+            (byte) sourceFanDirectionCodeForState(state),
+            sourceEmitterPowerForState(state)
+        );
     }
 
     private byte fanSurfaceKindForCell(ClientWorld world, BlockPos pos) {
@@ -1382,6 +1770,29 @@ final class ClientL2Solver {
             case NORTH -> SURFACE_KIND_FAN_Z_NEG;
             case SOUTH -> SURFACE_KIND_FAN_Z_POS;
         };
+    }
+
+    private int sourceFanDirectionCodeForState(BlockState state) {
+        if (state == null || !state.isOf(ModBlocks.FAN_BLOCK)) {
+            return 0;
+        }
+        Direction direction = state.getOrEmpty(FanBlock.FACING).orElse(Direction.NORTH);
+        return switch (direction) {
+            case WEST -> 1;
+            case EAST -> 2;
+            case DOWN -> 3;
+            case UP -> 4;
+            case NORTH -> 5;
+            case SOUTH -> 6;
+        };
+    }
+
+    private float sourceEmitterPowerForState(BlockState state) {
+        return state == null ? 0.0f : sampleEmitterThermalPowerWatts(state);
+    }
+
+    private boolean sourceSolidForState(ClientWorld world, BlockPos pos, BlockState state) {
+        return state != null && isSolidObstacle(world, pos, state);
     }
 
     private boolean isFanSurfaceKind(int surfaceKind) {
@@ -1545,21 +1956,39 @@ final class ClientL2Solver {
     private record StaticBrickCacheKey(Identifier dimensionId, int brickX, int brickY, int brickZ) {
     }
 
-    private record StaticCellSample(boolean solid, byte surfaceKind, short openFaceMask, float emitterPowerWatts) {
+    private record StaticCellSample(
+        boolean solid,
+        byte surfaceKind,
+        short openFaceMask,
+        float emitterPowerWatts,
+        byte sourceFanDirection,
+        float sourceEmitterPowerWatts
+    ) {
     }
 
-    private record StaticBrickSnapshot(byte[] obstacle, byte[] surfaceKind, short[] openFaceMask, float[] emitterPower) {
+    private record StaticBrickSnapshot(
+        byte[] obstacle,
+        byte[] surfaceKind,
+        short[] openFaceMask,
+        float[] emitterPower,
+        byte[] sourceFanDirection,
+        float[] sourceEmitterPower
+    ) {
         static StaticBrickSnapshot copyFrom(
             byte[] obstacle,
             byte[] surfaceKind,
             short[] openFaceMask,
-            float[] emitterPower
+            float[] emitterPower,
+            byte[] sourceFanDirection,
+            float[] sourceEmitterPower
         ) {
             return new StaticBrickSnapshot(
                 java.util.Arrays.copyOf(obstacle, obstacle.length),
                 java.util.Arrays.copyOf(surfaceKind, surfaceKind.length),
                 java.util.Arrays.copyOf(openFaceMask, openFaceMask.length),
-                java.util.Arrays.copyOf(emitterPower, emitterPower.length)
+                java.util.Arrays.copyOf(emitterPower, emitterPower.length),
+                java.util.Arrays.copyOf(sourceFanDirection, sourceFanDirection.length),
+                java.util.Arrays.copyOf(sourceEmitterPower, sourceEmitterPower.length)
             );
         }
 
@@ -1567,13 +1996,32 @@ final class ClientL2Solver {
             byte[] outObstacle,
             byte[] outSurfaceKind,
             short[] outOpenFaceMask,
-            float[] outEmitterPower
+            float[] outEmitterPower,
+            byte[] outSourceFanDirection,
+            float[] outSourceEmitterPower
         ) {
             System.arraycopy(obstacle, 0, outObstacle, 0, Math.min(obstacle.length, outObstacle.length));
             System.arraycopy(surfaceKind, 0, outSurfaceKind, 0, Math.min(surfaceKind.length, outSurfaceKind.length));
             System.arraycopy(openFaceMask, 0, outOpenFaceMask, 0, Math.min(openFaceMask.length, outOpenFaceMask.length));
             System.arraycopy(emitterPower, 0, outEmitterPower, 0, Math.min(emitterPower.length, outEmitterPower.length));
+            System.arraycopy(
+                sourceFanDirection,
+                0,
+                outSourceFanDirection,
+                0,
+                Math.min(sourceFanDirection.length, outSourceFanDirection.length)
+            );
+            System.arraycopy(
+                sourceEmitterPower,
+                0,
+                outSourceEmitterPower,
+                0,
+                Math.min(sourceEmitterPower.length, outSourceEmitterPower.length)
+            );
         }
+    }
+
+    private record PendingSourcePatch(BlockPos pos, BlockState oldState, BlockState newState) {
     }
 
     private enum BrickPreparationResult {
@@ -1606,6 +2054,8 @@ final class ClientL2Solver {
         byte[] surfaceKind,
         short[] openFaceMask,
         float[] emitterPower,
+        byte[] sourceFanDirection,
+        float[] sourceEmitterPower,
         byte[] faceSkyExposure,
         byte[] faceDirectExposure,
         float[] flowState,
@@ -1639,6 +2089,12 @@ final class ClientL2Solver {
     }
 
     private record LocalAtlasSnapshot(Identifier dimensionId, BlockPos origin, int sampleStride, short[] packedFlow) {
+    }
+
+    private record WorkerDeltaKey(int type, int x, int y, int z, int data0) {
+        static WorkerDeltaKey of(NativeSimulationBridge.WorldDelta delta) {
+            return new WorkerDeltaKey(delta.type(), delta.x(), delta.y(), delta.z(), delta.data0());
+        }
     }
 
     private final class ClientL2Worker {
@@ -1692,6 +2148,10 @@ final class ClientL2Solver {
             return atlases.poll();
         }
 
+        int queueSize() {
+            return commands.size();
+        }
+
         void reset() {
             commands.clear();
             atlases.clear();
@@ -1730,11 +2190,102 @@ final class ClientL2Solver {
                 return;
             }
             startIfNeeded();
+            if (command instanceof StepCommand) {
+                droppedCommands += removeQueuedStepCommands();
+            } else if (command instanceof WorldDeltasCommand worldDeltas) {
+                command = coalesceQueuedWorldDeltas(worldDeltas);
+            } else if (isPriorityCommand(command)) {
+                droppedCommands += removeQueuedStepCommands();
+            }
             if (!commands.offer(command)) {
-                commands.poll();
+                if (command instanceof StepCommand) {
+                    droppedCommands++;
+                    return;
+                }
+                if (!removeOneQueuedStepCommand()) {
+                    commands.poll();
+                }
                 droppedCommands++;
                 commands.offer(command);
             }
+        }
+
+        private boolean isPriorityCommand(WorkerCommand command) {
+            return command instanceof ActiveHintsCommand
+                || command instanceof WorldDeltasCommand
+                || command instanceof BrickSeedCommand
+                || command instanceof BoundaryReferenceCommand
+                || command instanceof ResetCommand
+                || command instanceof CloseCommand;
+        }
+
+        private WorldDeltasCommand coalesceQueuedWorldDeltas(WorldDeltasCommand incoming) {
+            java.util.ArrayList<NativeSimulationBridge.WorldDelta> merged = new java.util.ArrayList<>(incoming.deltas().length);
+            for (WorkerCommand queued : commands.toArray(new WorkerCommand[0])) {
+                if (queued instanceof WorldDeltasCommand existing
+                    && existing.worldKey() == incoming.worldKey()
+                    && commands.remove(queued)) {
+                    java.util.Collections.addAll(merged, existing.deltas());
+                }
+            }
+            java.util.Collections.addAll(merged, incoming.deltas());
+            return new WorldDeltasCommand(incoming.worldKey(), coalesceWorldDeltas(merged));
+        }
+
+        private NativeSimulationBridge.WorldDelta[] coalesceWorldDeltas(
+            java.util.List<NativeSimulationBridge.WorldDelta> deltas
+        ) {
+            java.util.LinkedHashMap<WorkerDeltaKey, NativeSimulationBridge.WorldDelta> byCell = new java.util.LinkedHashMap<>();
+            for (NativeSimulationBridge.WorldDelta delta : deltas) {
+                WorkerDeltaKey key = WorkerDeltaKey.of(delta);
+                NativeSimulationBridge.WorldDelta existing = byCell.get(key);
+                if (existing == null) {
+                    byCell.put(key, delta);
+                    continue;
+                }
+                if (delta.type() == NativeSimulationBridge.WORLD_DELTA_BRICK_STATIC_SOURCE_PATCH) {
+                    int packedState = (existing.data1() & 0x000001)
+                        | (delta.data1() & 0x000002)
+                        | (existing.data1() & 0x00FF00)
+                        | (delta.data1() & 0xFF0000);
+                    byCell.put(key, new NativeSimulationBridge.WorldDelta(
+                        delta.type(),
+                        delta.x(),
+                        delta.y(),
+                        delta.z(),
+                        delta.data0(),
+                        packedState,
+                        delta.data2(),
+                        delta.data3(),
+                        existing.value0(),
+                        delta.value1(),
+                        delta.value2(),
+                        delta.value3()
+                    ));
+                } else {
+                    byCell.put(key, delta);
+                }
+            }
+            return byCell.values().toArray(new NativeSimulationBridge.WorldDelta[0]);
+        }
+
+        private int removeQueuedStepCommands() {
+            int removed = 0;
+            for (WorkerCommand queued : commands.toArray(new WorkerCommand[0])) {
+                if (queued instanceof StepCommand && commands.remove(queued)) {
+                    removed++;
+                }
+            }
+            return removed;
+        }
+
+        private boolean removeOneQueuedStepCommand() {
+            for (WorkerCommand queued : commands.toArray(new WorkerCommand[0])) {
+                if (queued instanceof StepCommand && commands.remove(queued)) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private void startIfNeeded() {
@@ -1830,7 +2381,7 @@ final class ClientL2Solver {
             if (!ensureRuntime(command.worldKey())) {
                 return;
             }
-            if (!bridge.uploadBrickWorldStaticBrick(
+            if (!bridge.uploadBrickWorldStaticBrickWithSources(
                 serviceKey,
                 command.worldKey(),
                 BRICK_SIZE,
@@ -1841,6 +2392,8 @@ final class ClientL2Solver {
                 command.surfaceKind(),
                 command.openFaceMask(),
                 command.emitterPower(),
+                command.sourceFanDirection(),
+                command.sourceEmitterPower(),
                 command.faceSkyExposure(),
                 command.faceDirectExposure()
             )) {
@@ -2040,6 +2593,7 @@ final class ClientL2Solver {
         activeDimension = null;
         activeHintUploaded = false;
         activeBrickCount = 0;
+        clearPendingStaticPatches();
         prepareCursor = 0;
         refreshCursor = 0;
         publishCursor = 0;
@@ -2053,6 +2607,7 @@ final class ClientL2Solver {
         lastSolveClientGameTime = Long.MIN_VALUE;
         lastPublishedClientGameTime = Long.MIN_VALUE;
         lastBoundaryRefreshClientGameTime = Long.MIN_VALUE;
+        lastStaticPatchSubmitClientGameTime = Long.MIN_VALUE;
         visualizer.clearLocalFlowFields();
     }
 
@@ -2062,6 +2617,15 @@ final class ClientL2Solver {
         staticBrickCache.clear();
         worker.close();
         fastSuspendUntilGameTime = Long.MIN_VALUE;
+    }
+
+    private void clearPendingStaticPatches() {
+        pendingSourcePatches.clear();
+        pendingStaticPatchDimension = null;
+        pendingStaticPatchWorldKey = 0L;
+        pendingStaticPatchFirstChangeGameTime = Long.MIN_VALUE;
+        pendingStaticPatchLastChangeGameTime = Long.MIN_VALUE;
+        pendingStaticPatchSourceChanges = 0;
     }
 
     String status() {
@@ -2077,8 +2641,11 @@ final class ClientL2Solver {
             + " staticCache=" + staticBrickCache.size()
             + "/" + STATIC_CACHE_MAX_BRICKS
             + " staticPatches=" + lastStaticPatchCount
+            + " pendingStaticPatches=" + pendingSourcePatches.size()
+            + " pendingStaticPatchChanges=" + pendingStaticPatchSourceChanges
             + " fanPatchCells=" + lastFanPatchCellCount
             + " heatPatchCells=" + lastHeatPatchCellCount
+            + " stress=" + stressStatus()
             + " solveInterval=" + SOLVE_INTERVAL_TICKS
             + " publishInterval=" + LOCAL_PUBLISH_INTERVAL_TICKS
             + " publishStride=" + LOCAL_PUBLISH_SAMPLE_STRIDE
@@ -2090,6 +2657,36 @@ final class ClientL2Solver {
             + " boundaryPrep=" + boundaryReferenceRefreshStatus()
             + " fastSuspendUntil=" + fastSuspendUntilGameTime
             + " lastServerTick=" + lastServerTick;
+    }
+
+    String setStressMode(String modeName) {
+        StressMode requested = StressMode.parse(modeName);
+        if (stressMode != requested) {
+            markAllActiveBricksStaticRefreshPending();
+        }
+        stressMode = requested;
+        stressStartedGameTime = Long.MIN_VALUE;
+        lastStressSubmitGameTime = Long.MIN_VALUE;
+        stressSubmittedTicks = 0L;
+        stressSubmittedPatches = 0L;
+        stressSubmittedFanCells = 0L;
+        stressSubmittedHeatCells = 0L;
+        stressSubmittedDirtyCells = 0L;
+        stressStaticSubmittedForActiveSet = false;
+        return "Client L2 stress " + requested.name().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    String stressStatus() {
+        return stressMode.name().toLowerCase(java.util.Locale.ROOT)
+            + ":ticks=" + stressSubmittedTicks
+            + ":patches=" + stressSubmittedPatches
+            + ":fan=" + stressSubmittedFanCells
+            + ":heat=" + stressSubmittedHeatCells
+            + ":dirty=" + stressSubmittedDirtyCells
+            + ":staticSubmitted=" + stressStaticSubmittedForActiveSet
+            + ":patchesPerTick=" + STRESS_PATCHES_PER_TICK
+            + ":interval=" + STRESS_INTERVAL_TICKS
+            + ":queueLimit=" + STRESS_QUEUE_BACKLOG_LIMIT;
     }
 
     private String formatNativeStatus(NativeSimulationBridge.BrickWorldRuntimeStatus status) {

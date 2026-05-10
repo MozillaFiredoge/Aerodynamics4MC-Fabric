@@ -111,6 +111,20 @@ public final class AeroClientMod implements ClientModInitializer {
                         .executes(ctx -> setClientL2Experimental(ctx.getSource(), true)))
                     .then(ClientCommandManager.literal("off")
                         .executes(ctx -> setClientL2Experimental(ctx.getSource(), false)))
+                    .then(ClientCommandManager.literal("stress")
+                        .executes(ctx -> clientL2StressStatus(ctx.getSource()))
+                        .then(ClientCommandManager.literal("status")
+                            .executes(ctx -> clientL2StressStatus(ctx.getSource())))
+                        .then(ClientCommandManager.literal("off")
+                            .executes(ctx -> setClientL2Stress(ctx.getSource(), "off")))
+                        .then(ClientCommandManager.literal("fan")
+                            .executes(ctx -> setClientL2Stress(ctx.getSource(), "fan")))
+                        .then(ClientCommandManager.literal("thermal")
+                            .executes(ctx -> setClientL2Stress(ctx.getSource(), "thermal")))
+                        .then(ClientCommandManager.literal("dirty")
+                            .executes(ctx -> setClientL2Stress(ctx.getSource(), "dirty")))
+                        .then(ClientCommandManager.literal("mixed")
+                            .executes(ctx -> setClientL2Stress(ctx.getSource(), "mixed"))))
             );
             dispatcher.register(
                 ClientCommandManager.literal("aero")
@@ -195,6 +209,24 @@ public final class AeroClientMod implements ClientModInitializer {
         }
         sendClientL2Preference(enabled);
         source.sendFeedback(Text.literal("Client L2 local solve " + (enabled ? "enabled" : "disabled")));
+        return 1;
+    }
+
+    private int clientL2StressStatus(net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource source) {
+        source.sendFeedback(Text.literal("Client L2 stress " + clientL2Solver.stressStatus()));
+        return 1;
+    }
+
+    private int setClientL2Stress(
+        net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource source,
+        String mode
+    ) {
+        try {
+            source.sendFeedback(Text.literal(clientL2Solver.setStressMode(mode)));
+        } catch (IllegalArgumentException error) {
+            source.sendFeedback(Text.literal(error.getMessage()));
+            return 0;
+        }
         return 1;
     }
 
