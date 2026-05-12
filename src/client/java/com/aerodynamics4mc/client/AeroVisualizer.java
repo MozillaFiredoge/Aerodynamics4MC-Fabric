@@ -1,15 +1,21 @@
 package com.aerodynamics4mc.client;
 
-import com.aerodynamics4mc.api.AeroWindSample;
+import java.util.HashMap;
+import java.util.Map;
+
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.blaze3d.vertex.VertexConsumer;
+import org.joml.Matrix4f;
+
 import com.aerodynamics4mc.api.AeroWindSamplingRules;
+import com.aerodynamics4mc.api.AeroWindSample;
 import com.aerodynamics4mc.api.SamplePolicy;
 import com.aerodynamics4mc.flow.AnalysisFlowCodec;
 import com.aerodynamics4mc.net.AeroCoarseWindPayload;
 import com.aerodynamics4mc.net.AeroFlowAnalysisPayload;
 import com.aerodynamics4mc.net.AeroFlowPayload;
 import com.aerodynamics4mc.runtime.NativeSimulationBridge;
-import com.mojang.blaze3d.vertex.PoseStack;
-import com.mojang.blaze3d.vertex.VertexConsumer;
+
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
@@ -175,7 +181,7 @@ final class AeroVisualizer {
     }
 
     AeroWindSample sampleFlow(Identifier dimensionId, Vec3 position) {
-        return sampleFlow(dimensionId, position, SamplePolicy.SERVER_AGGREGATED_PREFERRED);
+        return sampleFlow(dimensionId, position, SamplePolicy.SERVER_COARSE_ONLY);
     }
 
     AeroWindSample sampleFlow(Identifier dimensionId, Vec3 position, SamplePolicy policy) {
@@ -206,7 +212,7 @@ final class AeroVisualizer {
     }
 
     private SamplePolicy effectiveSamplePolicyForLocalPlayer(SamplePolicy policy) {
-        SamplePolicy effectivePolicy = policy == null ? SamplePolicy.SERVER_AGGREGATED_PREFERRED : policy;
+        SamplePolicy effectivePolicy = policy == null ? SamplePolicy.SERVER_COARSE_ONLY : policy;
         Minecraft client = Minecraft.getInstance();
         if (effectivePolicy != SamplePolicy.DIAGNOSTIC_ALL_SOURCES
                 && client != null
@@ -840,20 +846,20 @@ final class AeroVisualizer {
         float[] c1;
         float u;
         if (t < 0.25f) {
-            c0 = new float[] {0.267f, 0.005f, 0.329f};
-            c1 = new float[] {0.283f, 0.141f, 0.458f};
+            c0 = new float[]{0.267f, 0.005f, 0.329f};
+            c1 = new float[]{0.283f, 0.141f, 0.458f};
             u = t / 0.25f;
         } else if (t < 0.50f) {
-            c0 = new float[] {0.283f, 0.141f, 0.458f};
-            c1 = new float[] {0.254f, 0.265f, 0.530f};
+            c0 = new float[]{0.283f, 0.141f, 0.458f};
+            c1 = new float[]{0.254f, 0.265f, 0.530f};
             u = (t - 0.25f) / 0.25f;
         } else if (t < 0.75f) {
-            c0 = new float[] {0.254f, 0.265f, 0.530f};
-            c1 = new float[] {0.207f, 0.372f, 0.553f};
+            c0 = new float[]{0.254f, 0.265f, 0.530f};
+            c1 = new float[]{0.207f, 0.372f, 0.553f};
             u = (t - 0.50f) / 0.25f;
         } else {
-            c0 = new float[] {0.207f, 0.372f, 0.553f};
-            c1 = new float[] {0.993f, 0.906f, 0.144f};
+            c0 = new float[]{0.207f, 0.372f, 0.553f};
+            c1 = new float[]{0.993f, 0.906f, 0.144f};
             u = (t - 0.75f) / 0.25f;
         }
         return argb(alpha, lerp(c0[0], c1[0], u), lerp(c0[1], c1[1], u), lerp(c0[2], c1[2], u));

@@ -550,9 +550,23 @@ struct ContextState {
     float last_force[3] = {0.0f, 0.0f, 0.0f};
     std::uint64_t step_counter = 0;
 
-#if defined(AERO_LBM_OPENCL)
     bool gpu_buffers_ready = false;
     bool gpu_initialized = false;
+
+    bool compact_buffers_ready = false;
+    bool compact_initialized = false;
+    bool compact_output_ready = false;
+    std::size_t compact_output_bytes = 0;
+
+    bool d3q27_f16_buffers_ready = false;
+    bool d3q27_f16_initialized = false;
+    int d3q27_f16_parity = 0;
+    std::size_t d3q27_f16_output_bytes = 0;
+    bool d3q27_f16_boundary_ready = false;
+    int d3q27_f16_boundary_layers = 0;
+    float d3q27_f16_boundary_relaxation = 0.0f;
+
+#if defined(AERO_LBM_OPENCL)
     cl_mem d_payload = nullptr;
     cl_mem d_f = nullptr;
     cl_mem d_f_post = nullptr;
@@ -563,25 +577,19 @@ struct ContextState {
     cl_mem d_thermal_f = nullptr;
     cl_mem d_thermal_f_post = nullptr;
 
-    bool compact_buffers_ready = false;
-    bool compact_initialized = false;
-    bool compact_output_ready = false;
     cl_mem d_compact_state = nullptr;
     cl_mem d_compact_state_next = nullptr;
     cl_mem d_compact_solid = nullptr;
     cl_mem d_compact_output = nullptr;
-    std::size_t compact_output_bytes = 0;
 
-    bool d3q27_f16_buffers_ready = false;
-    bool d3q27_f16_initialized = false;
-    int d3q27_f16_parity = 0;
     cl_mem d_d3q27_f16 = nullptr;
     cl_mem d_d3q27_f16_solid = nullptr;
     cl_mem d_d3q27_f16_cell_class = nullptr;
     cl_mem d_d3q27_f16_fan_dir = nullptr;
     cl_mem d_d3q27_f16_active_cells = nullptr;
+    cl_mem d_d3q27_f16_boundary_mask = nullptr;
+    cl_mem d_d3q27_f16_boundary_state = nullptr;
     cl_mem d_d3q27_f16_output = nullptr;
-    std::size_t d3q27_f16_output_bytes = 0;
 #endif
 
     std::vector<uint8_t> compact_solid_cache;
@@ -589,6 +597,8 @@ struct ContextState {
     std::vector<uint8_t> d3q27_f16_solid_staging;
     std::vector<uint8_t> d3q27_f16_cell_class_staging;
     std::vector<uint8_t> d3q27_f16_fan_dir_staging;
+    std::vector<uint8_t> d3q27_f16_boundary_mask_staging;
+    std::vector<std::uint16_t> d3q27_f16_boundary_state_staging;
     std::vector<std::int32_t> d3q27_f16_active_cells_staging;
     std::vector<std::uint16_t> d3q27_f16_staging;
     std::uint64_t d3q27_f16_active_cells = 0;
@@ -4473,7 +4483,19 @@ inline void d3q27_f16_apply_fan_force(uchar fan_dir, float* ux, float* uy, float
     *uz += 0.5f * beta * (axial_push * n.z - FAN_PERP_DAMP * u_perp_z);
 }
 
-inline void d3q27_f16_collide_srt(float fi[KQ], float omega, float4 inlet_value, int inlet_blend, uchar fan_dir) {
+inline void d3q27_f16_collide_srt(
+    float fi[KQ],
+    float omega,
+    float4 inlet_value,
+    int inlet_blend,
+    uchar fan_dir,
+    uchar boundary_layer,
+    __global const ushort* boundary_state,
+    int cells,
+    int cell,
+    int boundary_layers,
+    float boundary_relaxation
+) {
     float rho = 0.0f;
     float ux = 0.0f;
     float uy = 0.0f;
@@ -4510,6 +4532,22 @@ inline void d3q27_f16_collide_srt(float fi[KQ], float omega, float4 inlet_value,
             uz *= scale;
         }
     }
+    if (boundary_layer != (uchar)0
+        && boundary_layers > 0
+        && boundary_relaxation > 0.0f) {
+        int bbase = cell * 4;
+        float target_ux = half_bits_to_float(boundary_state[bbase + 0]);
+        float target_uy = half_bits_to_float(boundary_state[bbase + 1]);
+        float target_uz = half_bits_to_float(boundary_state[bbase + 2]);
+        float target_p = half_bits_to_float(boundary_state[bbase + 3]);
+        float shell_t = 1.0f - ((float)((int)boundary_layer - 1) / fmax(1.0f, (float)boundary_layers));
+        float alpha = clampf(boundary_relaxation * shell_t * shell_t, 0.0f, 0.5f);
+        float target_rho = clampf(1.0f + clampf(target_p, P_MIN, P_MAX), RHO_MIN, RHO_MAX);
+        ux += alpha * (target_ux - ux);
+        uy += alpha * (target_uy - uy);
+        uz += alpha * (target_uz - uz);
+        rho += alpha * (target_rho - rho);
+    }
     for (int q = 0; q < KQ; ++q) {
         float eq = feq(q, rho, ux, uy, uz);
         fi[q] = fi[q] - omega * (fi[q] - eq);
@@ -4529,7 +4567,11 @@ kernel void d3q27_f16_step_even(
     int nz,
     int cells,
     float omega,
-    float4 inlet_value
+    float4 inlet_value,
+    __global const uchar* boundary_mask,
+    __global const ushort* boundary_state,
+    int boundary_layers,
+    float boundary_relaxation
 ) {
     int work_index = (int)get_global_id(0);
     int work_count = active_mode != 0 ? active_count : cells;
@@ -4546,7 +4588,20 @@ kernel void d3q27_f16_step_even(
     for (int q = 0; q < KQ; ++q) {
         fi[q] = d3q27_f16_load(f, q, cells, cell);
     }
-    d3q27_f16_collide_srt(fi, omega, inlet_value, x <= 0 ? 1 : 0, fan_dir[cell]);
+    uchar boundary_layer = boundary_mask[cell];
+    d3q27_f16_collide_srt(
+        fi,
+        omega,
+        inlet_value,
+        x <= 0 ? 1 : 0,
+        fan_dir[cell],
+        boundary_layer,
+        boundary_state,
+        cells,
+        cell,
+        boundary_layers,
+        boundary_relaxation
+    );
     for (int q = 0; q < KQ; ++q) {
         d3q27_f16_store(f, OPP[q], cells, cell, fi[q]);
     }
@@ -4565,7 +4620,11 @@ kernel void d3q27_f16_step_odd(
     int nz,
     int cells,
     float omega,
-    float4 inlet_value
+    float4 inlet_value,
+    __global const uchar* boundary_mask,
+    __global const ushort* boundary_state,
+    int boundary_layers,
+    float boundary_relaxation
 ) {
     int work_index = (int)get_global_id(0);
     int work_count = active_mode != 0 ? active_count : cells;
@@ -4585,7 +4644,20 @@ kernel void d3q27_f16_step_odd(
             int delta = CX[q] * yz + CY[q] * nz + CZ[q];
             fi[q] = d3q27_f16_load(f, OPP[q], cells, cell - delta);
         }
-        d3q27_f16_collide_srt(fi, omega, inlet_value, 0, fan_dir[cell]);
+        uchar boundary_layer = boundary_mask[cell];
+        d3q27_f16_collide_srt(
+            fi,
+            omega,
+            inlet_value,
+            0,
+            fan_dir[cell],
+            boundary_layer,
+            boundary_state,
+            cells,
+            cell,
+            boundary_layers,
+            boundary_relaxation
+        );
         for (int q = 0; q < KQ; ++q) {
             int delta = CX[q] * yz + CY[q] * nz + CZ[q];
             d3q27_f16_store(f, q, cells, cell + delta, fi[q]);
@@ -4615,7 +4687,20 @@ kernel void d3q27_f16_step_odd(
         }
     }
 
-    d3q27_f16_collide_srt(fi, omega, inlet_value, x <= 0 ? 1 : 0, fan_dir[cell]);
+    uchar boundary_layer = boundary_mask[cell];
+    d3q27_f16_collide_srt(
+        fi,
+        omega,
+        inlet_value,
+        x <= 0 ? 1 : 0,
+        fan_dir[cell],
+        boundary_layer,
+        boundary_state,
+        cells,
+        cell,
+        boundary_layers,
+        boundary_relaxation
+    );
 
     float boundary_rho = clampf(1.0f + inlet_value.w, RHO_MIN, RHO_MAX);
     for (int q = 0; q < KQ; ++q) {
@@ -5183,16 +5268,21 @@ void release_opencl_runtime() {
 
 void release_context_d3q27_f16_buffers(ContextState& ctx) {
     if (ctx.d_d3q27_f16_output) clReleaseMemObject(ctx.d_d3q27_f16_output);
+    if (ctx.d_d3q27_f16_boundary_state) clReleaseMemObject(ctx.d_d3q27_f16_boundary_state);
+    if (ctx.d_d3q27_f16_boundary_mask) clReleaseMemObject(ctx.d_d3q27_f16_boundary_mask);
     if (ctx.d_d3q27_f16_active_cells) clReleaseMemObject(ctx.d_d3q27_f16_active_cells);
     if (ctx.d_d3q27_f16_fan_dir) clReleaseMemObject(ctx.d_d3q27_f16_fan_dir);
     if (ctx.d_d3q27_f16_cell_class) clReleaseMemObject(ctx.d_d3q27_f16_cell_class);
     if (ctx.d_d3q27_f16_solid) clReleaseMemObject(ctx.d_d3q27_f16_solid);
     if (ctx.d_d3q27_f16) clReleaseMemObject(ctx.d_d3q27_f16);
-    ctx.d_d3q27_f16_output = ctx.d_d3q27_f16_active_cells = ctx.d_d3q27_f16_fan_dir = ctx.d_d3q27_f16_cell_class = ctx.d_d3q27_f16_solid = ctx.d_d3q27_f16 = nullptr;
+    ctx.d_d3q27_f16_output = ctx.d_d3q27_f16_boundary_state = ctx.d_d3q27_f16_boundary_mask = ctx.d_d3q27_f16_active_cells = ctx.d_d3q27_f16_fan_dir = ctx.d_d3q27_f16_cell_class = ctx.d_d3q27_f16_solid = ctx.d_d3q27_f16 = nullptr;
     ctx.d3q27_f16_buffers_ready = false;
     ctx.d3q27_f16_initialized = false;
     ctx.d3q27_f16_parity = 0;
     ctx.d3q27_f16_output_bytes = 0;
+    ctx.d3q27_f16_boundary_ready = false;
+    ctx.d3q27_f16_boundary_layers = 0;
+    ctx.d3q27_f16_boundary_relaxation = 0.0f;
 }
 
 void release_context_compact_gpu_buffers(ContextState& ctx) {
@@ -5237,6 +5327,7 @@ struct GpuMemoryStats {
     std::uint64_t d3q27_class = 0;
     std::uint64_t d3q27_fan = 0;
     std::uint64_t d3q27_active = 0;
+    std::uint64_t d3q27_boundary = 0;
     std::uint64_t d3q27_output = 0;
     std::uint64_t compact_state = 0;
     std::uint64_t compact_solid = 0;
@@ -5278,6 +5369,12 @@ GpuMemoryStats collect_gpu_memory_stats() {
         }
         if (ctx.d_d3q27_f16_active_cells) {
             add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(std::int32_t), stats.d3q27_active, stats);
+        }
+        if (ctx.d_d3q27_f16_boundary_mask) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * sizeof(std::uint8_t), stats.d3q27_boundary, stats);
+        }
+        if (ctx.d_d3q27_f16_boundary_state) {
+            add_gpu_bytes(static_cast<std::uint64_t>(ctx.cells) * 4u * sizeof(std::uint16_t), stats.d3q27_boundary, stats);
         }
         if (ctx.d_d3q27_f16_output) {
             add_gpu_bytes(static_cast<std::uint64_t>(ctx.d3q27_f16_output_bytes), stats.d3q27_output, stats);
@@ -5343,6 +5440,7 @@ std::string memory_info_string() {
         + ",d3q27_class=" + std::to_string(stats.d3q27_class)
         + ",d3q27_fan=" + std::to_string(stats.d3q27_fan)
         + ",d3q27_active=" + std::to_string(stats.d3q27_active)
+        + ",d3q27_boundary=" + std::to_string(stats.d3q27_boundary)
         + ",d3q27_output=" + std::to_string(stats.d3q27_output)
         + ",compact_state=" + std::to_string(stats.compact_state)
         + ",compact_solid=" + std::to_string(stats.compact_solid)
@@ -6301,6 +6399,153 @@ bool patch_d3q27_f16_static_cells(
     return true;
 }
 
+bool ensure_d3q27_f16_boundary_buffers(ContextState& ctx) {
+    if (!g_opencl.available || ctx.cells == 0) return false;
+    cl_int err = CL_SUCCESS;
+    if (!ctx.d_d3q27_f16_boundary_mask) {
+        const std::size_t mask_bytes = ctx.cells * sizeof(std::uint8_t);
+        ctx.d_d3q27_f16_boundary_mask = clCreateBuffer(g_opencl.context, CL_MEM_READ_ONLY, mask_bytes, nullptr, &err);
+        if (err != CL_SUCCESS || !ctx.d_d3q27_f16_boundary_mask) {
+            g_opencl.error = format_opencl_api_error("clCreateBuffer(d_d3q27_f16_boundary_mask)", err);
+            return false;
+        }
+    }
+    if (!ctx.d_d3q27_f16_boundary_state) {
+        const std::size_t state_bytes = ctx.cells * 4u * sizeof(std::uint16_t);
+        ctx.d_d3q27_f16_boundary_state = clCreateBuffer(g_opencl.context, CL_MEM_READ_ONLY, state_bytes, nullptr, &err);
+        if (err != CL_SUCCESS || !ctx.d_d3q27_f16_boundary_state) {
+            g_opencl.error = format_opencl_api_error("clCreateBuffer(d_d3q27_f16_boundary_state)", err);
+            if (ctx.d_d3q27_f16_boundary_mask) {
+                clReleaseMemObject(ctx.d_d3q27_f16_boundary_mask);
+                ctx.d_d3q27_f16_boundary_mask = nullptr;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+void clear_d3q27_f16_boundary_shell(ContextState& ctx) {
+    ctx.d3q27_f16_boundary_ready = false;
+    ctx.d3q27_f16_boundary_layers = 0;
+    ctx.d3q27_f16_boundary_relaxation = 0.0f;
+}
+
+bool upload_d3q27_f16_boundary_shell(
+    ContextState& ctx,
+    const float* flow_state,
+    int flow_channels,
+    int face_mask,
+    int shell_layers,
+    float relaxation
+) {
+    if (!flow_state || flow_channels < 4 || face_mask == 0 || shell_layers <= 0 || relaxation <= 0.0f) {
+        clear_d3q27_f16_boundary_shell(ctx);
+        return true;
+    }
+    if (!g_opencl.available || ctx.cells == 0) {
+        return false;
+    }
+    const int layers = std::max(1, std::min({shell_layers, ctx.nx, ctx.ny, ctx.nz}));
+    const float relax = clampf(finite_or(relaxation, 0.0f), 0.0f, 0.5f);
+    if (relax <= 0.0f) {
+        clear_d3q27_f16_boundary_shell(ctx);
+        return true;
+    }
+
+    ctx.d3q27_f16_boundary_mask_staging.assign(ctx.cells, 0u);
+    ctx.d3q27_f16_boundary_state_staging.assign(ctx.cells * 4u, 0u);
+    const bool have_solid_cache = ctx.d3q27_f16_solid_staging.size() == ctx.cells;
+    const int yz = ctx.ny * ctx.nz;
+    for (std::size_t cell = 0; cell < ctx.cells; ++cell) {
+        if (have_solid_cache && ctx.d3q27_f16_solid_staging[cell] != 0) {
+            continue;
+        }
+        const int cell_i32 = static_cast<int>(cell);
+        const int x = cell_i32 / yz;
+        const int rem = cell_i32 - x * yz;
+        const int y = rem / ctx.nz;
+        const int z = rem - y * ctx.nz;
+        int best_layer = layers + 1;
+        if ((face_mask & (1 << 0)) != 0 && x < layers) best_layer = std::min(best_layer, x + 1);
+        if ((face_mask & (1 << 1)) != 0 && x >= ctx.nx - layers) best_layer = std::min(best_layer, ctx.nx - x);
+        if ((face_mask & (1 << 2)) != 0 && y < layers) best_layer = std::min(best_layer, y + 1);
+        if ((face_mask & (1 << 3)) != 0 && y >= ctx.ny - layers) best_layer = std::min(best_layer, ctx.ny - y);
+        if ((face_mask & (1 << 4)) != 0 && z < layers) best_layer = std::min(best_layer, z + 1);
+        if ((face_mask & (1 << 5)) != 0 && z >= ctx.nz - layers) best_layer = std::min(best_layer, ctx.nz - z);
+        if (best_layer > layers) {
+            continue;
+        }
+
+        const std::size_t flow_base = cell * static_cast<std::size_t>(flow_channels);
+        float vx = finite_or(flow_state[flow_base + 0], 0.0f);
+        float vy = finite_or(flow_state[flow_base + 1], 0.0f);
+        float vz = finite_or(flow_state[flow_base + 2], 0.0f);
+        const float pressure = clampf(
+            finite_or(flow_state[flow_base + 3], 0.0f),
+            kPressureMin,
+            kPressureMax
+        );
+        const float speed2 = vx * vx + vy * vy + vz * vz;
+        if (!finitef(speed2) || speed2 > kMaxSpeed * kMaxSpeed) {
+            if (!finitef(speed2) || speed2 <= 0.0f) {
+                vx = vy = vz = 0.0f;
+            } else {
+                const float scale = kMaxSpeed / std::sqrt(speed2);
+                vx *= scale;
+                vy *= scale;
+                vz *= scale;
+            }
+        }
+        ctx.d3q27_f16_boundary_mask_staging[cell] = static_cast<std::uint8_t>(best_layer);
+        const std::size_t state_base = cell * 4u;
+        ctx.d3q27_f16_boundary_state_staging[state_base + 0] = float_to_half_bits(vx);
+        ctx.d3q27_f16_boundary_state_staging[state_base + 1] = float_to_half_bits(vy);
+        ctx.d3q27_f16_boundary_state_staging[state_base + 2] = float_to_half_bits(vz);
+        ctx.d3q27_f16_boundary_state_staging[state_base + 3] = float_to_half_bits(pressure);
+    }
+
+    if (!ensure_d3q27_f16_boundary_buffers(ctx)) {
+        return false;
+    }
+    const std::size_t mask_bytes = ctx.d3q27_f16_boundary_mask_staging.size() * sizeof(std::uint8_t);
+    const std::size_t state_bytes = ctx.d3q27_f16_boundary_state_staging.size() * sizeof(std::uint16_t);
+    cl_int err = clEnqueueWriteBuffer(
+        g_opencl.queue,
+        ctx.d_d3q27_f16_boundary_mask,
+        CL_TRUE,
+        0,
+        mask_bytes,
+        ctx.d3q27_f16_boundary_mask_staging.data(),
+        0,
+        nullptr,
+        nullptr
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_d3q27_f16_boundary_mask)", err);
+        return false;
+    }
+    err = clEnqueueWriteBuffer(
+        g_opencl.queue,
+        ctx.d_d3q27_f16_boundary_state,
+        CL_TRUE,
+        0,
+        state_bytes,
+        ctx.d3q27_f16_boundary_state_staging.data(),
+        0,
+        nullptr,
+        nullptr
+    );
+    if (err != CL_SUCCESS) {
+        g_opencl.error = format_opencl_api_error("clEnqueueWriteBuffer(d_d3q27_f16_boundary_state)", err);
+        return false;
+    }
+    ctx.d3q27_f16_boundary_ready = true;
+    ctx.d3q27_f16_boundary_layers = layers;
+    ctx.d3q27_f16_boundary_relaxation = relax;
+    return true;
+}
+
 bool ensure_compact_output_buffer(ContextState& ctx, std::size_t output_bytes) {
     if (!g_opencl.available || output_bytes == 0) return false;
     if (ctx.d_compact_output && ctx.compact_output_bytes >= output_bytes) {
@@ -6516,6 +6761,18 @@ bool opencl_d3q27_f16_inplace_step(
     cl_mem active_cells_buffer = ctx.d_d3q27_f16_active_cells
         ? ctx.d_d3q27_f16_active_cells
         : ctx.d_d3q27_f16_solid;
+    cl_mem boundary_mask_buffer = ctx.d3q27_f16_boundary_ready && ctx.d_d3q27_f16_boundary_mask
+        ? ctx.d_d3q27_f16_boundary_mask
+        : ctx.d_d3q27_f16_solid;
+    cl_mem boundary_state_buffer = ctx.d3q27_f16_boundary_ready && ctx.d_d3q27_f16_boundary_state
+        ? ctx.d_d3q27_f16_boundary_state
+        : ctx.d_d3q27_f16;
+    const int boundary_layers = ctx.d3q27_f16_boundary_ready
+        ? ctx.d3q27_f16_boundary_layers
+        : 0;
+    const float boundary_relaxation = ctx.d3q27_f16_boundary_ready
+        ? ctx.d3q27_f16_boundary_relaxation
+        : 0.0f;
     err |= clSetKernelArg(kernel, 0, sizeof(cl_mem), &ctx.d_d3q27_f16);
     err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &ctx.d_d3q27_f16_solid);
     err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &ctx.d_d3q27_f16_cell_class);
@@ -6529,6 +6786,10 @@ bool opencl_d3q27_f16_inplace_step(
     err |= clSetKernelArg(kernel, 10, sizeof(int), &cells_i32);
     err |= clSetKernelArg(kernel, 11, sizeof(float), &omega);
     err |= clSetKernelArg(kernel, 12, sizeof(OpenClFaceData), inlet.data());
+    err |= clSetKernelArg(kernel, 13, sizeof(cl_mem), &boundary_mask_buffer);
+    err |= clSetKernelArg(kernel, 14, sizeof(cl_mem), &boundary_state_buffer);
+    err |= clSetKernelArg(kernel, 15, sizeof(int), &boundary_layers);
+    err |= clSetKernelArg(kernel, 16, sizeof(float), &boundary_relaxation);
     if (err != CL_SUCCESS) return fail_cl("clSetKernelArg(k_d3q27_f16_step)", err);
     if (dispatch_cells_i32 > 0) {
         cl_event step_event = nullptr;
@@ -9680,6 +9941,83 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_patch_d3q27_f16_static_cells_rect(
     (void)fan_dir_values;
     set_last_native_error("patch_d3q27_f16_static_cells: OpenCL disabled");
     return 0;
+#endif
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_set_d3q27_f16_boundary_shell_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    const float* flow_state,
+    int flow_channels,
+    int face_mask,
+    int shell_layers,
+    float relaxation
+) {
+#if defined(AERO_LBM_OPENCL)
+    clear_last_native_error();
+    if (!g_cfg.initialized || !g_cfg.opencl_enabled || !g_opencl.available) {
+        set_last_native_error("set_d3q27_f16_boundary_shell: runtime is not initialized for OpenCL");
+        return 0;
+    }
+    if (nx <= 0 || ny <= 0 || nz <= 0 || nx != g_cfg.nx || ny != g_cfg.ny || nz != g_cfg.nz) {
+        set_last_native_error("set_d3q27_f16_boundary_shell: invalid dimensions");
+        return 0;
+    }
+    if (!flow_state || flow_channels < 4) {
+        set_last_native_error("set_d3q27_f16_boundary_shell: missing flow state");
+        return 0;
+    }
+    const std::size_t cells = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+    LockedContext locked_context(static_cast<jlong>(context_key), false);
+    if (!locked_context.ctx) {
+        set_last_native_error("set_d3q27_f16_boundary_shell: context not found");
+        return 0;
+    }
+    ContextState& ctx = *locked_context.ctx;
+    if (ctx.nx != nx || ctx.ny != ny || ctx.nz != nz || ctx.cells != cells) {
+        set_last_native_error("set_d3q27_f16_boundary_shell: context shape mismatch");
+        return 0;
+    }
+    if (!upload_d3q27_f16_boundary_shell(
+            ctx,
+            flow_state,
+            flow_channels,
+            face_mask,
+            shell_layers,
+            relaxation)) {
+        set_last_native_error(g_opencl.error.empty() ? "set_d3q27_f16_boundary_shell failed" : g_opencl.error);
+        return 0;
+    }
+    return 1;
+#else
+    (void)nx;
+    (void)ny;
+    (void)nz;
+    (void)context_key;
+    (void)flow_state;
+    (void)flow_channels;
+    (void)face_mask;
+    (void)shell_layers;
+    (void)relaxation;
+    set_last_native_error("set_d3q27_f16_boundary_shell: OpenCL disabled");
+    return 0;
+#endif
+}
+
+AERO_LBM_CAPI_EXPORT int aero_lbm_clear_d3q27_f16_boundary_shell_rect(long long context_key) {
+#if defined(AERO_LBM_OPENCL)
+    clear_last_native_error();
+    LockedContext locked_context(static_cast<jlong>(context_key), false);
+    if (!locked_context.ctx) {
+        return 1;
+    }
+    clear_d3q27_f16_boundary_shell(*locked_context.ctx);
+    return 1;
+#else
+    (void)context_key;
+    return 1;
 #endif
 }
 

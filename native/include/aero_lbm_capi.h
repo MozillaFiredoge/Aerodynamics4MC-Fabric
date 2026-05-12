@@ -173,6 +173,18 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_patch_d3q27_f16_static_cells_rect(
     const uint8_t* solid_values,
     const uint8_t* fan_dir_values
 );
+AERO_LBM_CAPI_EXPORT int aero_lbm_set_d3q27_f16_boundary_shell_rect(
+    int nx,
+    int ny,
+    int nz,
+    long long context_key,
+    const float* flow_state,
+    int flow_channels,
+    int face_mask,
+    int shell_layers,
+    float relaxation
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_clear_d3q27_f16_boundary_shell_rect(long long context_key);
 AERO_LBM_CAPI_EXPORT int aero_lbm_step_rect_with_sparse_overlays(
     const float* packet,
     int nx,

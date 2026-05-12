@@ -7,7 +7,7 @@ public enum SamplePolicy {
     VISUAL_LOCAL_FIRST(true, true, true),
     /** Server-side gameplay path: trusted server L2 when active, otherwise server L1/L0. */
     GAMEPLAY_SERVER_ONLY(false, true, true),
-    /** Default client path when local L2 is off: server L2 atlas when present, otherwise L1/L0. */
+    /** Legacy/compat client path: server L2 atlas when present, otherwise L1/L0. */
     SERVER_AGGREGATED_PREFERRED(false, true, true),
     /** Coarse authoritative weather only: L1 first, then L0. */
     SERVER_COARSE_ONLY(false, false, true),

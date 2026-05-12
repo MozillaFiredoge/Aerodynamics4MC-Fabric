@@ -256,6 +256,7 @@ constexpr int k_nested_boundary_layers = 3;
 constexpr float k_nested_boundary_min_keep = 0.25f;
 // Keep this aligned with aero_lbm_jni.cpp runtime state nudge layers.
 constexpr int k_brick_boundary_reference_layers = 8;
+constexpr float k_brick_boundary_reference_relaxation = 0.10f;
 constexpr float k_sponge_relaxation_max = 0.95f;
 constexpr float k_runtime_temperature_scale_kelvin = 20.0f;
 constexpr int k_tornado_descriptor_floats = 17;
@@ -1393,6 +1394,44 @@ bool brick_face_exposed(
     return it == runtime.bricks.end() || !brick_is_solver_active(runtime, it->second);
 }
 
+int exposed_face_mask_for_brick(const FluidWorldRuntime& runtime, const BrickCoord& coord) {
+    int mask = 0;
+    if (brick_face_exposed(runtime, coord, 0, false)) mask |= 1 << 0;
+    if (brick_face_exposed(runtime, coord, 0, true)) mask |= 1 << 1;
+    if (brick_face_exposed(runtime, coord, 1, false)) mask |= 1 << 2;
+    if (brick_face_exposed(runtime, coord, 1, true)) mask |= 1 << 3;
+    if (brick_face_exposed(runtime, coord, 2, false)) mask |= 1 << 4;
+    if (brick_face_exposed(runtime, coord, 2, true)) mask |= 1 << 5;
+    return mask;
+}
+
+void update_brick_d3q27_boundary_shell(
+    const FluidWorldRuntime& runtime,
+    const BrickCoord& coord,
+    BrickData& brick
+) {
+    if (brick.context_key == 0) {
+        return;
+    }
+    const DynamicRegionData* reference = brick.boundary_reference_region.get();
+    const int face_mask = exposed_face_mask_for_brick(runtime, coord);
+    if (face_mask == 0 || !brick_dynamic_region_valid(runtime, reference)) {
+        aero_lbm_clear_d3q27_f16_boundary_shell_rect(brick.context_key);
+        return;
+    }
+    (void)aero_lbm_set_d3q27_f16_boundary_shell_rect(
+        runtime.brick_size,
+        runtime.brick_size,
+        runtime.brick_size,
+        brick.context_key,
+        reference->flow_state.data(),
+        AERO_LBM_SIMULATION_FLOW_STATE_CHANNELS,
+        face_mask,
+        k_brick_boundary_reference_layers,
+        k_brick_boundary_reference_relaxation
+    );
+}
+
 bool build_brick_step_packet(
     const FluidWorldRuntime& runtime,
     const BrickCoord& coord,
@@ -1433,8 +1472,7 @@ bool build_brick_step_packet(
         std::fill(packet.begin(), packet.end(), 0.0f);
     }
     const DynamicRegionData* boundary_reference = brick.boundary_reference_region.get();
-    const bool boundary_reference_valid = brick_dynamic_region_valid(runtime, boundary_reference)
-        && dynamic_has_nonzero_flow(*boundary_reference);
+    const bool boundary_reference_valid = brick_dynamic_region_valid(runtime, boundary_reference);
     const bool exposed_x_neg = boundary_reference_valid && brick_face_exposed(runtime, coord, 0, false);
     const bool exposed_x_pos = boundary_reference_valid && brick_face_exposed(runtime, coord, 0, true);
     const bool exposed_y_neg = boundary_reference_valid && brick_face_exposed(runtime, coord, 1, false);
@@ -1703,6 +1741,7 @@ bool step_brick_actual(
         return false;
     }
     if (compact_step_ok) {
+        update_brick_d3q27_boundary_shell(runtime, coord, brick);
         brick.pending_static_patch_cells.clear();
         return true;
     }
@@ -1724,6 +1763,7 @@ bool step_brick_actual(
         return true;
     }
     apply_brick_static_constraints(runtime, brick);
+    update_brick_d3q27_boundary_shell(runtime, coord, brick);
     brick.pending_static_patch_cells.clear();
     return true;
 }
@@ -1800,6 +1840,196 @@ void ensure_static_region_source_buffers(StaticRegionData& stat) {
     }
     if (stat.source_emitter_power_watts.size() != cells) {
         stat.source_emitter_power_watts.assign(cells, 0.0f);
+    }
+}
+
+bool local_static_solid(const StaticRegionData& stat, int size, int x, int y, int z) {
+    if (x < 0 || y < 0 || z < 0 || x >= size || y >= size || z >= size) {
+        return true;
+    }
+    const size_t cell = static_cast<size_t>(local_cell_index(size, x, y, z));
+    return cell >= stat.obstacle.size() || stat.obstacle[cell] != 0;
+}
+
+uint16_t local_open_face_mask(const StaticRegionData& stat, int size, int x, int y, int z) {
+    if (local_static_solid(stat, size, x, y, z)) {
+        return 0u;
+    }
+    uint16_t mask = 0u;
+    for (int face = 0; face < k_face_count; ++face) {
+        if (!local_static_solid(
+                stat,
+                size,
+                x + k_java_face_offsets[face][0],
+                y + k_java_face_offsets[face][1],
+                z + k_java_face_offsets[face][2])) {
+            mask = static_cast<uint16_t>(mask | (1u << face));
+        }
+    }
+    return mask;
+}
+
+bool local_fan_path_clear(
+    const StaticRegionData& stat,
+    int size,
+    int fan_x,
+    int fan_y,
+    int fan_z,
+    int dir,
+    int distance,
+    int a,
+    int b
+) {
+    const int axis = (dir <= 2) ? 0 : (dir <= 4 ? 1 : 2);
+    int lane_x = fan_x;
+    int lane_y = fan_y;
+    int lane_z = fan_z;
+    if (axis == 0) {
+        lane_y += a;
+        lane_z += b;
+    } else if (axis == 1) {
+        lane_x += a;
+        lane_z += b;
+    } else {
+        lane_x += a;
+        lane_y += b;
+    }
+    const int dx = k_fan_dir_offsets[dir][0];
+    const int dy = k_fan_dir_offsets[dir][1];
+    const int dz = k_fan_dir_offsets[dir][2];
+    for (int step = 1; step < distance; ++step) {
+        if (local_static_solid(stat, size, lane_x + dx * step, lane_y + dy * step, lane_z + dz * step)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool local_heat_path_clear(
+    const StaticRegionData& stat,
+    int size,
+    int source_x,
+    int source_y,
+    int source_z,
+    int target_y
+) {
+    for (int y = source_y + 1; y < target_y; ++y) {
+        if (local_static_solid(stat, size, source_x, y, source_z)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void rebuild_static_region_derived_fields_from_sources(StaticRegionData& stat) {
+    if (stat.nx <= 0 || stat.nx != stat.ny || stat.nx != stat.nz) {
+        return;
+    }
+    const int size = stat.nx;
+    const size_t cells = static_cast<size_t>(size) * static_cast<size_t>(size) * static_cast<size_t>(size);
+    if (stat.obstacle.size() != cells) {
+        return;
+    }
+    if (stat.surface_kind.size() != cells) {
+        stat.surface_kind.assign(cells, 0u);
+    } else {
+        std::fill(stat.surface_kind.begin(), stat.surface_kind.end(), 0u);
+    }
+    if (stat.open_face_mask.size() != cells) {
+        stat.open_face_mask.assign(cells, 0u);
+    }
+    if (stat.emitter_power_watts.size() != cells) {
+        stat.emitter_power_watts.assign(cells, 0.0f);
+    } else {
+        std::fill(stat.emitter_power_watts.begin(), stat.emitter_power_watts.end(), 0.0f);
+    }
+    ensure_static_region_source_buffers(stat);
+
+    for (int x = 0; x < size; ++x) {
+        for (int y = 0; y < size; ++y) {
+            for (int z = 0; z < size; ++z) {
+                const size_t cell = static_cast<size_t>(local_cell_index(size, x, y, z));
+                stat.open_face_mask[cell] = local_open_face_mask(stat, size, x, y, z);
+            }
+        }
+    }
+
+    for (int fan_x = 0; fan_x < size; ++fan_x) {
+        for (int fan_y = 0; fan_y < size; ++fan_y) {
+            for (int fan_z = 0; fan_z < size; ++fan_z) {
+                const size_t source_cell = static_cast<size_t>(local_cell_index(size, fan_x, fan_y, fan_z));
+                const uint8_t dir = source_cell < stat.source_fan_dir.size()
+                    ? std::min<uint8_t>(stat.source_fan_dir[source_cell], 6u)
+                    : 0u;
+                if (dir == 0u) {
+                    continue;
+                }
+                const int dx = k_fan_dir_offsets[dir][0];
+                const int dy = k_fan_dir_offsets[dir][1];
+                const int dz = k_fan_dir_offsets[dir][2];
+                const int axis = (dir <= 2) ? 0 : (dir <= 4 ? 1 : 2);
+                for (int distance = 1; distance <= k_client_fan_force_length_cells; ++distance) {
+                    const int center_x = fan_x + dx * distance;
+                    const int center_y = fan_y + dy * distance;
+                    const int center_z = fan_z + dz * distance;
+                    for (int a = -k_client_fan_force_radius_cells; a <= k_client_fan_force_radius_cells; ++a) {
+                        for (int b = -k_client_fan_force_radius_cells; b <= k_client_fan_force_radius_cells; ++b) {
+                            int tx = center_x;
+                            int ty = center_y;
+                            int tz = center_z;
+                            if (axis == 0) {
+                                ty += a;
+                                tz += b;
+                            } else if (axis == 1) {
+                                tx += a;
+                                tz += b;
+                            } else {
+                                tx += a;
+                                ty += b;
+                            }
+                            if (local_static_solid(stat, size, tx, ty, tz)
+                                || !local_fan_path_clear(stat, size, fan_x, fan_y, fan_z, dir, distance, a, b)) {
+                                continue;
+                            }
+                            const size_t target_cell = static_cast<size_t>(local_cell_index(size, tx, ty, tz));
+                            if (target_cell < stat.surface_kind.size()) {
+                                stat.surface_kind[target_cell] = client_fan_surface_kind_from_dir_code(dir);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (int source_x = 0; source_x < size; ++source_x) {
+        for (int source_y = 0; source_y < size; ++source_y) {
+            for (int source_z = 0; source_z < size; ++source_z) {
+                const size_t source_cell = static_cast<size_t>(local_cell_index(size, source_x, source_y, source_z));
+                if (source_cell >= stat.source_emitter_power_watts.size()) {
+                    continue;
+                }
+                const float source_power = stat.source_emitter_power_watts[source_cell];
+                if (!(source_power > 0.0f) || !std::isfinite(source_power)) {
+                    continue;
+                }
+                for (int distance = 0; distance <= k_client_heat_plume_height_cells; ++distance) {
+                    const int target_y = source_y + distance;
+                    if (target_y < 0 || target_y >= size
+                        || local_static_solid(stat, size, source_x, target_y, source_z)
+                        || !local_heat_path_clear(stat, size, source_x, source_y, source_z, target_y)) {
+                        continue;
+                    }
+                    const size_t target_cell = static_cast<size_t>(local_cell_index(size, source_x, target_y, source_z));
+                    const float contribution = distance == 0
+                        ? source_power
+                        : source_power * k_client_heat_coupling_to_adjacent_air / static_cast<float>(distance * distance);
+                    if (target_cell < stat.emitter_power_watts.size()) {
+                        stat.emitter_power_watts[target_cell] += contribution;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4695,6 +4925,9 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_static_brick_wit
     } else {
         region->source_emitter_power_watts.assign(static_cast<size_t>(cells), 0.0f);
     }
+    if (source_fan_dir || source_emitter_power_watts) {
+        rebuild_static_region_derived_fields_from_sources(*region);
+    }
     region->face_sky_exposure.assign(face_sky_exposure, face_sky_exposure + static_cast<size_t>(cells) * k_face_count);
     region->face_direct_exposure.assign(face_direct_exposure, face_direct_exposure + static_cast<size_t>(cells) * k_face_count);
 
@@ -5200,9 +5433,11 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_upload_brick_world_boundary_referen
     dynamic->surface_temperature.assign(surface_temperature, surface_temperature + cells);
 
     BrickData& brick = runtime.bricks[BrickCoord{brick_x, brick_y, brick_z}];
+    const BrickCoord coord{brick_x, brick_y, brick_z};
     brick.boundary_reference_region = std::move(dynamic);
     brick.active = true;
     brick.last_active_epoch = runtime.epoch;
+    update_brick_d3q27_boundary_shell(runtime, coord, brick);
     return 1;
 }
 

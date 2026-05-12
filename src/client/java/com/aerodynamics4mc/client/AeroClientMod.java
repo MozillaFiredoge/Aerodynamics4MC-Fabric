@@ -4,9 +4,10 @@ import com.aerodynamics4mc.api.AeroWindSample;
 import com.aerodynamics4mc.api.SamplePolicy;
 import com.aerodynamics4mc.net.AeroClientL2PreferencePayload;
 import com.aerodynamics4mc.net.AeroCoarseWindPayload;
-import com.aerodynamics4mc.net.AeroFlowAnalysisPayload;
 import com.aerodynamics4mc.net.AeroFlowPayload;
+import com.aerodynamics4mc.net.AeroFlowAnalysisPayload;
 import com.aerodynamics4mc.net.AeroRuntimeStatePayload;
+
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -43,7 +44,7 @@ public final class AeroClientMod implements ClientModInitializer {
         AeroClientMod active = instance;
         SamplePolicy policy = active != null && active.clientL2Solver.isExperimentalEnabled()
                 ? SamplePolicy.CLIENT_LOCAL_PREFERRED
-                : SamplePolicy.SERVER_AGGREGATED_PREFERRED;
+                : SamplePolicy.SERVER_COARSE_ONLY;
         return sampleFlow(world, position, policy);
     }
 
