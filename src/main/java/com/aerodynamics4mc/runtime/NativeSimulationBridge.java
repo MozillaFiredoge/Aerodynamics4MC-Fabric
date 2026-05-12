@@ -13,6 +13,10 @@ public final class NativeSimulationBridge {
     public static final int NESTED_FEEDBACK_STATUS_FIELDS = 6;
     public static final int BRICK_HINT_COORDS_PER_BRICK = 3;
     public static final int BRICK_RUNTIME_STATUS_FIELDS = 8;
+    public static final int REALTIME_SOLVER_AUTO = 0;
+    public static final int REALTIME_SOLVER_CLASSIC_D3Q27 = 1;
+    public static final int REALTIME_SOLVER_COMPACT_EXPERIMENTAL = 2;
+    public static final int REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL = 3;
     private static final int FACE_COUNT = 6;
     public static final int WORLD_DELTA_BLOCK_CHANGED = 1;
     public static final int WORLD_DELTA_CHUNK_LOADED = 2;
@@ -119,6 +123,11 @@ public final class NativeSimulationBridge {
             && Float.isFinite(dxMeters) && dxMeters > 0.0f
             && Float.isFinite(dtSeconds) && dtSeconds > 0.0f
             && nativeEnsureBrickWorldRuntime(serviceKey, worldKey, brickSize, dxMeters, dtSeconds);
+    }
+
+    public boolean setBrickWorldSolverMode(long serviceKey, long worldKey, int solverMode) {
+        return LOADED && serviceKey != 0L && worldKey != 0L
+            && nativeSetBrickWorldSolverMode(serviceKey, worldKey, solverMode);
     }
 
     public boolean setBrickWorldActiveHints(
@@ -1242,6 +1251,8 @@ public final class NativeSimulationBridge {
         float dxMeters,
         float dtSeconds
     );
+
+    private static native boolean nativeSetBrickWorldSolverMode(long serviceKey, long worldKey, int solverMode);
 
     private static native boolean nativeSetBrickWorldActiveHints(
         long serviceKey,

@@ -176,7 +176,7 @@ final class AeroVisualizer {
     }
 
     AeroWindSample sampleFlow(Identifier dimensionId, Vec3d position) {
-        return sampleFlow(dimensionId, position, SamplePolicy.SERVER_COARSE_ONLY);
+        return sampleFlow(dimensionId, position, SamplePolicy.SERVER_AGGREGATED_PREFERRED);
     }
 
     AeroWindSample sampleFlow(Identifier dimensionId, Vec3d position, SamplePolicy policy) {
@@ -207,7 +207,7 @@ final class AeroVisualizer {
     }
 
     private SamplePolicy effectiveSamplePolicyForLocalPlayer(SamplePolicy policy) {
-        SamplePolicy effectivePolicy = policy == null ? SamplePolicy.SERVER_COARSE_ONLY : policy;
+        SamplePolicy effectivePolicy = policy == null ? SamplePolicy.SERVER_AGGREGATED_PREFERRED : policy;
         MinecraftClient client = MinecraftClient.getInstance();
         if (effectivePolicy != SamplePolicy.DIAGNOSTIC_ALL_SOURCES
             && client != null

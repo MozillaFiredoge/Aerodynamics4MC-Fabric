@@ -11,16 +11,16 @@ import org.slf4j.LoggerFactory;
 
 import com.aerodynamics4mc.FanBlock;
 import com.aerodynamics4mc.ModBlocks;
-import com.aerodynamics4mc.api.AeroWindSamplingRules;
 import com.aerodynamics4mc.api.AeroWindSample;
+import com.aerodynamics4mc.api.AeroWindSamplingRules;
 import com.aerodynamics4mc.net.AeroCoarseWindPayload;
 import com.aerodynamics4mc.runtime.NativeSimulationBridge;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
-import net.minecraft.block.Blocks;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.state.property.Properties;
@@ -33,6 +33,98 @@ import net.minecraft.util.math.Vec3d;
 final class ClientL2Solver {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerodynamics4mc/ClientL2Solver");
 
+    private enum SolverMode {
+        OFF(
+            "off",
+            false,
+            false,
+            32,
+            NativeSimulationBridge.REALTIME_SOLVER_CLASSIC_D3Q27
+        ),
+        V0_1(
+            "v0.1-classic-d3q27",
+            true,
+            false,
+            32,
+            NativeSimulationBridge.REALTIME_SOLVER_CLASSIC_D3Q27
+        ),
+        COMPACT(
+            "compact-experimental",
+            true,
+            true,
+            128,
+            NativeSimulationBridge.REALTIME_SOLVER_COMPACT_EXPERIMENTAL
+        ),
+        FP16_INPLACE(
+            "d3q27-fp16-inplace-experimental",
+            true,
+            true,
+            128,
+            NativeSimulationBridge.REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL
+        );
+
+        private final String statusName;
+        private final boolean enabledByDefault;
+        private final boolean experimental;
+        private final int defaultBrickSize;
+        private final int nativeSolverMode;
+
+        SolverMode(
+            String statusName,
+            boolean enabledByDefault,
+            boolean experimental,
+            int defaultBrickSize,
+            int nativeSolverMode
+        ) {
+            this.statusName = statusName;
+            this.enabledByDefault = enabledByDefault;
+            this.experimental = experimental;
+            this.defaultBrickSize = defaultBrickSize;
+            this.nativeSolverMode = nativeSolverMode;
+        }
+
+        static SolverMode parse(String value) {
+            if (value == null || value.isBlank()) {
+                return V0_1;
+            }
+            String normalized = value.trim()
+                .toLowerCase(java.util.Locale.ROOT)
+                .replace('-', '_')
+                .replace('.', '_')
+                .replace(' ', '_');
+            return switch (normalized) {
+                case "off", "none", "disable", "disabled" -> OFF;
+                case "default", "v0", "v01", "v0_1", "classic", "classic_d3q27",
+                    "cumulant", "cumulant_d3q27", "d3q27", "32", "32_3" -> V0_1;
+                case "compact", "compact_path", "compact_experimental", "compact_realtime", "compact_realtime_fp16" -> COMPACT;
+                case "fp16", "fp16_inplace", "fp16_inplace_d3q27", "d3q27_fp16", "d3q27_fp16_inplace",
+                    "d3q27_fp16_inplace_srt", "d3q27_fp16_inplace_experimental" -> FP16_INPLACE;
+                default -> throw new IllegalArgumentException("Unknown Client L2 solver mode: " + value);
+            };
+        }
+
+        String statusName() {
+            return statusName;
+        }
+
+        boolean enabledByDefault() {
+            return enabledByDefault;
+        }
+
+        boolean experimental() {
+            return experimental;
+        }
+
+        int defaultBrickSize() {
+            return defaultBrickSize;
+        }
+
+        int nativeSolverMode() {
+            return nativeSolverMode;
+        }
+    }
+
+    private static final SolverMode CLIENT_L2_MODE = configuredSolverMode();
     private static final int BRICK_SIZE = configuredBrickSize();
     private static final int CELL_COUNT = BRICK_SIZE * BRICK_SIZE * BRICK_SIZE;
     private static final int FLOW_CHANNELS = NativeSimulationBridge.FLOW_STATE_CHANNELS;
@@ -212,10 +304,10 @@ final class ClientL2Solver {
         WORKER_QUEUE_CAPACITY
     );
     private static final int ALL_OPEN_FACE_MASK = (1 << FACE_COUNT) - 1;
-    private static final boolean CLIENT_L2_DEFAULT_ENABLED = configuredBoolean(
+    private static final boolean CLIENT_L2_DEFAULT_ENABLED = CLIENT_L2_MODE != SolverMode.OFF && configuredBoolean(
         "a4mc.clientL2.enabled",
         "AERO_LBM_CLIENT_L2_ENABLED",
-        false
+        CLIENT_L2_MODE.enabledByDefault()
     );
 
     private enum StressMode {
@@ -343,11 +435,24 @@ final class ClientL2Solver {
         this.visualizer = visualizer;
     }
 
+    private static SolverMode configuredSolverMode() {
+        String value = System.getProperty("a4mc.clientL2.mode");
+        if (value == null || value.isBlank()) {
+            value = System.getenv("AERO_LBM_CLIENT_L2_MODE");
+        }
+        try {
+            return SolverMode.parse(value);
+        } catch (IllegalArgumentException error) {
+            LOGGER.warn("Client L2 config a4mc.clientL2.mode={} is invalid; using v0_1", value);
+            return SolverMode.V0_1;
+        }
+    }
+
     private static int configuredBrickSize() {
         int requested = configuredInt(
             "a4mc.clientL2.brickSize",
             "AERO_LBM_CLIENT_L2_BRICK_SIZE",
-            32,
+            CLIENT_L2_MODE.defaultBrickSize(),
             16,
             128
         );
@@ -405,6 +510,13 @@ final class ClientL2Solver {
     }
 
     void initialize() {
+        LOGGER.info(
+            "Client L2 mode={} enabledByDefault={} brickSize={} experimental={}",
+            CLIENT_L2_MODE.statusName(),
+            CLIENT_L2_DEFAULT_ENABLED,
+            BRICK_SIZE,
+            CLIENT_L2_MODE.experimental()
+        );
         ClientTickEvents.END_CLIENT_TICK.register(this::onClientTick);
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> close());
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> close());
@@ -2474,6 +2586,10 @@ final class ClientL2Solver {
                 lastError = "ensureBrickWorldRuntime failed: " + bridge.lastError();
                 return false;
             }
+            if (!bridge.setBrickWorldSolverMode(serviceKey, worldKey, CLIENT_L2_MODE.nativeSolverMode())) {
+                lastError = "setBrickWorldSolverMode failed: " + bridge.lastError();
+                return false;
+            }
             return true;
         }
 
@@ -2752,9 +2868,11 @@ final class ClientL2Solver {
 
     String status() {
         if (!experimentalEnabled) {
-            return "client L2 localSolve=off";
+            return "client L2 localSolve=off mode=" + CLIENT_L2_MODE.statusName();
         }
-        return "client L2 localSolve=on streaming=" + streamingEnabled
+        return "client L2 localSolve=on mode=" + CLIENT_L2_MODE.statusName()
+            + " experimental=" + CLIENT_L2_MODE.experimental()
+            + " streaming=" + streamingEnabled
             + " disabled=" + clientSolveDisabled
             + " brickSize=" + BRICK_SIZE
             + " cells=" + CELL_COUNT
@@ -2849,6 +2967,9 @@ final class ClientL2Solver {
     }
 
     void setExperimentalEnabled(boolean enabled) {
+        if (CLIENT_L2_MODE == SolverMode.OFF) {
+            enabled = false;
+        }
         if (experimentalEnabled == enabled) {
             return;
         }
