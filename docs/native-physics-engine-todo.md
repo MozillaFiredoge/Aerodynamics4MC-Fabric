@@ -23,10 +23,11 @@ The main missing areas are usability, observability, and the foliage/shaderpack 
 There is also a strategic change:
 
 - stitched runtime `L2` should no longer be treated as the main player-facing CFD showcase
-- the next local-air push should center on an on-demand local `L2` patch near the player
-- `L1` should remain the default background air field outside active local solves
-- see `docs/on-demand-l2-prefetch-design.md`
-- for the longer-term engine-grade `L2` direction, see `docs/native-authoritative-l2-runtime-design.md`
+- `L1` should become the default gameplay wind and weather layer
+- local `L2` / CFD should be optional debug, calibration, or special-case refinement infrastructure
+- machine gameplay should prefer reduced-order models calibrated by CFD, not full CFD solves every tick
+- see `docs/runtime-aerodynamics-strategy.md`
+- older local-patch and native-authoritative L2 documents should be read as historical or optional design references
 
 ## P0: Restore Missing Tooling
 
@@ -97,9 +98,10 @@ These are still largely not done.
 - duct/fan explanation and debugging polish
 - chimney / ventilation airflow mechanics
 
-## P3.5: On-Demand Local L2
+## P3.5: Optional Local L2 / CFD Calibration
 
-This is now the main local-air direction.
+This is no longer the main runtime direction.
+The current strategy is to make `L1` the default player-facing wind layer and keep CFD for controlled local refinement, debug visualization, and offline/runtime calibration data.
 
 Solver-core status:
 
@@ -112,36 +114,33 @@ Solver-core status:
 
 Open architecture work:
 
-- remove synchronous static/dynamic rebuild stalls; a rebuild currently can scan millions of cells and freeze the client for seconds
-- define the final boundary model: one-brick L1 boundary shell first, true halo exchange only when multiple active L2 bricks are introduced
-- preserve physical continuity when the local patch moves or wakes from cache
-- make atlas/probe publication independent from rebuild work, so visualization never disappears during geometry bursts
+- keep static/dynamic rebuild work off the client hot path when L2 is enabled
+- keep the one-brick `L1` boundary shell as the practical boundary model
+- preserve physical continuity only for explicit refinement/debug sessions
+- make atlas/probe publication independent from rebuild work, so optional visualization does not disappear during geometry bursts
 
 Target:
 
-- one on-demand local patch
+- one optional local patch
 - `64 blocks -> 128^3`
 - six-face background boundary
 - sponge shell
 - native precompute of `5` local frames
 - `int16` quantized direct-buffer publication to Java
-- local consumers only
+- debug/refinement/calibration consumers only
 
 Primary goals:
 
-- make air feel continuous near the player
-- make geometry-shaped wakes and recirculation legible
-- drive smoke / steam / fire and building airflow mechanics
+- provide controlled CFD reference behavior
+- generate or validate coefficients for reduced-order runtime models
+- debug local flow scenes when L1 or reduced-order behavior looks wrong
 
 First implementation priorities:
 
-- sampler around the player
-- handwritten discriminator
-- fixed-size local patch activation state machine
-- six-face boundary sampling from the existing weather stack
-- native precompute ring buffer
-- Java-side interpolation and consumption
-- smoke/fire/chimney consumers
+- expose explicit debug/calibration commands
+- keep six-face boundary sampling from the existing weather stack
+- publish compact reference frames for visualization
+- compare reduced-order fan, vent, plume, and obstacle models against CFD scenes
 
 ## P4: Client Visualization
 

@@ -1,5 +1,9 @@
 # Local Air Patch Design
 
+> Status: historical / optional refinement design.
+> The current runtime strategy is `docs/runtime-aerodynamics-strategy.md`.
+> A `128^3` local patch is no longer the main player-facing airflow direction; it should be used only for explicit debug, calibration, or high-value local refinement.
+
 ## Purpose
 
 This document defines the next local-air direction for `aerodynamics4mc`.

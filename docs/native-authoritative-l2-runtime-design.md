@@ -1,5 +1,9 @@
 # Native Authoritative L2 Runtime Design
 
+> Status: historical / optional engine-grade L2 reference.
+> The current runtime strategy is `docs/runtime-aerodynamics-strategy.md`.
+> Native authoritative `L2` should not be treated as the default product direction unless a future feature has a clear CFD requirement.
+
 ## Purpose
 
 This document defines how to migrate the current stitched `L2` runtime toward an engine-grade architecture:

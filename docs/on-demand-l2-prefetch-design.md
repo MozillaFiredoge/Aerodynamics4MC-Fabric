@@ -1,5 +1,9 @@
 # On-Demand L2 Prefetch Design
 
+> Status: historical / optional refinement design.
+> The current runtime strategy is `docs/runtime-aerodynamics-strategy.md`.
+> On-demand `L2` remains useful as a bounded CFD tool, but it is no longer the default path for player-facing wind.
+
 ## Purpose
 
 This document defines a simpler player-facing local-air architecture for `aerodynamics4mc`.

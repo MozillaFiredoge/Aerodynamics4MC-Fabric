@@ -214,19 +214,21 @@ It is not necessary to own that gameplay ourselves.
 The highest-value next work is:
 
 1. stop treating stitched `L2` as the main player-facing airflow showcase
-2. move to an on-demand local `L2` architecture:
-   - `L1` stays as the always-on background field
-   - sampler + discriminator decide whether local `L2` is worth activating
-   - local `L2` uses one fixed `64 blocks -> 128^3` patch
-   - native side precomputes a short horizon and publishes it through a direct buffer
-   - sponge shell
-3. connect that patch first to:
+2. make `L1` the default player-facing wind layer:
+   - coherent gusts and circulation
+   - visible wind waves through foliage, smoke, particles, and fire
+   - stable sampling APIs for gameplay and rendering
+   - tornado / cyclone descriptors expressed through environment wind
+3. use reduced-order mechanics for machines:
+   - fans, vents, ducts, jets, plumes, and cooling use coefficients and compact models
+   - CFD generates or validates those coefficients instead of running every tick
+4. connect the runtime first to:
    - directional smoke / steam / fire
    - one building-useful airflow mechanic such as chimney draft
 
 That sequence is deliberate:
 
-- local patch proves “this is air, not noise”
+- L1 proves “this is air, not noise”
 - smoke/fire proves “air has direction”
 - chimneys/vents prove “air can be used”
 
@@ -234,15 +236,16 @@ That sequence is deliberate:
 
 ### Do next
 
-- write and freeze the local patch architecture
-- implement the first `64 blocks -> 128^3` local patch
-- directional smoke and flame response driven by that patch
+- write and freeze the runtime aerodynamics strategy
+- make foliage, particles, smoke, and flame respond visibly to `L1`
+- define the first reduced-order fan / vent / chimney mechanics
 - one architecture-facing airflow mechanic
 - maintain `dumpdata` and snapshot tooling for the world-scale stack, but stop expanding stitched `L2` visualization as the main product path
 
 ### Defer until later
 
 - generalized monolithic inspection tooling beyond what is needed to validate the patch
+- always-on client-local `128^3` CFD as a default gameplay layer
 - cloud rendering
 - ML `L3`
 - aircraft gameplay
