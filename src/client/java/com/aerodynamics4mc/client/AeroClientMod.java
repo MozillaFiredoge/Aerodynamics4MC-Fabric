@@ -43,8 +43,8 @@ public final class AeroClientMod implements ClientModInitializer {
     public static AeroWindSample sampleFlow(ClientLevel world, Vec3 position) {
         AeroClientMod active = instance;
         SamplePolicy policy = active != null && active.clientL2Solver.isExperimentalEnabled()
-                ? SamplePolicy.CLIENT_LOCAL_PREFERRED
-                : SamplePolicy.SERVER_COARSE_ONLY;
+            ? SamplePolicy.CLIENT_LOCAL_PREFERRED
+            : SamplePolicy.SERVER_COARSE_ONLY;
         return sampleFlow(world, position, policy);
     }
 

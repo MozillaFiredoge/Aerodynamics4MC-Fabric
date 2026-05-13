@@ -150,6 +150,7 @@ struct FluidWorldRuntime {
     int brick_size = 0;
     float dx_meters = 1.0f;
     float dt_seconds = 0.05f;
+    int solver_mode = AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27;
     bool exact_active_hints = false;
     std::uint64_t epoch = 0;
     std::uint64_t compact_cached_attempts = 0;
@@ -226,6 +227,8 @@ ServiceState g_service_storage;
 ServiceState* g_service = nullptr;
 long long g_service_key = 0;
 std::string g_simulation_last_error;
+
+void release_brick_context(BrickData& brick);
 
 constexpr int k_default_packed_atlas_stride = 4;
 constexpr float k_atlas_velocity_quant_range = 5.6f;
@@ -377,7 +380,66 @@ bool brick_world_compact_enabled() {
     if (std::getenv("AERO_LBM_SIMULATION_COMPACT")) {
         return simulation_compact_enabled();
     }
-    return true;
+    return false;
+}
+
+int normalize_realtime_solver_mode(int solver_mode) {
+    switch (solver_mode) {
+        case AERO_LBM_REALTIME_SOLVER_AUTO:
+        case AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27:
+        case AERO_LBM_REALTIME_SOLVER_COMPACT_EXPERIMENTAL:
+        case AERO_LBM_REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL:
+            return solver_mode;
+        default:
+            return AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27;
+    }
+}
+
+const char* realtime_solver_mode_name(int solver_mode) {
+    switch (normalize_realtime_solver_mode(solver_mode)) {
+        case AERO_LBM_REALTIME_SOLVER_AUTO:
+            return "auto";
+        case AERO_LBM_REALTIME_SOLVER_COMPACT_EXPERIMENTAL:
+            return "compact-experimental";
+        case AERO_LBM_REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL:
+            return "d3q27-fp16-inplace-experimental";
+        case AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27:
+        default:
+            return "classic-d3q27";
+    }
+}
+
+bool realtime_solver_mode_uses_experimental_path(int solver_mode) {
+    switch (normalize_realtime_solver_mode(solver_mode)) {
+        case AERO_LBM_REALTIME_SOLVER_COMPACT_EXPERIMENTAL:
+        case AERO_LBM_REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL:
+            return true;
+        case AERO_LBM_REALTIME_SOLVER_AUTO:
+            return brick_world_compact_enabled();
+        case AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27:
+        default:
+            return false;
+    }
+}
+
+bool runtime_uses_experimental_realtime(const FluidWorldRuntime& runtime) {
+    return realtime_solver_mode_uses_experimental_path(runtime.solver_mode);
+}
+
+struct RealtimeSolverModeScope {
+    explicit RealtimeSolverModeScope(int solver_mode) {
+        aero_lbm_set_realtime_solver_mode(normalize_realtime_solver_mode(solver_mode));
+    }
+
+    ~RealtimeSolverModeScope() {
+        aero_lbm_set_realtime_solver_mode(AERO_LBM_REALTIME_SOLVER_AUTO);
+    }
+};
+
+void release_brick_runtime_contexts(FluidWorldRuntime& runtime) {
+    for (auto& entry : runtime.bricks) {
+        release_brick_context(entry.second);
+    }
 }
 
 AeroLbmBoundaryFaceConfig simulation_compact_face(int hydro_kind, int thermal_kind) {
@@ -601,7 +663,7 @@ bool brick_is_solver_active(const FluidWorldRuntime& runtime, const BrickData& b
 bool brick_dynamic_region_valid(const FluidWorldRuntime& runtime, const DynamicRegionData* dynamic);
 
 bool brick_compact_cached_ready(const FluidWorldRuntime& runtime, const BrickData& brick) {
-    return brick_world_compact_enabled()
+    return runtime_uses_experimental_realtime(runtime)
         && brick.compact_context_active
         && brick.context_key != 0
         && !brick.forcing_dirty
@@ -1615,7 +1677,7 @@ bool apply_pending_static_patches_to_d3q27(FluidWorldRuntime& runtime, BrickData
 
 bool step_brick_compact_cached(FluidWorldRuntime& runtime, BrickData& brick, int size) {
     runtime.compact_cached_attempts++;
-    if (!brick_world_compact_enabled()
+    if (!runtime_uses_experimental_realtime(runtime)
         || !brick.compact_context_active
         || brick.context_key == 0
         || brick.geometry_dirty
@@ -1648,6 +1710,7 @@ bool step_brick_actual(
     BrickData& brick,
     DynamicRegionData& dynamic
 ) {
+    RealtimeSolverModeScope realtime_solver_mode_scope(runtime.solver_mode);
     std::shared_ptr<DynamicRegionData> zero_output_fallback;
     const int size = runtime.brick_size;
     if (step_brick_compact_cached(runtime, brick, size)) {
@@ -1668,7 +1731,7 @@ bool step_brick_actual(
     bool compact_step_ok = false;
     CompactBrickPacketSummary compact_summary{};
     bool have_compact_summary = false;
-    if (brick_world_compact_enabled()) {
+    if (runtime_uses_experimental_realtime(runtime)) {
         compact_summary = summarize_compact_brick_packet(brick.packet_cache);
         have_compact_summary = true;
         runtime.compact_last_fluid_cells = static_cast<std::uint64_t>(std::max(0, compact_summary.fluid_cells));
@@ -4581,6 +4644,36 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_brick_world_runtime(
     return ensure_brick_world_runtime(*service, world_key, brick_size, dx_meters, dt_seconds) ? 1 : 0;
 }
 
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_brick_world_solver_mode(
+    long long service_key,
+    long long world_key,
+    int solver_mode
+) {
+    std::lock_guard<SpinMutex> lock(g_simulation_mutex);
+    ServiceState* service = lookup_service(service_key);
+    if (!service) {
+        set_simulation_last_error("simulation_set_brick_world_solver_mode: missing service");
+        return 0;
+    }
+    auto runtime_iterator = service->brick_world_runtimes.find(world_key);
+    if (runtime_iterator == service->brick_world_runtimes.end()) {
+        set_simulation_last_error("simulation_set_brick_world_solver_mode: missing brick runtime");
+        return 0;
+    }
+    FluidWorldRuntime& runtime = runtime_iterator->second;
+    const int normalized = normalize_realtime_solver_mode(solver_mode);
+    if (runtime.solver_mode != normalized) {
+        runtime.solver_mode = normalized;
+        release_brick_runtime_contexts(runtime);
+        for (auto& entry : runtime.bricks) {
+            entry.second.pending_reinit = true;
+            entry.second.dynamic_region_stale = true;
+        }
+        runtime.epoch++;
+    }
+    return 1;
+}
+
 static int set_brick_world_active_hints_locked(
     long long service_key,
     long long world_key,
@@ -6810,6 +6903,9 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     std::uint64_t compact_last_thermal_cells = 0;
     std::uint64_t compact_last_nonfinite_cells = 0;
     std::uint64_t max_brick_epoch = 0;
+    bool any_brick_world_experimental = false;
+    int reported_solver_mode = -1;
+    bool mixed_solver_modes = false;
     if (g_service) {
         for (const auto& region : g_service->regions) {
             if (region.second.active) {
@@ -6821,6 +6917,13 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
         atlas_count = g_service->atlases.size();
         brick_world_count = g_service->brick_world_runtimes.size();
         for (const auto& entry : g_service->brick_world_runtimes) {
+            const int solver_mode = normalize_realtime_solver_mode(entry.second.solver_mode);
+            any_brick_world_experimental = any_brick_world_experimental || runtime_uses_experimental_realtime(entry.second);
+            if (reported_solver_mode < 0) {
+                reported_solver_mode = solver_mode;
+            } else if (reported_solver_mode != solver_mode) {
+                mixed_solver_modes = true;
+            }
             brick_count += entry.second.bricks.size();
             active_brick_count += static_cast<size_t>(count_active_bricks(entry.second));
             solver_active_brick_count += static_cast<size_t>(count_solver_active_bricks(entry.second));
@@ -6863,10 +6966,14 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_simulation_runtime_info(void) {
     std::string native_timing = aero_lbm_timing_info();
     std::replace(native_timing.begin(), native_timing.end(), '|', '/');
     std::replace(native_timing.begin(), native_timing.end(), ' ', '_');
+    std::string brick_world_solver = mixed_solver_modes
+        ? "mixed"
+        : (reported_solver_mode < 0 ? "none" : realtime_solver_mode_name(reported_solver_mode));
     text = "simulation_bridge|services=" + std::to_string(g_service ? 1 : 0)
         + "|solver_runtime=" + solver_runtime
         + "|compact_experimental=" + std::string(simulation_compact_enabled() ? "on" : "off")
-        + "|brick_world_compact=" + std::string(brick_world_compact_enabled() ? "on" : "off")
+        + "|brick_world_solver=" + brick_world_solver
+        + "|brick_world_compact=" + std::string(any_brick_world_experimental ? "on" : "off")
         + "|active_regions=" + std::to_string(active_region_count)
         + "|static_regions=" + std::to_string(static_region_count)
         + "|dynamic_regions=" + std::to_string(dynamic_region_count)
@@ -7024,6 +7131,20 @@ JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBrid
         brick_size,
         dx_meters,
         dt_seconds
+    ) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_aerodynamics4mc_runtime_NativeSimulationBridge_nativeSetBrickWorldSolverMode(
+    JNIEnv*,
+    jclass,
+    jlong service_key,
+    jlong world_key,
+    jint solver_mode
+) {
+    return aero_lbm_simulation_set_brick_world_solver_mode(
+        static_cast<long long>(service_key),
+        static_cast<long long>(world_key),
+        solver_mode
     ) ? JNI_TRUE : JNI_FALSE;
 }
 

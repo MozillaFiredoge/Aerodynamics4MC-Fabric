@@ -25,6 +25,13 @@ enum {
     AERO_LBM_SIMULATION_BRICK_RUNTIME_STATUS_FIELDS = 8
 };
 
+enum {
+    AERO_LBM_REALTIME_SOLVER_AUTO = 0,
+    AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27 = 1,
+    AERO_LBM_REALTIME_SOLVER_COMPACT_EXPERIMENTAL = 2,
+    AERO_LBM_REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL = 3
+};
+
 typedef enum AeroLbmBenchmarkPreset {
     AERO_LBM_BENCHMARK_PRESET_NONE = 0,
     AERO_LBM_BENCHMARK_PRESET_TAYLOR_GREEN_3D = 1,
@@ -273,6 +280,7 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_last_error(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_timing_info(void);
 AERO_LBM_CAPI_EXPORT const char* aero_lbm_memory_info(void);
 AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void);
+AERO_LBM_CAPI_EXPORT void aero_lbm_set_realtime_solver_mode(int solver_mode);
 AERO_LBM_CAPI_EXPORT int aero_lbm_finish(void);
 AERO_LBM_CAPI_EXPORT int aero_lbm_get_timing_snapshot(AeroLbmTimingSnapshot* out_snapshot);
 AERO_LBM_CAPI_EXPORT void aero_lbm_mesoscale_default_config(AeroLbmMesoscaleConfig* out_config);
@@ -312,6 +320,11 @@ AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_ensure_brick_world_runtime(
     int brick_size,
     float dx_meters,
     float dt_seconds
+);
+AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_brick_world_solver_mode(
+    long long service_key,
+    long long world_key,
+    int solver_mode
 );
 AERO_LBM_CAPI_EXPORT int aero_lbm_simulation_set_brick_world_active_hints(
     long long service_key,

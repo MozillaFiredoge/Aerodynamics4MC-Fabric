@@ -611,6 +611,7 @@ Config g_cfg;
 std::unordered_map<jlong, ContextState> g_contexts;
 SpinMutex g_contexts_mutex;
 std::string g_last_native_error;
+int g_realtime_solver_mode = AERO_LBM_REALTIME_SOLVER_AUTO;
 
 struct StepTiming {
     double payload_copy_ms = 0.0;
@@ -5675,6 +5676,13 @@ cl_int enqueue_kernel_1d(cl_kernel kernel, int cells, cl_event* event = nullptr)
 }
 
 bool compact_realtime_env_enabled() {
+    if (g_realtime_solver_mode == AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27
+        || g_realtime_solver_mode == AERO_LBM_REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL) {
+        return false;
+    }
+    if (g_realtime_solver_mode == AERO_LBM_REALTIME_SOLVER_COMPACT_EXPERIMENTAL) {
+        return true;
+    }
     const char* primary = std::getenv("AERO_LBM_COMPACT_REALTIME");
     const char* legacy = std::getenv("AERO_LBM_REALTIME_COMPACT");
     const char* env = primary ? primary : legacy;
@@ -5721,6 +5729,13 @@ float compact_viscosity_alpha() {
 }
 
 bool d3q27_f16_inplace_env_enabled() {
+    if (g_realtime_solver_mode == AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27
+        || g_realtime_solver_mode == AERO_LBM_REALTIME_SOLVER_COMPACT_EXPERIMENTAL) {
+        return false;
+    }
+    if (g_realtime_solver_mode == AERO_LBM_REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL) {
+        return true;
+    }
     const char* value = std::getenv("AERO_LBM_D3Q27_FP16_INPLACE");
     if (!value) return false;
     return std::strcmp(value, "0") != 0
@@ -10281,6 +10296,20 @@ AERO_LBM_CAPI_EXPORT const char* aero_lbm_memory_info(void) {
 
 AERO_LBM_CAPI_EXPORT void aero_lbm_reset_timing(void) {
     reset_timing_stats();
+}
+
+AERO_LBM_CAPI_EXPORT void aero_lbm_set_realtime_solver_mode(int solver_mode) {
+    switch (solver_mode) {
+        case AERO_LBM_REALTIME_SOLVER_AUTO:
+        case AERO_LBM_REALTIME_SOLVER_CLASSIC_D3Q27:
+        case AERO_LBM_REALTIME_SOLVER_COMPACT_EXPERIMENTAL:
+        case AERO_LBM_REALTIME_SOLVER_D3Q27_FP16_INPLACE_EXPERIMENTAL:
+            g_realtime_solver_mode = solver_mode;
+            break;
+        default:
+            g_realtime_solver_mode = AERO_LBM_REALTIME_SOLVER_AUTO;
+            break;
+    }
 }
 
 AERO_LBM_CAPI_EXPORT int aero_lbm_finish(void) {
