@@ -34,11 +34,16 @@ public final class ModBlocks {
     }
 
     public static void register() {
-        ItemGroupEvents.modifyEntriesEvent(CreativeModeTabs.TOOLS_AND_UTILITIES).register(entries -> entries.prepend(WIND_METER_ITEM));
+        ItemGroupEvents.modifyEntriesEvent(CreativeModeTabs.TOOLS_AND_UTILITIES).register(entries -> {
+            entries.prepend(FAN_BLOCK);
+            entries.prepend(DUCT_BLOCK);
+            entries.prepend(WIND_METER_ITEM);
+            entries.prepend(WIND_TURBINE_PROBE_BLOCK);
+        });
     }
 
     public static <T extends Item> T register(String name, Function<Item.Properties, T> itemFactory, Item.Properties settings) {
-        ResourceKey<Item> itemKey = ResourceKey.create(Registries.ITEM, Identifier.fromNamespaceAndPath(MOD_ID, name));
+        ResourceKey<Item> itemKey = keyOfItem(name);
 
         T item = itemFactory.apply(settings.setId(itemKey));
 
