@@ -1,6 +1,6 @@
 package com.aerodynamics4mc.net;
 
-import com.aerodynamics4mc.ModBlocks;
+import com.aerodynamics4mc.ModTemplate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
@@ -17,7 +17,7 @@ public record AeroFlowPayload(
     private static final int MAX_PACKED_FLOW_SHORTS = 1_048_576;
 
     public static final Type<AeroFlowPayload> ID =
-        new Type<>(Identifier.fromNamespaceAndPath(ModBlocks.MOD_ID, "flow_field"));
+        new Type<>(Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "flow_field"));
     public static final StreamCodec<RegistryFriendlyByteBuf, AeroFlowPayload> CODEC =
 			StreamCodec.ofMember(AeroFlowPayload::write, AeroFlowPayload::new);
 

@@ -1,8 +1,8 @@
 package com.aerodynamics4mc.runtime;
 
-import com.aerodynamics4mc.FanBlock;
-import com.aerodynamics4mc.FanBlockEntity;
-import com.aerodynamics4mc.ModBlocks;
+import com.aerodynamics4mc.block.FanBlock;
+import com.aerodynamics4mc.block.FanBlockEntity;
+import com.aerodynamics4mc.block.ModBlocks;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceKey;
@@ -14,7 +14,14 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
