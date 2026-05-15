@@ -1,6 +1,6 @@
 package com.aerodynamics4mc.net;
 
-import com.aerodynamics4mc.ModBlocks;
+import com.aerodynamics4mc.block.ModBlocks;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;

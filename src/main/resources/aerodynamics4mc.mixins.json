@@ -1,0 +1,11 @@
+{
+  "package": "com.aerodynamics4mc.mixin",
+  "required": true,
+  "minVersion": "0.8",
+  "compatibilityLevel": "${java}",
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "mixins": ${common_array},
+  "client": ${client_array}
+}

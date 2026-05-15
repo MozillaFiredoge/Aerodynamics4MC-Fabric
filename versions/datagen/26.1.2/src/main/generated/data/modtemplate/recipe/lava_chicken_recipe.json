@@ -1,0 +1,11 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    "minecraft:lava_bucket",
+    "minecraft:chicken"
+  ],
+  "result": {
+    "id": "minecraft:cooked_chicken"
+  }
+}
