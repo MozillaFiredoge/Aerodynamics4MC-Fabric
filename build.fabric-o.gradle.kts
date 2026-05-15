@@ -85,6 +85,7 @@ repositories {
 	mavenCentral()
 	strictMaven("https://maven.terraformersmc.com/", "com.terraformersmc") { name = "TerraformersMC" }
 	strictMaven("https://api.modrinth.com/maven", "maven.modrinth") { name = "Modrinth" }
+	strictMaven("https://jitpack.io") { name = "Jitpack" }
 }
 
 configurations.all {
@@ -105,4 +106,12 @@ dependencies {
 	// include(libs.moulberry.mixinconstraints)
 	modImplementation("net.fabricmc.fabric-api:fabric-api:${prop("deps.fabric-api")}")
 	modLocalRuntime("com.terraformersmc:modmenu:${prop("deps.modmenu")}")
+
+	compileOnly("org.projectlombok:lombok:1.18.46")
+	annotationProcessor("org.projectlombok:lombok:1.18.46")
+
+	testCompileOnly("org.projectlombok:lombok:1.18.46")
+	testAnnotationProcessor("org.projectlombok:lombok:1.18.46")
+
+	//include(implementation("com.github.RazorPlay01:PacketHandler:1.3.0")!!)
 }

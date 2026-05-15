@@ -1,8 +1,8 @@
 package com.aerodynamics4mc.client;
 
+import com.aerodynamics4mc.ModTemplate;
 import com.aerodynamics4mc.api.SamplePolicy;
 import com.aerodynamics4mc.api.client.AeroClientWindApi;
-import com.aerodynamics4mc.block.ModBlocks;
 import com.mojang.blaze3d.platform.NativeImage;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -24,7 +24,7 @@ import java.util.Arrays;
 
 final class IrisWindBridge {
     private static final Logger LOGGER = LoggerFactory.getLogger("aerodynamics4mc/IrisWindBridge");
-    static final Identifier WIND_TEXTURE_ID = Identifier.fromNamespaceAndPath(ModBlocks.MOD_ID, "dynamic/foliage_wind");
+    static final Identifier WIND_TEXTURE_ID = Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "dynamic/foliage_wind");
 
     static final int GRID_X = 48;
     static final int GRID_Y = 24;

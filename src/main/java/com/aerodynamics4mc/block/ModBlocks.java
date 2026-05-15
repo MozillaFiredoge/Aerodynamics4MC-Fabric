@@ -1,5 +1,6 @@
 package com.aerodynamics4mc.block;
 
+import com.aerodynamics4mc.ModTemplate;
 import net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents;
 import net.fabricmc.fabric.api.object.builder.v1.block.entity.FabricBlockEntityTypeBuilder;
 import net.minecraft.core.Registry;
@@ -18,11 +19,10 @@ import net.minecraft.world.level.block.state.BlockBehaviour;
 import java.util.function.Function;
 
 public final class ModBlocks {
-    public static final String MOD_ID = "aerodynamics4mc";
-    public static final Identifier FAN_ID = Identifier.fromNamespaceAndPath(MOD_ID, "fan");
-    public static final Identifier DUCT_ID = Identifier.fromNamespaceAndPath(MOD_ID, "duct");
-    public static final Identifier WIND_METER_ID = Identifier.fromNamespaceAndPath(MOD_ID, "wind_meter");
-    public static final Identifier WIND_TURBINE_PROBE_ID = Identifier.fromNamespaceAndPath(MOD_ID, "wind_turbine_probe");
+    public static final Identifier FAN_ID = Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "fan");
+    public static final Identifier DUCT_ID = Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "duct");
+    public static final Identifier WIND_METER_ID = Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "wind_meter");
+    public static final Identifier WIND_TURBINE_PROBE_ID = Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "wind_turbine_probe");
     public static Block FAN_BLOCK = register(FAN_ID.getPath(), FanBlock::new, Block.Properties.of().strength(1.5f), true);
     public static Block DUCT_BLOCK = register(DUCT_ID.getPath(), DuctBlock::new, Block.Properties.of().strength(1.0f), true);
     public static Item WIND_METER_ITEM = register(WIND_METER_ID.getPath(), WindMeterItem::new, new Item.Properties().stacksTo(1));
@@ -67,11 +67,11 @@ public final class ModBlocks {
     }
 
     private static ResourceKey<Block> keyOfBlock(String name) {
-        return ResourceKey.create(Registries.BLOCK, Identifier.fromNamespaceAndPath(MOD_ID, name));
+        return ResourceKey.create(Registries.BLOCK, Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, name));
     }
 
     private static ResourceKey<Item> keyOfItem(String name) {
-        return ResourceKey.create(Registries.ITEM, Identifier.fromNamespaceAndPath(MOD_ID, name));
+        return ResourceKey.create(Registries.ITEM, Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, name));
     }
 
     private static <T extends BlockEntity> BlockEntityType<T> register(
@@ -79,7 +79,7 @@ public final class ModBlocks {
             FabricBlockEntityTypeBuilder.Factory<? extends T> entityFactory,
             Block... blocks
     ) {
-        Identifier id = Identifier.fromNamespaceAndPath(MOD_ID, name);
+        Identifier id = Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, name);
         return Registry.register(BuiltInRegistries.BLOCK_ENTITY_TYPE, id, FabricBlockEntityTypeBuilder.<T>create(entityFactory, blocks).build());
     }
 }

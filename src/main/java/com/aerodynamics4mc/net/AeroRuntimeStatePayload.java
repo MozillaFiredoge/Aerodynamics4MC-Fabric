@@ -1,6 +1,6 @@
 package com.aerodynamics4mc.net;
 
-import com.aerodynamics4mc.block.ModBlocks;
+import com.aerodynamics4mc.ModTemplate;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -12,7 +12,7 @@ public record AeroRuntimeStatePayload(
 		boolean renderStreamlines
 ) implements CustomPacketPayload {
 	public static final Type<AeroRuntimeStatePayload> ID =
-			new Type<>(Identifier.fromNamespaceAndPath(ModBlocks.MOD_ID, "runtime_state"));
+			new Type<>(Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "runtime_state"));
 	public static final StreamCodec<RegistryFriendlyByteBuf, AeroRuntimeStatePayload> CODEC =
 			StreamCodec.ofMember(AeroRuntimeStatePayload::write, AeroRuntimeStatePayload::new);
 

@@ -1,6 +1,6 @@
 package com.aerodynamics4mc.net;
 
-import com.aerodynamics4mc.block.ModBlocks;
+import com.aerodynamics4mc.ModTemplate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
@@ -23,7 +23,7 @@ public record AeroCoarseWindPayload(
 	private static final int MAX_PACKED_ATMOSPHERE_SHORTS = 1_048_576;
 
 	public static final Type<AeroCoarseWindPayload> ID =
-			new Type<>(Identifier.fromNamespaceAndPath(ModBlocks.MOD_ID, "coarse_wind"));
+			new Type<>(Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "coarse_wind"));
 	public static final StreamCodec<RegistryFriendlyByteBuf, AeroCoarseWindPayload> CODEC =
 			StreamCodec.ofMember(AeroCoarseWindPayload::write, AeroCoarseWindPayload::new);
 

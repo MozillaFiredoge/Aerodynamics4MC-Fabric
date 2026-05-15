@@ -1,6 +1,6 @@
 package com.aerodynamics4mc.net;
 
-import com.aerodynamics4mc.block.ModBlocks;
+import com.aerodynamics4mc.ModTemplate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
@@ -24,7 +24,7 @@ public record AeroFlowAnalysisPayload(
 	private static final int MAX_RESIDUAL_BYTES = 4_194_304;
 
 	public static final Type<AeroFlowAnalysisPayload> ID =
-			new Type<>(Identifier.fromNamespaceAndPath(ModBlocks.MOD_ID, "flow_field_analysis"));
+			new Type<>(Identifier.fromNamespaceAndPath(ModTemplate.MOD_ID, "flow_field_analysis"));
 	public static final StreamCodec<RegistryFriendlyByteBuf, AeroFlowAnalysisPayload> CODEC =
 			StreamCodec.ofMember(AeroFlowAnalysisPayload::write, AeroFlowAnalysisPayload::new);
 
