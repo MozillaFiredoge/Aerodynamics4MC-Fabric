@@ -9,7 +9,6 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldTerrainRenderContext;
-import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.client.renderer.texture.TextureManager;
@@ -96,7 +95,7 @@ final class IrisWindBridge {
     }
 
     private void onClientTick(Minecraft client) {
-        boolean irisLoaded = FabricLoader.getInstance().isModLoaded("iris");
+        boolean irisLoaded = ModTemplate.xplat().isModLoaded("iris");
         if (!irisLoaded) {
             if (!loggedMissingIris) {
                 LOGGER.info("Iris wind bridge idle: Iris mod not loaded");
@@ -165,7 +164,7 @@ final class IrisWindBridge {
         if (!streamingEnabled) {
             return;
         }
-        if (!FabricLoader.getInstance().isModLoaded("iris") || !isShaderPackInUseReflective()) {
+        if (!ModTemplate.xplat().isModLoaded("iris") || !isShaderPackInUseReflective()) {
             return;
         }
         long gameTime = client.level.getGameTime();

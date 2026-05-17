@@ -41,7 +41,7 @@ public class ModTemplate {
 		AeroClientMod.getInstance().onInitializeClient();
 	}
 
-	static Platform xplat() {
+	public static Platform xplat() {
 		return PLATFORM;
 	}
 

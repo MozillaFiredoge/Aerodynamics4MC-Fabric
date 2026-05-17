@@ -1,6 +1,5 @@
 package com.aerodynamics4mc.api;
 
-
 import net.minecraft.world.phys.Vec3;
 
 public final class AeroWindSamplingRules {
