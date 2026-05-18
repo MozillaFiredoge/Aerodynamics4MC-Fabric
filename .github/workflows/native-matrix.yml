@@ -198,10 +198,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MOD_JAR="$(ls build/libs/*.jar | grep -E -v '(-sources|-dev)\\.jar$' | head -n 1 || true)"
+          mapfile -t CANDIDATE_JARS < <(
+            {
+              find versions -path '*/build/libs/*.jar' -type f -name '*.jar' 2>/dev/null | sort || true
+              find build/libs -maxdepth 1 -type f -name '*.jar' 2>/dev/null | sort || true
+            } | grep -E -v '(-sources|-dev)\.jar$' || true
+          )
+          MOD_JAR="${CANDIDATE_JARS[0]:-}"
           if [[ -z "${MOD_JAR}" ]]; then
-            echo "release mod jar not found in build/libs"
+            echo "release mod jar not found in build/libs or versions/*/build/libs"
             ls -la build/libs || true
+            find versions -path '*/build/libs' -type d -print -exec ls -la {} \; || true
             exit 1
           fi
           echo "MOD_JAR=${MOD_JAR}" >> "$GITHUB_ENV"

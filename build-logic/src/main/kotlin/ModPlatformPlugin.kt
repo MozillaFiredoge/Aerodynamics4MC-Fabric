@@ -238,6 +238,10 @@ abstract class ModPlatformPlugin @Inject constructor() : Plugin<Project> {
 				copyNative("native/build-linux-arm64/libaero_lbm.so", "natives/linux-arm64/libaero_lbm.so")
 				copyNative("native/build-macos-arm64/libaero_lbm.dylib", "natives/macos-arm64/libaero_lbm.dylib")
 				copyNative("native/build-windows-x86_64/aero_lbm.dll", "natives/windows-x86_64/aero_lbm.dll")
+				copyNative("native/dist/natives/linux-x86_64/libaero_lbm.so", "natives/linux-x86_64/libaero_lbm.so")
+				copyNative("native/dist/natives/linux-arm64/libaero_lbm.so", "natives/linux-arm64/libaero_lbm.so")
+				copyNative("native/dist/natives/windows-x86_64/aero_lbm.dll", "natives/windows-x86_64/aero_lbm.dll")
+				copyNative("native/dist/natives/macos-arm64/libaero_lbm.dylib", "natives/macos-arm64/libaero_lbm.dylib")
 
 				if (packedCount == 0) {
 					logger.lifecycle("⚠️ No native binaries found")
